@@ -106,6 +106,13 @@ These are hard rules, not preferences:
   relevant, the invariants it upholds. **Every public item gets a `///` doc
   comment.** Comment anything a competent reader would otherwise find unclear
   — and nothing that is already obvious from the code.
+- **Comments are self-contained.** Never cite process artifacts anywhere in
+  the repository — not in code comments, manifest/config comments, docs, or
+  commit messages. Prohibited: references to AGENTS.md or its sections, user
+  review feedback, PR threads, or conversation history ("per review",
+  "as discussed", "see Review paragraph 5", "allowed by AGENTS.md §4"). State
+  the actual technical reason in place instead: process references are
+  meaningless to a future reader and rot as those documents change.
 - **No unclean code.** No dead code, no commented-out code, no debug leftovers,
   no orphaned imports. If *your* change makes something unused, remove it; do
   not remove pre-existing dead code unless asked (report it instead).
@@ -195,7 +202,30 @@ inconvenient is prohibited.
   not observed. If a gate fails and you cannot fix it within the rules above,
   report the failure honestly with the output.
 
-## 8. Definition of done
+## 8. Commit conventions
+
+- **Subject format:** `<area>: <imperative summary>` — e.g.
+  `loader: print firmware revision at boot`. Lowercase, imperative mood
+  ("add", not "added" or "adds"), no trailing period, whole subject line
+  ≤ 72 characters.
+- **Areas:** `loader` (hv-loader), `workspace` (root manifests, toolchain,
+  lint/format/config files), `docs` (documentation-only changes). A new crate
+  introduces its own area named after the crate minus the `hv-` prefix.
+- **Body:** separated from the subject by one blank line, prose wrapped at
+  72 columns. Explain *what* changed and *why* — motivation and non-obvious
+  consequences — not a replay of the diff. Trivial self-explanatory changes
+  may omit the body.
+- **Self-contained** (§4): commit messages never cite AGENTS.md, reviews, or
+  conversation history; they carry the actual reasoning themselves.
+- **One logical change per commit.** Never mix a refactor with a behavior
+  change, or formatting churn with anything else.
+- **Every commit passes the Definition of done (§9).** Never commit code that
+  fails a gate or is "fixed in the next commit". `Cargo.lock` changes are
+  committed together with the manifest change that caused them.
+- **Commit only when the user asks.** Never push, tag, amend, or rewrite
+  history unprompted.
+
+## 9. Definition of done
 
 A change may be presented as finished only when ALL of the following hold:
 
