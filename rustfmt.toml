@@ -1,0 +1,6 @@
+# Formatting policy. The non-default options below are unstable, which is fine:
+# rustfmt always runs on the pinned nightly toolchain (rust-toolchain.toml).
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+wrap_comments = true
+format_code_in_doc_comments = true

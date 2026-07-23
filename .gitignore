@@ -1,0 +1,31 @@
+# Build artifacts. Every crate (host tools, the UEFI loader, and the
+# freestanding hv-core image built with a custom target JSON) lands here.
+/target/
+**/target/
+
+# Cargo.lock is intentionally NOT ignored. This workspace only produces
+# binaries/firmware images, never a published library, so the lockfile is
+# committed for reproducible builds.
+
+# Local build output staged for running/flashing, once xtask exists.
+/dist/
+
+# Boot/image artifacts that may get produced locally while iterating.
+*.efi
+*.img
+*.iso
+*.qcow2
+*.bin
+
+# Debug symbols and logs.
+*.pdb
+*.log
+
+# Editor/IDE state.
+.vscode/
+.idea/
+*.swp
+
+# OS noise.
+.DS_Store
+Thumbs.db

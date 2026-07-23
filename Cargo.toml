@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/hv-loader"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# rust-osdev UEFI bindings. `panic_handler` and `global_allocator` install the
+# crate's own handlers so firmware-side binaries need no boilerplate of their
+# own; `logger` backs `uefi::println!` via the firmware text console.
+uefi = { version = "0.39.0", features = ["panic_handler", "global_allocator", "logger"] }
+
+# Zero-warnings policy: every rustc warning and all of
+# clippy::pedantic are hard errors. Exceptions only as narrowly scoped
+# `#[expect(..., reason = "...")]` attributes — never blanket downgrades.
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+allow_attributes_without_reason = "deny"

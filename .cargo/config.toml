@@ -1,0 +1,4 @@
+# The workspace's primary artifacts are UEFI PE images, so that is the default
+# target. Host-side tooling (if added later) must pass its --target explicitly.
+[build]
+target = "x86_64-unknown-uefi"
