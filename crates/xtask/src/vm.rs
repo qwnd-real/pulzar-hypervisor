@@ -74,21 +74,21 @@ pub fn launch(spec: &Spec) -> Result<()> {
             "if=none,id=esp,format=raw,file=fat:rw:{}",
             drive_path(dir)
         ));
-        qemu.args(["-device", "ide-hd,drive=esp,bootindex=0"]);
+        qemu.args(["-device", "ide-hd,drive=esp,bus=ide.0,bootindex=0"]);
     }
     if let Some(image) = &spec.disk {
         qemu.arg("-drive").arg(format!(
             "if=none,id=os,format=qcow2,file={}",
             drive_path(image)
         ));
-        qemu.args(["-device", "ide-hd,drive=os,bootindex=1"]);
+        qemu.args(["-device", "ide-hd,drive=os,bus=ide.1,bootindex=1"]);
     }
     if let Some(iso) = &spec.installer {
         qemu.arg("-drive").arg(format!(
             "if=none,id=installer,format=raw,media=cdrom,file={}",
             drive_path(iso)
         ));
-        qemu.args(["-device", "ide-cd,drive=installer,bootindex=0"]);
+        qemu.args(["-device", "ide-cd,drive=installer,bus=ide.2,bootindex=0"]);
     }
     let _tpm = if spec.tpm {
         Some(start_swtpm(spec.label, &mut qemu)?)
