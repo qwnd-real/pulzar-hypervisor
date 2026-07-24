@@ -1,4 +1,4 @@
-# The workspace's primary artifacts are UEFI PE images, so that is the default
-# target. Host-side tooling (if added later) must pass its --target explicitly.
-[build]
-target = "x86_64-unknown-uefi"
+# No workspace-wide default target is set: the UEFI crates pin
+# `x86_64-unknown-uefi` themselves via `forced-target` in their manifests
+# (nightly `per-package-target` feature), so host-side and firmware crates
+# both build correctly under a plain `cargo build`.

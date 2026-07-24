@@ -1,9 +1,15 @@
+# `per-package-target` lets this manifest pin its own build target, so the
+# workspace needs no global default and host-side crates coexist with UEFI
+# ones under a plain `cargo build`.
+cargo-features = ["per-package-target"]
+
 [package]
 name = "hv-loader"
 description = "First-stage UEFI loader for the pulzar hypervisor"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+forced-target = "x86_64-unknown-uefi"
 
 # A `no_std` UEFI binary cannot host the libtest harness (it would link a
 # second panic handler), so test/bench targets are disabled explicitly.
