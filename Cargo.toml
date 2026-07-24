@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hv-core", "crates/hv-loader"]
+members = ["crates/hv-core", "crates/hv-loader", "crates/xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,14 @@ publish = false
 # crate's own handlers so firmware-side binaries need no boilerplate of their
 # own; `logger` backs `uefi::println!` via the firmware text console.
 uefi = { version = "0.39.0", features = ["panic_handler", "global_allocator", "logger"] }
+
+# Host-side dependencies, used only by the `xtask` runner.
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+dirs = "6.0"
+ovmf-prebuilt = "0.2.9"
+sha2 = "0.11"
+ureq = "3.3"
 
 # Zero-warnings policy: every rustc warning and all of
 # clippy::pedantic are hard errors. Exceptions only as narrowly scoped

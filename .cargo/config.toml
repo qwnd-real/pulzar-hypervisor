@@ -2,3 +2,16 @@
 # `x86_64-unknown-uefi` themselves via `forced-target` in their manifests
 # (nightly `per-package-target` feature), so host-side and firmware crates
 # both build correctly under a plain `cargo build`.
+
+[alias]
+xtask = "run --package xtask --"
+
+# Resolve features per package instead of workspace-wide. Host-side and UEFI
+# crates share dependencies (e.g. `bitflags`), and workspace-wide unification
+# would let host crates switch `std` features on for the `no_std` firmware
+# builds.
+[unstable]
+feature-unification = true
+
+[resolver]
+feature-unification = "package"
