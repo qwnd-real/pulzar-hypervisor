@@ -39,6 +39,11 @@ enum Cli {
         /// Build with the release profile.
         #[arg(long)]
         release: bool,
+        /// Capture a guest serial port to a file, created fresh each run.
+        /// Repeatable: the first use maps to COM1, the next to COM2, and so
+        /// on. Without it, COM1 goes to stdio as before.
+        #[arg(long, value_name = "FILE")]
+        serial_log: Vec<PathBuf>,
     },
 }
 
@@ -90,6 +95,10 @@ fn main() -> Result<()> {
         Cli::Build { release } => esp::stage(release).map(|_| ()),
         Cli::Disk(DiskCommand::Linux { force }) => disk::linux(force),
         Cli::Disk(DiskCommand::Windows { iso, force }) => disk::windows(&iso, force),
-        Cli::Run { os, release } => vm::run(os, release),
+        Cli::Run {
+            os,
+            release,
+            serial_log,
+        } => vm::run(os, release, serial_log),
     }
 }

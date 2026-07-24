@@ -81,6 +81,7 @@ pub fn windows(iso: &Path, force: bool) -> Result<()> {
         disk: Some(image),
         installer: Some(iso.to_path_buf()),
         tpm: true,
+        serial_logs: Vec::new(),
     })?;
     println!(
         "installer session ended — if setup completed, boot the guest behind the hypervisor with `cargo xtask run --os windows`; otherwise rerun with --force"

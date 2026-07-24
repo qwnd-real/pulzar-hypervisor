@@ -35,10 +35,13 @@ pub struct Spec {
     pub installer: Option<PathBuf>,
     /// Attach an emulated TPM 2.0 backed by `swtpm`.
     pub tpm: bool,
+    /// Serial ports to capture: entry N becomes COM(N+1), written to the
+    /// named file. Empty means the default single COM1-on-stdio port.
+    pub serial_logs: Vec<PathBuf>,
 }
 
 /// Builds the boot media and runs it in QEMU, optionally with a guest disk.
-pub fn run(os: Guest, release: bool) -> Result<()> {
+pub fn run(os: Guest, release: bool, serial_logs: Vec<PathBuf>) -> Result<()> {
     let staged = esp::stage(release)?;
     let disk = match os {
         Guest::None => None,
@@ -54,6 +57,7 @@ pub fn run(os: Guest, release: bool) -> Result<()> {
         disk,
         installer: None,
         tpm: matches!(os, Guest::Windows),
+        serial_logs,
     })
 }
 
@@ -62,7 +66,8 @@ pub fn launch(spec: &Spec) -> Result<()> {
     let (code, vars) = firmware(spec.label)?;
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.args(["-machine", "q35,accel=kvm", "-cpu", "host"]);
-    qemu.args(["-smp", "4", "-m", "4G", "-serial", "stdio"]);
+    qemu.args(["-smp", "4", "-m", "4G"]);
+    serial_args(&mut qemu, &spec.serial_logs)?;
     qemu.arg("-drive").arg(format!(
         "if=pflash,format=raw,readonly=on,file={}",
         drive_path(&code)
@@ -96,6 +101,30 @@ pub fn launch(spec: &Spec) -> Result<()> {
         None
     };
     proc::run(&mut qemu, QEMU_INSTALL_HINT)
+}
+
+/// Wires the guest serial ports into `qemu`: with no capture files
+/// requested, COM1 goes to stdio as always; otherwise each file becomes a
+/// chardev feeding one COM port, in request order. Files are created empty
+/// up front — appending to a previous run's log, or silently keeping one
+/// around when QEMU fails to start, would be a debugging hazard.
+fn serial_args(qemu: &mut Command, logs: &[PathBuf]) -> Result<()> {
+    if logs.is_empty() {
+        qemu.args(["-serial", "stdio"]);
+        return Ok(());
+    }
+    ensure!(
+        logs.len() <= 4,
+        "QEMU's PC machines expose at most four serial ports (COM1–COM4)"
+    );
+    for (index, path) in logs.iter().enumerate() {
+        fs::File::create(path)
+            .with_context(|| format!("failed to create serial log {}", path.display()))?;
+        qemu.arg("-chardev")
+            .arg(format!("file,id=char{index},path={}", drive_path(path)));
+        qemu.arg("-serial").arg(format!("chardev:char{index}"));
+    }
+    Ok(())
 }
 
 /// Removes a guest's firmware-variable store and TPM state, so a recreated
