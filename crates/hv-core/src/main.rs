@@ -21,7 +21,13 @@ use uefi::prelude::*;
 /// invariant.
 #[entry]
 fn main() -> Status {
-    uefi::helpers::init().expect("UEFI logger/allocator must initialize");
+    // Serial logging comes up before anything else so even this refusal
+    // path is observable. Firmware calls this entry on the bootstrap
+    // processor with application processors still parked, so no second
+    // core can race this call — and `serial::init` tolerates concurrent
+    // callers if that ever changes.
+    serial::init().expect("serial logging must initialize");
+    uefi::helpers::init().expect("UEFI allocator must initialize");
     uefi::println!("pulzar.efi is the hypervisor image; boot hv-loader (BOOTX64.EFI) instead");
     Status::UNSUPPORTED
 }

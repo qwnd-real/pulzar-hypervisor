@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hv-core", "crates/hv-loader", "crates/xtask"]
+members = ["crates/hv-core", "crates/hv-loader", "crates/serial", "crates/xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,8 +10,19 @@ publish = false
 [workspace.dependencies]
 # rust-osdev UEFI bindings. `panic_handler` and `global_allocator` install the
 # crate's own handlers so firmware-side binaries need no boilerplate of their
-# own; `logger` backs `uefi::println!` via the firmware text console.
-uefi = { version = "0.39.0", features = ["panic_handler", "global_allocator", "logger"] }
+# own. The `logger` feature stays off: it would claim the global `log` slot
+# that the serial backend owns (`uefi::println!` works without it).
+uefi = { version = "0.39.0", features = ["panic_handler", "global_allocator"] }
+
+# Firmware-side logging stack: `log` is the facade the binaries log through,
+# `serial` is this workspace's 16550 UART backend behind it, `spin` supplies
+# the no_std locks, `thiserror` derives the error types (default features
+# off: they pull in std), and `x86_64` wraps port I/O and interrupt control.
+log = "0.4"
+serial = { path = "crates/serial" }
+spin = "0.12"
+thiserror = { version = "2.0", default-features = false }
+x86_64 = "0.15"
 
 # Host-side dependencies, used only by the `xtask` runner.
 anyhow = "1.0"

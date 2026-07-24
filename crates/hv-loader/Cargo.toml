@@ -19,6 +19,8 @@ test = false
 bench = false
 
 [dependencies]
+log = { workspace = true }
+serial = { workspace = true }
 uefi = { workspace = true }
 
 [lints]

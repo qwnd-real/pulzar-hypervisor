@@ -17,7 +17,14 @@ use uefi::prelude::*;
 /// a broken invariant.
 #[entry]
 fn main() -> Status {
-    uefi::helpers::init().expect("UEFI logger/allocator must initialize");
+    // Serial logging comes up before anything else so every subsequent
+    // stage is observable from its first instruction. Firmware calls this
+    // entry on the bootstrap processor with application processors still
+    // parked, so no second core can race this call — and `serial::init`
+    // tolerates concurrent callers if that ever changes.
+    serial::init().expect("serial logging must initialize");
+    log::info!("serial logging active");
+    uefi::helpers::init().expect("UEFI allocator must initialize");
     uefi::println!("pulzar hv-loader: Hello, World!");
     Status::SUCCESS
 }
