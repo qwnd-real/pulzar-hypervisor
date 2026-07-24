@@ -11,12 +11,6 @@ edition.workspace = true
 publish.workspace = true
 forced-target = "x86_64-unknown-uefi"
 
-# A `no_std` UEFI crate cannot host the libtest harness (it would link a
-# second panic handler), so test/bench targets are disabled explicitly.
-[lib]
-test = false
-bench = false
-
 [dependencies]
 log = { workspace = true }
 spin = { workspace = true }
