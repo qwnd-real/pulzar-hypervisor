@@ -47,21 +47,25 @@ pulzar/
 ├── Cargo.toml           ← workspace root; lints and shared deps live HERE
 ├── rust-toolchain.toml  ← pinned nightly; do not float the channel
 ├── rustfmt.toml         ← formatting policy (uses unstable options → nightly)
-├── .cargo/config.toml   ← default build target: x86_64-unknown-uefi
+├── .cargo/config.toml   ← cargo aliases (`cargo xtask`)
 └── crates/
-    └── hv-loader/       ← UEFI application: first-stage loader for the hypervisor
+    ├── hv-loader/       ← UEFI application: first-stage loader for the hypervisor
+    ├── hv-core/         ← UEFI application: hypervisor image (stub until the loader loads it)
+    └── xtask/           ← host tool: stages boot media, provisions guest disks, runs QEMU
 ```
 
 - `hv-loader` is a `no_std`/`no_main` UEFI PE application built for
   `x86_64-unknown-uefi`, using the rust-osdev `uefi` crate. It runs under
   firmware boot services; its job (eventually) is to locate, map, and jump into
   the hypervisor image.
-- The hypervisor core will later live in its own crate(s) built for a custom
-  freestanding target with `-Z build-std` — this is why the toolchain is
-  nightly. Do not create those crates until asked.
-- Future host-side tooling (e.g. an `xtask` runner) must pass
-  `--target x86_64-unknown-linux-gnu` explicitly, because the workspace default
-  target is UEFI.
+- `hv-core` is today a UEFI PE stub standing in for the hypervisor image, so
+  boot media and staging are exercised end to end. The real hypervisor core
+  will move to a custom freestanding target with `-Z build-std` — this is why
+  the toolchain is nightly.
+- There is no workspace-wide default target: the UEFI crates pin
+  `x86_64-unknown-uefi` via `forced-target` (nightly `per-package-target`
+  feature) and `xtask` builds for the host, so plain `cargo build` compiles
+  every crate for its correct target.
 
 ## 3. Toolchain and build
 
@@ -86,6 +90,7 @@ cargo build                      # produces target/x86_64-unknown-uefi/debug/hv-
 cargo clippy --all-targets       # must exit 0 with zero warnings
 cargo fmt --all                  # must produce no diff on committed code
 cargo fmt --all -- --check       # verification form
+cargo xtask --help               # stage boot media, provision guest disks, run QEMU
 ```
 
 ## 4. Coding style — hard rules
