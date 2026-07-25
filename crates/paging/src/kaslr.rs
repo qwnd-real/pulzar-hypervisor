@@ -11,6 +11,7 @@
 //! window, so their addresses move with the window's base.
 
 use log::warn;
+use processor::Features;
 use x86_64::{VirtAddr, instructions::random::RdRand};
 
 use crate::{PagingError, chunk};
@@ -131,13 +132,18 @@ impl Entropy {
     /// Opens the best available source.
     #[must_use]
     pub fn new() -> Self {
-        let source = RdRand::new();
+        // The processor crate answers whether the instruction exists; `RdRand`
+        // is only the wrapper that issues it.
+        let source = processor::features()
+            .contains(Features::RDRAND)
+            .then(RdRand::new)
+            .flatten();
         if source.is_none() {
             warn!("paging: no RDRAND; layout entropy degraded to the timestamp counter");
         }
         Self {
             source,
-            state: timestamp(),
+            state: processor::timestamp(),
         }
     }
 
@@ -153,7 +159,7 @@ impl Entropy {
         self.source
             .and_then(|source| (0..RETRIES).find_map(|_| source.get_u64()))
             .unwrap_or_else(|| {
-                self.state ^= timestamp();
+                self.state ^= processor::timestamp();
                 mix(&mut self.state)
             })
     }
@@ -174,13 +180,4 @@ fn mix(state: &mut u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     value ^ (value >> 31)
-}
-
-/// The timestamp counter, the only monotonically varying value available this
-/// early in boot.
-fn timestamp() -> u64 {
-    // SAFETY: `rdtsc` is unconditionally available on x86-64 and reads a counter
-    // without side effects. `CR4.TSD` could make it fault at CPL 3, and this
-    // runs at CPL 0.
-    unsafe { core::arch::x86_64::_rdtsc() }
 }

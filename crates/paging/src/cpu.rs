@@ -1,43 +1,24 @@
-//! The processor features and architectural state the address space depends on.
+//! The architectural state the address space depends on.
 //!
-//! Everything here is read or programmed once, during bring-up, before any
-//! mapping exists. Two of the checks are refusals rather than adaptations:
-//! without `NX` there is no way to honour the no-execute requests the rest of
-//! the subsystem makes, and under 5-level paging the register the code treats
-//! as a PML4 pointer is a PML5 pointer, so proceeding would corrupt an address
-//! space rather than build one. Refusing to boot beats either.
+//! What the processor *can* do is the [`processor`] crate's answer. This module
+//! is the rest of it: what has to be programmed on the processor before the
+//! subsystem's assumptions about page table entries hold, and what has to be
+//! refused outright.
+//!
+//! Everything here happens once, during bring-up, before any mapping exists.
+//! Two of the checks are refusals rather than adaptations: without `NX` there
+//! is no way to honour the no-execute requests the rest of the subsystem makes,
+//! and under 5-level paging the register the code treats as a PML4 pointer is a
+//! PML5 pointer, so proceeding would corrupt an address space rather than build
+//! one. Refusing to boot beats either.
 
-use core::arch::x86_64::__cpuid;
-
+use processor::Features;
 use x86_64::registers::{
     control::{Cr4, Cr4Flags},
     model_specific::{Efer, EferFlags, Msr},
 };
 
 use crate::PagingError;
-
-/// Optional processor features the subsystem adapts to.
-#[derive(Clone, Copy, Debug)]
-pub struct Features {
-    /// `CPUID.80000001h:EDX.PDPE1GB[26]` — 1 GiB pages are available, so the
-    /// direct map costs one PDPT entry per gigabyte instead of a whole page
-    /// directory.
-    pub gib_pages: bool,
-    /// `CPUID.01h:ECX.RDRAND[30]` — a hardware entropy source for layout
-    /// randomization.
-    pub rdrand: bool,
-}
-
-/// Reads the features that matter to the address space.
-#[must_use]
-pub fn features() -> Features {
-    Features {
-        gib_pages: extended_edx().is_some_and(|edx| edx & (1 << 26) != 0),
-        // Leaf 1 exists on every processor that can run 64-bit code, so it needs
-        // no maximum-leaf check.
-        rdrand: __cpuid(1).ecx & (1 << 30) != 0,
-    }
-}
 
 /// Enables `EFER.NXE` so the no-execute bit in page tables is honoured rather
 /// than reserved.
@@ -48,7 +29,7 @@ pub fn features() -> Features {
 /// `NX`, which would leave every mapping this crate marks non-executable
 /// executable instead.
 pub fn enable_no_execute() -> Result<(), PagingError> {
-    if extended_edx().is_none_or(|edx| edx & (1 << 20) == 0) {
+    if !processor::features().contains(Features::NO_EXECUTE) {
         return Err(PagingError::NoExecuteUnsupported);
     }
     // SAFETY: setting `EFER.NXE` only changes how bit 63 of a page table entry
@@ -103,12 +84,4 @@ pub fn ensure_default_pat() -> bool {
     // firmware's, which are write-back — the type entry 0 keeps.
     unsafe { pat.write(DEFAULT_PAT) };
     true
-}
-
-/// `CPUID.80000001h:EDX`, or `None` if the leaf is not implemented.
-fn extended_edx() -> Option<u32> {
-    // Leaf 0x8000_0000 is the defined way to ask for the highest extended leaf,
-    // and answers even on a processor that implements none of them.
-    let highest = __cpuid(0x8000_0000).eax;
-    (highest >= 0x8000_0001).then(|| __cpuid(0x8000_0001).edx)
 }

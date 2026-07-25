@@ -32,6 +32,7 @@
 //! tables again on every mapping.
 
 use log::{info, warn};
+use processor::Features;
 use x86_64::{
     PhysAddr, VirtAddr,
     registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags},
@@ -45,7 +46,7 @@ use x86_64::{
 use crate::{
     DirectMap, Frames, PagingError, Slots, as_u64, as_usize, buddy,
     chunk::{self, FRAME_SIZE},
-    cpu::{self, Features},
+    cpu,
     kaslr::Placement,
 };
 
@@ -133,7 +134,7 @@ impl AddressSpace {
             ),
             frames,
             slots,
-            features: cpu::features(),
+            features: processor::features(),
         };
         // SAFETY: `root` is a freshly allocated, zeroed frame no one else refers
         // to, and the active address space is still firmware's.
@@ -181,7 +182,7 @@ impl AddressSpace {
             direct_map,
             frames,
             slots,
-            features: cpu::features(),
+            features: processor::features(),
         })
     }
 
@@ -539,7 +540,7 @@ impl AddressSpace {
             "{who}: direct map {:#x}+{:#x} ({} pages), window {:#x}+{:#x}, {} slots free",
             self.direct_map.base(),
             self.direct_map.size(),
-            if self.features.gib_pages {
+            if self.features.contains(Features::GIB_PAGES) {
                 "1 GiB"
             } else {
                 "2 MiB"
@@ -633,7 +634,7 @@ impl AddressSpace {
         let base = self.direct_map.base();
         for gib in (0..self.direct_map.size()).step_by(as_usize(Size1GiB::SIZE)) {
             let holds_chunk = gib < owned.end && owned.start < gib + Size1GiB::SIZE;
-            if self.features.gib_pages && !holds_chunk {
+            if self.features.contains(Features::GIB_PAGES) && !holds_chunk {
                 // SAFETY: the direct map is this space's own alias of physical
                 // memory, established before anything else maps any of it, and
                 // no-execute keeps it from being a path to executing data.
