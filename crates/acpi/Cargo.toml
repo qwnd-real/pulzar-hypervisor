@@ -4,20 +4,17 @@
 cargo-features = ["per-package-target"]
 
 [package]
-name = "hv-loader"
-description = "First-stage UEFI loader for the pulzar hypervisor"
+name = "acpi"
+description = "Firmware ACPI tables, cached and parsed for the pulzar hypervisor"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 forced-target = "x86_64-unknown-uefi"
 
 [dependencies]
-handoff = { workspace = true }
 log = { workspace = true }
 paging = { workspace = true }
-serial = { workspace = true }
 thiserror = { workspace = true }
-uefi = { workspace = true }
 x86_64 = { workspace = true }
 
 [lints]

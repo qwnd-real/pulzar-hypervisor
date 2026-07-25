@@ -1,0 +1,303 @@
+//! Everything the loader asks of firmware.
+//!
+//! Boot services are only available while the loader runs, so every use of them
+//! is gathered here: the loader's own image, the reserved chunk, the hypervisor
+//! image's file, and firmware's memory map. Nothing in this module knows how a
+//! page table or a PE image is built, and nothing outside it calls a boot
+//! service.
+//!
+//! Firmware objects are closed explicitly rather than dropped, because the
+//! loader ends by jumping into the hypervisor and never returns: no destructor
+//! at the end of `main` will ever run.
+
+use uefi::{
+    Handle, Status,
+    boot::{self, AllocateType, MemoryDescriptor, MemoryType, ScopedProtocol},
+    cstr16,
+    mem::memory_map::MemoryMap,
+    proto::{
+        loaded_image::LoadedImage,
+        media::{
+            file::{File, FileAttribute, FileMode, RegularFile},
+            fs::SimpleFileSystem,
+        },
+    },
+    system,
+    table::cfg::ConfigTableEntry,
+};
+use x86_64::PhysAddr;
+
+use crate::{
+    bytes,
+    error::{Context, LoaderError},
+    wide,
+};
+
+/// Path of the hypervisor image on the boot volume.
+const IMAGE_PATH: &uefi::CStr16 = cstr16!("\\pulzar.efi");
+
+/// The loader's own image, as firmware describes it.
+///
+/// The hypervisor evicts the loader with these: firmware needs the handle to
+/// unload the image, and the range is what is left to wipe afterwards.
+#[derive(Clone, Copy, Debug)]
+pub struct Loader {
+    /// Handle firmware created when it loaded this image.
+    pub handle: Handle,
+    /// Base address of the loaded image. Firmware's identity map makes this
+    /// both its physical and its virtual address.
+    pub base: u64,
+    /// Bytes the image occupies, rounded up to a whole number of pages —
+    /// firmware allocated it in pages, so the rounding stays inside the
+    /// allocation and the tail gets wiped with the rest.
+    pub size: u64,
+}
+
+/// Registers the unload handler and reports where firmware put this image.
+///
+/// Firmware refuses to unload a started image that has no unload handler, so
+/// registering one is what makes the hypervisor's eviction of the loader
+/// possible at all. It is done here, at the start of the boot, rather than
+/// later: there is no point building an address space for an image that could
+/// never get rid of us.
+///
+/// # Errors
+///
+/// [`LoaderError::Firmware`] if the loaded-image protocol cannot be opened,
+/// which would mean firmware did not give us the handle it started us with.
+pub fn claim_self() -> Result<Loader, LoaderError> {
+    let handle = boot::image_handle();
+    let mut image = boot::open_protocol_exclusive::<LoadedImage>(handle)
+        .context("open the loader's own loaded-image protocol")?;
+    // SAFETY: `unload` is a function in this image's code, which firmware calls
+    // during `UnloadImage` and frees only afterwards, so it is mapped and
+    // executable for as long as it can be called.
+    unsafe { image.set_unload(unload) };
+    let (base, size) = image.info();
+    Ok(Loader {
+        handle,
+        base: wide(base.addr()),
+        size: size.next_multiple_of(paging::chunk::FRAME_SIZE),
+    })
+}
+
+/// Reserves the one region of physical memory the hypervisor will own.
+///
+/// [`MemoryType::RESERVED`] is what keeps the region out of every later
+/// consumer's hands, firmware's included, and unlike loader-owned memory it
+/// survives the loader being unloaded — which it must, since it holds the page
+/// tables the hypervisor is running on by then.
+///
+/// Firmware only promises page alignment, so the request is one alignment
+/// larger than the chunk and the base is rounded up inside it. The slack stays
+/// reserved and unused: freeing it would hand a hole back in the middle of a
+/// region whose whole purpose is to be untouchable.
+///
+/// # Errors
+///
+/// [`LoaderError::Firmware`] if firmware has no contiguous region that large.
+pub fn allocate_chunk() -> Result<PhysAddr, LoaderError> {
+    let span = paging::chunk::CHUNK_SIZE + paging::chunk::CHUNK_ALIGN;
+    let pages = bytes(span / paging::chunk::FRAME_SIZE);
+    let base = boot::allocate_pages(AllocateType::AnyPages, MemoryType::RESERVED, pages)
+        .context("reserve the hypervisor's memory chunk")?;
+    Ok(PhysAddr::new(
+        wide(base.addr().get()).next_multiple_of(paging::chunk::CHUNK_ALIGN),
+    ))
+}
+
+/// The hypervisor image's file, open for reading.
+///
+/// The file system protocol is held alongside the file because closing it would
+/// take the volume the file lives on with it.
+#[derive(Debug)]
+pub struct ImageFile {
+    // Declared before the protocol it came from, so that dropping this closes
+    // the file first and the volume second.
+    file: RegularFile,
+    // Never read: held only so the volume stays open for as long as a file on it
+    // does, and closed by dropping it.
+    _volume: ScopedProtocol<SimpleFileSystem>,
+}
+
+impl ImageFile {
+    /// Opens the hypervisor image on the volume the loader was started from.
+    ///
+    /// # Errors
+    ///
+    /// [`LoaderError::Firmware`] if the volume cannot be opened or the image is
+    /// not on it, or [`LoaderError::NotARegularFile`] if the path names
+    /// something other than a file.
+    pub fn open() -> Result<Self, LoaderError> {
+        let mut volume = boot::get_image_file_system(boot::image_handle())
+            .context("open the file system the loader was started from")?;
+        let mut root = volume
+            .open_volume()
+            .context("open the root directory of the boot volume")?;
+        let handle = root
+            .open(IMAGE_PATH, FileMode::Read, FileAttribute::empty())
+            .context("open the hypervisor image")?;
+        let file = handle
+            .into_regular_file()
+            .ok_or(LoaderError::NotARegularFile)?;
+        Ok(Self {
+            file,
+            _volume: volume,
+        })
+    }
+
+    /// Reads up to `buffer.len()` bytes from `offset`, returning how many
+    /// arrived.
+    ///
+    /// # Errors
+    ///
+    /// [`LoaderError::Firmware`] if the seek or the read fails.
+    pub fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<usize, LoaderError> {
+        self.file
+            .set_position(offset)
+            .context("seek in the hypervisor image")?;
+        self.file
+            .read(buffer)
+            .context("read from the hypervisor image")
+    }
+
+    /// Fills `buffer` from `offset`, refusing a short read.
+    ///
+    /// A read that stops early is reported by firmware as success, so leaving
+    /// it unchecked would map a partly loaded section and fault somewhere
+    /// far from the cause.
+    ///
+    /// # Errors
+    ///
+    /// As [`ImageFile::read_at`], plus [`LoaderError::ShortRead`] if the file
+    /// ends inside the requested range.
+    pub fn read_exact(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), LoaderError> {
+        let wanted = buffer.len();
+        let got = self.read_at(offset, buffer)?;
+        if got == wanted {
+            return Ok(());
+        }
+        Err(LoaderError::ShortRead {
+            offset,
+            wanted,
+            got,
+        })
+    }
+}
+
+/// Physical address of the ACPI root pointer firmware published, or zero if it
+/// published none.
+///
+/// UEFI advertises one configuration table entry per ACPI generation, and
+/// firmware that supports ACPI 2.0 or later publishes both. The newer entry
+/// wins where both exist: it leads to a root pointer that carries a revision
+/// and a 64-bit table directory, while the 1.0 entry can only ever describe
+/// tables below 4 GiB. What either entry holds is a physical address, because
+/// firmware runs the boot services phase on an identity map.
+///
+/// A machine with no ACPI at all is reported as zero rather than refused here.
+/// Which tables the hypervisor cannot do without is the hypervisor's judgement
+/// to make, not the loader's.
+pub fn acpi_rsdp() -> u64 {
+    system::with_config_table(|entries| {
+        [ConfigTableEntry::ACPI2_GUID, ConfigTableEntry::ACPI_GUID]
+            .into_iter()
+            .find_map(|wanted| {
+                entries
+                    .iter()
+                    .find(|entry| entry.guid == wanted)
+                    .map(|entry| wide(entry.address.addr()))
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// What firmware's memory map told the loader.
+#[derive(Clone, Copy, Debug)]
+pub struct Memory {
+    /// One past the highest physical address firmware describes as memory.
+    /// Device apertures are excluded.
+    pub top_of_ram: u64,
+    /// Descriptors copied out of the map.
+    pub entries: usize,
+}
+
+/// Copies firmware's memory map into the chunk and finds the top of RAM.
+///
+/// The copy exists because firmware's own map lives in memory the hypervisor
+/// stops being able to reach: it is allocated from the pool, in the half of the
+/// address space that gets dropped. The stride is normalized to
+/// [`MemoryDescriptor`]'s own size rather than firmware's, which is free to be
+/// larger, so the hypervisor reads a plain array.
+///
+/// It is a snapshot, and boot services stay live afterwards — the pool
+/// allocation this call itself makes and releases is not reflected in it. The
+/// hypervisor uses it to know what memory exists, not what is currently free.
+///
+/// The top is the end of the highest descriptor that describes memory.
+/// Reserved, unusable and not-yet-accepted ranges all count — they are RAM
+/// whoever owns them, and counting reserved memory is what puts the chunk
+/// itself under the direct map.
+///
+/// Device memory does not count, and that is the point of computing this at
+/// all. The direct map exists to make reads and writes of RAM cheap; a device
+/// aperture can sit terabytes above the last stick of RAM, and sizing the
+/// direct map to reach it would cost page tables proportional to that gap for
+/// ranges that must not be accessed through a cached, always-present mapping
+/// anyway. Device registers are reached by mapping them explicitly, with the
+/// caching and protection the device requires. So the three non-memory types
+/// are left out: memory-mapped I/O and I/O port space, which belong to devices,
+/// and Itanium processor code, which cannot occur here.
+///
+/// # Errors
+///
+/// [`LoaderError::Firmware`] if firmware will not produce a map, or
+/// [`LoaderError::MemoryMapTooLarge`] if it is larger than `capacity`
+/// descriptors.
+///
+/// # Safety
+///
+/// `destination` must be writable for `capacity` descriptors.
+pub unsafe fn capture_memory_map(
+    destination: core::ptr::NonNull<MemoryDescriptor>,
+    capacity: usize,
+) -> Result<Memory, LoaderError> {
+    /// Memory types whose descriptors describe something other than RAM.
+    const NOT_MEMORY: [MemoryType; 3] = [
+        MemoryType::MMIO,
+        MemoryType::MMIO_PORT_SPACE,
+        MemoryType::PAL_CODE,
+    ];
+
+    let map = boot::memory_map(MemoryType::LOADER_DATA).context("retrieve the UEFI memory map")?;
+    let entries = map.len();
+    if entries > capacity {
+        return Err(LoaderError::MemoryMapTooLarge { entries, capacity });
+    }
+    let mut top_of_ram = 0;
+    for (index, descriptor) in map.entries().enumerate() {
+        if !NOT_MEMORY.contains(&descriptor.ty) {
+            let end = descriptor.phys_start + descriptor.page_count * paging::chunk::FRAME_SIZE;
+            top_of_ram = top_of_ram.max(end);
+        }
+        // SAFETY: `index` is below `entries`, which the check above holds to
+        // `capacity`, so this stays inside the region the caller vouched for.
+        // `write` does not read what was there, which matters because reserved
+        // memory arrives holding whatever its last owner left.
+        unsafe { destination.add(index).write(*descriptor) };
+    }
+    Ok(Memory {
+        top_of_ram,
+        entries,
+    })
+}
+
+/// The unload handler firmware requires before it will unload a started image.
+///
+/// There is nothing to undo. The chunk is deliberately reserved memory rather
+/// than loader-owned memory, so unloading the loader does not take the
+/// hypervisor's page tables with it, and every firmware object the loader
+/// opened is closed before it jumps.
+extern "efiapi" fn unload(_image_handle: Handle) -> Status {
+    Status::SUCCESS
+}

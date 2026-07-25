@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/hv-core", "crates/hv-loader", "crates/serial", "crates/xtask"]
+members = [
+    "crates/acpi",
+    "crates/descriptors",
+    "crates/handoff",
+    "crates/hv-core",
+    "crates/hv-loader",
+    "crates/paging",
+    "crates/serial",
+    "crates/xtask",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,10 +18,26 @@ publish = false
 
 [workspace.dependencies]
 # rust-osdev UEFI bindings. `panic_handler` and `global_allocator` install the
-# crate's own handlers so firmware-side binaries need no boilerplate of their
-# own. The `logger` feature stays off: it would claim the global `log` slot
-# that the serial backend owns (`uefi::println!` works without it).
+# crate's own handlers so `hv-loader` needs no boilerplate of its own. The
+# `logger` feature stays off: it would claim the global `log` slot that the
+# serial backend owns.
 uefi = { version = "0.39.0", features = ["panic_handler", "global_allocator"] }
+
+# The same bindings without any of the runtime: `uefi-raw` is what `uefi` is
+# built on, and it installs neither a panic handler nor a global allocator.
+# `hv-core` uses it instead of `uefi` because the hypervisor outlives the
+# firmware environment — after the lower half of its address space is gone
+# there is no UEFI left to wrap.
+uefi-raw = "0.15.1"
+
+# Firmware-side pulzar crates. `handoff` is the ABI the loader and the
+# hypervisor image agree on; `paging` is the address-space subsystem both of
+# them drive; `acpi` turns the firmware tables into data the hypervisor owns;
+# `descriptors` owns the processor's own tables and the interrupt entry path.
+acpi = { path = "crates/acpi" }
+descriptors = { path = "crates/descriptors" }
+handoff = { path = "crates/handoff" }
+paging = { path = "crates/paging" }
 
 # Firmware-side logging stack: `log` is the facade the binaries log through,
 # `serial` is this workspace's 16550 UART backend behind it, `spin` supplies
@@ -23,6 +48,14 @@ serial = { path = "crates/serial" }
 spin = "0.12"
 thiserror = { version = "2.0", default-features = false }
 x86_64 = "0.15"
+
+# The allocator `hv-core` installs as its global allocator. Talc keeps its
+# bookkeeping inside the memory it manages and needs nothing from the
+# environment but a span of bytes, which is exactly what a run of frames from
+# the reserved chunk is. No features are enabled: `counters` would add
+# per-allocation accounting on top of what `Talc::reserved` already answers for
+# the one place utilization is reported.
+talc = "5.0.4"
 
 # Host-side dependencies, used only by the `xtask` runner.
 anyhow = "1.0"
