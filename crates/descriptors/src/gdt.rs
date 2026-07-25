@@ -16,8 +16,9 @@
 //! and a descriptor nobody can select is one fewer descriptor that can be
 //! selected wrongly.
 
+use alloc::boxed::Box;
+
 use paging::{AddressSpace, PagingError};
-use spin::Once;
 use x86_64::{
     VirtAddr,
     instructions::{
@@ -41,13 +42,6 @@ use crate::InterruptStack;
 /// left to report it from.
 const STACK_PAGES: u64 = 4;
 
-/// The task state segment. The processor keeps a descriptor pointing at it for
-/// as long as the task register is loaded, so it must never move.
-static TSS: Once<TaskStateSegment> = Once::new();
-
-/// The global descriptor table, together with the selectors into it.
-static GDT: Once<Table> = Once::new();
-
 /// Selectors into the global descriptor table.
 ///
 /// A selector means nothing without the table it indexes, so they travel
@@ -62,8 +56,16 @@ pub struct Selectors {
     pub task: SegmentSelector,
 }
 
-/// Allocates the interrupt stacks, builds the tables, and switches the
-/// processor onto them.
+/// Allocates this processor's interrupt stacks, builds its tables, and switches
+/// it onto them.
+///
+/// Every processor gets its own of both. A task state segment cannot be shared
+/// — two processors taking a double fault at once would take it on one stack —
+/// and the global descriptor table cannot be either, because the descriptor for
+/// that task state segment is in it. They are leaked rather than kept in a
+/// static: the processor keeps a pointer to each for as long as it runs, so they
+/// must never move and never be dropped, and how many there will be is firmware's
+/// to say rather than a number written here.
 ///
 /// # Errors
 ///
@@ -74,13 +76,15 @@ pub(crate) fn install(space: &mut AddressSpace) -> Result<Selectors, PagingError
     for stack in InterruptStack::ALL {
         stacks[usize::from(stack.slot())] = space.allocate_stack(STACK_PAGES)?.top();
     }
-    let tss = TSS.call_once(|| task_state(&stacks));
-    let table = GDT.call_once(|| Table::new(tss));
+    let tss = Box::leak(Box::new(task_state(&stacks)));
+    let table = Box::leak(Box::new(Table::new(tss)));
 
     // SAFETY: nothing in this image depends on the segmentation firmware set up
-    // — it uses no segment base and makes no privilege transition — and the
-    // table being replaced lives in the half of the address space that is about
-    // to stop existing anyway.
+    // — it uses no segment base and makes no privilege transition — and on the
+    // boot processor the table being replaced lives in the half of the address
+    // space that is about to stop existing anyway. A processor being started has
+    // nothing to depend on: the table it is on is the one the trampoline built
+    // for the jump into long mode.
     unsafe { table.activate() };
     Ok(table.selectors)
 }

@@ -81,6 +81,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apic"
+version = "0.1.0"
+
+[[package]]
 name = "base16ct"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -211,6 +215,17 @@ name = "const_fn"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
+
+[[package]]
+name = "cpu"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "log",
+ "spin",
+ "thiserror",
+ "x86_64",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -416,6 +431,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipi"
+version = "0.1.0"
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -521,6 +540,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "processor",
+ "spin",
  "thiserror",
  "x86_64",
 ]

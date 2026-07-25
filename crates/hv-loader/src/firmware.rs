@@ -83,6 +83,32 @@ pub fn claim_self() -> Result<Loader, LoaderError> {
     })
 }
 
+/// The physical memory the loader takes out of firmware's hands for good.
+///
+/// Two regions, reserved together because they are the same kind of thing: both
+/// outlive the loader, both are [`MemoryType::RESERVED`] so that nothing after
+/// pulzar reuses them, and neither can be asked for once firmware is gone.
+#[derive(Clone, Copy, Debug)]
+pub struct Reserved {
+    /// Base of the hypervisor's 64 MiB chunk, [`paging::chunk::CHUNK_ALIGN`]
+    /// aligned and below 4 GiB.
+    pub chunk: PhysAddr,
+    /// Base of the page the other processors start executing on, below 1 MiB.
+    pub trampoline: PhysAddr,
+}
+
+/// Reserves both regions.
+///
+/// # Errors
+///
+/// [`LoaderError::Firmware`] if firmware cannot satisfy either request.
+pub fn reserve() -> Result<Reserved, LoaderError> {
+    Ok(Reserved {
+        chunk: allocate_chunk()?,
+        trampoline: allocate_trampoline()?,
+    })
+}
+
 /// Reserves the one region of physical memory the hypervisor will own.
 ///
 /// [`MemoryType::RESERVED`] is what keeps the region out of every later
@@ -95,17 +121,58 @@ pub fn claim_self() -> Result<Loader, LoaderError> {
 /// reserved and unused: freeing it would hand a hole back in the middle of a
 /// region whose whole purpose is to be untouchable.
 ///
+/// The ceiling is not arbitrary. The hypervisor's PML4 is one of the chunk's
+/// frames, and the last thing a processor being started does before it enters
+/// long mode is load that address into `CR3` — while it is still in 32-bit
+/// protected mode, where the register is 32 bits wide. A chunk above 4 GiB
+/// would give it a page table it cannot name.
+///
 /// # Errors
 ///
-/// [`LoaderError::Firmware`] if firmware has no contiguous region that large.
-pub fn allocate_chunk() -> Result<PhysAddr, LoaderError> {
+/// [`LoaderError::Firmware`] if firmware has no contiguous region that large
+/// below 4 GiB.
+fn allocate_chunk() -> Result<PhysAddr, LoaderError> {
     let span = paging::chunk::CHUNK_SIZE + paging::chunk::CHUNK_ALIGN;
     let pages = bytes(span / paging::chunk::FRAME_SIZE);
-    let base = boot::allocate_pages(AllocateType::AnyPages, MemoryType::RESERVED, pages)
-        .context("reserve the hypervisor's memory chunk")?;
+    let base = boot::allocate_pages(
+        AllocateType::MaxAddress(FOUR_GIB),
+        MemoryType::RESERVED,
+        pages,
+    )
+    .context("reserve the hypervisor's memory chunk below 4 GiB")?;
     Ok(PhysAddr::new(
         wide(base.addr().get()).next_multiple_of(paging::chunk::CHUNK_ALIGN),
     ))
+}
+
+/// One past the highest physical address a 32-bit `CR3` can name.
+const FOUR_GIB: u64 = 1 << 32;
+
+/// One past the highest physical address a startup interprocessor interrupt can
+/// send a processor to: the vector is eight bits and the processor reads it as
+/// `vector << 12`.
+const ONE_MIB: u64 = 1 << 20;
+
+/// Reserves the page the other processors will start executing on.
+///
+/// It has to be in the first megabyte because that is the only place a startup
+/// interprocessor interrupt can point a processor at, and the first megabyte is
+/// firmware's — it keeps its own idle processors parked somewhere in it. So the
+/// page is asked for rather than picked out of the memory map, and firmware
+/// answers with one nothing else is using.
+///
+/// [`MemoryType::RESERVED`] for the same reason the chunk uses it: the page
+/// outlives the loader, and the other processors may be started at any point
+/// after boot, not only during it.
+///
+/// # Errors
+///
+/// [`LoaderError::Firmware`] if firmware has no free page below 1 MiB, which
+/// leaves no way to start another processor.
+fn allocate_trampoline() -> Result<PhysAddr, LoaderError> {
+    let base = boot::allocate_pages(AllocateType::MaxAddress(ONE_MIB), MemoryType::RESERVED, 1)
+        .context("reserve the application processors' trampoline page below 1 MiB")?;
+    Ok(PhysAddr::new(wide(base.addr().get())))
 }
 
 /// The hypervisor image's file, open for reading.

@@ -53,11 +53,17 @@ const _: () = assert!(
     "an interrupt descriptor table is one sixteen-byte gate per vector"
 );
 
-/// Builds the table and points the processor at it.
+/// Builds the table if it does not exist yet, and points this processor at it.
 ///
 /// Must run after the global descriptor table is loaded and `CS` reloaded: a
 /// gate records the code selector to enter its handler with, and that is taken
 /// from whatever `CS` holds while the gate is written.
+///
+/// One table serves every processor, and the selector baked into its gates is
+/// correct on all of them for the same reason it is correct on the one that
+/// built it: each processor builds its own descriptor table to the same shape,
+/// so the code segment is at the same index in every one of them. A gate names
+/// an index, not a table.
 pub(crate) fn install() {
     let table = IDT.call_once(build);
     // SAFETY: `table` is a `'static` table of the size `LIMIT` describes, with a

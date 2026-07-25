@@ -170,12 +170,55 @@ pub fn register(vector: Vector, handler: Handler) -> Result<(), DescriptorError>
         .map_err(|_| DescriptorError::VectorTaken { vector })
 }
 
+/// Pins `handler` to the highest free vector in `first..=last`.
+///
+/// For subsystems that need a vector rather than a particular one — an
+/// interprocessor interrupt is only ever addressed by the sender, so which
+/// number it is matters to nobody but the priority the processor gives it.
+/// Highest first, because on this architecture a vector's high nibble *is* its
+/// priority.
+///
+/// # Errors
+///
+/// [`DescriptorError::NoVectorFree`] if every vector in the range is taken, or
+/// whatever [`register`] reports for a range that includes a vector nothing may
+/// claim.
+pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, DescriptorError> {
+    (first.number()..=last.number())
+        .rev()
+        .map(Vector::new)
+        .find(|vector| register(*vector, handler).is_ok())
+        .ok_or(DescriptorError::NoVectorFree { first, last })
+}
+
 /// Records what becomes of an unclaimed interrupt.
 ///
-/// Called before the interrupt descriptor table is loaded, so that no delivery
-/// can happen while there is no answer to give.
-pub(crate) fn adopt(unclaimed: Unclaimed) {
-    UNCLAIMED.store(unclaimed as *mut (), Ordering::Release);
+/// One answer for the whole machine, given once and before any processor loads a
+/// table of gates, so that no delivery can happen while there is nothing to give
+/// it to. That ordering is enforced from the other side:
+/// [`Descriptors::install`](crate::Descriptors::install) refuses until this has
+/// run.
+///
+/// # Errors
+///
+/// [`DescriptorError::AlreadyAdopted`] for a second call. Replacing this while
+/// interrupts are being delivered through it would change what happens to a
+/// guest's interrupts underneath the guest.
+pub fn adopt(unclaimed: Unclaimed) -> Result<(), DescriptorError> {
+    UNCLAIMED
+        .compare_exchange(
+            null_mut(),
+            unclaimed as *mut (),
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .map(drop)
+        .map_err(|_| DescriptorError::AlreadyAdopted)
+}
+
+/// Whether anything has said what becomes of an unclaimed interrupt.
+pub(crate) fn adopted() -> bool {
+    !UNCLAIMED.load(Ordering::Acquire).is_null()
 }
 
 /// Where every entry point ends up.

@@ -34,23 +34,36 @@
 //! - [`dispatch`] is where they all arrive and where the hypervisor's own
 //!   interrupts are separated from everyone else's.
 //!
-//! # One processor
+//! # Every processor
 //!
-//! These are the boot processor's tables. The interrupt descriptor table is the
-//! same for every processor and can be shared as it stands, but a task state
-//! segment cannot: each processor needs its own stacks and its own descriptor
-//! for them. Starting the others is what will introduce that, and it is not
-//! pretended at here.
+//! Two of the three tables are per processor and one is not, and which is which
+//! follows from what each of them holds.
+//!
+//! A task state segment holds stacks, and a stack cannot be shared: two
+//! processors taking a double fault at once would take it on the same one. The
+//! global descriptor table holds the descriptor for that task state segment, so
+//! it cannot be shared either. Both are therefore built by each processor for
+//! itself, in [`Descriptors::install`].
+//!
+//! The interrupt descriptor table holds only gates, and a gate names an entry
+//! point and a selector — the same entry point on every processor, and the same
+//! selector, because every processor's descriptor table puts its code segment at
+//! the same index. So one table is built and every processor is pointed at it.
+//!
+//! What becomes of an unclaimed interrupt is not a per-processor fact at all: it
+//! is what this hypervisor does. So it is said once, with [`adopt`], and saying
+//! it is a precondition of any processor installing tables — an interrupt must
+//! never arrive to find no answer.
 
 #![feature(abi_x86_interrupt)]
 #![no_std]
+
+extern crate alloc;
 
 mod dispatch;
 mod gdt;
 mod idt;
 mod vector;
-
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use log::info;
 use paging::{AddressSpace, PagingError};
@@ -58,7 +71,7 @@ use thiserror::Error;
 use x86_64::instructions::{hlt, interrupts};
 
 pub use crate::{
-    dispatch::{Disposition, Handler, Interrupt, Unclaimed, register},
+    dispatch::{Disposition, Handler, Interrupt, Unclaimed, adopt, claim, register},
     gdt::Selectors,
     vector::{InterruptStack, Vector},
 };
@@ -81,26 +94,21 @@ impl Descriptors {
     /// those two steps the live interrupt descriptor table is still firmware's,
     /// and its gates name selectors in a table that is no longer loaded.
     ///
+    /// Called once per processor, by that processor. Calling it twice on one
+    /// processor would leave it running on a second set of tables and leak the
+    /// first, which nothing here can detect and nothing has reason to do.
+    ///
     /// # Errors
     ///
-    /// [`DescriptorError::AlreadyInstalled`] if this processor already has
-    /// tables — replacing them underneath itself is never what a second caller
-    /// wants — or [`DescriptorError::Paging`] if the interrupt stacks cannot be
-    /// backed.
-    pub fn install(
-        space: &mut AddressSpace,
-        unclaimed: Unclaimed,
-    ) -> Result<Self, DescriptorError> {
-        if INSTALLED
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err(DescriptorError::AlreadyInstalled);
+    /// [`DescriptorError::Unadopted`] if nothing has said yet what becomes of an
+    /// unclaimed interrupt, since loading a table of gates before then would
+    /// make a delivery possible that has no answer; or
+    /// [`DescriptorError::Paging`] if the interrupt stacks cannot be backed.
+    pub fn install(space: &mut AddressSpace) -> Result<Self, DescriptorError> {
+        if !dispatch::adopted() {
+            return Err(DescriptorError::Unadopted);
         }
         let selectors = interrupts::without_interrupts(|| gdt::install(space))?;
-        // Before the table that names the entry points is loaded, so that no
-        // delivery can find no answer.
-        dispatch::adopt(unclaimed);
         idt::install();
         Ok(Self { selectors })
     }
@@ -148,9 +156,14 @@ pub enum DescriptorError {
     /// The interrupt stacks could not be allocated or mapped.
     #[error(transparent)]
     Paging(#[from] PagingError),
-    /// This processor already has descriptor tables.
-    #[error("this processor already has descriptor tables")]
-    AlreadyInstalled,
+    /// Nothing has said what becomes of an interrupt no handler claims, so no
+    /// table of gates may be loaded yet.
+    #[error("nothing has adopted the unclaimed interrupts yet")]
+    Unadopted,
+    /// Something already said what becomes of an unclaimed interrupt, and it is
+    /// one answer for the whole machine.
+    #[error("the unclaimed interrupts have already been adopted")]
+    AlreadyAdopted,
     /// Something already claimed the vector, and a vector holds one handler.
     #[error("{vector} already has a handler")]
     VectorTaken {
@@ -165,8 +178,12 @@ pub enum DescriptorError {
         /// The vector in question.
         vector: Vector,
     },
+    /// Every vector in the range asked for already has a handler.
+    #[error("no vector between {first} and {last} is free")]
+    NoVectorFree {
+        /// Low end of the range searched.
+        first: Vector,
+        /// High end of the range searched.
+        last: Vector,
+    },
 }
-
-/// Claimed by the first install, so a second cannot replace the tables the
-/// processor is already running on while it is running on them.
-static INSTALLED: AtomicBool = AtomicBool::new(false);

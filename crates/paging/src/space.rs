@@ -48,6 +48,7 @@ use crate::{
     chunk::{self, FRAME_SIZE},
     cpu,
     kaslr::Placement,
+    shootdown,
 };
 
 /// Entries in a page table at any level.
@@ -303,10 +304,11 @@ impl AddressSpace {
     ///
     /// # Errors
     ///
-    /// [`PagingError::NotMapped`] if the mapping is already gone. On failure
-    /// the window slots are deliberately *not* returned: handing out
-    /// addresses that still have live translations would alias, so leaking
-    /// the run is the safe outcome.
+    /// [`PagingError::NotMapped`] if the mapping is already gone, or
+    /// [`PagingError::ShootdownIncomplete`] if some processor did not
+    /// acknowledge dropping the translations. On failure the window slots are
+    /// deliberately *not* returned: handing out addresses that still have live
+    /// translations would alias, so leaking the run is the safe outcome.
     ///
     /// # Safety
     ///
@@ -318,7 +320,47 @@ impl AddressSpace {
     pub unsafe fn unmap(&mut self, mapping: Mapping) -> Result<(), PagingError> {
         (0..as_u64(mapping.pages))
             .try_for_each(|index| self.unmap_one::<Size4KiB>(mapping.first + index).map(drop))?;
-        self.slots.release(mapping.first, mapping.order)
+        self.slots.release(mapping.first, mapping.order)?;
+        broadcast()
+    }
+
+    /// Releases a mapping made with [`AddressSpace::map_region`].
+    ///
+    /// The physical memory is untouched, as with [`AddressSpace::unmap`]: this
+    /// only removes the description of it. Intermediate tables stay, as
+    /// everywhere in this crate.
+    ///
+    /// This is the counterpart `map_region` needs and `unmap` cannot be: a
+    /// region mapped at a dictated address holds no window slots and so has no
+    /// [`Mapping`] to give back.
+    ///
+    /// # Errors
+    ///
+    /// [`PagingError::Misaligned`] unless `virt` is frame-aligned,
+    /// [`PagingError::EmptyRegion`] for a zero length,
+    /// [`PagingError::NotMapped`] if any page of the range is not mapped, or
+    /// [`PagingError::ShootdownIncomplete`] if some processor did not
+    /// acknowledge dropping the translations.
+    ///
+    /// # Safety
+    ///
+    /// Nothing derived from the range may still be in use, on this processor or
+    /// any other.
+    pub unsafe fn unmap_region(&mut self, virt: VirtAddr, len: u64) -> Result<(), PagingError> {
+        if len == 0 {
+            return Err(PagingError::EmptyRegion);
+        }
+        if !virt.as_u64().is_multiple_of(FRAME_SIZE) {
+            return Err(PagingError::Misaligned {
+                value: virt.as_u64(),
+                align: FRAME_SIZE,
+            });
+        }
+        (0..len.div_ceil(FRAME_SIZE)).try_for_each(|index| {
+            self.unmap_one::<Size4KiB>(Page::containing_address(virt + index * FRAME_SIZE))
+                .map(drop)
+        })?;
+        broadcast()
     }
 
     /// Maps physical memory, hands its address to `action`, and unmaps it.
@@ -419,8 +461,10 @@ impl AddressSpace {
     /// # Errors
     ///
     /// [`PagingError::Misaligned`] for a range that is not 2 MiB aligned and
-    /// sized, [`PagingError::EmptyRegion`] for a zero length, or
-    /// [`PagingError::NotMapped`] if the direct map does not cover the range.
+    /// sized, [`PagingError::EmptyRegion`] for a zero length,
+    /// [`PagingError::NotMapped`] if the direct map does not cover the range,
+    /// or [`PagingError::ShootdownIncomplete`] if some processor did not
+    /// acknowledge dropping the translations this tightened.
     pub fn protect_direct_map(
         &mut self,
         phys: PhysAddr,
@@ -453,7 +497,8 @@ impl AddressSpace {
             unsafe { mapper.update_flags(page, flags) }
                 .map(MapperFlush::flush)
                 .map_err(|error| flag_update_error(virt, &error))
-        })
+        })?;
+        broadcast()
     }
 
     /// Makes this space the active one.
@@ -481,7 +526,9 @@ impl AddressSpace {
     /// # Errors
     ///
     /// [`PagingError::Unreachable`] if the window does not reach the PML4,
-    /// which would mean the direct map was never built.
+    /// which would mean the direct map was never built, or
+    /// [`PagingError::ShootdownIncomplete`] if some processor did not
+    /// acknowledge dropping what it had cached of the half just removed.
     ///
     /// # Safety
     ///
@@ -515,7 +562,7 @@ impl AddressSpace {
                 Cr4::write(cr4);
             }
         }
-        Ok(())
+        broadcast()
     }
 
     /// Resolves `virt` in this space, or `None` if it is not mapped.
@@ -932,6 +979,20 @@ impl Stack {
     pub const fn run(&self) -> (Page<Size4KiB>, usize) {
         (self.first, self.order)
     }
+}
+
+/// Tells every other processor that translations it may hold no longer
+/// describe anything.
+///
+/// Called after the local invalidation, and only where an entry stopped
+/// describing what it used to. Making a mapping needs none of this: the address
+/// came from the window allocator, so no processor has touched it and none can
+/// have cached anything about it.
+fn broadcast() -> Result<(), PagingError> {
+    if shootdown::broadcast() {
+        return Ok(());
+    }
+    Err(PagingError::ShootdownIncomplete)
 }
 
 /// Translates a mapping failure, discarding the page size the generic error

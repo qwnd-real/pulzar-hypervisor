@@ -114,6 +114,18 @@ pub struct Handoff {
     /// So the reading is taken once, while there is still firmware to take it
     /// from, and everything after it is that number plus elapsed time.
     pub boot_wall_nanos: u64,
+
+    /// Physical base of the page reserved for the trampoline the other
+    /// processors start on, always below 1 MiB and always frame-aligned.
+    ///
+    /// A processor answering a startup interprocessor interrupt begins in real
+    /// mode at `vector << 12`, and the vector is eight bits wide, so the first
+    /// instruction it executes has to be somewhere in the first megabyte. That
+    /// is firmware's memory, and firmware is still using it — its own idle
+    /// processors are parked down there — so the page is asked for rather than
+    /// picked. It is reserved memory, like the chunk, which is what lets the
+    /// other processors be started long after the loader is gone.
+    pub ap_trampoline_base: u64,
 }
 
 impl Handoff {
@@ -124,7 +136,7 @@ impl Handoff {
     pub const MAGIC: u64 = u64::from_le_bytes(*b"PULZARH1");
 
     /// Current protocol version.
-    pub const VERSION: u32 = 3;
+    pub const VERSION: u32 = 4;
 
     /// Validates `ptr` and borrows the handoff behind it.
     ///

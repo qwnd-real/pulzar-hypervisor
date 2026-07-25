@@ -49,6 +49,21 @@ bitflags! {
         /// state and whichever core reads it, which is what makes it a timebase
         /// rather than merely a cycle counter.
         const INVARIANT_TSC = 1 << 3;
+        /// The processor has a local interrupt controller on board. Without it
+        /// there is no way to address another processor, and no way to take a
+        /// timer interrupt that is the hypervisor's own, so pulzar refuses to
+        /// run without it.
+        const APIC = 1 << 4;
+        /// The local interrupt controller can be put into x2APIC mode, where
+        /// its registers are model-specific registers rather than a page of
+        /// memory-mapped ones and identifiers are 32 bits wide rather than
+        /// eight. A machine with more than 255 processors can only be addressed
+        /// this way.
+        const X2APIC = 1 << 5;
+        /// The local timer can be armed with a timestamp counter deadline
+        /// instead of a countdown, which is the only one of its modes that is
+        /// not quantized to the timer's own divided tick.
+        const TSC_DEADLINE = 1 << 6;
     }
 }
 
@@ -70,6 +85,7 @@ impl Features {
     /// leaf describing a feature does not have the feature.
     fn read() -> Self {
         let cpuid = CpuId::new();
+        let basic = cpuid.get_feature_info();
         let extended = cpuid.get_extended_processor_and_feature_identifiers();
         let mut features = Self::empty();
         features.set(
@@ -86,10 +102,7 @@ impl Features {
         );
         features.set(
             Self::RDRAND,
-            cpuid
-                .get_feature_info()
-                .as_ref()
-                .is_some_and(FeatureInfo::has_rdrand),
+            basic.as_ref().is_some_and(FeatureInfo::has_rdrand),
         );
         features.set(
             Self::INVARIANT_TSC,
@@ -97,6 +110,15 @@ impl Features {
                 .get_advanced_power_mgmt_info()
                 .as_ref()
                 .is_some_and(ApmInfo::has_invariant_tsc),
+        );
+        features.set(Self::APIC, basic.as_ref().is_some_and(FeatureInfo::has_apic));
+        features.set(
+            Self::X2APIC,
+            basic.as_ref().is_some_and(FeatureInfo::has_x2apic),
+        );
+        features.set(
+            Self::TSC_DEADLINE,
+            basic.as_ref().is_some_and(FeatureInfo::has_tsc_deadline),
         );
         features
     }

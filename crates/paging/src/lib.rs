@@ -27,6 +27,24 @@
 //! - [`kaslr`] places the high-half regions; [`cpu`] establishes the processor
 //!   state the rest of it assumes; [`chunk`] fixes the geometry both images
 //!   agree on.
+//! - [`adopt`] and [`with`] are how a machine with more than one processor
+//!   reaches the single [`AddressSpace`] all of them run in; [`shootdown`] is
+//!   how the others are told a translation they may hold is gone.
+//!
+//! # More than one processor
+//!
+//! Two things change once the other processors are running, and only two.
+//!
+//! The address space stops being a value one function owns and becomes
+//! something behind a lock, because there is no `&mut` to hand a processor that
+//! was not there when the space was built. Everything below that is unchanged:
+//! a page table entry is an aligned eight-byte store, which the hardware page
+//! walker already reads atomically, so the lock is the whole of what is needed
+//! and per-entry atomics would add nothing. Their absence is deliberate.
+//!
+//! And invalidating an entry stops being a local matter. [`shootdown`] is the
+//! seam for that, empty until something fills it — which is exactly right on a
+//! machine where nothing else is running.
 //!
 //! # Two kinds of physical access
 //!
@@ -42,9 +60,11 @@ pub mod buddy;
 pub mod chunk;
 pub mod cpu;
 pub mod kaslr;
+pub mod shootdown;
 
 mod direct;
 mod frames;
+mod global;
 mod slots;
 mod space;
 
@@ -52,6 +72,7 @@ use core::ptr::NonNull;
 
 pub use direct::DirectMap;
 pub use frames::Frames;
+pub use global::{adopt, adopted, with};
 pub use slots::Slots;
 pub use space::{AddressSpace, CacheType, Existing, Mapping, Protection, Stack};
 use thiserror::Error;
@@ -192,6 +213,19 @@ pub enum PagingError {
         /// The address that was found.
         phys: u64,
     },
+    /// The address space has already been handed over, and every processor is
+    /// running in it.
+    #[error("an address space has already been adopted")]
+    AlreadyAdopted,
+    /// No address space has been handed over yet, so there is not yet one the
+    /// whole machine shares.
+    #[error("no address space has been adopted")]
+    NotAdopted,
+    /// Some processor did not acknowledge dropping a translation that no longer
+    /// describes anything. What was unmapped is unmapped; what is not known is
+    /// whether every processor has stopped believing otherwise.
+    #[error("a processor did not acknowledge dropping a stale translation")]
+    ShootdownIncomplete,
     /// The buddy allocator underneath refused the operation.
     #[error(transparent)]
     Buddy(#[from] BuddyError),

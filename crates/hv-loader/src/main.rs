@@ -51,7 +51,7 @@ use x86_64::{
 
 use crate::{
     error::LoaderError,
-    firmware::{ImageFile, Loader, Memory},
+    firmware::{ImageFile, Loader, Memory, Reserved},
     image::Image,
 };
 
@@ -125,10 +125,12 @@ fn boot() -> Result<Infallible, LoaderError> {
         loader.base, loader.size
     );
 
-    let chunk_base = firmware::allocate_chunk()?;
+    let reserved = firmware::reserve()?;
+    let chunk_base = reserved.chunk;
     info!(
-        "loader: reserved chunk at {chunk_base:#x}, {:#x} bytes",
-        chunk::CHUNK_SIZE
+        "loader: reserved chunk at {chunk_base:#x}, {:#x} bytes, trampoline page at {:#x}",
+        chunk::CHUNK_SIZE,
+        reserved.trampoline
     );
 
     let memory = survey_memory(chunk_base)?;
@@ -164,7 +166,7 @@ fn boot() -> Result<Infallible, LoaderError> {
 
     let handoff = publish(
         &space,
-        chunk_base,
+        reserved,
         loader,
         memory,
         image.size(),
@@ -365,7 +367,7 @@ fn map_image(
 /// [`LoaderError::Paging`] if a window does not reach the chunk.
 fn publish(
     space: &AddressSpace,
-    chunk_base: PhysAddr,
+    reserved: Reserved,
     loader: Loader,
     memory: Memory,
     core_image_size: u64,
@@ -376,6 +378,7 @@ fn publish(
         operation: "locate the UEFI system table",
         status: Status::NOT_FOUND,
     })?;
+    let chunk_base = reserved.chunk;
     let handoff = Handoff {
         magic: Handoff::MAGIC,
         version: Handoff::VERSION,
@@ -405,6 +408,7 @@ fn publish(
         // as the loader can make it: nothing measures that gap, and whatever it
         // is, the wall clock is behind by it for good.
         boot_wall_nanos: firmware::wall_clock().map_or(0, Wall::nanos),
+        ap_trampoline_base: reserved.trampoline.as_u64(),
     };
 
     let phys = chunk_base + chunk::HANDOFF_OFFSET;

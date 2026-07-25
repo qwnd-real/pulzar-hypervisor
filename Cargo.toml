@@ -2,11 +2,14 @@
 resolver = "3"
 members = [
     "crates/acpi",
+    "crates/apic",
     "crates/clock",
+    "crates/cpu",
     "crates/descriptors",
     "crates/handoff",
     "crates/hv-core",
     "crates/hv-loader",
+    "crates/ipi",
     "crates/paging",
     "crates/processor",
     "crates/serial",
@@ -37,11 +40,16 @@ uefi-raw = "0.15.1"
 # them drive; `acpi` turns the firmware tables into data the hypervisor owns;
 # `descriptors` owns the processor's own tables and the interrupt entry path;
 # `processor` answers what the processor underneath all of them can do; `clock`
-# turns the machine's counters into time.
+# turns the machine's counters into time; `cpu` answers which processors the
+# machine has and which one is running; `apic` drives their interrupt
+# controllers and starts them; `ipi` is how one of them reaches another.
 acpi = { path = "crates/acpi" }
+apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
+cpu = { path = "crates/cpu" }
 descriptors = { path = "crates/descriptors" }
 handoff = { path = "crates/handoff" }
+ipi = { path = "crates/ipi" }
 paging = { path = "crates/paging" }
 processor = { path = "crates/processor" }
 
