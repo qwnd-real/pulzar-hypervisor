@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/acpi",
+    "crates/clock",
     "crates/descriptors",
     "crates/handoff",
     "crates/hv-core",
@@ -35,8 +36,10 @@ uefi-raw = "0.15.1"
 # hypervisor image agree on; `paging` is the address-space subsystem both of
 # them drive; `acpi` turns the firmware tables into data the hypervisor owns;
 # `descriptors` owns the processor's own tables and the interrupt entry path;
-# `processor` answers what the processor underneath all of them can do.
+# `processor` answers what the processor underneath all of them can do; `clock`
+# turns the machine's counters into time.
 acpi = { path = "crates/acpi" }
+clock = { path = "crates/clock" }
 descriptors = { path = "crates/descriptors" }
 handoff = { path = "crates/handoff" }
 paging = { path = "crates/paging" }
