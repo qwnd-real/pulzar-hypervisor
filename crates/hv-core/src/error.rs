@@ -5,6 +5,7 @@
 //! to diagnose from.
 
 use acpi::AcpiError;
+use clock::ClockError;
 use descriptors::DescriptorError;
 use handoff::HandoffError;
 use paging::PagingError;
@@ -26,6 +27,10 @@ pub enum CoreError {
     /// The processor's own descriptor tables could not be set up.
     #[error(transparent)]
     Descriptors(#[from] DescriptorError),
+    /// No timebase could be established, so the hypervisor would have no way to
+    /// tell how much time had passed.
+    #[error(transparent)]
+    Clock(#[from] ClockError),
     /// The allocator would not take the span reserved for the heap, which can
     /// only mean it is too small to hold the allocator's own bookkeeping.
     #[error("the allocator refused the {bytes:#x}-byte heap at {base:#x}")]

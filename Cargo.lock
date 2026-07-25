@@ -379,6 +379,7 @@ name = "hv-core"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "clock",
  "descriptors",
  "handoff",
  "log",

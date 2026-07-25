@@ -47,6 +47,7 @@ mod heap;
 use core::{convert::Infallible, ffi::c_void, hint::black_box, panic::PanicInfo};
 
 use acpi::Acpi;
+use clock::{Clock, Wall};
 use descriptors::{Descriptors, Interrupt, halt};
 use handoff::{Handoff, HandoffError};
 use log::{error, info, warn};
@@ -58,6 +59,10 @@ use crate::{error::CoreError, firmware::Firmware, heap::Heap};
 
 /// Bytes of stack the self check writes and reads back after the transition.
 const PROBE_BYTES: usize = 256;
+
+/// Microseconds the clock is asked to wait for once it is up, as a check that
+/// the delay it produces is the delay that was asked for.
+const CLOCK_PROBE_MICROS: u64 = 1000;
 
 /// Byte the stack probe writes. Any value other than zero would do; this one is
 /// recognizable in a memory dump and cannot be confused with the zero a page
@@ -146,6 +151,7 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     info!("core: dropped the firmware half of the address space");
 
     let acpi = survey_machine(handoff, &space)?;
+    start_clock(&mut space, &acpi, handoff)?;
     heap.describe("core");
     self_check(&space, handoff)?;
     info!(
@@ -153,6 +159,44 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
         acpi.madt().processors().len()
     );
     halt()
+}
+
+/// Establishes the timebase from whichever counter the machine turned out to
+/// have.
+///
+/// It comes after the firmware tables because it is built out of them — where
+/// the event timer is, and what its fallback would be — and after the lower
+/// half is gone because the counter is reached through a mapping of pulzar's
+/// own, like everything else from here on.
+///
+/// The wall-clock reading in the boot protocol is what the clock counts forward
+/// from. Zero is how the loader says firmware would not give it one, which is a
+/// hypervisor with a monotonic clock and no dates, not a failure.
+///
+/// # Errors
+///
+/// [`CoreError::Clock`] if the machine describes no counter of known rate, if
+/// nothing here can keep time on it, or if the counter's registers cannot be
+/// reached.
+fn start_clock(
+    space: &mut AddressSpace,
+    acpi: &Acpi,
+    handoff: &Handoff,
+) -> Result<Clock, CoreError> {
+    let boot = (handoff.boot_wall_nanos != 0).then(|| Wall::from_nanos(handoff.boot_wall_nanos));
+    let clock = Clock::install(space, acpi, boot)?;
+    clock.describe("core");
+
+    // A measured delay, because a clock that is out by an order of magnitude
+    // still logs a plausible frequency, and the first thing that will depend on
+    // this is a bring-up delay that has to be real.
+    let before = clock.now();
+    clock.sleep_micros(CLOCK_PROBE_MICROS);
+    info!(
+        "core: clock slept {CLOCK_PROBE_MICROS} us, measured {} ns",
+        (clock.now() - before).as_nanos()
+    );
+    Ok(clock)
 }
 
 /// Reads the machine's own description out of firmware's tables.
@@ -205,6 +249,10 @@ fn announce(handoff: &Handoff) {
         handoff.memory_map_entries, handoff.memory_map, handoff.top_of_ram
     );
     info!("core: acpi root pointer at {:#x}", handoff.acpi_rsdp);
+    match (handoff.boot_wall_nanos != 0).then(|| Wall::from_nanos(handoff.boot_wall_nanos)) {
+        Some(wall) => info!("core: firmware's clock read {wall} during the loader"),
+        None => info!("core: the loader got no wall-clock time from firmware"),
+    }
 }
 
 /// The address-space description the paging subsystem adopts, out of the boot
