@@ -21,7 +21,8 @@
 //! later without walking firmware's structures again, and full parses of the
 //! ones that are needed now: the [`Madt`], for the processors and interrupt
 //! controllers, the [`Mcfg`], for PCI Express configuration space, and the
-//! [`Hpet`], for the counter the hypervisor keeps time with. Parsing the rest
+//! [`Hpet`] and the timer of the [`Fadt`], for the counters the hypervisor
+//! keeps time with. Parsing the rest
 //! when the rest is needed costs nothing that has been given up here, because
 //! the directory kept their addresses.
 //!
@@ -55,6 +56,7 @@
 
 extern crate alloc;
 
+mod fadt;
 mod gas;
 mod hpet;
 mod madt;
@@ -71,6 +73,7 @@ use thiserror::Error;
 use x86_64::PhysAddr;
 
 pub use crate::{
+    fadt::{Fadt, PmTimer},
     gas::{GenericAddress, Space},
     hpet::Hpet,
     madt::{
@@ -104,6 +107,7 @@ pub struct Acpi {
     madt: Madt,
     mcfg: Option<Mcfg>,
     hpet: Option<Hpet>,
+    fadt: Option<Fadt>,
 }
 
 impl Acpi {
@@ -135,6 +139,7 @@ impl Acpi {
             revision: pointer.revision(),
             mcfg: optional(&memory, &tables, Signature::MCFG, Mcfg::parse)?,
             hpet: optional(&memory, &tables, Signature::HPET, Hpet::parse)?,
+            fadt: optional(&memory, &tables, Signature::FADT, Fadt::parse)?,
             directory,
             tables,
             madt,
@@ -191,6 +196,16 @@ impl Acpi {
         self.hpet.as_ref()
     }
 
+    /// What was kept of the fixed hardware description, if the machine has one.
+    ///
+    /// Every machine does in practice — the FADT is how ACPI describes the
+    /// platform's own registers — but nothing pulzar needs from it is worth
+    /// refusing a machine over, so its absence is reported rather than fatal.
+    #[must_use]
+    pub const fn fadt(&self) -> Option<&Fadt> {
+        self.fadt.as_ref()
+    }
+
     /// Logs everything that was collected.
     pub fn describe(&self, who: &str) {
         info!(
@@ -216,6 +231,10 @@ impl Acpi {
         match &self.hpet {
             Some(hpet) => hpet.describe(who),
             None => info!("{who}: acpi has no hpet"),
+        }
+        match &self.fadt {
+            Some(fadt) => fadt.describe(who),
+            None => info!("{who}: acpi has no fadt, so no fixed hardware description"),
         }
     }
 }

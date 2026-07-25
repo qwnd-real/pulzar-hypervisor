@@ -8,10 +8,9 @@
 //!
 //! Two address spaces are modelled, because two are all a timer can be in on a
 //! machine pulzar runs on: physical memory and the processor's I/O ports. Every
-//! other space ACPI defines — embedded controller, system management bus, PCI
-//! configuration —
-//! is kept as the raw identifier firmware wrote, so that a consumer refuses it
-//! by name rather than mistaking it for one of the two it can reach.
+//! other space ACPI defines is kept as the raw identifier firmware wrote, so
+//! that a consumer refuses it by name rather than mistaking it for one of the
+//! two it can reach.
 //!
 //! The access size is not modelled. The registers this crate describes state
 //! their width in the same table, and the field was reserved before ACPI 2.0,
@@ -76,6 +75,21 @@ impl GenericAddress {
     #[must_use]
     pub const fn address(&self) -> u64 {
         self.address
+    }
+
+    /// The generic address form of a register a table gave as a bare I/O port.
+    ///
+    /// Tables that predate the generic address structure describe fixed
+    /// hardware registers as port numbers, with the width stated somewhere
+    /// else. Putting those into this shape is what lets a consumer handle
+    /// one description of a register instead of two.
+    pub(crate) fn io(port: u32, bit_width: u8) -> Self {
+        Self {
+            space: Space::Io,
+            bit_width,
+            bit_offset: 0,
+            address: u64::from(port),
+        }
     }
 
     /// Reads the structure at `at`.

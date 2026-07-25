@@ -39,6 +39,11 @@ impl Signature {
     /// described anything else.
     pub const MADT: Self = Self(*b"APIC");
 
+    /// Fixed ACPI Description Table: the platform's own registers, sleep states
+    /// and feature flags. Signed `FACP`, from before the table was named after
+    /// what it describes.
+    pub const FADT: Self = Self(*b"FACP");
+
     /// High Precision Event Timer: where one event timer's register block is.
     pub const HPET: Self = Self(*b"HPET");
 
