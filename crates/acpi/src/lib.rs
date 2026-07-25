@@ -19,10 +19,15 @@
 //!
 //! A directory of every table the root directory lists, so a table can be found
 //! later without walking firmware's structures again, and full parses of the
-//! two that are needed now: the [`Madt`], for the processors and interrupt
-//! controllers, and the [`Mcfg`], for PCI Express configuration space. Parsing
-//! the rest when the rest is needed costs nothing that has been given up here,
-//! because the directory kept their addresses.
+//! ones that are needed now: the [`Madt`], for the processors and interrupt
+//! controllers, the [`Mcfg`], for PCI Express configuration space, and the
+//! [`Hpet`], for the counter the hypervisor keeps time with. Parsing the rest
+//! when the rest is needed costs nothing that has been given up here, because
+//! the directory kept their addresses.
+//!
+//! Only the [`Madt`] is required. A machine may legitimately have no PCI
+//! Express and no event timer, so those two are parsed if present and reported
+//! as absent if not — what to do without them belongs to whoever needed them.
 //!
 //! # How much firmware is trusted
 //!
@@ -50,6 +55,8 @@
 
 extern crate alloc;
 
+mod gas;
+mod hpet;
 mod madt;
 mod mcfg;
 mod raw;
@@ -64,6 +71,8 @@ use thiserror::Error;
 use x86_64::PhysAddr;
 
 pub use crate::{
+    gas::{GenericAddress, Space},
+    hpet::Hpet,
     madt::{
         IoApic, LocalNmi, Madt, NmiSource, NmiTarget, Polarity, Processor, ProcessorState,
         SourceOverride, Trigger,
@@ -72,7 +81,10 @@ pub use crate::{
     rsdp::Directory,
     sdt::{Signature, Table},
 };
-use crate::{raw::Physical, rsdp::RootPointer};
+use crate::{
+    raw::{Fields, Physical},
+    rsdp::RootPointer,
+};
 
 /// Table lengths and entry counts are `u32` while addresses are `u64` and
 /// indices are `usize`, so the three are converted constantly. That is lossless
@@ -91,6 +103,7 @@ pub struct Acpi {
     tables: Vec<Table>,
     madt: Madt,
     mcfg: Option<Mcfg>,
+    hpet: Option<Hpet>,
 }
 
 impl Acpi {
@@ -117,16 +130,14 @@ impl Acpi {
             signature: Signature::MADT,
         })?;
         let madt = Madt::parse(&sdt::contents(&memory, madt)?)?;
-        let mcfg = lookup(&tables, Signature::MCFG)
-            .map(|table| sdt::contents(&memory, table).and_then(|body| Mcfg::parse(&body)))
-            .transpose()?;
 
         Ok(Self {
             revision: pointer.revision(),
+            mcfg: optional(&memory, &tables, Signature::MCFG, Mcfg::parse)?,
+            hpet: optional(&memory, &tables, Signature::HPET, Hpet::parse)?,
             directory,
             tables,
             madt,
-            mcfg,
         })
     }
 
@@ -171,6 +182,15 @@ impl Acpi {
         self.mcfg.as_ref()
     }
 
+    /// The first high precision event timer, if the machine has one.
+    ///
+    /// The first, because a machine with several describes each in a table of
+    /// its own and nothing pulzar does needs more than one counter.
+    #[must_use]
+    pub const fn hpet(&self) -> Option<&Hpet> {
+        self.hpet.as_ref()
+    }
+
     /// Logs everything that was collected.
     pub fn describe(&self, who: &str) {
         info!(
@@ -192,6 +212,10 @@ impl Acpi {
         match &self.mcfg {
             Some(mcfg) => mcfg.describe(who),
             None => info!("{who}: acpi has no mcfg, so no memory-mapped pci configuration space"),
+        }
+        match &self.hpet {
+            Some(hpet) => hpet.describe(who),
+            None => info!("{who}: acpi has no hpet"),
         }
     }
 }
@@ -339,6 +363,23 @@ fn listed_tables(memory: &Physical, directory: Directory) -> Result<Vec<Table>, 
 /// The first table with this signature.
 fn lookup(tables: &[Table], signature: Signature) -> Option<&Table> {
     tables.iter().find(|table| table.signature() == signature)
+}
+
+/// Parses a table the machine may or may not have.
+///
+/// Absence is `Ok(None)`: every table reached this way describes hardware a
+/// machine is allowed not to have. A table that is present but does not parse
+/// is still an error, because that is firmware describing something incorrectly
+/// rather than describing nothing.
+fn optional<T>(
+    memory: &Physical,
+    tables: &[Table],
+    signature: Signature,
+    parse: impl FnOnce(&Fields<'_>) -> Result<T, AcpiError>,
+) -> Result<Option<T>, AcpiError> {
+    lookup(tables, signature)
+        .map(|table| sdt::contents(memory, table).and_then(|body| parse(&body)))
+        .transpose()
 }
 
 /// A physical address out of a firmware table.

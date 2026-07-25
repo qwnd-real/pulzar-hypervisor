@@ -39,6 +39,9 @@ impl Signature {
     /// described anything else.
     pub const MADT: Self = Self(*b"APIC");
 
+    /// High Precision Event Timer: where one event timer's register block is.
+    pub const HPET: Self = Self(*b"HPET");
+
     /// Memory Mapped Configuration Space: where PCI Express configuration
     /// space is mapped, per segment group.
     pub const MCFG: Self = Self(*b"MCFG");
