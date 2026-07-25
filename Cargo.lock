@@ -395,6 +395,7 @@ dependencies = [
 name = "hv-loader"
 version = "0.1.0"
 dependencies = [
+ "clock",
  "handoff",
  "log",
  "paging",

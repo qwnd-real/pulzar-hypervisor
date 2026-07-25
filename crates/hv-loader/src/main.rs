@@ -36,6 +36,7 @@ mod image;
 
 use core::{arch::asm, convert::Infallible, ptr::NonNull};
 
+use clock::Wall;
 use handoff::Handoff;
 use log::{error, info};
 use paging::{
@@ -399,6 +400,11 @@ fn publish(
         memory_map_entry_size: narrow(size_of::<MemoryDescriptor>()),
         top_of_ram: memory.top_of_ram,
         acpi_rsdp: firmware::acpi_rsdp(),
+        // Read here rather than at the start of the boot, so that the gap
+        // between this reading and the hypervisor's clock coming up is as small
+        // as the loader can make it: nothing measures that gap, and whatever it
+        // is, the wall clock is behind by it for good.
+        boot_wall_nanos: firmware::wall_clock().map_or(0, Wall::nanos),
     };
 
     let phys = chunk_base + chunk::HANDOFF_OFFSET;

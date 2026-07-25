@@ -4,8 +4,9 @@
 //! UEFI application. It maps the image itself, at a randomized high-half
 //! virtual address, and jumps to its entry point with a pointer to a
 //! [`Handoff`] in the first argument register. Everything the hypervisor needs
-//! to continue — where its memory is, where its address space came from, and
-//! which firmware objects are still alive — arrives in that one structure.
+//! to continue — where its memory is, where its address space came from, which
+//! firmware objects are still alive, and what time firmware says it is —
+//! arrives in that one structure.
 //!
 //! The structure lives in the loader's reserved memory chunk rather than in
 //! either image, because the loader's image is wiped moments after the jump.
@@ -102,6 +103,17 @@ pub struct Handoff {
     /// tables themselves long after firmware is gone rather than having them
     /// copied for it.
     pub acpi_rsdp: u64,
+
+    /// Nanoseconds since the Unix epoch, in UTC, as firmware's real-time clock
+    /// read when the loader asked it — or zero if firmware would not say, or
+    /// said something the calendar does not admit.
+    ///
+    /// This is the only absolute time pulzar is ever handed. The hypervisor
+    /// runs on after boot services are gone, and nothing left in the machine
+    /// then knows what year it is: the counters it keeps time with only count.
+    /// So the reading is taken once, while there is still firmware to take it
+    /// from, and everything after it is that number plus elapsed time.
+    pub boot_wall_nanos: u64,
 }
 
 impl Handoff {
@@ -112,7 +124,7 @@ impl Handoff {
     pub const MAGIC: u64 = u64::from_le_bytes(*b"PULZARH1");
 
     /// Current protocol version.
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
 
     /// Validates `ptr` and borrows the handoff behind it.
     ///

@@ -10,6 +10,8 @@
 //! loader ends by jumping into the hypervisor and never returns: no destructor
 //! at the end of `main` will ever run.
 
+use clock::{Civil, Wall};
+use log::{info, warn};
 use uefi::{
     Handle, Status,
     boot::{self, AllocateType, MemoryDescriptor, MemoryType, ScopedProtocol},
@@ -22,7 +24,7 @@ use uefi::{
             fs::SimpleFileSystem,
         },
     },
-    system,
+    runtime, system,
     table::cfg::ConfigTableEntry,
 };
 use x86_64::PhysAddr;
@@ -210,6 +212,44 @@ pub fn acpi_rsdp() -> u64 {
             })
             .unwrap_or_default()
     })
+}
+
+/// The wall-clock time firmware's real-time clock reports, in UTC.
+///
+/// `GetTime` is a runtime service rather than a boot service, so it is one of
+/// the few firmware calls that would still answer after boot services are gone.
+/// It is made here all the same: the hypervisor drops the half of the address
+/// space firmware's code lives in, so the reading has to be taken while that
+/// half is still there and travel in the boot protocol instead.
+///
+/// The reading is normalized to UTC using the offset firmware states. The
+/// daylight-saving flags beside it are not applied — they say whether the
+/// reading has already been adjusted, not that it needs to be.
+///
+/// `None` where the machine has no real-time clock, firmware refuses the call,
+/// or the answer is one the calendar does not admit, which is what a clock that
+/// has lost its battery reports. That leaves the hypervisor with a monotonic
+/// clock and no dates in its log, which is worth saying plainly and not worth
+/// failing a boot over.
+pub fn wall_clock() -> Option<Wall> {
+    let time = runtime::get_time()
+        .inspect_err(|error| warn!("loader: firmware would not report the time: {error}"))
+        .ok()?;
+    let wall = Wall::from_civil(Civil {
+        year: time.year(),
+        month: time.month(),
+        day: time.day(),
+        hour: time.hour(),
+        minute: time.minute(),
+        second: time.second(),
+        nanosecond: time.nanosecond(),
+        utc_offset_minutes: time.time_zone(),
+    });
+    match wall {
+        Some(wall) => info!("loader: firmware's clock reads {wall}"),
+        None => warn!("loader: firmware reported {time}, which is not a time"),
+    }
+    wall
 }
 
 /// What firmware's memory map told the loader.

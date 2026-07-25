@@ -52,6 +52,17 @@ const DAYS_BEFORE_EPOCH: u64 = 719_468;
 /// The largest offset from UTC ACPI and UEFI admit: a whole day either way.
 const MAX_OFFSET_MINUTES: i16 = 1440;
 
+/// The first year a `u64` of nanoseconds since the epoch can express, which is
+/// the epoch's own.
+const MIN_YEAR: u16 = 1970;
+
+/// The last year one can express. The range ends part-way through it, and the
+/// arithmetic below is what refuses the days past the end; this bound is here
+/// so that a reading centuries out — which is what an unset real-time clock
+/// tends to produce — is refused as the nonsense it is rather than as an
+/// overflow.
+const MAX_YEAR: u16 = 2554;
+
 /// A point in wall-clock time, as nanoseconds since 1970-01-01T00:00:00Z.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Wall(u64);
@@ -158,9 +169,12 @@ pub struct Civil {
 }
 
 impl Civil {
-    /// Whether the calendar admits this reading.
+    /// Whether the calendar admits this reading, and whether it lands in the
+    /// span a [`Wall`] can hold.
     fn is_valid(&self) -> bool {
-        days_in_month(self.year, self.month).is_some_and(|last| (1..=last).contains(&self.day))
+        (MIN_YEAR..=MAX_YEAR).contains(&self.year)
+            && days_in_month(self.year, self.month)
+                .is_some_and(|last| (1..=last).contains(&self.day))
             && self.hour < 24
             && self.minute < 60
             && self.second < 60
@@ -180,7 +194,7 @@ impl Civil {
 fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
     // A March-based year puts the leap day at the end, so February's length
     // never shifts the days before it and no month needs a special case.
-    let year = year - u64::from(month <= 2);
+    let year = year.checked_sub(u64::from(month <= 2))?;
     let era = year / 400;
     let year_of_era = year - era * 400;
     let month_of_year = if month > 2 { month - 3 } else { month + 9 };
