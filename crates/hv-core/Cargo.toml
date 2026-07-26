@@ -21,6 +21,7 @@ handoff = { workspace = true }
 ipi = { workspace = true }
 log = { workspace = true }
 paging = { workspace = true }
+partition = { workspace = true }
 pci = { workspace = true }
 serial = { workspace = true }
 snapshot = { workspace = true }
@@ -28,6 +29,7 @@ spin = { workspace = true }
 talc = { workspace = true }
 thiserror = { workspace = true }
 uefi-raw = { workspace = true }
+vcpu = { workspace = true }
 x86_64 = { workspace = true }
 
 [lints]

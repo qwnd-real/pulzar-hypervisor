@@ -426,6 +426,7 @@ dependencies = [
  "ipi",
  "log",
  "paging",
+ "partition",
  "pci",
  "serial",
  "snapshot",
@@ -433,6 +434,7 @@ dependencies = [
  "talc",
  "thiserror",
  "uefi-raw",
+ "vcpu",
  "x86_64",
 ]
 

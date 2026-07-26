@@ -12,9 +12,11 @@ use descriptors::DescriptorError;
 use handoff::HandoffError;
 use ipi::IpiError;
 use paging::PagingError;
+use partition::PartitionError;
 use pci::PciError;
 use thiserror::Error;
 use uefi_raw::Status;
+use vcpu::VcpuError;
 
 /// A failure during bring-up.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -49,6 +51,16 @@ pub enum CoreError {
     /// The machine's devices could not be surveyed.
     #[error(transparent)]
     Pci(#[from] PciError),
+    /// The guest could not be established, or this processor could not join it.
+    #[error(transparent)]
+    Partition(#[from] PartitionError),
+    /// The virtualization extension could not be enabled on this processor.
+    #[error(transparent)]
+    Vcpu(#[from] VcpuError),
+    /// A processor came up before the boot processor had established the guest,
+    /// which the order of bring-up is supposed to rule out.
+    #[error("the guest was not established before this processor came up")]
+    NoPartition,
     /// The allocator would not take the span reserved for the heap, which can
     /// only mean it is too small to hold the allocator's own bookkeeping.
     #[error("the allocator refused the {bytes:#x}-byte heap at {base:#x}")]

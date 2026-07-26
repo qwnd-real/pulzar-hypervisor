@@ -53,8 +53,10 @@ use descriptors::{Descriptors, Interrupt, halt};
 use handoff::{Handoff, HandoffError};
 use log::{error, info, warn};
 use paging::{AddressSpace, CacheType, Existing, PagingError, Protection, chunk};
+use partition::Partition;
 use pci::Pci;
 use snapshot::FirmwareContext;
+use spin::Once;
 use uefi_raw::Status;
 use x86_64::{PhysAddr, VirtAddr, instructions::interrupts, structures::paging::PhysFrame};
 
@@ -71,6 +73,14 @@ const CLOCK_PROBE_MICROS: u64 = 1000;
 /// recognizable in a memory dump and cannot be confused with the zero a page
 /// that was never written to reads as.
 const PROBE_PATTERN: u8 = 0xA5;
+
+/// The one guest this hypervisor runs.
+///
+/// Established on the boot processor before any other is started, and reached
+/// by all of them afterwards: what it holds — the description of the guest's
+/// memory and the tag its cached translations carry — is shared by every
+/// processor that runs the guest, and none of them owns it.
+static PARTITION: Once<Partition> = Once::new();
 
 /// Entry point, reached either by the loader's jump or by firmware starting
 /// this image as an application.
@@ -176,6 +186,15 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     cpu::attach(apic::local()?.id()?)?;
     ipi::install()?;
 
+    // After the block, because enabling virtualization snapshots host state that
+    // includes the `GS` base a block is reached through, and before any other
+    // processor is started, because each of them joins a guest that has to
+    // already exist.
+    PARTITION
+        .try_call_once(|| Partition::establish(&mut space))?
+        .describe("core");
+    virtualize(&mut space)?;
+
     // Last of the subsystems that take the address space by value, and
     // deliberately so. It maps and releases a range per bus, which costs nothing
     // while this is the only processor running and an interprocessor interrupt
@@ -233,7 +252,49 @@ fn attach() -> Result<cpu::ApicId, CoreError> {
     paging::with(Descriptors::install)??;
     let id = apic::LocalApic::enable()?.id()?;
     cpu::attach(id)?;
+    paging::with(virtualize)??;
     Ok(id)
+}
+
+/// Turns virtualization on for the calling processor and gives it a place in
+/// the guest.
+///
+/// Last of the per-processor steps, and it has to be: enabling the extension
+/// takes a snapshot of the host state a world switch does not restore by itself
+/// — the task register, the `GS` base — and both of those are established by
+/// the two steps before it. A snapshot taken any earlier would be restored on
+/// every exit, faithfully, and be wrong.
+///
+/// The control block this produces holds no guest state: no instruction
+/// pointer, no stack pointer, no segments, nothing to run. So it is built,
+/// reported on and handed straight back, which exercises every step of the path
+/// — the chunk finding a page, the window reaching it, the block being
+/// programmed, the entry rules being checked — without leaving a page allocated
+/// for a guest that does not exist yet. Its report says in as many words that
+/// it would not be entered, and which rule says so.
+///
+/// # Errors
+///
+/// [`CoreError::NoPartition`] if this processor came up before the guest
+/// existed, [`CoreError::Vcpu`] if the extension cannot be enabled — a
+/// processor without it, or firmware having turned it off — or
+/// [`CoreError::Partition`] if the chunk cannot back a control block.
+fn virtualize(space: &mut AddressSpace) -> Result<(), CoreError> {
+    let partition = PARTITION.get().ok_or(CoreError::NoPartition)?;
+    let window = space.direct_map();
+    // SAFETY: this processor has installed its descriptor tables and attached,
+    // so the task register and the `GS` base hold what it will keep using;
+    // nothing in this image changes either afterwards, nor any fast-system-call
+    // register. Every processor reaches this once, on its own way up.
+    let host = unsafe { vcpu::Host::install(space.frames(), window) }?;
+    host.describe("core");
+
+    let vcpu = partition.attach(host, space)?;
+    vcpu.describe("core");
+    // SAFETY: nothing has entered this block — there is no guest state in it to
+    // enter — so no world switch naming it can be in flight anywhere.
+    unsafe { vcpu.release(space.frames()) }?;
+    Ok(())
 }
 
 /// Stops this processor, but leaves it able to answer.
