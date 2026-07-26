@@ -46,12 +46,29 @@
 //! which is what keeps a guest that merely walks physical memory out of
 //! trouble.
 //!
-//! A guest *writing* there is a different matter, and is deliberately
-//! unfinished: the write faults, [`Npt::fault`] reports
-//! [`Resolution::Shadowed`], and with nothing to emulate the instruction with,
-//! the guest re-executes it and faults again. That is a live-lock rather than a
-//! corruption or a crash, and it is where instruction emulation will be hooked
-//! in. It is stated here so that nobody diagnoses it as a bug in the tables.
+//! A guest *writing* there is a different matter. The write faults and
+//! [`Npt::fault`] reports [`Resolution::Shadowed`], which is as far as these
+//! tables can take it: there is no page to accept the write and there never
+//! will be. Resuming the guest unchanged re-executes the instruction and faults
+//! again, so the caller has to step over it instead — emulate the instruction,
+//! discard the write, and resume past it. That is not something the tables can
+//! do, and it is stated here so that a live-lock is not diagnosed as a bug in
+//! them.
+//!
+//! # Regions the hardware does not answer for
+//!
+//! [`Npt::protect`] marks a range as one whose accesses belong to something
+//! other than the memory or device behind it — a device the hypervisor
+//! interposes on, presenting the guest a view that is not the hardware's.
+//! Either writes alone fault or every access does, and [`Npt::fault`] reports
+//! [`Resolution::Trapped`] for an address inside one rather than describing it.
+//!
+//! Trapping a range is the one thing here that needs finer granularity than the
+//! fill rule produces, so it splits whatever large page covers the range into
+//! 4 KiB entries first. It is also why the fill rule has a third case: a 2 MiB
+//! region holding a trapped page cannot be described all at once, so the region
+//! containing an address is narrowed until it holds no trapped page, down to a
+//! single page if it must be.
 //!
 //! # Why the memory type is write-back everywhere
 //!
@@ -67,10 +84,17 @@
 //!
 //! Filling only ever turns a not-present entry present, and the architecture
 //! requires no invalidation for that — the walker detects a constraint being
-//! removed on its own. Flushing a guest's tagged translations is only necessary
-//! when a hypervisor reduces permissions, clears present bits, or changes what
-//! an address translates to, none of which happens here. That is why nothing in
-//! this crate touches `TLB_CONTROL`.
+//! removed on its own. Splitting replaces one entry with a table describing the
+//! same memory the same way, which removes no constraint either.
+//!
+//! [`Npt::protect`] is the one operation here that reduces what an entry
+//! permits, and it needs no invalidation for a different reason: it may only be
+//! called before the guest has ever run. Nothing has walked these tables at
+//! that point, so no processor holds a translation that the tables have stopped
+//! justifying, and there is nothing to flush. That precondition is the whole
+//! reason nothing in this crate touches `TLB_CONTROL`, and it is what would
+//! have to be revisited first if a region ever had to be trapped while a guest
+//! is running.
 
 #![no_std]
 
@@ -83,7 +107,7 @@ use svm::exit::NestedPageFault;
 use thiserror::Error;
 use x86_64::{PhysAddr, structures::paging::PageTableFlags};
 
-use crate::walk::{Level, PARENT};
+use crate::walk::{Level, Meeting, PARENT};
 
 /// One guest's nested page tables.
 ///
@@ -95,7 +119,8 @@ use crate::walk::{Level, PARENT};
 pub struct Npt {
     root: PhysAddr,
     zero: PhysAddr,
-    owned: Owned,
+    owned: Span,
+    trapped: [Option<Interposed>; TRAPPED_REGIONS],
     window: DirectMap,
     large: bool,
 }
@@ -129,10 +154,8 @@ impl Npt {
         Ok(Self {
             root,
             zero,
-            owned: Owned {
-                base,
-                end: base + chunk::CHUNK_SIZE,
-            },
+            owned: Span::new(frames.chunk_base(), chunk::CHUNK_SIZE),
+            trapped: [None; TRAPPED_REGIONS],
             window,
             large: processor::features().contains(Features::GIB_PAGES),
         })
@@ -143,6 +166,18 @@ impl Npt {
     #[must_use]
     pub const fn root(&self) -> PhysAddr {
         self.root
+    }
+
+    /// The window these tables are reached through, which is the same window
+    /// whatever they translate to has to be reached through.
+    ///
+    /// Handed out so that anything reading a guest's memory uses the window
+    /// this was built with rather than one it found for itself. Two windows
+    /// onto physical memory would be two chances to disagree about what is
+    /// reachable.
+    #[must_use]
+    pub const fn window(&self) -> DirectMap {
+        self.window
     }
 
     /// Describes the region containing a guest physical address that had no
@@ -165,8 +200,13 @@ impl Npt {
         gpa: PhysAddr,
         cause: NestedPageFault,
     ) -> Result<Resolution, NptError> {
+        // Before anything else, because a trapped address faults on purpose and
+        // describing it is exactly what must not happen.
+        if self.caught(gpa) {
+            return Ok(Resolution::Trapped);
+        }
         let ours = self.owned.contains(gpa);
-        if !walk::translated(self.window, self.root, gpa)? {
+        if walk::lookup(self.window, self.root, gpa)?.is_none() {
             if ours {
                 self.shadow(frames, gpa)?;
             } else {
@@ -178,6 +218,98 @@ impl Npt {
         } else {
             Resolution::Mapped
         })
+    }
+
+    /// Where a guest physical address really is, or `None` if nothing describes
+    /// it yet.
+    ///
+    /// This is how anything outside the guest reaches the guest's memory: the
+    /// address a guest calls physical means nothing to the machine until these
+    /// tables have said what it is.
+    ///
+    /// `None` is not a failure. A guest's memory is described as it is touched,
+    /// so an address it has not touched has no translation and the answer is to
+    /// describe it — which needs the frame allocator, and so belongs to whoever
+    /// owns that rather than here.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::Unreachable`] if the window does not reach one of these
+    /// tables, which is a broken window rather than anything about `gpa`.
+    pub fn translate(&self, gpa: PhysAddr) -> Result<Option<Translation>, NptError> {
+        let Some(leaf) = walk::lookup(self.window, self.root, gpa)? else {
+            return Ok(None);
+        };
+        // How far into the region the address falls, which is both how far into
+        // the frame it lands and how much of the region is behind it.
+        let offset = gpa.as_u64() - gpa.align_down(leaf.level.span()).as_u64();
+        Ok(Some(Translation {
+            spa: leaf.frame + offset,
+            writable: leaf.flags.contains(PageTableFlags::WRITABLE),
+            span: leaf.level.span() - offset,
+        }))
+    }
+
+    /// Marks a range as one whose accesses are not the hardware's to answer.
+    ///
+    /// The range is described one page at a time, splitting whatever larger
+    /// page covers it, because permissions belong to an entry and
+    /// neighbouring pages must keep theirs. What the guest may still do for
+    /// itself is [`Trap`]'s to say.
+    ///
+    /// The range is remembered as well as described, because describing it is
+    /// not enough on its own: [`Npt::fault`] would otherwise fill a trapped
+    /// page back in the first time the guest touched it, and would describe
+    /// a 2 MiB region straight over one.
+    ///
+    /// # Only before a guest has run
+    ///
+    /// This is the one operation here that reduces what an entry permits, and
+    /// it may only be called before these tables have ever been entered.
+    /// Every processor's cached translations would otherwise have to be
+    /// discarded, and nothing here does that — precisely because nothing
+    /// can have cached one yet. Trapping a region while a guest is running
+    /// would need that machinery first, and would need it before this call
+    /// rather than after.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::TrapGeometry`] unless the range is a whole number of pages
+    /// on a page boundary, [`NptError::TooManyTrapped`] if these tables
+    /// have no room to remember another region, [`NptError::OutOfFrames`]
+    /// if the chunk cannot spare a table, [`NptError::Unreachable`] if the
+    /// window does not reach one, or [`NptError::LargePage`] if a large
+    /// page turns up at a level the architecture has none at.
+    pub fn protect(
+        &mut self,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+        bytes: u64,
+        trap: Trap,
+    ) -> Result<(), NptError> {
+        let page = Level::Page.span();
+        if bytes == 0 || !gpa.as_u64().is_multiple_of(page) || !bytes.is_multiple_of(page) {
+            return Err(NptError::TrapGeometry {
+                gpa: gpa.as_u64(),
+                bytes,
+            });
+        }
+        let Some(slot) = self.trapped.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(NptError::TooManyTrapped {
+                limit: TRAPPED_REGIONS,
+            });
+        };
+        // Remembered before it is described, so that a failure part-way through
+        // leaves a region that still traps everything it should. The reverse
+        // order would leave pages described as untouchable that nothing knows to
+        // trap, which is a guest faulting for ever on an address the tables have
+        // no answer for.
+        *slot = Some(Interposed {
+            span: Span::new(gpa, bytes),
+            trap,
+        });
+
+        (0..bytes / page).try_for_each(|index| self.interpose(frames, gpa + index * page, trap))
     }
 
     /// Logs the shape of the translation, which is the whole of what a guest's
@@ -192,28 +324,97 @@ impl Npt {
             "{who}: npt shadows physical {:#x}..{:#x} onto {:#x}, read only",
             self.owned.base, self.owned.end, self.zero,
         );
+        for region in self.trapped.iter().flatten() {
+            info!(
+                "{who}: npt traps physical {:#x}..{:#x}, {}",
+                region.span.base,
+                region.span.end,
+                match region.trap {
+                    Trap::Writes => "writes only",
+                    Trap::Everything => "every access",
+                },
+            );
+        }
     }
 
-    /// Maps the largest region containing `gpa` that holds none of the
-    /// hypervisor's own memory, to itself.
+    /// Maps the largest region containing `gpa` that can be answered the same
+    /// way throughout, to itself.
     ///
-    /// The 2 MiB fallback needs no check of its own. This is only reached for
-    /// an address outside the chunk, and a 2 MiB region that overlapped the
-    /// chunk would lie entirely inside it — so the region containing an
-    /// address outside the chunk cannot overlap it.
+    /// Three cases rather than two, because a trapped page can sit anywhere. A
+    /// 2 MiB region overlapping the chunk lies entirely inside it, so an
+    /// address outside the chunk is never narrowed on the chunk's account —
+    /// but a 2 MiB region holding one trapped page is otherwise ordinary
+    /// memory, and the 511 pages around it are still the guest's to reach
+    /// at full speed.
+    ///
+    /// Narrowing to a single page is therefore the floor, and it is always
+    /// right when it is reached: [`Npt::fault`] has already answered for an
+    /// address that is the hypervisor's or trapped, so what is left is one page
+    /// of real memory that is neither.
     fn identity(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
-        let huge = Level::Pointer;
         if self.large {
-            let base = gpa.align_down(huge.span());
-            if !self.owned.overlaps(base, huge.span()) {
-                return self.itself(frames, base, huge);
+            let base = gpa.align_down(Level::Pointer.span());
+            if self.describable(base, Level::Pointer) {
+                return self.itself(frames, base, Level::Pointer);
             }
         }
-        self.itself(
+        let base = gpa.align_down(Level::Directory.span());
+        if self.describable(base, Level::Directory) {
+            return self.itself(frames, base, Level::Directory);
+        }
+        self.itself(frames, gpa.align_down(Level::Page.span()), Level::Page)
+    }
+
+    /// Whether the whole `level`-sized region at `base` can be described as
+    /// itself: none of it the hypervisor's own, and none of it trapped.
+    fn describable(&self, base: PhysAddr, level: Level) -> bool {
+        !self.owned.overlaps(base, level.span())
+            && !self
+                .trapped
+                .iter()
+                .flatten()
+                .any(|region| region.span.overlaps(base, level.span()))
+    }
+
+    /// Whether this address is inside a region the hardware does not answer
+    /// for.
+    fn caught(&self, gpa: PhysAddr) -> bool {
+        self.trapped
+            .iter()
+            .flatten()
+            .any(|region| region.span.contains(gpa))
+    }
+
+    /// Describes one page of a trapped region.
+    ///
+    /// A write-trapped page is still described, as itself and read-only, so
+    /// that reads reach the hardware without an exit. A page where every
+    /// access is trapped is described as nothing at all: a present entry
+    /// has no bit that denies a read, so not present is the only encoding
+    /// that faults on one.
+    fn interpose(
+        &mut self,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+        trap: Trap,
+    ) -> Result<(), NptError> {
+        let mut table = walk::descend(
+            self.window,
+            self.root,
+            gpa,
+            Level::Page,
             frames,
-            gpa.align_down(Level::Directory.span()),
-            Level::Directory,
-        )
+            Meeting::Split,
+        )?;
+        // SAFETY: `descend` returns a table of these nested tables, reached
+        // through the window, and `&mut self` is the only handle to them.
+        let table = unsafe { table.as_mut() };
+        let entry = &mut table[Level::Page.index(gpa)];
+        match trap {
+            Trap::Writes => entry.set_addr(gpa, TRAPPED),
+            Trap::Everything => entry.set_unused(),
+        }
+        Ok(())
     }
 
     /// Points every 4 KiB of the 2 MiB region containing `gpa` at the shared
@@ -225,7 +426,14 @@ impl Npt {
     /// same table.
     fn shadow(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
         let base = gpa.align_down(Level::Directory.span());
-        let mut table = walk::descend(self.window, self.root, base, Level::Page, frames)?;
+        let mut table = walk::descend(
+            self.window,
+            self.root,
+            base,
+            Level::Page,
+            frames,
+            Meeting::Refuse,
+        )?;
         // SAFETY: `descend` returns a table of these nested tables, reached
         // through the window, and `&mut self` is the only handle to them.
         let table = unsafe { table.as_mut() };
@@ -258,10 +466,51 @@ pub enum Resolution {
     /// retries it.
     Mapped,
     /// The guest tried to write memory the hypervisor owns. Reads there see
-    /// zeroes; a write cannot be satisfied, so resuming the guest re-executes
-    /// it and faults again. Stepping over it needs instruction emulation,
-    /// which does not exist yet.
+    /// zeroes; a write cannot be satisfied, so resuming the guest unchanged
+    /// re-executes it and faults again. The caller has to emulate the
+    /// instruction, discard the write, and resume past it.
     Shadowed,
+    /// The address is inside a region the hardware does not answer for.
+    /// Nothing was described and nothing will be: what the access means is the
+    /// caller's to decide, and stepping the guest past it is the caller's to
+    /// do.
+    Trapped,
+}
+
+/// Where a guest physical address really is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Translation {
+    /// The system physical address it translates to.
+    pub spa: PhysAddr,
+    /// Whether the guest may write there.
+    ///
+    /// Clear for every page of the hypervisor's own memory, which all
+    /// translates to one shared page of zeroes — so anything writing on a
+    /// guest's behalf has to consult this rather than assume, or that one page
+    /// stops being zeroes for every address that shadows it at once.
+    pub writable: bool,
+    /// Bytes from [`Translation::spa`] that the same entry describes.
+    ///
+    /// What makes a copy across a large page cost one translation instead of
+    /// one per 4 KiB: the caller can move this many bytes before it has to ask
+    /// again.
+    pub span: u64,
+}
+
+/// What a guest may still do for itself in a trapped region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trap {
+    /// Reads reach the hardware directly and cost nothing; writes fault.
+    ///
+    /// The choice for a device whose registers read back what they are, and
+    /// where only what the guest writes has to be interfered with.
+    Writes,
+    /// Every access faults.
+    ///
+    /// The choice for a device the guest must be shown something other than
+    /// the truth about. It costs an exit per read as well as per write, which
+    /// is the price of the read never reaching the hardware.
+    Everything,
 }
 
 /// Why a guest physical address could not be described.
@@ -292,26 +541,66 @@ pub enum NptError {
         /// How long it is.
         size: u64,
     },
+    /// A region to be trapped was not a whole number of pages on a page
+    /// boundary, which is the granularity permissions come in.
+    #[error("a trapped region at {gpa:#x} of {bytes:#x} bytes is not a whole number of pages")]
+    TrapGeometry {
+        /// Where the region begins.
+        gpa: u64,
+        /// How long it is.
+        bytes: u64,
+    },
+    /// More regions were trapped than these tables have room to remember.
+    #[error("no room to trap another region; {limit} is the most these tables remember")]
+    TooManyTrapped {
+        /// How many they remember.
+        limit: usize,
+    },
 }
 
-/// The span of physical memory that is the hypervisor's own.
+/// How many regions of a guest's physical memory may be trapped at once.
 ///
-/// The reserved chunk and nothing else: the loader copies pulzar's image into
-/// chunk frames, and its heap, stacks, tables and control blocks all come from
-/// the same place, so this one range is the whole of what a guest must not see.
+/// Sized for the devices a pass-through hypervisor interposes on rather than
+/// for a machine's aperture space: each one is a device's registers, and every
+/// fault consults the whole list, so this is a number that wants to stay small
+/// enough to scan. A hypervisor that needed hundreds would want a different
+/// structure rather than a larger array.
+const TRAPPED_REGIONS: usize = 16;
+
+/// One region whose accesses are not the hardware's to answer.
 #[derive(Clone, Copy, Debug)]
-struct Owned {
+struct Interposed {
+    span: Span,
+    trap: Trap,
+}
+
+/// A run of guest physical addresses.
+///
+/// Two quite different things are described by one of these — the memory that
+/// is the hypervisor's own, and a region something interposes on — but the
+/// questions asked of them are the same two, so they are written once.
+#[derive(Clone, Copy, Debug)]
+struct Span {
     base: u64,
     end: u64,
 }
 
-impl Owned {
-    /// Whether this address is the hypervisor's.
+impl Span {
+    /// The run of `bytes` beginning at `base`.
+    fn new(base: PhysAddr, bytes: u64) -> Self {
+        let base = base.as_u64();
+        Self {
+            base,
+            end: base.saturating_add(bytes),
+        }
+    }
+
+    /// Whether this address is inside the run.
     fn contains(self, phys: PhysAddr) -> bool {
         (self.base..self.end).contains(&phys.as_u64())
     }
 
-    /// Whether any of `span` bytes from `base` is the hypervisor's.
+    /// Whether any of `span` bytes from `base` is inside the run.
     fn overlaps(self, base: PhysAddr, span: u64) -> bool {
         let base = base.as_u64();
         base < self.end && self.base < base.saturating_add(span)
@@ -328,6 +617,15 @@ const LEAF: PageTableFlags = PARENT;
 /// executable so that a guest walking memory is not surprised, and not writable
 /// so that the shared page of zeroes stays zero.
 const SHADOW: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
+
+/// Flags on a leaf of a region whose writes are trapped: describing the memory
+/// that is really there, readable and executable, and not writable — so a read
+/// costs nothing and a write faults.
+///
+/// The same bits as [`SHADOW`] and for an entirely different reason. They are
+/// named apart so that changing what one of them means cannot quietly change
+/// the other.
+const TRAPPED: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
 
 /// A zeroed frame of the chunk, and proof that the window reaches it.
 ///
@@ -358,6 +656,11 @@ const _: () = assert!(
 const _: () = assert!(
     !SHADOW.contains(PageTableFlags::WRITABLE),
     "the page of zeroes standing in for the hypervisor must not be writable",
+);
+const _: () = assert!(
+    TRAPPED.contains(PageTableFlags::PRESENT) && !TRAPPED.contains(PageTableFlags::WRITABLE),
+    "a write-trapped page must be present, so that reads cost nothing, and not \
+     writable, so that writes fault",
 );
 const _: () = assert!(
     LEAF.contains(PageTableFlags::USER_ACCESSIBLE)
