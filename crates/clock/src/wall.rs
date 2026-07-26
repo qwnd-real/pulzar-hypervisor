@@ -38,9 +38,6 @@ const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 /// them, and no clock pulzar reads reports one.
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 
-/// Days in each month of a non-leap year.
-const MONTH_LENGTHS: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
 /// Days in the calendar's 400-year cycle, after which every date, weekday and
 /// leap day repeats exactly.
 const DAYS_PER_ERA: u64 = 146_097;
@@ -54,14 +51,14 @@ const MAX_OFFSET_MINUTES: i16 = 1440;
 
 /// The first year a `u64` of nanoseconds since the epoch can express, which is
 /// the epoch's own.
-const MIN_YEAR: u16 = 1970;
+const MIN_YEAR: u64 = 1970;
 
 /// The last year one can express. The range ends part-way through it, and the
 /// arithmetic below is what refuses the days past the end; this bound is here
 /// so that a reading centuries out — which is what an unset real-time clock
 /// tends to produce — is refused as the nonsense it is rather than as an
 /// overflow.
-const MAX_YEAR: u16 = 2554;
+const MAX_YEAR: u64 = 2554;
 
 /// A point in wall-clock time, as nanoseconds since 1970-01-01T00:00:00Z.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -172,7 +169,7 @@ impl Civil {
     /// Whether the calendar admits this reading, and whether it lands in the
     /// span a [`Wall`] can hold.
     fn is_valid(&self) -> bool {
-        (MIN_YEAR..=MAX_YEAR).contains(&self.year)
+        (MIN_YEAR..=MAX_YEAR).contains(&u64::from(self.year))
             && days_in_month(self.year, self.month)
                 .is_some_and(|last| (1..=last).contains(&self.day))
             && self.hour < 24
@@ -191,10 +188,17 @@ impl Civil {
 /// this crate converts in this direction is one that has to land at or after
 /// the epoch to be representable, so a date before it drops out of the one
 /// subtraction that can underflow.
-fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+const fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
     // A March-based year puts the leap day at the end, so February's length
     // never shifts the days before it and no month needs a special case.
-    let year = year.checked_sub(u64::from(month <= 2))?;
+    let year = if month <= 2 {
+        match year.checked_sub(1) {
+            Some(year) => year,
+            None => return None,
+        }
+    } else {
+        year
+    };
     let era = year / 400;
     let year_of_era = year - era * 400;
     let month_of_year = if month > 2 { month - 3 } else { month + 9 };
@@ -208,7 +212,7 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
 /// The inverse of [`days_from_civil`], and negative dates are absent for the
 /// same reason: a [`Wall`] counts from the epoch, so the day number never goes
 /// below it.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
+const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let days = days + DAYS_BEFORE_EPOCH;
     let era = days / DAYS_PER_ERA;
     let day_of_era = days - era * DAYS_PER_ERA;
@@ -222,16 +226,18 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     } else {
         month_of_year - 9
     };
-    (year_of_era + era * 400 + u64::from(month <= 2), month, day)
+    let next_year = if month <= 2 { 1 } else { 0 };
+    (year_of_era + era * 400 + next_year, month, day)
 }
 
 /// Days in `month` of `year`, or `None` if that is not a month.
-fn days_in_month(year: u16, month: u8) -> Option<u8> {
-    let length = *MONTH_LENGTHS.get(usize::from(month.checked_sub(1)?))?;
-    Some(if month == 2 && is_leap_year(year) {
-        length + 1
-    } else {
-        length
+const fn days_in_month(year: u16, month: u8) -> Option<u8> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
     })
 }
 
@@ -239,3 +245,74 @@ fn days_in_month(year: u16, month: u8) -> Option<u8> {
 const fn is_leap_year(year: u16) -> bool {
     year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
+
+// The calendar, checked where the check costs nothing and cannot be skipped.
+// This is the one part of the crate no machine can disagree with — the
+// arithmetic is the same everywhere — and the one a wrong answer from would be
+// hardest to notice, because an off-by-one here produces a date that looks
+// entirely ordinary.
+const _: () = {
+    // The epoch, a leap day and the day after it, the century that is a leap
+    // year and the century that is not, an ordinary date, and the last day the
+    // range holds.
+    const DATES: [(u64, u64, u64); 7] = [
+        (1970, 1, 1),
+        (1972, 2, 29),
+        (1972, 3, 1),
+        (2000, 2, 29),
+        (2100, 3, 1),
+        (2026, 7, 26),
+        (2554, 7, 21),
+    ];
+
+    assert!(
+        days_from_civil(MIN_YEAR, 1, 1).unwrap() == 0,
+        "the epoch has to be day zero"
+    );
+    assert!(
+        days_from_civil(1969, 12, 31).is_none(),
+        "the day before the epoch has to be out of reach, not wrapped into range"
+    );
+
+    let mut index = 0;
+    while index < DATES.len() {
+        let (year, month, day) = DATES[index];
+        let (again, month_again, day_again) =
+            civil_from_days(days_from_civil(year, month, day).unwrap());
+        assert!(
+            again == year && month_again == month && day_again == day,
+            "a date has to survive the trip to a day number and back unchanged"
+        );
+        index += 1;
+    }
+
+    assert!(
+        is_leap_year(2024) && is_leap_year(2000) && !is_leap_year(2100) && !is_leap_year(1970),
+        "a leap year is every fourth, less every hundredth, plus every four hundredth"
+    );
+    assert!(
+        days_in_month(2000, 2).unwrap() == 29 && days_in_month(2100, 2).unwrap() == 28,
+        "february is the month the leap rule reaches"
+    );
+    assert!(
+        days_in_month(2026, 0).is_none() && days_in_month(2026, 13).is_none(),
+        "a month outside the year is not a month"
+    );
+};
+
+// Where [`MAX_YEAR`] comes from. It is not a policy about how far ahead a clock
+// may be set: it is the year a `u64` of nanoseconds runs out in, and these two
+// assertions are what keep the constant pinned to that fact rather than to
+// whoever last edited it.
+const _: () = {
+    let last = days_from_civil(MAX_YEAR, 1, 1).unwrap() * SECONDS_PER_DAY;
+    assert!(
+        last.checked_mul(NANOS_PER_SECOND).is_some(),
+        "the whole of the last year has to be representable"
+    );
+    let past = days_from_civil(MAX_YEAR + 1, 1, 1).unwrap() * SECONDS_PER_DAY;
+    assert!(
+        past.checked_mul(NANOS_PER_SECOND).is_none(),
+        "the year after it has to be out of reach"
+    );
+};

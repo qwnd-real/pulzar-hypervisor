@@ -92,6 +92,34 @@ impl Frequency {
     }
 }
 
+// Converted at compile time, so that a change to the arithmetic cannot quietly
+// move a rate a machine actually reports.
+const _: () = {
+    // The event timer every PC chipset derives from the original colour burst
+    // clock. Its nominal rate is 14 318 180 Hz and the period it reports
+    // divides out one hertz short of that: the truncation
+    // `from_period_femtos` describes, at 0.07 parts per million.
+    assert!(
+        Frequency::from_period_femtos(69_841_279).unwrap().hz() == 14_318_179,
+        "a 69.841279 ns tick period is a 14.318 MHz counter"
+    );
+    assert!(
+        Frequency::from_period_femtos(FEMTOS_PER_SECOND)
+            .unwrap()
+            .hz()
+            == 1,
+        "a tick period of one second is a counter that ticks once a second"
+    );
+    assert!(
+        Frequency::from_period_femtos(0).is_none(),
+        "a counter with no tick period is not a counter"
+    );
+    assert!(
+        Frequency::from_hz(0).is_none(),
+        "a counter that does not tick is not a counter"
+    );
+};
+
 /// A point on the monotonic clock, as nanoseconds since it was installed.
 ///
 /// It says nothing about what time it is — that is [`crate::Wall`] — only how
