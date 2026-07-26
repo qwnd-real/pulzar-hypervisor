@@ -1,4 +1,0 @@
-curl: (56) Recv failure: Connection timed out
-APM vol2 -> 000 0
--rw-r--r-- 1 qwnd qwnd 3564611 26. Jul 10:43 apm2.pdf
-zsh:1: no such file or directory: fe_oa_28de397a5dc39f600ebd3cbfab8562155e0962f91240e938/claude-f349-cwd
