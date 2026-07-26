@@ -54,6 +54,7 @@ use handoff::{Handoff, HandoffError};
 use log::{error, info, warn};
 use paging::{AddressSpace, CacheType, Existing, PagingError, Protection, chunk};
 use pci::Pci;
+use snapshot::FirmwareContext;
 use uefi_raw::Status;
 use x86_64::{PhysAddr, VirtAddr, instructions::interrupts, structures::paging::PhysFrame};
 
@@ -155,6 +156,11 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // keeps is the copy in the chunk.
     unsafe { space.drop_lower_half() }?;
     info!("core: dropped the firmware half of the address space");
+
+    // Logged on this side of the transition rather than the other, because that
+    // is what proves the capture survived it: nothing firmware left is
+    // addressable any more, and these numbers come out of the chunk.
+    inherited(handoff)?.describe("core");
 
     let acpi = survey_machine(handoff, &space)?;
     start_clock(&mut space, &acpi, handoff)?;
@@ -516,6 +522,27 @@ fn phys(value: u64) -> Result<PhysAddr, CoreError> {
 /// [`CoreError::BadAddress`] if the value is not canonical.
 fn virt(value: u64) -> Result<VirtAddr, CoreError> {
     VirtAddr::try_new(value).map_err(|_| CoreError::BadAddress { value })
+}
+
+/// The state firmware was running with, out of the chunk.
+///
+/// The loader captured it before it had modified anything and left it beside
+/// the boot protocol, because by now there is nowhere else it could come from:
+/// the registers it describes hold pulzar's values, and firmware's own copies
+/// of what it does not hold are in memory that is no longer addressable.
+///
+/// # Errors
+///
+/// [`CoreError::BadAddress`] if the handoff names an address this processor
+/// cannot form.
+fn inherited(handoff: &Handoff) -> Result<&'static FirmwareContext, CoreError> {
+    let address = virt(handoff.firmware_context)?;
+    // SAFETY: the loader wrote a `FirmwareContext` here, into the chunk region
+    // set aside for exactly that, which no allocator hands out and nothing ever
+    // frees — so the reference cannot dangle and `'static` is honest. The
+    // address is a direct-map one, which is what keeps it mapped now that the
+    // firmware half of the address space is gone.
+    Ok(unsafe { &*address.as_ptr::<FirmwareContext>() })
 }
 
 /// A byte count as a `usize`.

@@ -17,6 +17,7 @@ handoff = { workspace = true }
 log = { workspace = true }
 paging = { workspace = true }
 serial = { workspace = true }
+snapshot = { workspace = true }
 thiserror = { workspace = true }
 uefi = { workspace = true }
 x86_64 = { workspace = true }

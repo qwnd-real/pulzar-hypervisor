@@ -56,13 +56,34 @@ impl Register {
     pub(crate) const VERSION: Self = Self(0x30);
     /// Task priority: which interrupt priorities this processor will accept.
     pub(crate) const TASK_PRIORITY: Self = Self(0x80);
+    /// The priority this processor is actually servicing at, which is its task
+    /// priority or the highest interrupt in service, whichever is higher.
+    pub(crate) const PROCESSOR_PRIORITY: Self = Self(0xA0);
     /// Written to acknowledge the interrupt currently being serviced.
     pub(crate) const END_OF_INTERRUPT: Self = Self(0xB0);
+    /// Which logical destinations this processor answers to.
+    pub(crate) const LOGICAL_DESTINATION: Self = Self(0xD0);
+    /// How the logical destination above is matched. The older interface only:
+    /// x2APIC has one model and no register to choose it with.
+    pub(crate) const DESTINATION_FORMAT: Self = Self(0xE0);
     /// Spurious interrupt vector, and the bit that software-enables the
     /// controller.
     pub(crate) const SPURIOUS: Self = Self(0xF0);
+    /// First of the eight registers saying which vectors this processor has
+    /// accepted and not yet acknowledged.
+    pub(crate) const IN_SERVICE: Self = Self(0x100);
+    /// First of the eight registers saying which of the vectors in service
+    /// arrived level triggered.
+    pub(crate) const TRIGGER_MODE: Self = Self(0x180);
+    /// First of the eight registers saying which vectors have been delivered to
+    /// this processor and not yet accepted.
+    pub(crate) const INTERRUPT_REQUEST: Self = Self(0x200);
     /// Errors the controller noticed, latched until written.
     pub(crate) const ERROR_STATUS: Self = Self(0x280);
+    /// Local vector table entry for corrected machine-check errors. The last
+    /// entry the architecture added, so a controller only has it if its version
+    /// register counts far enough to reach it.
+    pub(crate) const LVT_CORRECTED_MACHINE_CHECK: Self = Self(0x2F0);
     /// The low half of the interrupt command register: everything but the
     /// destination.
     pub(crate) const COMMAND_LOW: Self = Self(0x300);
@@ -87,6 +108,16 @@ impl Register {
     /// How far the bus clock is divided before the timer counts it.
     pub(crate) const TIMER_DIVIDE: Self = Self(0x3E0);
 
+    /// The register `slots` slots past this one.
+    ///
+    /// Three of the controller's registers are really the first of eight
+    /// consecutive ones, describing the two hundred and fifty-six vectors
+    /// thirty-two at a time. Deriving the rest from the first is what keeps
+    /// twenty-four offsets from being written out by hand.
+    pub(crate) const fn offset_by(self, slots: u32) -> Self {
+        Self(self.0 + slots * STRIDE)
+    }
+
     /// The model-specific register x2APIC puts this register in.
     const fn msr(self) -> u32 {
         X2APIC_BASE_MSR + self.0 / STRIDE
@@ -108,7 +139,7 @@ const STRIDE: u32 = 16;
 
 /// The single model-specific register x2APIC gives the interrupt command, in
 /// place of the two the older interface splits it across.
-const X2APIC_COMMAND_MSR: u32 = 0x830;
+pub(crate) const X2APIC_COMMAND_MSR: u32 = 0x830;
 
 /// The bit the older interface sets in the command register while a command is
 /// still being sent. x2APIC has no such bit: its write does not return until

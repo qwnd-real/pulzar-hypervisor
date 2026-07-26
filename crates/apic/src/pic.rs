@@ -43,3 +43,22 @@ pub(crate) fn mask() {
         Port::<u8>::new(PRIMARY_DATA).write(ALL_MASKED);
     }
 }
+
+/// Both controllers' interrupt masks, the primary's first.
+///
+/// Reading the data port is how a mask is read back, and it needs no command
+/// written first — unlike the in-service and request registers, which are
+/// reached by writing a selector and so cannot be asked about without changing
+/// what the controller answers next. So nothing here disturbs anything.
+///
+/// What comes back means nothing on a machine with no legacy controllers.
+/// Whether it has them is firmware's to say, in a table read long after this,
+/// and a port nothing decodes returns the floating bus rather than an error.
+pub(crate) fn masks() -> [u8; 2] {
+    let mut primary = Port::<u8>::new(PRIMARY_DATA);
+    let mut secondary = Port::<u8>::new(SECONDARY_DATA);
+    // SAFETY: both are the architectural data ports of the legacy controllers,
+    // and reading one returns the interrupt mask register with no side effect
+    // on the controller or on anything it is wired to.
+    unsafe { [primary.read(), secondary.read()] }
+}

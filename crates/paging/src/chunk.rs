@@ -48,8 +48,19 @@ pub const HANDOFF_OFFSET: u64 = 0;
 /// Space set aside for the boot protocol structure.
 pub const HANDOFF_SIZE: u64 = FRAME_SIZE;
 
+/// Offset of the state firmware was running with, captured by the loader before
+/// it modified any of it.
+///
+/// Beside the handoff rather than anywhere else, because it is the same kind of
+/// thing: written once by the loader, read by the hypervisor image, and part of
+/// what the two agree on rather than something either of them allocates.
+pub const FIRMWARE_CONTEXT_OFFSET: u64 = HANDOFF_OFFSET + HANDOFF_SIZE;
+
+/// Space set aside for the captured firmware state.
+pub const FIRMWARE_CONTEXT_SIZE: u64 = FRAME_SIZE;
+
 /// Offset of the physical frame allocator's state.
-pub const FRAME_STATE_OFFSET: u64 = HANDOFF_OFFSET + HANDOFF_SIZE;
+pub const FRAME_STATE_OFFSET: u64 = FIRMWARE_CONTEXT_OFFSET + FIRMWARE_CONTEXT_SIZE;
 
 /// Space set aside for the physical frame allocator's state.
 pub const FRAME_STATE_SIZE: u64 = 4 * FRAME_SIZE;

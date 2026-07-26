@@ -14,6 +14,7 @@ members = [
     "crates/pci",
     "crates/processor",
     "crates/serial",
+    "crates/snapshot",
     "crates/svm",
     "crates/xtask",
 ]
@@ -45,7 +46,8 @@ uefi-raw = "0.15.1"
 # turns the machine's counters into time; `cpu` answers which processors the
 # machine has and which one is running; `apic` drives their interrupt
 # controllers and starts them; `ipi` is how one of them reaches another; `svm`
-# states what the processor's virtualization structures look like.
+# states what the processor's virtualization structures look like; `snapshot`
+# is what firmware was running with, read before any of it is overwritten.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -56,6 +58,7 @@ ipi = { path = "crates/ipi" }
 paging = { path = "crates/paging" }
 pci = { path = "crates/pci" }
 processor = { path = "crates/processor" }
+snapshot = { path = "crates/snapshot" }
 svm = { path = "crates/svm" }
 
 # `CPUID` decoding, so no leaf number or feature bit position is written out by

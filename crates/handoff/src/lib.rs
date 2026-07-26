@@ -126,6 +126,19 @@ pub struct Handoff {
     /// picked. It is reserved memory, like the chunk, which is what lets the
     /// other processors be started long after the loader is gone.
     pub ap_trampoline_base: u64,
+
+    /// Direct-map address of the state firmware was running with, captured
+    /// before the loader had modified any of it.
+    ///
+    /// Everything a guest that continues the firmware environment has to be
+    /// entered with, and everything a virtual interrupt controller has to be
+    /// seeded from. It travels here rather than being re-read because there is
+    /// nothing left to re-read it from: by the time the hypervisor wants it,
+    /// every register it describes holds pulzar's value instead.
+    ///
+    /// A direct-map address, like [`Handoff::memory_map`], so it survives the
+    /// firmware half of the address space being dropped.
+    pub firmware_context: u64,
 }
 
 impl Handoff {
@@ -136,7 +149,7 @@ impl Handoff {
     pub const MAGIC: u64 = u64::from_le_bytes(*b"PULZARH1");
 
     /// Current protocol version.
-    pub const VERSION: u32 = 4;
+    pub const VERSION: u32 = 5;
 
     /// Validates `ptr` and borrows the handoff behind it.
     ///

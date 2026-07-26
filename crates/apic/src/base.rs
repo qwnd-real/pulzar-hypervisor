@@ -26,11 +26,17 @@ use crate::{ApicError, Mode};
 const IA32_APIC_BASE: u32 = 0x1B;
 
 /// The controller answers through model-specific registers.
-const X2APIC_ENABLE: u64 = 1 << 10;
+pub(crate) const X2APIC_ENABLE: u64 = 1 << 10;
 
 /// The controller is switched on. Clearing this is what the architecture calls
 /// disabling it, and on many processors it cannot be set again.
-const GLOBAL_ENABLE: u64 = 1 << 11;
+pub(crate) const GLOBAL_ENABLE: u64 = 1 << 11;
+
+/// The bits holding the physical address of the memory-mapped register page.
+///
+/// Frame-aligned and no wider than a physical address, so the field is the
+/// whole of the register except the flags below it and the reserved bits above.
+pub(crate) const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// Switches this processor's controller into `mode`, if it is not there
 /// already.
@@ -71,7 +77,7 @@ pub(crate) fn enter(mode: Mode) -> Result<(), ApicError> {
 }
 
 /// The register's current value.
-fn read() -> u64 {
+pub(crate) fn read() -> u64 {
     // SAFETY: `IA32_APIC_BASE` is architectural on every processor that has a
     // local APIC, which `Features::APIC` is checked for before anything here
     // runs, and reading it has no side effect.

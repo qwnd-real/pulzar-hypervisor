@@ -428,6 +428,7 @@ dependencies = [
  "paging",
  "pci",
  "serial",
+ "snapshot",
  "spin",
  "talc",
  "thiserror",
@@ -444,6 +445,7 @@ dependencies = [
  "log",
  "paging",
  "serial",
+ "snapshot",
  "thiserror",
  "uefi",
  "x86_64",
@@ -778,6 +780,18 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "snapshot"
+version = "0.1.0"
+dependencies = [
+ "apic",
+ "bitfield-struct",
+ "log",
+ "paging",
+ "svm",
+ "x86_64",
+]
 
 [[package]]
 name = "spin"

@@ -1,22 +1,26 @@
 //! First-stage UEFI loader for the pulzar hypervisor.
 //!
 //! Firmware starts this image; it ends by jumping into the hypervisor image
-//! with an address space of pulzar's own making. In between it does five
+//! with an address space of pulzar's own making. In between it does six
 //! things, in this order and for these reasons:
 //!
-//! 1. Registers an unload handler on itself, so the hypervisor can evict it
+//! 1. Captures the state firmware was running with, before anything else at
+//!    all. Every register in it is one the steps below overwrite, and none can
+//!    be read back afterwards.
+//! 2. Registers an unload handler on itself, so the hypervisor can evict it
 //!    later. Nothing else works if this does not.
-//! 2. Reserves the one chunk of physical memory pulzar will own. It has to
+//! 3. Reserves the one chunk of physical memory pulzar will own. It has to
 //!    happen before the memory map is captured, so the chunk appears in the map
 //!    as reserved rather than as memory something might hand out again.
-//! 3. Captures firmware's memory map into that chunk, because the address space
+//! 4. Captures firmware's memory map into that chunk, because the address space
 //!    is sized from it and because firmware's own copy lives in memory the
 //!    hypervisor will lose.
-//! 4. Loads, relocates and maps the hypervisor image at a randomized high-half
+//! 5. Loads, relocates and maps the hypervisor image at a randomized high-half
 //!    address, alongside a guarded stack, a direct map of physical memory and a
 //!    window for explicit mappings.
-//! 5. Publishes a [`Handoff`] describing all of it and jumps, with the new
-//!    address space active.
+//! 6. Publishes a [`Handoff`] describing all of it, with the captured firmware
+//!    state beside it in the chunk, and jumps with the new address space
+//!    active.
 //!
 //! The address space it activates is deliberately half firmware's: the lower
 //! half is copied from firmware's own tables, so boot services keep working
@@ -43,6 +47,7 @@ use paging::{
     AddressSpace, CacheType, DirectMap, PagingError, Protection, Stack, buddy, chunk,
     kaslr::{self, Entropy, Placement},
 };
+use snapshot::FirmwareContext;
 use uefi::{Status, boot::MemoryDescriptor, entry};
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -90,18 +95,33 @@ const _: () = assert!(
     "the handoff does not fit the chunk region reserved for it"
 );
 
+/// The captured firmware state goes in the region beside it, on the same terms.
+const _: () = assert!(
+    size_of::<FirmwareContext>() as u64 <= chunk::FIRMWARE_CONTEXT_SIZE,
+    "the firmware context does not fit the chunk region reserved for it"
+);
+
 /// Firmware's entry point.
 ///
-/// Serial comes up first so that everything after it, including a failure, is
-/// observable. There is nowhere to report a serial failure to, which is why it
-/// is the one step whose error is a bare status.
+/// The capture comes before serial, and serial before everything else. Serial
+/// is first because everything after it, including a failure, has to be
+/// observable — it is the one step whose error is a bare status, since there is
+/// nowhere to report a serial failure to. The capture is ahead of even that
+/// because bringing a serial port up reprograms one, and a snapshot of firmware
+/// taken after pulzar has changed something is a snapshot of pulzar.
 #[entry]
 fn main() -> Status {
+    // SAFETY: firmware's address space is the active one — nothing has run that
+    // could have changed it — and in it a physical address is its own virtual
+    // address, which is exactly what the identity window describes. The
+    // descriptor tables read here are the ones the processor is running on.
+    let firmware = unsafe { snapshot::capture(DirectMap::identity()) };
     if serial::init().is_err() {
         return Status::DEVICE_ERROR;
     }
     info!("loader: pulzar hv-loader starting");
-    match boot() {
+    firmware.describe("loader");
+    match boot(&firmware) {
         // `boot` only ever returns by failing; its success type is uninhabited.
         Ok(never) => match never {},
         Err(error) => {
@@ -118,7 +138,7 @@ fn main() -> Status {
 /// The first failure of any step, which ends the boot. Nothing is rolled back:
 /// the reserved chunk stays reserved and firmware is left as it was found,
 /// which is what firmware expects of an application that returns an error.
-fn boot() -> Result<Infallible, LoaderError> {
+fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
     let loader = firmware::claim_self()?;
     info!(
         "loader: own image at {:#x}, {:#x} bytes, unload handler registered",
@@ -157,7 +177,7 @@ fn boot() -> Result<Infallible, LoaderError> {
     // maps identically, and `top_of_ram` is one past the highest physical address
     // firmware's memory map describes.
     let mut space = unsafe { AddressSpace::build(chunk_base, memory.top_of_ram, placement) }?;
-    let stack = load(&mut space, &mut file, &image, placement)?;
+    let hypervisor = load(&mut space, &mut file, &image, placement)?;
 
     // Firmware objects are closed here rather than dropped: the jump below never
     // returns, so no destructor at the end of this function would ever run.
@@ -165,25 +185,19 @@ fn boot() -> Result<Infallible, LoaderError> {
     space.describe("loader");
 
     let handoff = publish(
-        &space,
-        reserved,
-        loader,
-        memory,
-        image.size(),
-        stack,
-        placement,
+        &space, reserved, loader, memory, hypervisor, placement, firmware,
     )?;
     let entry = VirtAddr::new(image.entry(placement.image_base.as_u64()));
     info!(
         "loader: entering hypervisor at {entry:#x}, stack top {:#x}, handoff {handoff:#x}",
-        stack.top()
+        hypervisor.stack.top()
     );
     // SAFETY: `space` maps the hypervisor's image at `entry` and its stack below
     // `stack.top()`, and its lower half is firmware's own, so the instructions
     // between the `CR3` load and the jump stay mapped where they are executing
     // from. `handoff` is a direct-map address of a `Handoff` this space maps, and
     // the entry point of a UEFI image never returns to its caller.
-    unsafe { enter(space.root(), stack.top(), entry, handoff) }
+    unsafe { enter(space.root(), hypervisor.stack.top(), entry, handoff) }
 }
 
 /// Copies firmware's memory map into the chunk's metadata region.
@@ -213,6 +227,18 @@ fn probe(file: &mut ImageFile) -> Result<Image, LoaderError> {
     Ok(Image::parse(&headers[..read])?)
 }
 
+/// What placing the hypervisor image produced.
+///
+/// The two facts the handoff needs and nothing else has: how far the image
+/// spans, and where its stack ended up. Together rather than separately because
+/// they are one step's output, and because the handoff is assembled from a
+/// bounded list of such outputs.
+#[derive(Clone, Copy, Debug)]
+struct Hypervisor {
+    stack: Stack,
+    image_size: u64,
+}
+
 /// Places the hypervisor image and its stack in the new address space.
 ///
 /// # Errors
@@ -225,7 +251,7 @@ fn load(
     file: &mut ImageFile,
     image: &Image,
     placement: Placement,
-) -> Result<Stack, LoaderError> {
+) -> Result<Hypervisor, LoaderError> {
     let order = image_order(image.size());
     let span = chunk::FRAME_SIZE << order;
     let phys = space
@@ -250,7 +276,10 @@ fn load(
         stack.bottom(),
         stack.top()
     );
-    Ok(stack)
+    Ok(Hypervisor {
+        stack,
+        image_size: image.size(),
+    })
 }
 
 /// Order of the frame run the image is loaded into.
@@ -355,11 +384,13 @@ fn map_image(
     Ok(())
 }
 
-/// Writes the handoff into the chunk and returns the address the hypervisor
-/// receives it at.
+/// Writes the handoff and the captured firmware state into the chunk, and
+/// returns the address the hypervisor receives the handoff at.
 ///
-/// That address is a direct-map one, so it stays valid after the hypervisor
-/// drops the firmware half of the address space.
+/// Both are written here because both are protocol rather than allocation: the
+/// loader is the only thing that can produce either, and the hypervisor is the
+/// only thing that reads them. The addresses are direct-map ones, so they stay
+/// valid after the hypervisor drops the firmware half of the address space.
 ///
 /// # Errors
 ///
@@ -370,15 +401,16 @@ fn publish(
     reserved: Reserved,
     loader: Loader,
     memory: Memory,
-    core_image_size: u64,
-    stack: Stack,
+    hypervisor: Hypervisor,
     placement: Placement,
+    firmware: &FirmwareContext,
 ) -> Result<VirtAddr, LoaderError> {
     let system_table = uefi::table::system_table_raw().ok_or(LoaderError::Firmware {
         operation: "locate the UEFI system table",
         status: Status::NOT_FOUND,
     })?;
     let chunk_base = reserved.chunk;
+    let context = chunk_base + chunk::FIRMWARE_CONTEXT_OFFSET;
     let handoff = Handoff {
         magic: Handoff::MAGIC,
         version: Handoff::VERSION,
@@ -395,9 +427,9 @@ fn publish(
         mapping_window_base: space.mapping_window().as_u64(),
         mapping_window_size: chunk::MAPPING_WINDOW_SIZE,
         core_image_base: placement.image_base.as_u64(),
-        core_image_size,
-        stack_base: stack.bottom().as_u64(),
-        stack_size: stack.pages() * chunk::FRAME_SIZE,
+        core_image_size: hypervisor.image_size,
+        stack_base: hypervisor.stack.bottom().as_u64(),
+        stack_size: hypervisor.stack.pages() * chunk::FRAME_SIZE,
         memory_map: direct(space, chunk_base + chunk::MEMORY_MAP_OFFSET)?.as_u64(),
         memory_map_entries: narrow(memory.entries),
         memory_map_entry_size: narrow(size_of::<MemoryDescriptor>()),
@@ -409,7 +441,15 @@ fn publish(
         // is, the wall clock is behind by it for good.
         boot_wall_nanos: firmware::wall_clock().map_or(0, Wall::nanos),
         ap_trampoline_base: reserved.trampoline.as_u64(),
+        firmware_context: direct(space, context)?.as_u64(),
     };
+
+    let pointer = identity_ptr::<FirmwareContext>(context)?;
+    // SAFETY: the firmware-context region is set aside for exactly this and is
+    // never handed out by an allocator — the metadata frames belong to no one —
+    // and firmware's active address space maps it read-write at its physical
+    // address.
+    unsafe { pointer.write(*firmware) };
 
     let phys = chunk_base + chunk::HANDOFF_OFFSET;
     let pointer = identity_ptr::<Handoff>(phys)?;

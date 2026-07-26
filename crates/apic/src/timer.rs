@@ -50,6 +50,17 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// The mode an entry the controller already holds is in, or `None` where
+    /// the field holds the encoding the architecture reserves.
+    pub(crate) const fn of(entry: u32) -> Option<Self> {
+        match (entry >> MODE_SHIFT) & MODE_MASK {
+            0b00 => Some(Self::OneShot),
+            0b01 => Some(Self::Periodic),
+            0b10 => Some(Self::Deadline),
+            _ => None,
+        }
+    }
+
     /// The mode field's encoding in the local vector table entry.
     const fn bits(self) -> u32 {
         match self {
@@ -63,8 +74,11 @@ impl Mode {
 /// Bits the timer's mode field is shifted by in its local vector table entry.
 const MODE_SHIFT: u32 = 17;
 
+/// The timer's mode field, once shifted down.
+const MODE_MASK: u32 = 0b11;
+
 /// The model-specific register holding the timestamp counter deadline.
-const IA32_TSC_DEADLINE: u32 = 0x6E0;
+pub(crate) const IA32_TSC_DEADLINE: u32 = 0x6E0;
 
 /// How far the input clock is divided before the timer counts it.
 ///

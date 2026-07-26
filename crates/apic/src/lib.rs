@@ -48,6 +48,7 @@
 extern crate alloc;
 
 mod base;
+mod capture;
 mod icr;
 mod lvt;
 mod pic;
@@ -69,6 +70,7 @@ use thiserror::Error;
 
 use crate::register::{Access, Register};
 pub use crate::{
+    capture::{FirmwareState, LocalState, VECTOR_WORDS, capture},
     icr::{Command, Delivery, Target},
     lvt::{Delivery as LvtDelivery, Entry, Polarity, Trigger},
     smp::{Started, start},
@@ -198,11 +200,11 @@ impl Apic {
 const REGISTER_PAGE: u64 = 4096;
 
 /// The version register's fields are one byte each.
-const VERSION_MASK: u32 = 0xFF;
+pub(crate) const VERSION_MASK: u32 = 0xFF;
 
 /// Bits the version register's local-vector-table count is shifted by. It holds
 /// one less than the number of entries.
-const LVT_COUNT_SHIFT: u32 = 16;
+pub(crate) const LVT_COUNT_SHIFT: u32 = 16;
 
 /// A handle to the controller of whichever processor is holding it.
 ///
