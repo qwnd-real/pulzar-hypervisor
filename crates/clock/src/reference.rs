@@ -14,9 +14,14 @@
 use acpi::{Acpi, Fadt, Hpet, PmTimer};
 use log::warn;
 use paging::{AddressSpace, Mapping};
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::PhysAddr;
 
-use crate::{ClockError, counter::Counter, hpet, pm_timer};
+use crate::{
+    ClockError,
+    counter::Counter,
+    hpet::{self, Restore},
+    pm_timer,
+};
 
 /// A counter of known rate the clock can measure against.
 #[derive(Clone, Copy, Debug)]
@@ -59,9 +64,9 @@ pub(crate) struct Borrowed {
     pub(crate) counter: Counter,
     /// The mapping it is read through, where it needed one.
     pub(crate) mapping: Option<Mapping>,
-    /// The event timer registers whose enable bit this clock set and has to
-    /// clear again.
-    pub(crate) started: Option<VirtAddr>,
+    /// The event timer this clock started, and what it has to undo to hand
+    /// the block back the way it was found.
+    pub(crate) started: Option<Restore>,
 }
 
 impl Borrowed {
@@ -93,8 +98,8 @@ impl Borrowed {
     /// the window address space it occupied spent but the machine's own
     /// hardware already restored.
     pub(crate) fn release(self, space: &mut AddressSpace) -> Result<(), ClockError> {
-        if let Some(registers) = self.started {
-            hpet::stop(registers);
+        if let Some(restore) = self.started {
+            hpet::stop(&restore);
         }
         match self.mapping {
             // SAFETY: the counter that read through this mapping is dropped with
