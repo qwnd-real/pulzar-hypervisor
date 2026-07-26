@@ -81,6 +81,16 @@ const PERIOD_SHIFT: u32 = 32;
 /// counter. A block reporting a slower one is describing itself impossibly.
 const MAX_PERIOD_FEMTOS: u64 = 100_000_000;
 
+/// The shortest this crate will believe: 1 ns, which is a 1 GHz counter.
+///
+/// The specification sets no floor of its own. This one is here because every
+/// event timer ever built counts between 10 and 100 MHz, so a block reporting
+/// ten times faster than the quickest of them is not describing a timer — it is
+/// describing a register nothing ever wrote. Taking it at its word would make
+/// every delay in the hypervisor orders of magnitude too short, which is the
+/// kind of wrong that looks like working.
+const MIN_PERIOD_FEMTOS: u64 = 1_000_000;
+
 /// Configuration: the main counter advances, and comparators may deliver.
 const ENABLE: u64 = 1 << 0;
 
@@ -164,9 +174,11 @@ pub(crate) fn stop(restore: &Restore) {
 fn probe(registers: VirtAddr) -> Result<(Counter, Option<Restore>), ClockError> {
     let capabilities = read(registers, CAPABILITIES);
     let femtos = capabilities >> PERIOD_SHIFT;
-    let frequency = Frequency::from_period_femtos(femtos)
-        .filter(|_| femtos <= MAX_PERIOD_FEMTOS)
-        .ok_or(ClockError::HpetPeriod { femtos })?;
+    if !(MIN_PERIOD_FEMTOS..=MAX_PERIOD_FEMTOS).contains(&femtos) {
+        return Err(ClockError::HpetPeriod { femtos });
+    }
+    let frequency =
+        Frequency::from_period_femtos(femtos).ok_or(ClockError::HpetPeriod { femtos })?;
 
     let main = registers + MAIN_COUNTER;
     let (register, bits) = if capabilities & COUNTER_64BIT == 0 {
