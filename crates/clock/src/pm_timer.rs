@@ -82,9 +82,5 @@ pub(crate) fn open(space: &mut AddressSpace, timer: PmTimer) -> Result<Borrowed,
     // the check above. Reading the timer — through memory or through its port —
     // returns the count and does nothing else to the machine.
     let counter = unsafe { Counter::new(Kind::PmTimer, register, FREQUENCY, timer.bits()) };
-    Ok(Borrowed {
-        counter,
-        mapping,
-        started: None,
-    })
+    Ok(Borrowed::new(counter, mapping, None))
 }

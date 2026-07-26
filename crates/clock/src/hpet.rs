@@ -128,11 +128,7 @@ pub(crate) fn open(space: &mut AddressSpace, base: PhysAddr) -> Result<Borrowed,
 
     let registers = mapping.addr();
     match probe(registers) {
-        Ok((counter, started)) => Ok(Borrowed {
-            counter,
-            mapping: Some(mapping),
-            started,
-        }),
+        Ok((counter, started)) => Ok(Borrowed::new(counter, Some(mapping), started)),
         Err(error) => {
             // The block is unusable, so its mapping serves nothing. An error
             // from releasing it is dropped rather than returned: it would

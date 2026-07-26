@@ -140,14 +140,13 @@ impl Clock {
         {
             return Err(ClockError::AlreadyInstalled);
         }
-        let borrowed = Borrowed::open(space, reference::choose(acpi)?)?;
-        let reference = borrowed.counter();
+        let borrowed = Borrowed::open(space, acpi)?;
 
         // With an invariant timestamp counter the reference's whole job is to
         // say how fast that counter runs, so the hardware goes back to the
         // machine as soon as it has.
         if processor::features().contains(Features::INVARIANT_TSC) {
-            let measured = tsc::calibrate(&reference);
+            let measured = tsc::calibrate(borrowed.counter());
             borrowed.release(space)?;
             let (frequency, calibration) = measured?;
             return Ok(Self::publish(
@@ -157,16 +156,20 @@ impl Clock {
             ));
         }
 
+        // Plain values rather than anything read through the mapping, so unlike
+        // the counter itself they may outlive the borrow.
+        let kind = borrowed.counter().kind();
+        let bits = borrowed.counter().bits();
         warn!(
-            "clock: the timestamp counter is not invariant, so the {} has to keep the time itself",
-            reference.kind()
+            "clock: the timestamp counter is not invariant, so the {kind} has to keep the time \
+             itself"
         );
-        if reference.kind() == Kind::Hpet && reference.bits() >= u64::BITS {
+        if kind == Kind::Hpet && bits >= u64::BITS {
             return Ok(Self::publish(borrowed.keep(), boot, None));
         }
         let refused = ClockError::NoTimebase {
-            reference: reference.kind(),
-            bits: reference.bits(),
+            reference: kind,
+            bits,
         };
         borrowed.release(space)?;
         Err(refused)

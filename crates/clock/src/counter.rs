@@ -58,6 +58,13 @@ impl Counter {
     /// width it is read at, for as long as this counter exists. A port must be
     /// one whose reads have no effect on the machine. Both are what make every
     /// later [`Counter::read`] sound without a further check.
+    ///
+    /// Where a counter needs a mapping, the `Borrowed` holding that mapping is
+    /// what keeps the promise, and it keeps it structurally: it lends the
+    /// counter out rather than handing it over, so nothing can hold a readable
+    /// counter across the call that unmaps it. The single exception is
+    /// `Borrowed::keep`, which gives the counter away precisely because it
+    /// never unmaps.
     pub(crate) const unsafe fn new(
         kind: Kind,
         register: Register,
