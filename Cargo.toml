@@ -10,6 +10,7 @@ members = [
     "crates/hv-core",
     "crates/hv-loader",
     "crates/ipi",
+    "crates/npt",
     "crates/paging",
     "crates/pci",
     "crates/processor",
@@ -47,7 +48,8 @@ uefi-raw = "0.15.1"
 # machine has and which one is running; `apic` drives their interrupt
 # controllers and starts them; `ipi` is how one of them reaches another; `svm`
 # states what the processor's virtualization structures look like; `snapshot`
-# is what firmware was running with, read before any of it is overwritten.
+# is what firmware was running with, read before any of it is overwritten;
+# `npt` is the second set of page tables a guest's memory is described by.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -55,6 +57,7 @@ cpu = { path = "crates/cpu" }
 descriptors = { path = "crates/descriptors" }
 handoff = { path = "crates/handoff" }
 ipi = { path = "crates/ipi" }
+npt = { path = "crates/npt" }
 paging = { path = "crates/paging" }
 pci = { path = "crates/pci" }
 processor = { path = "crates/processor" }

@@ -25,13 +25,9 @@
 //! finding out something about the machine it did not know — so it reaches the
 //! same callback and is reported with everything the processor said about it.
 
-use core::{
-    fmt::{self, Display, Formatter},
-    mem,
-    ptr::{NonNull, null_mut},
-    sync::atomic::{AtomicPtr, Ordering},
-};
+use core::fmt::{self, Display, Formatter};
 
+use spin::Once;
 use x86_64::{registers::control::Cr2, structures::idt::InterruptStackFrameValue};
 
 use crate::{DescriptorError, Vector};
@@ -131,16 +127,19 @@ impl Display for Interrupt {
 
 /// One slot per vector, holding the handler that claimed it or nothing.
 ///
-/// An array of pointers rather than anything behind a lock: this is read on
-/// every interrupt, and a delivery path that could block on a lock another
-/// processor holds would turn a contended registry into a stalled machine.
-static HANDLERS: [AtomicPtr<()>; Vector::COUNT] =
-    [const { AtomicPtr::new(null_mut()) }; Vector::COUNT];
+/// Write-once cells rather than anything behind a lock: this is read on every
+/// interrupt, and a delivery path that could block on a lock another processor
+/// holds would turn a contended registry into a stalled machine. Reading one is
+/// a load and a comparison, and a slot being written is indistinguishable from
+/// one nothing has claimed — which is the right answer while a registration is
+/// in flight, since nothing can be arriving on a vector that has not finished
+/// being claimed.
+static HANDLERS: [Once<Handler>; Vector::COUNT] = [const { Once::new() }; Vector::COUNT];
 
-/// What becomes of an interrupt no handler claimed. Null until the tables are
+/// What becomes of an interrupt no handler claimed. Empty until the tables are
 /// installed, which happens before the table naming these entry points is
 /// loaded, so a delivery can never find it unset.
-static UNCLAIMED: AtomicPtr<()> = AtomicPtr::new(null_mut());
+static UNCLAIMED: Once<Unclaimed> = Once::new();
 
 /// Pins `handler` to `vector`.
 ///
@@ -159,15 +158,17 @@ pub fn register(vector: Vector, handler: Handler) -> Result<(), DescriptorError>
     if !vector.returns() {
         return Err(DescriptorError::NotReturnable { vector });
     }
-    HANDLERS[usize::from(vector.number())]
-        .compare_exchange(
-            null_mut(),
-            handler as *mut (),
-            Ordering::Release,
-            Ordering::Relaxed,
-        )
-        .map(drop)
-        .map_err(|_| DescriptorError::VectorTaken { vector })
+    // The cell runs the closure for the one caller that fills it and for no
+    // other, so whether it ran is exactly whether this call is the one that
+    // claimed the vector.
+    let mut installed = false;
+    HANDLERS[usize::from(vector.number())].call_once(|| {
+        installed = true;
+        handler
+    });
+    installed
+        .then_some(())
+        .ok_or(DescriptorError::VectorTaken { vector })
 }
 
 /// Pins `handler` to the highest free vector in `first..=last`.
@@ -205,20 +206,21 @@ pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, De
 /// interrupts are being delivered through it would change what happens to a
 /// guest's interrupts underneath the guest.
 pub fn adopt(unclaimed: Unclaimed) -> Result<(), DescriptorError> {
-    UNCLAIMED
-        .compare_exchange(
-            null_mut(),
-            unclaimed as *mut (),
-            Ordering::Release,
-            Ordering::Relaxed,
-        )
-        .map(drop)
-        .map_err(|_| DescriptorError::AlreadyAdopted)
+    // As in `register`: the closure runs for the caller that fills the cell and
+    // for no other.
+    let mut installed = false;
+    UNCLAIMED.call_once(|| {
+        installed = true;
+        unclaimed
+    });
+    installed
+        .then_some(())
+        .ok_or(DescriptorError::AlreadyAdopted)
 }
 
 /// Whether anything has said what becomes of an unclaimed interrupt.
 pub(crate) fn adopted() -> bool {
-    !UNCLAIMED.load(Ordering::Acquire).is_null()
+    UNCLAIMED.is_completed()
 }
 
 /// Where every entry point ends up.
@@ -235,10 +237,13 @@ pub(crate) fn deliver(vector: Vector, frame: &InterruptStackFrameValue, error_co
         // fault, so anything this path did that faulted would replace it.
         fault_address: (vector == PAGE_FAULT).then(Cr2::read_raw),
     };
-    if claimed(vector).is_some_and(|handler| handler(&interrupt) == Disposition::Consumed) {
+    if HANDLERS[usize::from(vector.number())]
+        .get()
+        .is_some_and(|handler| handler(&interrupt) == Disposition::Consumed)
+    {
         return;
     }
-    match unclaimed() {
+    match UNCLAIMED.get() {
         Some(unclaimed) => unclaimed(&interrupt),
         // Unreachable: the table naming this entry point is loaded only after
         // the callback is recorded. Stopping rather than returning is what keeps
@@ -249,25 +254,3 @@ pub(crate) fn deliver(vector: Vector, frame: &InterruptStackFrameValue, error_co
 
 /// The vector whose faulting address the processor reports in `CR2`.
 const PAGE_FAULT: Vector = Vector::new(14);
-
-/// The handler that claimed `vector`, if any.
-fn claimed(vector: Vector) -> Option<Handler> {
-    // SAFETY: the only value `register` ever stores in a slot is a `Handler`
-    // cast to a raw pointer, and null — which is filtered out first — is the
-    // only other value a slot can hold. So the pointer here always came from a
-    // real function, and `transmute` checks that the two types are the same
-    // size, which makes this exactly the inverse of the cast that stored it.
-    load(&HANDLERS[usize::from(vector.number())])
-        .map(|slot| unsafe { mem::transmute::<NonNull<()>, Handler>(slot) })
-}
-
-/// The callback [`adopt`] recorded, if it has run.
-fn unclaimed() -> Option<Unclaimed> {
-    // SAFETY: as in `claimed`, for the one value `adopt` stores.
-    load(&UNCLAIMED).map(|slot| unsafe { mem::transmute::<NonNull<()>, Unclaimed>(slot) })
-}
-
-/// The non-null contents of a slot.
-fn load(slot: &AtomicPtr<()>) -> Option<NonNull<()>> {
-    NonNull::new(slot.load(Ordering::Acquire))
-}

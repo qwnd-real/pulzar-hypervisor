@@ -5,39 +5,48 @@
 //! interrupt that reaches the rest, and the function the address space
 //! subsystem calls to send it.
 //!
-//! # Why the handler flushes everything
+//! # What the handler is told
 //!
-//! Because it has no way to know what to flush. Several requests to one
-//! processor coalesce into a single arrival, so a handler that invalidated one
-//! address would be right only when nothing had been folded together — and
+//! Everything it needs and nothing more: a [`Flush`], packed into the one word
+//! a request carries. It says which pages stopped being described, so the
+//! handler invalidates those and leaves every other translation this processor
+//! has cached alone.
+//!
+//! Coalescing is what makes that harder than it sounds, and is why the payload
+//! is merged rather than replaced. Several requests to one processor collapse
+//! into a single delivery, so a handler that invalidated only the last one's
+//! range would be right exactly when nothing had been folded together — and
 //! being right most of the time is worse than being slow, because what it
 //! leaves behind is a translation to memory that has been given to something
-//! else.
+//! else. [`Flush::hull`] is what makes the single delivery answer for all of
+//! them.
 //!
-//! Reloading the page table root evicts every translation that is not marked
-//! global, and nothing pulzar maps is: so it evicts all of them. That costs the
-//! processor its cached translations, which it will fault back in. Unmapping is
-//! rare and correctness is not.
+//! Past a certain length the arithmetic stops paying and a request degrades to
+//! [`Flush::EVERYTHING`], which reloads the page table root. That is the old
+//! behaviour, now reached only where it is the cheaper answer rather than
+//! always.
 //!
 //! # What it must not do
 //!
 //! Ask for the address space lock. The processor that sent this is holding it
 //! and is waiting for this handler to finish; a handler that waited for the
-//! lock would be waiting for the processor that is waiting for it. Reloading a
-//! control register needs nothing, which is the other reason it is the right
+//! lock would be waiting for the processor that is waiting for it.
+//! Invalidating needs nothing, which is the other reason it is the right
 //! answer.
 
+use core::num::NonZeroU64;
+
+use paging::shootdown::Flush;
 use spin::Once;
-use x86_64::registers::control::Cr3;
 
 use crate::{Ipi, IpiError, Request};
 
 /// How long every other processor is given to acknowledge.
 ///
-/// Long by the standards of what the handler does, which is two instructions
-/// and no memory access. What it really bounds is a processor that is not
-/// answering interrupts at all, and for that the only wrong answer is waiting
-/// forever.
+/// Long by the standards of what the handler does, which is a bounded run of
+/// invalidations and no memory access. What it really bounds is a processor
+/// that is not answering interrupts at all, and for that the only wrong answer
+/// is waiting forever.
 const ACKNOWLEDGE_MICROS: u64 = 100_000;
 
 /// Registers the shootdown interrupt and hands the address space subsystem the
@@ -45,16 +54,17 @@ const ACKNOWLEDGE_MICROS: u64 = 100_000;
 ///
 /// # Errors
 ///
-/// Whatever registering the interrupt reported. A second call is refused by the
-/// address space subsystem, which takes the hook once.
-pub(crate) fn install() -> Result<Ipi, IpiError> {
-    let ipi = crate::register(flush)?;
+/// Whatever registering the interrupt reported, or
+/// [`IpiError::Shootdown`] if the address space subsystem already has a way to
+/// reach the other processors.
+pub(crate) fn install() -> Result<(), IpiError> {
+    let ipi = crate::register(invalidate, merge)?;
     SHOOTDOWN.call_once(|| ipi);
     // The address space subsystem is underneath this one and has no way to reach
     // another processor. This is the whole of what it is given: one function,
     // pointing downwards.
-    paging::shootdown::install(broadcast).map_err(|_| IpiError::AlreadyInstalled)?;
-    Ok(ipi)
+    paging::shootdown::install(broadcast)?;
+    Ok(())
 }
 
 /// What the address space subsystem calls after it has invalidated something.
@@ -63,13 +73,13 @@ pub(crate) fn install() -> Result<Ipi, IpiError> {
 /// a reason to retry — the invalidation has already happened — but it does mean
 /// some processor may still be holding a translation to memory that no longer
 /// describes what it did, which is something the caller has to be told.
-fn broadcast() -> bool {
+fn broadcast(flush: Flush) -> bool {
     let Some(ipi) = SHOOTDOWN.get() else {
         // Nothing has been installed, so nothing else can be running, so there
         // is no processor that could be holding anything.
         return true;
     };
-    match ipi.broadcast_and_wait(ACKNOWLEDGE_MICROS) {
+    match ipi.broadcast_and_wait(flush.bits(), ACKNOWLEDGE_MICROS) {
         Ok(_) => true,
         Err(error) => {
             log::error!("ipi: translation shootdown incomplete: {error}");
@@ -78,18 +88,22 @@ fn broadcast() -> bool {
     }
 }
 
-/// Drops every translation this processor has cached.
+/// Drops the translations one request describes from this processor.
 ///
-/// Writing the page table root back is what does it: the architecture defines
-/// that as invalidating everything not marked global, and nothing pulzar maps
-/// is marked global.
-fn flush(_: Request) {
-    let (root, flags) = Cr3::read();
-    // SAFETY: this writes back the value the register already holds, so the
-    // address space this processor is running in does not change and every
-    // address it is using stays mapped. What it does change is the translations
-    // cached for them, which is the point.
-    unsafe { Cr3::write(root, flags) };
+/// Nothing to do where the payload is gone: an earlier run of this handler
+/// already took a request this delivery's send had been folded into, and the
+/// invalidation it asked for has happened. Returning is what settles the debt.
+fn invalidate(request: Request) {
+    if let Some(payload) = request.payload() {
+        Flush::from_word(payload.get()).apply();
+    }
+}
+
+/// Folds two outstanding requests into the one that answers both.
+fn merge(held: NonZeroU64, sent: NonZeroU64) -> NonZeroU64 {
+    Flush::from_word(held.get())
+        .hull(Flush::from_word(sent.get()))
+        .bits()
 }
 
 /// The shootdown interrupt, once it has been registered.

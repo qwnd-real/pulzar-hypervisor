@@ -48,7 +48,7 @@ use crate::{
     chunk::{self, FRAME_SIZE},
     cpu,
     kaslr::Placement,
-    shootdown,
+    shootdown::{self, Flush},
 };
 
 /// Entries in a page table at any level.
@@ -321,7 +321,7 @@ impl AddressSpace {
         (0..as_u64(mapping.pages))
             .try_for_each(|index| self.unmap_one::<Size4KiB>(mapping.first + index).map(drop))?;
         self.slots.release(mapping.first, mapping.order)?;
-        broadcast()
+        broadcast(Flush::small(mapping.first, as_u64(mapping.pages)))
     }
 
     /// Releases a mapping made with [`AddressSpace::map_region`].
@@ -360,7 +360,10 @@ impl AddressSpace {
             self.unmap_one::<Size4KiB>(Page::containing_address(virt + index * FRAME_SIZE))
                 .map(drop)
         })?;
-        broadcast()
+        broadcast(Flush::small(
+            Page::containing_address(virt),
+            len.div_ceil(FRAME_SIZE),
+        ))
     }
 
     /// Maps physical memory, hands its address to `action`, and unmaps it.
@@ -498,7 +501,10 @@ impl AddressSpace {
                 .map(MapperFlush::flush)
                 .map_err(|error| flag_update_error(virt, &error))
         })?;
-        broadcast()
+        broadcast(Flush::large(
+            Page::containing_address(self.direct_map.base() + phys.as_u64()),
+            len / Size2MiB::SIZE,
+        ))
     }
 
     /// Makes this space the active one.
@@ -562,7 +568,10 @@ impl AddressSpace {
                 Cr4::write(cr4);
             }
         }
-        broadcast()
+        // Everything, because this is the one invalidation that also clears
+        // entries firmware may have marked global — which writing the page
+        // table root does not reach, on this processor or any other.
+        broadcast(Flush::EVERYTHING)
     }
 
     /// Resolves `virt` in this space, or `None` if it is not mapped.
@@ -988,8 +997,8 @@ impl Stack {
 /// describing what it used to. Making a mapping needs none of this: the address
 /// came from the window allocator, so no processor has touched it and none can
 /// have cached anything about it.
-fn broadcast() -> Result<(), PagingError> {
-    if shootdown::broadcast() {
+fn broadcast(flush: Flush) -> Result<(), PagingError> {
+    if shootdown::broadcast(flush) {
         return Ok(());
     }
     Err(PagingError::ShootdownIncomplete)

@@ -4,7 +4,7 @@
 //! carries nothing but a vector. That is the whole of the mechanism and it is
 //! less than it sounds, because a vector says nothing about who sent it — a
 //! hypervisor that passes the platform through shares its vectors with devices
-//! and with whatever was using the machine before. So this crate adds the two
+//! and with whatever was using the machine before. So this crate adds the three
 //! things the hardware does not give.
 //!
 //! It records, per processor, what was sent to it, so that a handler can tell
@@ -13,9 +13,23 @@
 //! which hands it to whoever the hypervisor said should have unclaimed
 //! interrupts — the seam that will one day give it to a guest.
 //!
+//! It carries a word of the sender's own choosing alongside, so that a handler
+//! is told what to do and not merely that there is something to do. Sends that
+//! coalesce have their words folded together by the interrupt's own [`Merge`],
+//! which is what keeps a payload honest when the controller collapses several
+//! requests into one delivery.
+//!
 //! And it records what has been *served*, so that a sender can wait. Sending is
 //! asynchronous and some things are not: telling every other processor to
 //! forget a translation is worthless unless you know they have.
+//!
+//! # Adding one
+//!
+//! [`register`] takes a handler and a merge and answers with an [`Ipi`]. The
+//! vector it lands on is chosen here and matters to nobody: an interprocessor
+//! interrupt is only ever named by the handle. What the payload means is
+//! entirely the caller's, and the only thing this crate asks of it is that the
+//! merge of two outstanding payloads describes everything both of them did.
 //!
 //! # Vectors
 //!
@@ -25,9 +39,6 @@
 //! processor is blocked waiting on. Below the two the interrupt controller
 //! keeps for itself.
 //!
-//! Which number a given interrupt ends up on does not matter to anyone: it is
-//! only ever named by [`Ipi`], never written down.
-//!
 //! # Translation shootdown
 //!
 //! [`install`] sets up one interprocessor interrupt of this crate's own and
@@ -35,24 +46,20 @@
 //! processor and must not gain one — it is underneath everything here. That is
 //! the whole of the dependency: a function pointer, going downwards.
 //!
-//! Its handler reloads the page table root and touches nothing else. In
-//! particular it never asks for the address space lock, which is what keeps a
-//! processor waiting for that lock from deadlocking against the processor
+//! Its handler invalidates what the payload describes and touches nothing else.
+//! In particular it never asks for the address space lock, which is what keeps
+//! a processor waiting for that lock from deadlocking against the processor
 //! holding it and waiting for this acknowledgement.
 
 #![no_std]
 
 extern crate alloc;
 
-mod pending;
+mod mailbox;
 mod shootdown;
 
-use alloc::{boxed::Box, vec::Vec};
-use core::{
-    mem,
-    ptr::{NonNull, null_mut},
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
-};
+use alloc::boxed::Box;
+use core::num::NonZeroU64;
 
 use apic::{ApicError, Command, Delivery, Target};
 use cpu::{CpuError, CpuIndex};
@@ -61,7 +68,7 @@ use log::info;
 use spin::Once;
 use thiserror::Error;
 
-use crate::pending::Slot;
+use crate::mailbox::{Counts, Mailbox};
 
 /// The highest vector an interprocessor interrupt may be given, one below the
 /// pair the interrupt controller keeps for itself.
@@ -82,21 +89,22 @@ const CAPACITY: usize = (LAST.number() - FIRST.number()) as usize + 1;
 /// What a handler is told about the arrival it is running for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Request {
-    count: u64,
+    payload: Option<NonZeroU64>,
     vector: Vector,
 }
 
 impl Request {
-    /// How many sends were folded into this one arrival.
+    /// Everything the outstanding sends merged to, or `None` if there is
+    /// nothing left to act on.
     ///
-    /// At least one. More than one means several processors, or one processor
-    /// several times, asked before this processor got round to answering —
-    /// which the controller cannot represent, since it holds a single bit
-    /// per vector. A handler that does one unit of work per request needs
-    /// this; one that brings something up to date can ignore it.
+    /// `None` is not an error and not an empty request: it means an earlier run
+    /// of this handler already took a payload that this delivery's send had
+    /// been folded into, so the work is done and only the acknowledgement is
+    /// outstanding. A handler that has nothing to do in that case should do
+    /// nothing — it will still be counted as having answered.
     #[must_use]
-    pub const fn count(&self) -> u64 {
-        self.count
+    pub const fn payload(&self) -> Option<NonZeroU64> {
+        self.payload
     }
 
     /// Which vector it arrived on.
@@ -114,11 +122,25 @@ impl Request {
 /// acknowledge the controller: that is done for it, after it returns.
 pub type Handler = fn(Request);
 
+/// How two outstanding payloads for one processor become the one payload the
+/// single delivery answering both will carry.
+///
+/// The controller holds one request bit per vector, so a second send to a
+/// processor that has not serviced the first does not produce a second
+/// interrupt. Whatever the payload means, this is what has to fold two of them
+/// into something that describes both — and it must describe *both*, since the
+/// delivery that carries the result is the only one either send will get.
+///
+/// It runs on the sending processor, inside the update of the shared word, so
+/// it must be cheap and it must not wait for anything.
+pub type Merge = fn(NonZeroU64, NonZeroU64) -> NonZeroU64;
+
 /// One kind of interprocessor interrupt, and the way to send it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Ipi {
     vector: Vector,
     slot: usize,
+    merge: Merge,
 }
 
 impl Ipi {
@@ -135,13 +157,17 @@ impl Ipi {
     /// [`IpiError::NotOnline`] if the processor has not attached, which means
     /// there is nothing there to answer; or whatever writing the command
     /// reported.
-    pub fn send(&self, target: CpuIndex) -> Result<(), IpiError> {
+    pub fn send(&self, target: CpuIndex, payload: NonZeroU64) -> Result<(), IpiError> {
         let block = cpu::by_index(target).ok_or(IpiError::NotOnline { index: target })?;
-        // The count goes up before the command goes out, so that a processor
-        // which takes the interrupt immediately still finds what explains it.
-        state()?.slot(self.slot, target).owe();
-        SENT.fetch_add(1, Ordering::Relaxed);
-        apic::local()?.send(Command::new(
+        let state = state()?;
+        // Resolved before the debt is recorded, so that a controller which is
+        // not up refuses the send without leaving a request behind for it.
+        let local = apic::local()?;
+        // The payload and the debt go in before the command goes out, so that a
+        // processor which takes the interrupt immediately still finds what
+        // explains it.
+        state.mailbox(self.slot, target).owe(payload, self.merge);
+        local.send(Command::new(
             Delivery::Fixed(self.vector),
             Target::One(block.apic_id()),
         ))?;
@@ -160,10 +186,10 @@ impl Ipi {
     /// # Errors
     ///
     /// Whatever writing a command reported. Returns how many were sent.
-    pub fn broadcast(&self) -> Result<usize, IpiError> {
+    pub fn broadcast(&self, payload: NonZeroU64) -> Result<usize, IpiError> {
         let mut sent = 0;
         for target in others() {
-            self.send(target)?;
+            self.send(target, payload)?;
             sent += 1;
         }
         Ok(sent)
@@ -175,10 +201,14 @@ impl Ipi {
     ///
     /// [`IpiError::Timeout`] if it did not answer in time, or whatever sending
     /// reported.
-    pub fn send_and_wait(&self, target: CpuIndex, micros: u64) -> Result<(), IpiError> {
-        let before = state()?.slot(self.slot, target).progress();
-        self.send(target)?;
-        self.await_progress(target, before, micros)
+    pub fn send_and_wait(
+        &self,
+        target: CpuIndex,
+        payload: NonZeroU64,
+        micros: u64,
+    ) -> Result<(), IpiError> {
+        self.send(target, payload)?;
+        self.wait(target, micros)
     }
 
     /// Sends this to every attached processor but the one sending, and waits
@@ -192,32 +222,30 @@ impl Ipi {
     ///
     /// [`IpiError::Timeout`] if any did not answer in time, or whatever sending
     /// reported. Returns how many answered.
-    pub fn broadcast_and_wait(&self, micros: u64) -> Result<usize, IpiError> {
-        let state = state()?;
-        let targets = others()
-            .map(|target| (target, state.slot(self.slot, target).progress()))
-            .collect::<Vec<_>>();
-        for (target, _) in &targets {
-            self.send(*target)?;
+    pub fn broadcast_and_wait(&self, payload: NonZeroU64, micros: u64) -> Result<usize, IpiError> {
+        let sent = self.broadcast(payload)?;
+        for target in others() {
+            self.wait(target, micros)?;
         }
-        for (target, before) in &targets {
-            self.await_progress(*target, *before, micros)?;
-        }
-        Ok(targets.len())
+        Ok(sent)
     }
 
-    /// Waits for a processor to have got further than it had.
-    fn await_progress(&self, target: CpuIndex, before: u64, micros: u64) -> Result<(), IpiError> {
-        let slot = state()?.slot(self.slot, target);
+    /// Waits until a processor has answered everything it was owed.
+    ///
+    /// Read once, before the wait, rather than tracked per send: everything
+    /// outstanding at this moment includes everything the caller just sent, so
+    /// waiting for the mailbox to catch up to it is at least as strong as
+    /// waiting for one send in particular — and needs nothing remembered per
+    /// target, which is what keeps a broadcast from having to allocate.
+    fn wait(&self, target: CpuIndex, micros: u64) -> Result<(), IpiError> {
+        let mailbox = state()?.mailbox(self.slot, target);
+        let upto = mailbox.outstanding();
         for _ in 0..micros.div_ceil(POLL_MICROS) {
-            if slot.progress() > before {
-                return Ok(());
-            }
             // Spun rather than slept for most of the wait, because an answer is
             // normally a few hundred cycles away and sleeping would cost more
             // than it saves. The sleep is what bounds the whole thing.
             for _ in 0..SPINS_PER_POLL {
-                if slot.progress() > before {
+                if mailbox.caught_up(upto) {
                     return Ok(());
                 }
                 core::hint::spin_loop();
@@ -237,21 +265,33 @@ const POLL_MICROS: u64 = 100;
 /// How many times a processor's progress is re-read before waiting at all.
 const SPINS_PER_POLL: u32 = 10_000;
 
-/// Registers `handler` on a vector of its own.
+/// Registers `handler` on a vector of its own, folding coalesced sends with
+/// `merge`.
 ///
 /// # Errors
 ///
 /// [`IpiError::NotInstalled`] before [`install`], or
 /// [`IpiError::Descriptors`] if every vector in the range is taken.
-pub fn register(handler: Handler) -> Result<Ipi, IpiError> {
+pub fn register(handler: Handler, merge: Merge) -> Result<Ipi, IpiError> {
     let state = state()?;
     let vector = descriptors::claim(FIRST, LAST, arrived)?;
-    let slot = usize::from(vector.number() - FIRST.number());
-    // Stored after the vector is claimed and before anything can be sent on it,
-    // which is the only ordering that leaves no window: a claimed vector with no
-    // handler behind it would answer an arrival as somebody else's.
-    state.handlers[slot].store(handler as *mut (), Ordering::Release);
-    Ok(Ipi { vector, slot })
+    // `claim` answers with a vector out of the range it was given, so this is
+    // the slot that vector belongs to. Asked rather than assumed, because the
+    // same arithmetic runs on the interrupt path, where being wrong is a fault
+    // rather than an error.
+    let slot = slot(vector).ok_or(DescriptorError::NoVectorFree {
+        first: FIRST,
+        last: LAST,
+    })?;
+    // Stored after the vector is claimed and before anything can be sent on it.
+    // An arrival in between finds no handler and is passed, which is right:
+    // nothing has been sent, so nothing on that vector can be ours yet.
+    state.handlers[slot].call_once(|| handler);
+    Ok(Ipi {
+        vector,
+        slot,
+        merge,
+    })
 }
 
 /// Sets up the tables every interprocessor interrupt shares, and gives the
@@ -266,16 +306,22 @@ pub fn register(handler: Handler) -> Result<Ipi, IpiError> {
 ///
 /// [`IpiError::AlreadyInstalled`] for a second call, [`IpiError::Cpu`] if the
 /// roster has not been taken, or whatever registering the shootdown reported.
-pub fn install() -> Result<Ipi, IpiError> {
+pub fn install() -> Result<(), IpiError> {
     let processors = cpu::roster()?.count();
-    if STATE.is_completed() {
+    // The cell runs the closure for the one caller that fills it and for no
+    // other, so whether it ran is exactly whether this call built the tables.
+    let mut built = false;
+    STATE.call_once(|| {
+        built = true;
+        State {
+            processors,
+            mailboxes: (0..CAPACITY * processors).map(|_| Mailbox::new()).collect(),
+            handlers: [const { Once::new() }; CAPACITY],
+        }
+    });
+    if !built {
         return Err(IpiError::AlreadyInstalled);
     }
-    STATE.call_once(|| State {
-        processors,
-        slots: (0..CAPACITY * processors).map(|_| Slot::new()).collect(),
-        handlers: [const { AtomicPtr::new(null_mut()) }; CAPACITY],
-    });
     shootdown::install()
 }
 
@@ -285,64 +331,78 @@ pub fn install() -> Result<Ipi, IpiError> {
 /// our vectors that we did not send is the machine telling us something about
 /// itself, and it is invisible unless it is counted.
 pub fn describe(who: &str) {
-    let sent = SENT.load(Ordering::Relaxed);
-    let served = SERVED.load(Ordering::Relaxed);
-    let arrivals = ARRIVALS.load(Ordering::Relaxed);
+    if paging::shootdown::in_hardware() {
+        info!("{who}: ipi translation shootdown is the processor's own, not an interrupt");
+    }
+    let Ok(state) = state() else {
+        info!("{who}: ipi is not installed");
+        return;
+    };
+    let counts = state.counts();
     info!(
-        "{who}: ipi {sent} sent, {served} served over {arrivals} arrivals, {} folded together",
-        served.saturating_sub(arrivals),
+        "{who}: ipi {} sent, {} served over {} arrivals, {} folded together",
+        counts.owed,
+        counts.served,
+        counts.arrivals,
+        counts.served.saturating_sub(counts.arrivals),
     );
-    let foreign = FOREIGN.load(Ordering::Relaxed);
-    if foreign > 0 {
-        info!("{who}: ipi {foreign} arrivals on our vectors were not ours");
+    if counts.foreign > 0 {
+        info!(
+            "{who}: ipi {} arrivals on our vectors were not ours",
+            counts.foreign
+        );
     }
 }
-
-/// Interrupts sent.
-static SENT: AtomicU64 = AtomicU64::new(0);
-
-/// Requests run, which is at least as many as there were arrivals.
-static SERVED: AtomicU64 = AtomicU64::new(0);
-
-/// Arrivals that were ours.
-static ARRIVALS: AtomicU64 = AtomicU64::new(0);
-
-/// Arrivals on one of our vectors that we had not sent.
-static FOREIGN: AtomicU64 = AtomicU64::new(0);
 
 /// Where every interprocessor interrupt arrives.
 ///
 /// One entry point for all of them, because the only thing that differs is the
 /// vector — and the vector is in the arrival, so it is also the index of
 /// everything else that differs.
+///
+/// Everything that could say this arrival is not ours is asked before anything
+/// is consumed, so that a delivery which turns out to belong to someone else
+/// leaves no trace: no payload taken, no debt settled, and nothing
+/// acknowledged. An interrupt that will be given to a guest is acknowledged as
+/// part of giving it to one.
 fn arrived(interrupt: &Interrupt) -> Disposition {
     let vector = interrupt.vector();
     let Ok(state) = state() else {
         return Disposition::Passed;
     };
-    let slot = usize::from(vector.number() - FIRST.number());
+    let Some(slot) = slot(vector) else {
+        return Disposition::Passed;
+    };
+    let Some(handler) = state.handlers[slot].get() else {
+        return Disposition::Passed;
+    };
 
     // SAFETY: this processor attached before it unmasked interrupts, and an
     // interprocessor interrupt cannot be delivered to it before then, so its
     // `GS` base points at its own block.
     let index = unsafe { cpu::current() }.index();
-    let count = state.slot(slot, index).take();
-    if count == 0 {
-        // Not one of ours. What becomes of it is the hypervisor's decision, and
-        // it is deliberately not acknowledged here: an interrupt that will be
-        // given to a guest is acknowledged as part of giving it to one.
-        FOREIGN.fetch_add(1, Ordering::Relaxed);
+    let mailbox = state.mailbox(slot, index);
+    let Some(claim) = mailbox.claim() else {
         return Disposition::Passed;
-    }
+    };
 
-    ARRIVALS.fetch_add(1, Ordering::Relaxed);
-    SERVED.fetch_add(count, Ordering::Relaxed);
-    if let Some(handler) = state.handler(slot) {
-        handler(Request { count, vector });
-    }
-    state.slot(slot, index).done(count);
+    handler(Request {
+        payload: NonZeroU64::new(claim.payload()),
+        vector,
+    });
+    mailbox.done(claim);
     let _ = apic::end_of_interrupt();
     Disposition::Consumed
+}
+
+/// Which of the shared tables' slots a vector belongs to, or `None` for one
+/// outside the range this crate claims from.
+fn slot(vector: Vector) -> Option<usize> {
+    vector
+        .number()
+        .checked_sub(FIRST.number())
+        .map(usize::from)
+        .filter(|slot| *slot < CAPACITY)
 }
 
 /// Every attached processor but this one.
@@ -360,8 +420,8 @@ fn others() -> impl Iterator<Item = CpuIndex> {
 #[derive(Debug)]
 struct State {
     processors: usize,
-    slots: Box<[Slot]>,
-    handlers: [AtomicPtr<()>; CAPACITY],
+    mailboxes: Box<[Mailbox]>,
+    handlers: [Once<Handler>; CAPACITY],
 }
 
 impl State {
@@ -370,18 +430,16 @@ impl State {
     /// Laid out interrupt by interrupt rather than processor by processor,
     /// because a broadcast walks every processor of one interrupt and nothing
     /// ever walks every interrupt of one processor.
-    fn slot(&self, slot: usize, index: CpuIndex) -> &Slot {
-        &self.slots[slot * self.processors + index.get()]
+    fn mailbox(&self, slot: usize, index: CpuIndex) -> &Mailbox {
+        &self.mailboxes[slot * self.processors + index.get()]
     }
 
-    /// What was registered on this slot, if anything.
-    fn handler(&self, slot: usize) -> Option<Handler> {
-        // SAFETY: the only value `register` stores in a slot is a `Handler` cast
-        // to a raw pointer, and null — filtered out first — is the only other
-        // value it can hold. `transmute` checks the two are the same size, which
-        // makes this exactly the inverse of the cast that stored it.
-        NonNull::new(self.handlers[slot].load(Ordering::Acquire))
-            .map(|handler| unsafe { mem::transmute::<NonNull<()>, Handler>(handler) })
+    /// What every mailbox has seen, added up.
+    fn counts(&self) -> Counts {
+        self.mailboxes
+            .iter()
+            .map(Mailbox::counts)
+            .fold(Counts::default(), Counts::and)
     }
 }
 
@@ -429,4 +487,9 @@ pub enum IpiError {
     /// The processor roster refused something.
     #[error(transparent)]
     Cpu(#[from] CpuError),
+    /// The address space subsystem already has a way to reach the other
+    /// processors, which can only mean something other than this crate gave it
+    /// one.
+    #[error(transparent)]
+    Shootdown(#[from] paging::shootdown::AlreadyInstalled),
 }
