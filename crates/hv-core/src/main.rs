@@ -47,13 +47,14 @@ mod heap;
 use core::{convert::Infallible, ffi::c_void, hint::black_box, panic::PanicInfo};
 
 use acpi::Acpi;
+use apic::Apic;
 use clock::{Clock, Wall};
 use descriptors::{Descriptors, Interrupt, halt};
 use handoff::{Handoff, HandoffError};
 use log::{error, info, warn};
 use paging::{AddressSpace, CacheType, Existing, PagingError, Protection, chunk};
 use uefi_raw::Status;
-use x86_64::{PhysAddr, VirtAddr, structures::paging::PhysFrame};
+use x86_64::{PhysAddr, VirtAddr, instructions::interrupts, structures::paging::PhysFrame};
 
 use crate::{error::CoreError, firmware::Firmware, heap::Heap};
 
@@ -140,7 +141,11 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     heap.describe("core");
 
     evict_loader(&mut space, handoff)?;
-    Descriptors::install(&mut space, unclaimed)?.describe("core");
+    // What becomes of an unclaimed interrupt is one answer for the machine;
+    // descriptor tables are one set per processor. Saying the first is what
+    // makes the second allowed.
+    descriptors::adopt(unclaimed)?;
+    Descriptors::install(&mut space)?.describe("core");
 
     // SAFETY: this space is the active one, physical memory is reached through
     // its direct map rather than firmware's identity map, and nothing firmware
@@ -152,13 +157,85 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
 
     let acpi = survey_machine(handoff, &space)?;
     start_clock(&mut space, &acpi, handoff)?;
+
+    // The roster first, because everything below it is sized by how many
+    // processors firmware described; then the interrupt controllers, which is
+    // where this processor learns what it is called; then a block of its own,
+    // which cannot come before its descriptor tables because loading a segment
+    // selector into `GS` zeroes the base a block is reached through.
+    cpu::survey(acpi.madt().processors())?;
+    let apic = Apic::install(&mut space, acpi.madt())?;
+    apic.describe("core");
+    cpu::attach(apic::local()?.id()?)?;
+    ipi::install()?;
+
+    // The last use of the address space as a value. From here it belongs to the
+    // machine rather than to this function, and every processor reaches the same
+    // one through the same lock.
+    paging::adopt(space)?;
+
+    // Delete this and the machine still works, on one processor, with every
+    // subsystem behaving exactly as it does here.
+    let started = apic::start(phys(handoff.ap_trampoline_base)?, ap_main)?;
+
     heap.describe("core");
-    self_check(&space, handoff)?;
+    cpu::describe("core");
+    ipi::describe("core");
+    paging::with(|space| self_check(space, handoff))??;
     info!(
-        "core: bring-up complete, {} processors described, halting",
-        acpi.madt().processors().len()
+        "core: bring-up complete, {} of {} processors online, halting",
+        started.online, started.startable
     );
-    halt()
+    park()
+}
+
+/// What every processor other than the boot processor runs, for good.
+///
+/// Reached from the trampoline with nothing but a stack and this address, so
+/// the order is forced. Descriptor tables first, because until they are loaded
+/// there is no way for this processor to report anything going wrong — a fault
+/// before that point is a triple fault and a reset machine. Then its own
+/// interrupt controller, which is what its identifier comes from, and only then
+/// a block of its own and the interrupts that reach it.
+fn ap_main() -> ! {
+    match attach() {
+        Ok(id) => info!("core: {id} online"),
+        Err(error) => {
+            error!("core: an application processor could not come up: {error}");
+            halt()
+        }
+    }
+    park()
+}
+
+/// Everything an application processor does before it is one of the machine's.
+///
+/// # Errors
+///
+/// The first failure of any step. There is nothing to roll back: a processor
+/// that cannot finish this has nothing to go back to, and the caller stops it.
+fn attach() -> Result<cpu::ApicId, CoreError> {
+    paging::with(Descriptors::install)??;
+    let id = apic::LocalApic::enable()?.id()?;
+    cpu::attach(id)?;
+    Ok(id)
+}
+
+/// Stops this processor, but leaves it able to answer.
+///
+/// Not [`halt`], which masks interrupts first and is for a processor that
+/// cannot continue. A processor that has finished coming up is idle rather than
+/// broken: it has to keep answering interprocessor interrupts, and a
+/// translation shootdown nobody acknowledges is a machine that stops the first
+/// time anything is unmapped.
+///
+/// The order matters and is the architecture's own guarantee: enabling
+/// interrupts leaves them masked for one more instruction, so nothing can
+/// arrive between these two and leave the processor halted with work waiting.
+fn park() -> ! {
+    loop {
+        interrupts::enable_and_hlt();
+    }
 }
 
 /// Establishes the timebase from whichever counter the machine turned out to
@@ -349,7 +426,7 @@ fn evict_loader(space: &mut AddressSpace, handoff: &Handoff) -> Result<(), CoreE
 ///
 /// [`CoreError::SelfCheckFailed`] naming whichever check did not hold, or
 /// [`CoreError::BadAddress`] if the image base in the handoff is not canonical.
-fn self_check(space: &AddressSpace, handoff: &Handoff) -> Result<(), CoreError> {
+fn self_check(space: &mut AddressSpace, handoff: &Handoff) -> Result<(), CoreError> {
     // `black_box` forces a real load: the magic was already read before the
     // transition, and a cached value would make this check prove nothing.
     if black_box(handoff).magic != Handoff::MAGIC {
@@ -393,12 +470,24 @@ fn self_check(space: &AddressSpace, handoff: &Handoff) -> Result<(), CoreError> 
 /// address space or of the descriptor tables is already broken, which is not
 /// something to continue past: it stops here, with everything the processor
 /// said about it on the record.
+/// Dropping one also means acknowledging it. The local interrupt controller
+/// holds an interrupt in service until it is told otherwise, and goes on
+/// refusing everything of that priority or lower until it is — so a processor
+/// that ignored one without saying so would quietly stop accepting a whole
+/// class of interrupts for the rest of its life. Reinjecting into a guest is
+/// what will take this over, and acknowledging is part of that too.
 fn unclaimed(interrupt: &Interrupt) {
     if interrupt.vector().is_exception() {
         error!("core: {interrupt}");
         halt()
     }
     warn!("core: ignoring unclaimed {interrupt}");
+    if let Err(error) = apic::end_of_interrupt() {
+        error!(
+            "core: could not acknowledge {}: {error}",
+            interrupt.vector()
+        );
+    }
 }
 
 /// A physical address out of the boot protocol.

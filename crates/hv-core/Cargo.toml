@@ -13,9 +13,12 @@ forced-target = "x86_64-unknown-uefi"
 
 [dependencies]
 acpi = { workspace = true }
+apic = { workspace = true }
 clock = { workspace = true }
+cpu = { workspace = true }
 descriptors = { workspace = true }
 handoff = { workspace = true }
+ipi = { workspace = true }
 log = { workspace = true }
 paging = { workspace = true }
 serial = { workspace = true }

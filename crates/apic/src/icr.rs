@@ -18,9 +18,9 @@
 //! A destination is either one processor, named by its identifier, or a
 //! shorthand. The shorthands exist because "everyone but me" is both the common
 //! case and the one that cannot be expressed as an identifier. Under x2APIC the
-//! identifier field is the whole upper word; under the older interface it is the
-//! top eight bits of it, which is why an identifier that does not fit is refused
-//! rather than silently truncated into somebody else's.
+//! identifier field is the whole upper word; under the older interface it is
+//! the top eight bits of it, which is why an identifier that does not fit is
+//! refused rather than silently truncated into somebody else's.
 
 use cpu::ApicId;
 use descriptors::Vector;
@@ -57,8 +57,9 @@ impl Target {
     /// # Errors
     ///
     /// [`ApicError::IdTooWide`] if the older interface is in use and the
-    /// identifier does not fit its eight-bit field. Truncating would deliver the
-    /// interrupt to a different processor, which is worse than refusing.
+    /// identifier does not fit its eight-bit field. Truncating would deliver
+    /// the interrupt to a different processor, which is worse than
+    /// refusing.
     const fn destination(self, mode: Mode) -> Result<u64, ApicError> {
         let Self::One(id) = self else {
             return Ok(0);
@@ -71,8 +72,8 @@ impl Target {
     }
 }
 
-/// Bits the older interface's eight-bit destination field is shifted by: the top
-/// eight of the register's upper word.
+/// Bits the older interface's eight-bit destination field is shifted by: the
+/// top eight of the register's upper word.
 const XAPIC_DESTINATION_SHIFT: u32 = 56;
 
 /// Bits the destination shorthand field is shifted by.

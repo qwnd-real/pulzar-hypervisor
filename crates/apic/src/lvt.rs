@@ -9,10 +9,20 @@
 //!
 //! The register is built here rather than assembled at each use site, so that
 //! the reserved bits stay zero and a field cannot be written into the wrong
-//! position. Every entry has a mask bit, and an entry this crate does not
-//! deliberately arm is masked: a source left in whatever state firmware wanted
-//! is a source that can deliver an interrupt to a vector chosen by something
-//! that is no longer running.
+//! position.
+//!
+//! # Every entry is written, and that is not belt and braces
+//!
+//! These registers come out of reset masked, so a processor being started for
+//! the first time needs none of this. The boot processor is the exception, and
+//! it is not a small one: firmware has been running on it, and firmware arms
+//! the local timer for its own use. Left alone, that entry goes on delivering —
+//! on whatever vector firmware chose — the moment this hypervisor unmasks
+//! interrupts, which is an interrupt arriving from something that no longer
+//! exists.
+//!
+//! So every entry is written on every processor: masked, except the two pins,
+//! which get whatever firmware's tables said they are wired to.
 
 use bitflags::bitflags;
 use descriptors::Vector;
@@ -140,10 +150,5 @@ impl Entry {
     /// The entry as the register holds it.
     pub(crate) const fn bits(self) -> u32 {
         self.0
-    }
-
-    /// An entry read back out of a register.
-    pub(crate) const fn from_bits(bits: u32) -> Self {
-        Self(bits)
     }
 }

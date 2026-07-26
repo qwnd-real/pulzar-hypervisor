@@ -47,13 +47,14 @@
 //!
 //! The interrupt descriptor table holds only gates, and a gate names an entry
 //! point and a selector — the same entry point on every processor, and the same
-//! selector, because every processor's descriptor table puts its code segment at
-//! the same index. So one table is built and every processor is pointed at it.
+//! selector, because every processor's descriptor table puts its code segment
+//! at the same index. So one table is built and every processor is pointed at
+//! it.
 //!
-//! What becomes of an unclaimed interrupt is not a per-processor fact at all: it
-//! is what this hypervisor does. So it is said once, with [`adopt`], and saying
-//! it is a precondition of any processor installing tables — an interrupt must
-//! never arrive to find no answer.
+//! What becomes of an unclaimed interrupt is not a per-processor fact at all:
+//! it is what this hypervisor does. So it is said once, with [`adopt`], and
+//! saying it is a precondition of any processor installing tables — an
+//! interrupt must never arrive to find no answer.
 
 #![feature(abi_x86_interrupt)]
 #![no_std]
@@ -100,9 +101,9 @@ impl Descriptors {
     ///
     /// # Errors
     ///
-    /// [`DescriptorError::Unadopted`] if nothing has said yet what becomes of an
-    /// unclaimed interrupt, since loading a table of gates before then would
-    /// make a delivery possible that has no answer; or
+    /// [`DescriptorError::Unadopted`] if nothing has said yet what becomes of
+    /// an unclaimed interrupt, since loading a table of gates before then
+    /// would make a delivery possible that has no answer; or
     /// [`DescriptorError::Paging`] if the interrupt stacks cannot be backed.
     pub fn install(space: &mut AddressSpace) -> Result<Self, DescriptorError> {
         if !dispatch::adopted() {

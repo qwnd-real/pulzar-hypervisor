@@ -1,9 +1,9 @@
 //! The pair of legacy interrupt controllers, and why they have to be silenced.
 //!
-//! A PC that still has the two 8259s wires them ahead of everything else, and at
-//! reset their sixteen inputs are mapped onto vectors 8 to 15 and 0x70 to 0x77.
-//! The first eight of those are exceptions: vector 8 is the double fault, which
-//! [`descriptors`] correctly refuses to let anything claim because the
+//! A PC that still has the two 8259s wires them ahead of everything else, and
+//! at reset their sixteen inputs are mapped onto vectors 8 to 15 and 0x70 to
+//! 0x77. The first eight of those are exceptions: vector 8 is the double fault,
+//! which [`descriptors`] correctly refuses to let anything claim because the
 //! architecture gives no way back from it. So a legacy interrupt arriving after
 //! this hypervisor unmasks interrupts would be delivered as a fault that cannot
 //! be returned from, over state that was perfectly fine.
@@ -15,9 +15,9 @@
 //! is the smallest thing that makes unmasking safe.
 //!
 //! Whether the machine has them at all is firmware's to say, in the multiple
-//! APIC description table's compatibility flag, so this is not done to a machine
-//! that has none: writing to ports nothing answers on is how a machine that
-//! never had 8259s gets a configuration it did not have.
+//! APIC description table's compatibility flag, so this is not done to a
+//! machine that has none: writing to ports nothing answers on is how a machine
+//! that never had 8259s gets a configuration it did not have.
 
 use x86_64::instructions::port::Port;
 

@@ -193,9 +193,9 @@ pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, De
 
 /// Records what becomes of an unclaimed interrupt.
 ///
-/// One answer for the whole machine, given once and before any processor loads a
-/// table of gates, so that no delivery can happen while there is nothing to give
-/// it to. That ordering is enforced from the other side:
+/// One answer for the whole machine, given once and before any processor loads
+/// a table of gates, so that no delivery can happen while there is nothing to
+/// give it to. That ordering is enforced from the other side:
 /// [`Descriptors::install`](crate::Descriptors::install) refuses until this has
 /// run.
 ///

@@ -21,8 +21,8 @@
 //!
 //! Arming programs the local vector table entry and the count, and does not
 //! register a handler. Which vector the timer uses and what happens when it
-//! fires are decisions about the hypervisor's interrupt structure, not about the
-//! timer, and they belong to whoever is arming it.
+//! fires are decisions about the hypervisor's interrupt structure, not about
+//! the timer, and they belong to whoever is arming it.
 
 use clock::Frequency;
 use descriptors::Vector;
@@ -68,8 +68,8 @@ const IA32_TSC_DEADLINE: u32 = 0x6E0;
 
 /// How far the input clock is divided before the timer counts it.
 ///
-/// The encoding is the awkward part and the reason this is an enum rather than a
-/// number: the three-bit field is split, with its middle bit skipped, so that
+/// The encoding is the awkward part and the reason this is an enum rather than
+/// a number: the three-bit field is split, with its middle bit skipped, so that
 /// the value written is not the ratio and is not even contiguous with it. It is
 /// written out once here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,8 +107,8 @@ impl Divisor {
 
     /// The divide configuration register's encoding.
     ///
-    /// Bit 2 of the field is not used, so the three meaningful bits are 0, 1 and
-    /// 3 — which is why the values below look nothing like the ratios.
+    /// Bit 2 of the field is not used, so the three meaningful bits are 0, 1
+    /// and 3 — which is why the values below look nothing like the ratios.
     const fn bits(self) -> u32 {
         match self {
             Self::By1 => 0b1011,
@@ -138,19 +138,19 @@ impl Divisor {
     }
 }
 
-/// This processor's local timer.
+/// The timer of whichever processor is holding this.
 ///
-/// A handle, not a state: everything it knows is in the controller's registers,
-/// and every one of them belongs to the processor the handle was obtained on.
+/// Zero-sized for the same reason [`LocalApic`] is: every register it drives is
+/// reached the same way on every processor and answers about the processor
+/// doing the reaching, so there is nothing for a handle to carry and a handle
+/// that named a processor would be one that could be wrong.
 #[derive(Clone, Copy, Debug)]
-pub struct Timer {
-    local: LocalApic,
-}
+pub struct Timer;
 
 impl Timer {
     /// This processor's timer.
-    pub(crate) const fn new(local: LocalApic) -> Self {
-        Self { local }
+    pub(crate) const fn new(_: LocalApic) -> Self {
+        Self
     }
 
     /// Stops the timer and stops it delivering.
@@ -279,8 +279,8 @@ impl Timer {
     ///
     /// [`ApicError::Clock`] if no timebase is installed to measure against,
     /// [`ApicError::Calibration`] if the timer did not move or moved so far it
-    /// wrapped, or [`ApicError::NotInstalled`] if this processor's controller is
-    /// not up.
+    /// wrapped, or [`ApicError::NotInstalled`] if this processor's controller
+    /// is not up.
     pub fn calibrate(self, divisor: Divisor) -> Result<Frequency, ApicError> {
         let access = crate::register::access()?;
         // SAFETY: a masked entry delivers nothing whatever the count does, and
@@ -296,18 +296,22 @@ impl Timer {
         let elapsed = (clock::now().ok_or(ApicError::Clock)? - started).as_nanos();
         self.disarm()?;
 
+        // Reaching zero means the count wrapped, so what is left says nothing
+        // about how far the timer got; not moving at all means the timer is not
+        // running. Neither is a measurement.
         let ticks = u64::from(u32::MAX - remaining);
         if ticks == 0 || remaining == 0 {
             return Err(ApicError::Calibration);
         }
-        Frequency::from_measurement(ticks, elapsed).ok_or(ApicError::Calibration)
+        let nanos = u64::try_from(elapsed).map_err(|_| ApicError::Calibration)?;
+        Frequency::from_measurement(ticks, nanos).ok_or(ApicError::Calibration)
     }
 }
 
 /// How long a rate measurement watches the timer for.
 ///
-/// The same order as the timestamp counter's own calibration window: long enough
-/// that the cost of reading the timebase at each end is lost in it, short enough
-/// that a timer counting an undivided gigahertz bus clock does not wrap its
-/// 32-bit count.
+/// The same order as the timestamp counter's own calibration window: long
+/// enough that the cost of reading the timebase at each end is lost in it,
+/// short enough that a timer counting an undivided gigahertz bus clock does not
+/// wrap its 32-bit count.
 const CALIBRATION_MICROS: u64 = 10_000;

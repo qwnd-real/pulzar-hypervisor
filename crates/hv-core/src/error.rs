@@ -5,9 +5,12 @@
 //! to diagnose from.
 
 use acpi::AcpiError;
+use apic::ApicError;
 use clock::ClockError;
+use cpu::CpuError;
 use descriptors::DescriptorError;
 use handoff::HandoffError;
+use ipi::IpiError;
 use paging::PagingError;
 use thiserror::Error;
 use uefi_raw::Status;
@@ -31,6 +34,17 @@ pub enum CoreError {
     /// tell how much time had passed.
     #[error(transparent)]
     Clock(#[from] ClockError),
+    /// The machine's processors could not be described, or this one could not
+    /// take a place among them.
+    #[error(transparent)]
+    Cpu(#[from] CpuError),
+    /// An interrupt controller could not be set up or driven, or a processor
+    /// could not be started.
+    #[error(transparent)]
+    Apic(#[from] ApicError),
+    /// Interprocessor interrupts could not be set up.
+    #[error(transparent)]
+    Ipi(#[from] IpiError),
     /// The allocator would not take the span reserved for the heap, which can
     /// only mean it is too small to hold the allocator's own bookkeeping.
     #[error("the allocator refused the {bytes:#x}-byte heap at {base:#x}")]

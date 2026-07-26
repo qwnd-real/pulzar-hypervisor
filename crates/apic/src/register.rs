@@ -3,7 +3,8 @@
 //! There are two interfaces to the same controller. The older one puts its
 //! registers in a 4 KiB page of memory-mapped space; x2APIC puts them in
 //! model-specific registers instead, which is faster, needs no mapping, and is
-//! the only way to address a processor whose identifier does not fit eight bits.
+//! the only way to address a processor whose identifier does not fit eight
+//! bits.
 //!
 //! Nothing above this module should have to know which is in use, and nothing
 //! here should have to say where a register is twice. It does not have to: the
@@ -20,10 +21,10 @@
 //! The interrupt command register is two 32-bit registers in the older
 //! interface and one 64-bit model-specific register in x2APIC. A write to the
 //! older one is posted, so its delivery status has to be polled before the next
-//! command; an x2APIC write is not, so there is nothing to poll and the bit does
-//! not exist. The destination format register exists only in the older
-//! interface. And x2APIC adds a register for sending a processor an interrupt to
-//! itself, which the older interface can only do the long way round.
+//! command; an x2APIC write is not, so there is nothing to poll and the bit
+//! does not exist. The destination format register exists only in the older
+//! interface. And x2APIC adds a register for sending a processor an interrupt
+//! to itself, which the older interface can only do the long way round.
 //!
 //! # One mapping, every processor
 //!
@@ -110,8 +111,8 @@ const STRIDE: u32 = 16;
 const X2APIC_COMMAND_MSR: u32 = 0x830;
 
 /// The bit the older interface sets in the command register while a command is
-/// still being sent. x2APIC has no such bit: its write does not return until the
-/// command has been accepted.
+/// still being sent. x2APIC has no such bit: its write does not return until
+/// the command has been accepted.
 const DELIVERY_PENDING: u32 = 1 << 12;
 
 /// How the local APIC's registers are reached on this machine.
@@ -181,7 +182,7 @@ impl Access {
     /// reset or deliver to a vector nothing is prepared for.
     pub(crate) unsafe fn send(self, command: u64) -> Result<(), ApicError> {
         match self {
-            Self::Mapped(base) => {
+            Self::Mapped(_) => {
                 self.settle()?;
                 // SAFETY: the destination half accepts any value in its top
                 // eight bits, and writing it sends nothing on its own.
@@ -191,10 +192,10 @@ impl Access {
                 unsafe { self.write(Register::COMMAND_LOW, truncate(command)) };
                 self.settle()
             }
-            // SAFETY: the caller vouches for the command. The write does not
-            // return until the controller has accepted it, so there is nothing
-            // to wait for on either side of it.
             Self::Msr => {
+                // SAFETY: the caller vouches for the command. The write does
+                // not return until the controller has accepted it, so there is
+                // nothing to wait for on either side of it.
                 unsafe { Msr::new(X2APIC_COMMAND_MSR).write(command) };
                 Ok(())
             }
@@ -203,9 +204,9 @@ impl Access {
 
     /// Waits for the older interface to finish sending whatever it was sending.
     ///
-    /// A bounded spin rather than a delay: the wait is normally a handful of bus
-    /// cycles, and a controller that has not finished after this many reads is
-    /// not going to.
+    /// A bounded spin rather than a delay: the wait is normally a handful of
+    /// bus cycles, and a controller that has not finished after this many
+    /// reads is not going to.
     fn settle(self) -> Result<(), ApicError> {
         let Self::Mapped(_) = self else {
             return Ok(());
@@ -221,8 +222,8 @@ impl Access {
 }
 
 /// How many times the command register is read before a still-pending command
-/// is called stuck. Each read is a bus cycle, so this is comfortably longer than
-/// any delivery and still a bounded wait on a broken machine.
+/// is called stuck. Each read is a bus cycle, so this is comfortably longer
+/// than any delivery and still a bounded wait on a broken machine.
 const COMMAND_POLLS: u32 = 1_000_000;
 
 /// Where a register sits in the mapped page.
@@ -248,9 +249,9 @@ static ACCESS: Once<Access> = Once::new();
 
 /// Records how the registers are reached.
 ///
-/// The choice belongs to the machine, not to a processor: every processor is put
-/// into the same mode, so that one destination format and one register width
-/// serve all of them.
+/// The choice belongs to the machine, not to a processor: every processor is
+/// put into the same mode, so that one destination format and one register
+/// width serve all of them.
 pub(crate) fn establish(access: Access) -> Access {
     *ACCESS.call_once(|| access)
 }

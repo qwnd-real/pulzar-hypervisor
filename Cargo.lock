@@ -83,6 +83,19 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "apic"
 version = "0.1.0"
+dependencies = [
+ "acpi",
+ "bitflags",
+ "clock",
+ "cpu",
+ "descriptors",
+ "log",
+ "paging",
+ "processor",
+ "spin",
+ "thiserror",
+ "x86_64",
+]
 
 [[package]]
 name = "base16ct"
@@ -394,9 +407,12 @@ name = "hv-core"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "apic",
  "clock",
+ "cpu",
  "descriptors",
  "handoff",
+ "ipi",
  "log",
  "paging",
  "serial",
@@ -433,6 +449,17 @@ dependencies = [
 [[package]]
 name = "ipi"
 version = "0.1.0"
+dependencies = [
+ "apic",
+ "clock",
+ "cpu",
+ "descriptors",
+ "log",
+ "paging",
+ "spin",
+ "thiserror",
+ "x86_64",
+]
 
 [[package]]
 name = "is_terminal_polyfill"

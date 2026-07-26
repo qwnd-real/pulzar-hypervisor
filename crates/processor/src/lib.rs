@@ -111,7 +111,10 @@ impl Features {
                 .as_ref()
                 .is_some_and(ApmInfo::has_invariant_tsc),
         );
-        features.set(Self::APIC, basic.as_ref().is_some_and(FeatureInfo::has_apic));
+        features.set(
+            Self::APIC,
+            basic.as_ref().is_some_and(FeatureInfo::has_apic),
+        );
         features.set(
             Self::X2APIC,
             basic.as_ref().is_some_and(FeatureInfo::has_x2apic),

@@ -2,16 +2,16 @@
 //!
 //! Everything above this crate that does something per processor needs two
 //! answers, and neither is available from anywhere else. What is the set of
-//! processors — which is firmware's to say, in a table whose identifiers are not
-//! indices and are not promised to be ordered or dense. And which one am I —
-//! which the processor itself has to answer, cheaply, from an interrupt handler,
-//! with nothing passed in.
+//! processors — which is firmware's to say, in a table whose identifiers are
+//! not indices and are not promised to be ordered or dense. And which one am I
+//! — which the processor itself has to answer, cheaply, from an interrupt
+//! handler, with nothing passed in.
 //!
 //! So this crate does two things and nothing else. [`survey`] reads the set out
-//! of the multiple APIC description table into a [`Roster`], which hands out the
-//! dense [`CpuIndex`] that other subsystems may size arrays by. And [`attach`]
-//! gives the calling processor a [`Block`] of its own, reached through its `GS`
-//! base, so that [`current`] is one load.
+//! of the multiple APIC description table into a [`Roster`], which hands out
+//! the dense [`CpuIndex`] that other subsystems may size arrays by. And
+//! [`attach`] gives the calling processor a [`Block`] of its own, reached
+//! through its `GS` base, so that [`current`] is one load.
 //!
 //! It deliberately owns no hardware. The local APIC identifier a processor
 //! attaches with is passed in, by the subsystem that just brought that
@@ -96,8 +96,8 @@ pub fn survey(processors: &[Processor]) -> Result<(), CpuError> {
 ///
 /// [`CpuError::NotSurveyed`] before [`survey`], [`CpuError::Unknown`] if no
 /// entry has this identifier, which means the processor running is one firmware
-/// did not describe, or [`CpuError::AlreadyAttached`] if the entry already has a
-/// block.
+/// did not describe, or [`CpuError::AlreadyAttached`] if the entry already has
+/// a block.
 pub fn attach(apic_id: ApicId) -> Result<&'static Block, CpuError> {
     let machine = machine()?;
     let index = machine
@@ -160,8 +160,8 @@ pub fn roster() -> Result<&'static Roster, CpuError> {
 
 /// Logs the roster and who is up.
 ///
-/// One line per processor, because which processors exist, which may be started,
-/// and which are running is the whole of what this crate knows.
+/// One line per processor, because which processors exist, which may be
+/// started, and which are running is the whole of what this crate knows.
 pub fn describe(who: &str) {
     let Ok(machine) = machine() else {
         info!("{who}: cpu roster not taken yet");
@@ -179,7 +179,7 @@ pub fn describe(who: &str) {
     );
     for entry in machine.roster.entries() {
         info!(
-            "{who}: cpu {} is {}, uid {}, {:?}, {}",
+            "{who}: {} is {}, uid {}, {:?}, {}",
             entry.index(),
             entry.apic_id(),
             entry.uid(),

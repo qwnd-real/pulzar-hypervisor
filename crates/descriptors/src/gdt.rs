@@ -63,9 +63,9 @@ pub struct Selectors {
 /// — two processors taking a double fault at once would take it on one stack —
 /// and the global descriptor table cannot be either, because the descriptor for
 /// that task state segment is in it. They are leaked rather than kept in a
-/// static: the processor keeps a pointer to each for as long as it runs, so they
-/// must never move and never be dropped, and how many there will be is firmware's
-/// to say rather than a number written here.
+/// static: the processor keeps a pointer to each for as long as it runs, so
+/// they must never move and never be dropped, and how many there will be is
+/// firmware's to say rather than a number written here.
 ///
 /// # Errors
 ///

@@ -1,10 +1,10 @@
 //! The block of state each processor reaches through its own `GS` base.
 //!
 //! Every processor needs to answer "which of us am I" without being told, and
-//! needs to answer it on the interrupt path, where there is no handle to thread.
-//! Reading the local APIC's identifier register would work — it is what the
-//! roster is keyed on — but it costs a model-specific-register read at best and
-//! an uncached bus cycle at worst, every time.
+//! needs to answer it on the interrupt path, where there is no handle to
+//! thread. Reading the local APIC's identifier register would work — it is what
+//! the roster is keyed on — but it costs a model-specific-register read at best
+//! and an uncached bus cycle at worst, every time.
 //!
 //! The architecture already has a per-processor pointer for this. `GS` has a
 //! 64-bit base that long mode otherwise leaves unused, and an access through it
@@ -28,18 +28,18 @@
 //!
 //! Because nothing swaps yet. `swapgs` exists to exchange this base with a
 //! shadow across a boundary where the other side owns `GS` — a ring 3 entry, or
-//! a guest exit. Nothing in pulzar crosses such a boundary, so there is one base
-//! and it is the live one. Entering a guest is what will introduce the shadow,
-//! and it will introduce it because it needs it.
+//! a guest exit. Nothing in pulzar crosses such a boundary, so there is one
+//! base and it is the live one. Entering a guest is what will introduce the
+//! shadow, and it will introduce it because it needs it.
 //!
 //! # Why reading it is unsafe
 //!
-//! Because the base is zero until a processor attaches, and virtual address zero
-//! is not mapped — the firmware half of the address space is gone by the time
-//! any of this runs. So a read before attaching is not a null pointer to be
-//! checked for, it is a page fault. [`current`] therefore states the
-//! precondition instead of pretending to detect it, and [`attached`] is the safe
-//! way to ask, at the cost of a register read.
+//! Because the base is zero until a processor attaches, and virtual address
+//! zero is not mapped — the firmware half of the address space is gone by the
+//! time any of this runs. So a read before attaching is not a null pointer to
+//! be checked for, it is a page fault. [`current`] therefore states the
+//! precondition instead of pretending to detect it, and [`attached`] is the
+//! safe way to ask, at the cost of a register read.
 
 use core::arch::asm;
 
@@ -55,9 +55,9 @@ use crate::{ApicId, CpuIndex};
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct Block {
-    /// This block's own address, so that a processor can turn its `GS` base into
-    /// a reference with one load rather than by reading a model-specific
-    /// register.
+    /// This block's own address, so that a processor can turn its `GS` base
+    /// into a reference with one load rather than by reading a
+    /// model-specific register.
     self_ptr: *const Self,
     index: CpuIndex,
     apic_id: ApicId,
@@ -102,9 +102,9 @@ impl Block {
     ///
     /// Taking a `&'static mut` is what makes this safe to offer at all: it is
     /// the type-level form of "leaked", and a base that cannot outlive what it
-    /// points at is the whole of what [`current`] needs. Which processor's block
-    /// it is, and that no descriptor table is loaded afterwards to zero the base
-    /// again, are correctness matters the one caller settles.
+    /// points at is the whole of what [`current`] needs. Which processor's
+    /// block it is, and that no descriptor table is loaded afterwards to
+    /// zero the base again, are correctness matters the one caller settles.
     pub(crate) fn activate(block: &'static mut Self) -> &'static Self {
         block.self_ptr = core::ptr::from_ref(block);
         let block: &'static Self = block;
@@ -115,16 +115,17 @@ impl Block {
 
 /// The block of the processor this runs on.
 ///
-/// One load. This is the reason the block exists at all: it is what an interrupt
-/// handler calls to find out which processor it is on.
+/// One load. This is the reason the block exists at all: it is what an
+/// interrupt handler calls to find out which processor it is on.
 ///
 /// # Safety
 ///
 /// This processor must have attached. Before that its `GS` base is zero, and
-/// virtual address zero is not mapped, so the read is a page fault rather than a
-/// null pointer that could be checked for. Every processor attaches immediately
-/// after installing its descriptor tables and before unmasking interrupts, which
-/// is what makes this hold on every path an interrupt can arrive through.
+/// virtual address zero is not mapped, so the read is a page fault rather than
+/// a null pointer that could be checked for. Every processor attaches
+/// immediately after installing its descriptor tables and before unmasking
+/// interrupts, which is what makes this hold on every path an interrupt can
+/// arrive through.
 #[must_use]
 pub unsafe fn current() -> &'static Block {
     let mut block: *const Block;
