@@ -36,7 +36,10 @@ pub mod svm;
 
 use bitflags::bitflags;
 use log::info;
-use raw_cpuid::{ApmInfo, CpuId, ExtendedProcessorFeatureIdentifiers, FeatureInfo};
+use raw_cpuid::{
+    ApmInfo, CpuId, ExtendedProcessorFeatureIdentifiers, FeatureInfo,
+    ProcessorCapacityAndFeatureInfo,
+};
 use spin::Once;
 
 pub use crate::svm::{Svm, SvmFeatures, svm};
@@ -143,6 +146,34 @@ pub fn features() -> Features {
     *FEATURES.call_once(Features::read)
 }
 
+/// How many bits of a physical address this processor implements.
+///
+/// The width every "must be zero" rule about a physical address is stated
+/// against. A control register or a table pointer with a bit set at or above
+/// this is not merely pointing at memory that is not there — writing one
+/// faults, and handing one to the virtualization extension makes entering a
+/// guest fail with a code that says nothing about which field was wrong.
+///
+/// The leaf reporting it is absent on processors old enough that the answer
+/// could only have been 36, which is what that case reports.
+#[must_use]
+pub fn physical_address_bits() -> u8 {
+    *PHYSICAL_ADDRESS_BITS.call_once(|| {
+        CpuId::new()
+            .get_processor_capacity_feature_info()
+            .as_ref()
+            .map_or(
+                LEGACY_PHYSICAL_ADDRESS_BITS,
+                ProcessorCapacityAndFeatureInfo::physical_address_bits,
+            )
+    })
+}
+
+/// What a processor whose `CPUID` does not describe its address widths
+/// implements, which is the width the extension defined before the leaf
+/// reporting it existed.
+const LEGACY_PHYSICAL_ADDRESS_BITS: u8 = 36;
+
 /// The timestamp counter.
 ///
 /// Raw and unordered: the processor may execute the read before or after
@@ -160,3 +191,6 @@ pub fn timestamp() -> u64 {
 
 /// The features of the processor this image runs on, read on first use.
 static FEATURES: Once<Features> = Once::new();
+
+/// How wide this processor's physical addresses are, read on first use.
+static PHYSICAL_ADDRESS_BITS: Once<u8> = Once::new();
