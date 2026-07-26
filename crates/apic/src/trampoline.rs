@@ -14,12 +14,14 @@
 //!
 //! # The descriptor table it loads
 //!
-//! Five entries, built here rather than assembled, because one of them has to
+//! Four entries, built here rather than assembled, because one of them has to
 //! contain an address. The 32-bit code segment is based at the page, which is
 //! what lets the first far jump name its target as an offset the assembler can
-//! work out instead of a linear address only this code knows. The rest are
-//! flat: the data segments describe all four gigabytes, and the 64-bit code
-//! segment's base is ignored by the mode it exists to enter.
+//! work out instead of a linear address only this code knows. The other two are
+//! flat: the data segment describes all four gigabytes, and the 64-bit code
+//! segment's base is ignored by the mode it exists to enter. One data segment
+//! is enough — 64-bit mode ignores what the stack segment describes, so the
+//! selector loaded in 32-bit mode is still the right one afterwards.
 
 use core::{
     mem::offset_of,
@@ -39,7 +41,7 @@ use crate::ApicError;
 const PARAMETERS: usize = 0x800;
 
 /// How many descriptors the trampoline's own table holds.
-const DESCRIPTORS: u16 = 5;
+const DESCRIPTORS: u16 = 4;
 
 /// The limit `lgdt` is given for it, which the processor reads as one less than
 /// the table's size.
@@ -152,8 +154,8 @@ struct FarPointer {
 /// it uses are computed from this declaration.
 #[repr(C)]
 struct Parameters {
-    /// Null, 32-bit code based at the page, flat data, 64-bit code, flat data.
-    gdt: [u64; 5],
+    /// Null, 32-bit code based at the page, flat data, 64-bit code.
+    gdt: [u64; 4],
     /// What `lgdt` is given for `gdt`.
     pointer: TablePointer,
     /// Where the first mode transition goes. An offset into the blob, because
@@ -173,9 +175,6 @@ struct Parameters {
     stack_top: u64,
     /// The 64-bit entry point it jumps to, which never returns.
     entry: u64,
-    /// Which processor this start is for, so that the one that arrives can be
-    /// checked against the one that was asked for.
-    apic_id: u32,
     /// Set by the processor being started, before it does anything else.
     started: AtomicU32,
 }
@@ -254,7 +253,6 @@ impl Trampoline {
             page_table_root: page_table_root.as_u64(),
             stack_top: 0,
             entry,
-            apic_id: 0,
             started: AtomicU32::new(0),
         };
         // SAFETY: the pointer is inside the caller's page, aligned, and nothing
@@ -264,15 +262,14 @@ impl Trampoline {
         Ok(Self { page, parameters })
     }
 
-    /// Points the next start at `stack_top`, records which processor it is for,
-    /// and clears the flag that processor will set.
-    pub(crate) fn prepare(&self, apic_id: u32, stack_top: u64) {
+    /// Points the next start at `stack_top` and clears the flag the processor
+    /// being started will set.
+    pub(crate) fn prepare(&self, stack_top: u64) {
         // SAFETY: the block was written by `place` into a page nothing else uses,
         // and only one processor is ever being started at a time, so nothing else
         // is reading these while they are written.
         unsafe {
             (&raw mut (*self.parameters).stack_top).write(stack_top);
-            (&raw mut (*self.parameters).apic_id).write(apic_id);
             self.started().store(0, Ordering::Release);
         }
     }
@@ -291,12 +288,9 @@ impl Trampoline {
 
     /// The eight-bit page number a startup command names this page by.
     pub(crate) fn vector(&self) -> u8 {
-        narrow_page(self.page.as_u64() / PAGE_SIZE)
+        narrow_page(self.page.as_u64() / crate::PAGE)
     }
 }
-
-/// Bytes in the page a startup command's vector selects.
-const PAGE_SIZE: u64 = 4096;
 
 /// The blob, as bytes.
 fn blob() -> &'static [u8] {
@@ -329,13 +323,13 @@ const fn wide(value: usize) -> u64 {
     value as u64
 }
 
-/// The five descriptors the trampoline loads.
+/// The four descriptors the trampoline loads.
 ///
 /// Only one of them contains an address. Basing the 32-bit code segment at the
 /// page is what lets the first far jump name its target as an offset from the
 /// start of the blob, which the assembler can compute, instead of a linear
 /// address that only run-time code knows.
-fn table(page: u64) -> [u64; 5] {
+fn table(page: u64) -> [u64; 4] {
     /// Bits the access byte occupies: present, privilege, and what kind of
     /// segment this is.
     const ACCESS: u32 = 40;
@@ -353,13 +347,7 @@ fn table(page: u64) -> [u64; 5] {
     /// Long mode.
     const LONG: u64 = 0x2 << FLAGS;
 
-    [
-        0,
-        CODE | WIDTH32 | based(page),
-        DATA | WIDTH32,
-        CODE | LONG,
-        DATA | WIDTH32,
-    ]
+    [0, CODE | WIDTH32 | based(page), DATA | WIDTH32, CODE | LONG]
 }
 
 /// A descriptor's base address, which the architecture splits across three

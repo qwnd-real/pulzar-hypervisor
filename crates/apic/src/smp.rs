@@ -21,6 +21,15 @@
 //! which is what lets the trampoline's parameter block be rewritten between
 //! processors instead of one existing per processor.
 //!
+//! # Never twice
+//!
+//! A startup command sent to a processor that is already running does not do
+//! nothing: `INIT` resets it. So a processor is only ever a target if it is not
+//! already one of the machine's, and firmware describing the same processor
+//! twice — which its tables have two ways of doing — cannot turn into two
+//! attempts. That is also what makes starting the rest of the machine later, or
+//! twice, safe rather than catastrophic.
+//!
 //! # The mapping that has to exist while this runs
 //!
 //! The trampoline turns paging on while executing at a low physical address,
@@ -32,16 +41,16 @@
 //! unmapped here, and the unmapping is what tells every processor that just
 //! used it to forget it.
 
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use cpu::ApicId;
-use descriptors::Vector;
 use log::{info, warn};
-use paging::{CacheType, Protection};
+use paging::{CacheType, Protection, Stack};
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::{
-    ApicError, LocalApic,
+    ApicError, LocalApic, PAGE,
     icr::{Command, Delivery, Target},
     trampoline::Trampoline,
 };
@@ -80,15 +89,13 @@ const ATTACH_MICROS: u64 = 1_000_000;
 /// One past the highest address a startup command can send a processor to.
 const ONE_MIB: u64 = 1 << 20;
 
-/// Bytes in the page a startup command's vector selects.
-const PAGE_SIZE: u64 = 4096;
-
 /// What starting the other processors came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Started {
     /// How many processors are now attached, this one included.
     pub online: usize,
-    /// How many the machine's own tables described as startable.
+    /// How many distinct processors the machine's own tables described as
+    /// startable, this one included.
     pub startable: usize,
 }
 
@@ -108,23 +115,17 @@ pub struct Started {
 /// # Errors
 ///
 /// [`ApicError::TrampolineUnreachable`] if the page is not a frame-aligned one
-/// below one megabyte, [`ApicError::Paging`] if it cannot be mapped or a stack
-/// cannot be allocated, or [`ApicError::NotInstalled`] if this processor's own
-/// controller is not up.
+/// below one megabyte, [`ApicError::Paging`] if it cannot be mapped or
+/// unmapped, [`ApicError::NotEnabled`] if this processor's own controller is
+/// not up, or whatever placing the trampoline reported.
 pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError> {
     let base = trampoline.as_u64();
-    if base >= ONE_MIB || !base.is_multiple_of(PAGE_SIZE) {
+    if base >= ONE_MIB || !base.is_multiple_of(PAGE) {
         return Err(ApicError::TrampolineUnreachable { phys: base });
     }
     let local = crate::local()?;
     let here = local.id()?;
-    let roster = cpu::roster()?;
-    let startable = roster
-        .entries()
-        .iter()
-        .filter(|entry| entry.startable() && entry.apic_id() != here)
-        .map(cpu::Entry::apic_id)
-        .collect::<alloc::vec::Vec<_>>();
+    let startable = startable()?;
 
     let root = paging::with(|space| space.root().start_address())?;
     let at = paging::with(|space| space.direct_map().ptr::<u8>(trampoline))?
@@ -141,7 +142,7 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
             space.map_region(
                 VirtAddr::new(base),
                 trampoline,
-                PAGE_SIZE,
+                PAGE,
                 Protection::ReadExecute,
                 CacheType::WriteBack,
             )
@@ -153,14 +154,7 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
     // physical address — checked above to be frame-aligned and below one
     // megabyte.
     let placed = unsafe { Trampoline::place(at.as_ptr(), trampoline, root, entry_address(main)) };
-    let result = placed.map(|trampoline| {
-        for target in startable.iter().copied() {
-            match bring_up(local, &trampoline, target) {
-                Ok(()) => info!("apic: {target} started"),
-                Err(error) => warn!("apic: {target} did not start: {error}"),
-            }
-        }
-    });
+    let result = placed.map(|trampoline| start_each(local, &trampoline, &startable, here));
 
     // Unmapped whatever happened above: leaving one executable page of the low
     // half behind would outlast the reason it existed. This is also what makes
@@ -168,27 +162,91 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
     let unmapped = paging::with(|space| {
         // SAFETY: every processor is either past the point of using this page —
         // each is waited for before the next is started — or never reached it.
-        unsafe { space.unmap_region(VirtAddr::new(base), PAGE_SIZE) }
+        unsafe { space.unmap_region(VirtAddr::new(base), PAGE) }
     })?;
 
     result?;
     unmapped?;
     Ok(Started {
-        online: cpu::online().count(),
-        startable: startable.len() + 1,
+        online: cpu::online_count(),
+        startable: startable.len(),
     })
+}
+
+/// Every processor firmware described as startable, named once each.
+///
+/// Deduplicated because a machine may describe one processor twice: the tables
+/// have two ways of naming a processor, one of them older and narrower, and
+/// firmware is free to use both. Two entries for one processor would otherwise
+/// become two startup sequences, and the second would reset a processor that
+/// the first had just brought up.
+fn startable() -> Result<Vec<ApicId>, ApicError> {
+    let mut startable = Vec::new();
+    for entry in cpu::roster()?.entries() {
+        if entry.startable() && !startable.contains(&entry.apic_id()) {
+            startable.push(entry.apic_id());
+        }
+    }
+    Ok(startable)
+}
+
+/// Takes each processor from reset to attached, one before the next.
+///
+/// Whoever is running this is skipped, and so is anyone already attached: a
+/// processor that is one of the machine's is one an `INIT` would reset rather
+/// than start.
+fn start_each(local: LocalApic, trampoline: &Trampoline, startable: &[ApicId], here: ApicId) {
+    let mut spare = None;
+    for target in startable.iter().copied() {
+        if target == here || attached(target) {
+            continue;
+        }
+        let stack = match spare.take().map_or_else(allocate_stack, Ok) {
+            Ok(stack) => stack,
+            // Every processor after this one would ask for the same thing and
+            // be refused the same way, so there is nothing to be gained by
+            // asking again.
+            Err(error) => {
+                warn!("apic: no stack for {target} or anything after it: {error}");
+                return;
+            }
+        };
+        match bring_up(local, trampoline, target, &stack) {
+            Ok(()) => info!("apic: {target} started"),
+            Err(error) => {
+                warn!("apic: {target} did not start: {error}");
+                // A processor that never executed an instruction never touched
+                // the stack it was given, so the next one can have it. One that
+                // began and did not arrive may be anywhere, and its stack has to
+                // be assumed to be under it.
+                if trampoline.started().load(Ordering::Acquire) == 0 {
+                    spare = Some(stack);
+                }
+            }
+        }
+    }
+}
+
+/// A stack for one processor to run on, out of the machine's address space.
+fn allocate_stack() -> Result<Stack, ApicError> {
+    paging::with(|space| space.allocate_stack(STACK_PAGES))?.map_err(ApicError::from)
 }
 
 /// Takes one processor from reset to attached.
 ///
 /// # Errors
 ///
-/// Whatever allocating its stack or sending it a command reported, or
-/// [`ApicError::WrongProcessor`] if it never arrived — the identifier in that
-/// case is the one that was asked for, since nothing else answered.
-fn bring_up(local: LocalApic, trampoline: &Trampoline, target: ApicId) -> Result<(), ApicError> {
-    let stack = paging::with(|space| space.allocate_stack(STACK_PAGES))??;
-    trampoline.prepare(target.get(), stack.top().as_u64());
+/// Whatever sending it a command reported, [`ApicError::NoStartupResponse`] if
+/// it never executed the first instruction of the trampoline, or
+/// [`ApicError::AttachTimeout`] if it began and never became one of the
+/// machine's.
+fn bring_up(
+    local: LocalApic,
+    trampoline: &Trampoline,
+    target: ApicId,
+    stack: &Stack,
+) -> Result<(), ApicError> {
+    trampoline.prepare(stack.top().as_u64());
 
     // Everything the processor will read has to be in memory before the command
     // that lets it read anything.
@@ -203,12 +261,20 @@ fn bring_up(local: LocalApic, trampoline: &Trampoline, target: ApicId) -> Result
             Target::One(target),
         ))?;
         sleep(STARTUP_MICROS)?;
-        if trampoline.started().load(Ordering::Acquire) != 0 {
+        if began(trampoline) {
             break;
         }
     }
+    if !began(trampoline) {
+        return Err(ApicError::NoStartupResponse { apic_id: target });
+    }
+    wait_for(target)
+}
 
-    wait_for(target, ATTACH_MICROS)
+/// Whether the processor being started has executed the first instruction of
+/// the trampoline, which it says before it does anything that could fail.
+fn began(trampoline: &Trampoline) -> bool {
+    trampoline.started().load(Ordering::Acquire) != 0
 }
 
 /// Where a function the trampoline jumps to lives.
@@ -227,18 +293,29 @@ fn entry_address(main: fn() -> !) -> u64 {
 /// one that has already begun is ignored.
 const STARTUP_COMMANDS: u32 = 2;
 
-/// Waits for `target` to appear in the roster as attached.
-fn wait_for(target: ApicId, micros: u64) -> Result<(), ApicError> {
-    for _ in 0..micros.div_ceil(POLL_MICROS) {
-        if cpu::online().any(|block| block.apic_id() == target) {
+/// Waits for `target` to become one of the machine's.
+///
+/// # Errors
+///
+/// [`ApicError::AttachTimeout`] if it never did, or [`ApicError::Clock`] if
+/// there is no timebase to wait on.
+fn wait_for(target: ApicId) -> Result<(), ApicError> {
+    for _ in 0..ATTACH_MICROS.div_ceil(POLL_MICROS) {
+        if attached(target) {
             return Ok(());
         }
         sleep(POLL_MICROS)?;
     }
-    Err(ApicError::WrongProcessor {
-        expected: target,
-        found: target,
-    })
+    Err(ApicError::AttachTimeout { apic_id: target })
+}
+
+/// Whether a processor is already one of the machine's.
+///
+/// Attached rather than started, which is the distinction the whole of this
+/// module turns on: a processor is only something other processors may send
+/// interrupts to and wait on once it has published a block of its own.
+fn attached(target: ApicId) -> bool {
+    cpu::online().any(|block| block.apic_id() == target)
 }
 
 /// How long each wait for a processor to arrive lasts before looking again.
@@ -252,11 +329,3 @@ const POLL_MICROS: u64 = 1_000;
 fn sleep(micros: u64) -> Result<(), ApicError> {
     clock::sleep_micros(micros).map_err(|_| ApicError::Clock)
 }
-
-/// The vector nothing here uses, named so that the range interprocessor
-/// interrupts are taken from cannot quietly grow into the two this crate owns.
-const _: () = assert!(
-    crate::SPURIOUS.number() > Vector::FIRST_EXTERNAL.number()
-        && crate::ERROR.number() > Vector::FIRST_EXTERNAL.number(),
-    "the apic's own vectors must be ones the platform may assign"
-);

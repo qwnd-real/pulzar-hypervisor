@@ -145,8 +145,16 @@ impl Command {
     /// # Errors
     ///
     /// [`ApicError::IdTooWide`] if the target's identifier does not fit the
-    /// interface in use.
+    /// interface in use, or [`ApicError::IllegalVector`] if the command names a
+    /// vector no controller may deliver — which a controller answers by
+    /// delivering nothing and latching an error, so that the interrupt a caller
+    /// is waiting for simply never arrives.
     pub(crate) const fn bits(self, mode: Mode) -> Result<u64, ApicError> {
+        if let Delivery::Fixed(vector) = self.delivery
+            && !crate::deliverable(vector)
+        {
+            return Err(ApicError::IllegalVector { vector });
+        }
         let destination = match self.target.destination(mode) {
             Ok(destination) => destination,
             Err(error) => return Err(error),

@@ -107,18 +107,6 @@ pub enum Divisor {
 }
 
 impl Divisor {
-    /// Every divisor, so a caller can search them without repeating the list.
-    pub const ALL: [Self; 8] = [
-        Self::By1,
-        Self::By2,
-        Self::By4,
-        Self::By8,
-        Self::By16,
-        Self::By32,
-        Self::By64,
-        Self::By128,
-    ];
-
     /// The divide configuration register's encoding.
     ///
     /// Bit 2 of the field is not used, so the three meaningful bits are 0, 1
@@ -135,36 +123,22 @@ impl Divisor {
             Self::By128 => 0b1010,
         }
     }
-
-    /// How many input ticks make one the timer counts.
-    #[must_use]
-    pub const fn ratio(self) -> u32 {
-        match self {
-            Self::By1 => 1,
-            Self::By2 => 2,
-            Self::By4 => 4,
-            Self::By8 => 8,
-            Self::By16 => 16,
-            Self::By32 => 32,
-            Self::By64 => 64,
-            Self::By128 => 128,
-        }
-    }
 }
 
 /// The timer of whichever processor is holding this.
 ///
-/// Zero-sized for the same reason [`LocalApic`] is: every register it drives is
-/// reached the same way on every processor and answers about the processor
-/// doing the reaching, so there is nothing for a handle to carry and a handle
-/// that named a processor would be one that could be wrong.
+/// Carries nothing for the same reason [`LocalApic`] carries nothing: every
+/// register it drives is reached the same way on every processor and answers
+/// about the processor doing the reaching, so a handle that named one would be
+/// a handle that could be wrong. Like that one, it is made only from a
+/// controller that is up, and only inside this crate.
 #[derive(Clone, Copy, Debug)]
-pub struct Timer;
+pub struct Timer(());
 
 impl Timer {
     /// This processor's timer.
     pub(crate) const fn new(_: LocalApic) -> Self {
-        Self
+        Self(())
     }
 
     /// Stops the timer and stops it delivering.
@@ -174,17 +148,30 @@ impl Timer {
     /// periodic mode is how the architecture spells "stopped" but leaves the
     /// entry armed for whoever writes a count next.
     ///
+    /// A deadline is a third thing to put down. Changing the mode disarms the
+    /// timer, so a masked entry is already enough to stop the interrupt — but
+    /// the deadline itself sits in a register of its own and would still be
+    /// there, describing a moment in the past, for whoever reads it next.
+    ///
     /// # Errors
     ///
     /// [`ApicError::NotInstalled`] if this processor's controller is not up.
     pub fn disarm(self) -> Result<(), ApicError> {
         let access = crate::register::access()?;
+        let was = Mode::of(access.read(Register::LVT_TIMER));
         // SAFETY: zero is the architectural way to stop a counting timer, and a
         // masked entry with a valid vector delivers nothing. Neither can produce
         // an interrupt, which is the whole point of doing them.
         unsafe {
             access.write(Register::TIMER_INITIAL_COUNT, 0);
             access.write(Register::LVT_TIMER, Entry::masked().bits());
+        }
+        if matches!(was, Some(Mode::Deadline)) {
+            // SAFETY: the entry the timer was holding says it was counting
+            // against a deadline, which only a processor that implements the
+            // register can be doing, and zero is what the architecture defines
+            // as no deadline at all.
+            unsafe { Msr::new(IA32_TSC_DEADLINE).write(0) };
         }
         Ok(())
     }
@@ -198,6 +185,7 @@ impl Timer {
     ///
     /// # Errors
     ///
+    /// [`ApicError::IllegalVector`] for a vector no controller may deliver;
     /// [`ApicError::ZeroCount`] for a count of zero, which the architecture
     /// reads as "stopped" rather than as "immediately" and which would leave a
     /// caller waiting for an interrupt that never comes;
@@ -211,6 +199,9 @@ impl Timer {
         divisor: Divisor,
         count: u32,
     ) -> Result<(), ApicError> {
+        if !crate::deliverable(vector) {
+            return Err(ApicError::IllegalVector { vector });
+        }
         if matches!(mode, Mode::Deadline) {
             return Err(ApicError::WrongTimerMode);
         }
@@ -238,10 +229,14 @@ impl Timer {
     ///
     /// # Errors
     ///
+    /// [`ApicError::IllegalVector`] for a vector no controller may deliver,
     /// [`ApicError::NoTscDeadline`] if the processor does not implement the
     /// mode, or [`ApicError::NotInstalled`] if this processor's controller is
     /// not up.
     pub fn arm_deadline(self, vector: Vector, deadline: u64) -> Result<(), ApicError> {
+        if !crate::deliverable(vector) {
+            return Err(ApicError::IllegalVector { vector });
+        }
         if !processor::features().contains(Features::TSC_DEADLINE) {
             return Err(ApicError::NoTscDeadline);
         }
@@ -288,6 +283,12 @@ impl Timer {
     /// The entry is masked throughout, so the count reaching zero during a
     /// measurement — which it should not, but a machine with a very fast bus
     /// clock and a slow caller could — delivers nothing.
+    ///
+    /// The span is bracketed by two timebase readings with the count read
+    /// between them, so it covers one register read more than it counted ticks
+    /// for. Over ten milliseconds that is around a hundred-thousandth of the
+    /// answer, which is orders of magnitude inside the tolerance of the crystal
+    /// being measured.
     ///
     /// # Errors
     ///

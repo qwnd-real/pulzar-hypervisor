@@ -18,6 +18,17 @@
 //! APIC description table's compatibility flag, so this is not done to a
 //! machine that has none: writing to ports nothing answers on is how a machine
 //! that never had 8259s gets a configuration it did not have.
+//!
+//! # What is deliberately not written
+//!
+//! A machine old enough to have these may also have an interrupt mode
+//! configuration register, which is how the pre-ACPI world moved the interrupt
+//! line running straight from the 8259 to the boot processor over to the APICs.
+//! Pulzar does not write it. It is a change to how the platform is wired rather
+//! than to what this hypervisor does with it, and it buys nothing here: every
+//! input is masked, so nothing asserts down either path, and the local
+//! controller's first pin — the other end of that wiring — is masked too unless
+//! firmware described it as a non-maskable interrupt.
 
 use x86_64::instructions::port::Port;
 

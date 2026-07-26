@@ -135,18 +135,6 @@ impl Entry {
         Self(bits)
     }
 
-    /// The same entry, masked.
-    #[must_use]
-    pub const fn mask(self) -> Self {
-        Self(self.0 | Bits::MASKED.bits())
-    }
-
-    /// Whether this entry delivers anything.
-    #[must_use]
-    pub const fn is_masked(self) -> bool {
-        self.0 & Bits::MASKED.bits() != 0
-    }
-
     /// The entry as the register holds it.
     pub(crate) const fn bits(self) -> u32 {
         self.0
