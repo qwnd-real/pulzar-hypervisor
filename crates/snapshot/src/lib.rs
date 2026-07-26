@@ -60,7 +60,7 @@
 
 mod segments;
 
-use apic::FirmwareState;
+use apic::{Controller, FirmwareState};
 use log::info;
 use paging::DirectMap;
 use svm::SaveArea;
@@ -185,6 +185,12 @@ impl FirmwareContext {
     fn describe_interrupts(&self, who: &str) {
         let apic = &self.interrupts;
         let local = &apic.local;
+        // Said first, because everything below it is zero when the controller
+        // was not read and zeros that mean "not read" look exactly like zeros
+        // that were read.
+        if apic.controller != Controller::Read {
+            info!("{who}: firmware apic not read: {:?}", apic.controller);
+        }
         info!(
             "{who}: firmware apic base {:#x}, id {:#x}, version {:#x}",
             apic.base, local.id, local.version
