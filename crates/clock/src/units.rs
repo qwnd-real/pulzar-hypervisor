@@ -90,6 +90,19 @@ impl Frequency {
     pub fn ticks(self, nanos: u64) -> u64 {
         narrow(u128::from(nanos) * u128::from(self.hz()) / u128::from(NANOS_PER_SECOND))
     }
+
+    /// The same rounded up, which is what a delay wants.
+    ///
+    /// A wait is specified as a minimum — the pause between the steps of a
+    /// startup sequence is the shortest one the processor will accept, not a
+    /// target to land near — so a conversion that rounded down would let the
+    /// wait end a tick before the span the caller asked for. One tick is
+    /// nothing on a timestamp counter and seventy nanoseconds on an event
+    /// timer, but it is on the wrong side.
+    #[must_use]
+    pub fn ticks_ceil(self, nanos: u64) -> u64 {
+        narrow((u128::from(nanos) * u128::from(self.hz())).div_ceil(u128::from(NANOS_PER_SECOND)))
+    }
 }
 
 // Converted at compile time, so that a change to the arithmetic cannot quietly

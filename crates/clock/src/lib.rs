@@ -201,11 +201,14 @@ impl Clock {
     /// steps, and little else — where the wait is microseconds long and there
     /// is nothing else for the processor to be doing. It is not a
     /// scheduling primitive and must not become one.
+    ///
+    /// Those pauses are minimums, so the conversion rounds up: waiting a tick
+    /// less than asked for is the one outcome a caller cannot check for.
     pub fn sleep_micros(&self, micros: u64) {
         let ticks = self
             .source
             .frequency()
-            .ticks(micros.saturating_mul(NANOS_PER_MICRO));
+            .ticks_ceil(micros.saturating_mul(NANOS_PER_MICRO));
         let started = self.source.read();
         while self.source.difference(started, self.source.read()) < ticks {
             core::hint::spin_loop();
