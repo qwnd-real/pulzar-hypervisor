@@ -147,8 +147,12 @@ impl Clock {
         // machine as soon as it has.
         if processor::features().contains(Features::INVARIANT_TSC) {
             let measured = tsc::calibrate(borrowed.counter());
-            borrowed.release(space)?;
+            let released = borrowed.release(space);
+            // The measurement's verdict is read first. A mapping that would not
+            // come back is worth reporting, but not in place of the reason
+            // there is no clock at all.
             let (frequency, calibration) = measured?;
+            released?;
             return Ok(Self::publish(
                 tsc::counter(frequency),
                 boot,
