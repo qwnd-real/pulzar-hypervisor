@@ -24,12 +24,14 @@
 //! is how the loader reaches page-table frames while it is still running under
 //! firmware's address space and building ours.
 
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{PageTable, PhysFrame, mapper::PageTableFrameMapping},
 };
+
+use crate::{PagingError, as_u64};
 
 /// A linear physical-to-virtual relation: `virt = base + phys`, valid for the
 /// first `size` bytes of physical memory.
@@ -89,6 +91,71 @@ impl DirectMap {
         (virt.as_u64() % align_of::<T>() as u64 == 0)
             .then(|| NonNull::new(virt.as_mut_ptr::<T>()))
             .flatten()
+    }
+
+    /// Copies `into.len()` bytes of physical memory out of the window.
+    ///
+    /// # Errors
+    ///
+    /// [`PagingError::Unreachable`] if any byte of the range falls outside the
+    /// window. The whole range is checked, not just where it starts.
+    ///
+    /// # Safety
+    ///
+    /// The range must be memory the caller is entitled to read, and none of it
+    /// may alias anything the hypervisor holds a Rust reference to. A range
+    /// something else is writing at the same time yields what a non-atomic copy
+    /// of it would, which is the answer the hardware gives too.
+    pub unsafe fn read(&self, phys: PhysAddr, into: &mut [u8]) -> Result<(), PagingError> {
+        let from = self.reach(phys, into.len())?;
+        // SAFETY: `reach` proved every byte of the source lies inside the window,
+        // so it is valid for `into.len()` bytes. The caller guarantees the range
+        // is theirs to read and aliases no live reference, which is what rules
+        // out the destination overlapping it.
+        unsafe { ptr::copy_nonoverlapping(from.as_ptr::<u8>(), into.as_mut_ptr(), into.len()) };
+        Ok(())
+    }
+
+    /// Copies `from.len()` bytes of physical memory into the window.
+    ///
+    /// # Errors
+    ///
+    /// [`PagingError::Unreachable`] if any byte of the range falls outside the
+    /// window.
+    ///
+    /// # Safety
+    ///
+    /// The range must be memory the caller owns or is entitled to overwrite,
+    /// and none of it may alias anything the hypervisor holds a Rust
+    /// reference to.
+    pub unsafe fn write(&self, phys: PhysAddr, from: &[u8]) -> Result<(), PagingError> {
+        let into = self.reach(phys, from.len())?;
+        // SAFETY: as in `read`, with the roles reversed: the destination is the
+        // range `reach` checked, and the caller guarantees it is theirs to write
+        // and aliases nothing.
+        unsafe { ptr::copy_nonoverlapping(from.as_ptr(), into.as_mut_ptr::<u8>(), from.len()) };
+        Ok(())
+    }
+
+    /// Where a run of `len` bytes from `phys` begins, provided all of it is
+    /// inside the window.
+    ///
+    /// [`DirectMap::virt`] answers for one address, which is not the same
+    /// question: a range starting just below the top of the window can end
+    /// above it, and a copy that trusted the start alone would run off the
+    /// end of the mapping into whatever the next region is.
+    fn reach(&self, phys: PhysAddr, len: usize) -> Result<VirtAddr, PagingError> {
+        let unreachable = || PagingError::Unreachable {
+            phys: phys.as_u64(),
+        };
+        let end = phys
+            .as_u64()
+            .checked_add(as_u64(len))
+            .ok_or_else(unreachable)?;
+        if end > self.size {
+            return Err(unreachable());
+        }
+        self.virt(phys).ok_or_else(unreachable)
     }
 }
 
