@@ -98,7 +98,18 @@ impl Counter {
     /// Correct across one wrap and no more, which is what
     /// [`Counter::can_span`] exists to establish before a measurement rather
     /// than after it.
+    ///
+    /// A counter as wide as the value holding it is the exception, and
+    /// deliberately so: wrapping one takes a century of uptime, so a reading
+    /// below the one it is compared against is far more likely a counter that
+    /// went *backwards* — another processor's timestamp counter, which counts
+    /// at the same rate as this one but need not have started from the same
+    /// value. Answering zero is wrong by that offset. Answering with a wrap
+    /// would be wrong by five hundred years.
     pub(crate) const fn difference(&self, earlier: u64, later: u64) -> u64 {
+        if self.bits >= u64::BITS {
+            return later.saturating_sub(earlier);
+        }
         later.wrapping_sub(earlier) & self.mask()
     }
 

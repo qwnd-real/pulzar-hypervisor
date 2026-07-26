@@ -51,6 +51,24 @@
 //! the interrupt paths — is exactly the code with no address space or subsystem
 //! handle to hand. Before the clock is installed those functions say so rather
 //! than answer from a guess.
+//!
+//! # Which processor is asking
+//!
+//! Every function here answers from whichever processor calls it, and two of
+//! them measure from a reading the *installing* processor took. An invariant
+//! timestamp counter is invariant in rate rather than in origin: the
+//! architecture promises that every core counts at the same speed, not that
+//! they all started from the same value. Firmware synchronizes them on the
+//! machines pulzar runs on, and no processor can confirm that on its own.
+//!
+//! So the arithmetic is arranged to fail small rather than spectacularly. A
+//! processor whose counter started from a different value than the installing
+//! one's reads an uptime off by that difference, floored at zero — not one five
+//! hundred years long, because a full-width counter reading below what it is
+//! compared against is taken as a counter that went backwards rather than one
+//! that came round. Delays are unaffected whoever asks: [`Clock::sleep_micros`]
+//! measures from a reading it takes itself, so only the rate matters, and the
+//! rate is the property the architecture actually guarantees.
 
 #![no_std]
 
@@ -155,12 +173,19 @@ impl Clock {
     }
 
     /// How long the clock has been running.
+    ///
+    /// Measured from the reading the installing processor took, so a processor
+    /// whose timestamp counter started from a different value reads an uptime
+    /// off by that difference, floored at zero. See the crate documentation.
     #[must_use]
     pub fn now(&self) -> Instant {
         Instant::from_nanos(self.source.nanos_since(self.origin))
     }
 
     /// What time it is, or `None` if firmware reported no time to count from.
+    ///
+    /// Firmware's reading plus [`Clock::now`], and so carries that reading's
+    /// dependence on which processor is asking.
     #[must_use]
     pub fn wall_clock(&self) -> Option<Wall> {
         self.boot.map(|boot| boot.after(self.now().nanos()))

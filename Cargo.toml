@@ -12,6 +12,7 @@ members = [
     "crates/ipi",
     "crates/npt",
     "crates/paging",
+    "crates/partition",
     "crates/pci",
     "crates/processor",
     "crates/serial",
@@ -51,7 +52,8 @@ uefi-raw = "0.15.1"
 # states what the processor's virtualization structures look like; `snapshot`
 # is what firmware was running with, read before any of it is overwritten;
 # `npt` is the second set of page tables a guest's memory is described by, and
-# `vcpu` is what turns the extension on and runs a guest on one processor.
+# `vcpu` is what turns the extension on and runs a guest on one processor, and
+# `partition` is the guest those processors are running.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -61,6 +63,7 @@ handoff = { path = "crates/handoff" }
 ipi = { path = "crates/ipi" }
 npt = { path = "crates/npt" }
 paging = { path = "crates/paging" }
+partition = { path = "crates/partition" }
 pci = { path = "crates/pci" }
 processor = { path = "crates/processor" }
 snapshot = { path = "crates/snapshot" }
