@@ -133,9 +133,11 @@ impl Clock {
         boot: Option<Wall>,
     ) -> Result<Self, ClockError> {
         // Claimed before any hardware is touched, so a second caller cannot
-        // start an event timer that the first is already reading.
+        // start an event timer that the first is already reading. Relaxed on
+        // both sides: nothing travels through this flag, and the clock itself
+        // is published by a `Once`, which carries the ordering that matters.
         if CLAIMED
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
             return Err(ClockError::AlreadyInstalled);
