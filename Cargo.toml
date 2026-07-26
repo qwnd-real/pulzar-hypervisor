@@ -11,6 +11,7 @@ members = [
     "crates/hv-loader",
     "crates/ipi",
     "crates/paging",
+    "crates/pci",
     "crates/processor",
     "crates/serial",
     "crates/xtask",
@@ -42,7 +43,8 @@ uefi-raw = "0.15.1"
 # `processor` answers what the processor underneath all of them can do; `clock`
 # turns the machine's counters into time; `cpu` answers which processors the
 # machine has and which one is running; `apic` drives their interrupt
-# controllers and starts them; `ipi` is how one of them reaches another.
+# controllers and starts them; `ipi` is how one of them reaches another; `pci`
+# is what the machine has plugged into it.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -51,6 +53,7 @@ descriptors = { path = "crates/descriptors" }
 handoff = { path = "crates/handoff" }
 ipi = { path = "crates/ipi" }
 paging = { path = "crates/paging" }
+pci = { path = "crates/pci" }
 processor = { path = "crates/processor" }
 
 # `CPUID` decoding, so no leaf number or feature bit position is written out by
@@ -61,6 +64,12 @@ raw-cpuid = "11.6"
 # Flag sets, for the places a group of related bits is one value: a processor's
 # feature set, a hardware register's fields.
 bitflags = "2.13"
+
+# Packed register layouts, for the places bits are not a set but a struct: a
+# field here, a flag there, reserved bits between them. Declaring the layout
+# once is what keeps a shift and a mask from being written out by hand at every
+# use, and what makes a field that does not fit its register a compile error.
+bitfield-struct = "0.13"
 
 # Firmware-side logging stack: `log` is the facade the binaries log through,
 # `serial` is this workspace's 16550 UART backend behind it, `spin` supplies

@@ -12,6 +12,7 @@ use descriptors::DescriptorError;
 use handoff::HandoffError;
 use ipi::IpiError;
 use paging::PagingError;
+use pci::PciError;
 use thiserror::Error;
 use uefi_raw::Status;
 
@@ -45,6 +46,9 @@ pub enum CoreError {
     /// Interprocessor interrupts could not be set up.
     #[error(transparent)]
     Ipi(#[from] IpiError),
+    /// The machine's devices could not be surveyed.
+    #[error(transparent)]
+    Pci(#[from] PciError),
     /// The allocator would not take the span reserved for the heap, which can
     /// only mean it is too small to hold the allocator's own bookkeeping.
     #[error("the allocator refused the {bytes:#x}-byte heap at {base:#x}")]

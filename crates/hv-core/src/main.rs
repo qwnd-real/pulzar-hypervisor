@@ -53,6 +53,7 @@ use descriptors::{Descriptors, Interrupt, halt};
 use handoff::{Handoff, HandoffError};
 use log::{error, info, warn};
 use paging::{AddressSpace, CacheType, Existing, PagingError, Protection, chunk};
+use pci::Pci;
 use uefi_raw::Status;
 use x86_64::{PhysAddr, VirtAddr, instructions::interrupts, structures::paging::PhysFrame};
 
@@ -168,6 +169,14 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     apic.describe("core");
     cpu::attach(apic::local()?.id()?)?;
     ipi::install()?;
+
+    // Last of the subsystems that take the address space by value, and
+    // deliberately so. It maps and releases a range per bus, which costs nothing
+    // while this is the only processor running and an interprocessor interrupt
+    // per processor per release once the others are up — so it belongs before
+    // `apic::start` — and it is by far the largest consumer of the mapping
+    // window, so everything the machine needs to run has already taken its share.
+    Pci::install(&mut space, &acpi)?.describe("core");
 
     // The last use of the address space as a value. From here it belongs to the
     // machine rather than to this function, and every processor reaches the same
