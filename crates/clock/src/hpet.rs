@@ -140,15 +140,12 @@ pub(crate) fn open(space: &mut AddressSpace, base: PhysAddr) -> Result<Borrowed,
     match probe(registers) {
         Ok((counter, started)) => Ok(Borrowed::new(counter, Some(mapping), started)),
         Err(error) => {
-            // The block is unusable, so its mapping serves nothing. An error
-            // from releasing it is dropped rather than returned: it would
-            // replace the reason the block was refused, which is the more
-            // useful of the two.
-            let _ = unsafe {
-                // SAFETY: nothing derived from the mapping outlives this call —
-                // `probe` failed, so no counter was built from it.
-                space.unmap(mapping)
-            };
+            // SAFETY: nothing derived from the mapping outlives this call —
+            // `probe` failed, so no counter was built from it. The result is
+            // discarded rather than returned: an error from releasing a mapping
+            // that now serves nothing would replace the reason the block was
+            // refused, which is the more useful of the two.
+            let _ = unsafe { space.unmap(mapping) };
             Err(error)
         }
     }

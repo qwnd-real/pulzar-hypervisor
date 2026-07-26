@@ -346,6 +346,12 @@ pub enum ClockError {
     },
     /// The reference would wrap inside the calibration window, so no difference
     /// across it could be believed.
+    ///
+    /// A guard on the arithmetic rather than on any machine that exists: the
+    /// narrowest reference this crate will pick is a 24-bit power management
+    /// timer, which spans four seconds against a ten-millisecond window. It is
+    /// kept because what makes the measurement sound is the check, not the
+    /// happy accident that both of today's counters pass it.
     #[error("the {reference} is {bits} bits wide, too narrow to calibrate against")]
     ReferenceTooNarrow {
         /// The counter in question.

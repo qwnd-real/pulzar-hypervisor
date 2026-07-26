@@ -29,10 +29,7 @@ const REGISTER_BYTES: u64 = 4;
 const ALIGN: u64 = REGISTER_BYTES;
 
 /// The rate ACPI fixes for the timer.
-const FREQUENCY: Frequency = Frequency::new(match NonZeroU64::new(PmTimer::FREQUENCY) {
-    Some(hz) => hz,
-    None => unreachable!(),
-});
+const FREQUENCY: Frequency = Frequency::new(NonZeroU64::new(PmTimer::FREQUENCY).unwrap());
 
 /// Opens the timer firmware described.
 ///
