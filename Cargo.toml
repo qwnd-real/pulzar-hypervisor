@@ -14,6 +14,7 @@ members = [
     "crates/pci",
     "crates/processor",
     "crates/serial",
+    "crates/svm",
     "crates/xtask",
 ]
 
@@ -43,8 +44,8 @@ uefi-raw = "0.15.1"
 # `processor` answers what the processor underneath all of them can do; `clock`
 # turns the machine's counters into time; `cpu` answers which processors the
 # machine has and which one is running; `apic` drives their interrupt
-# controllers and starts them; `ipi` is how one of them reaches another; `pci`
-# is what the machine has plugged into it.
+# controllers and starts them; `ipi` is how one of them reaches another; `svm`
+# states what the processor's virtualization structures look like.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -55,6 +56,7 @@ ipi = { path = "crates/ipi" }
 paging = { path = "crates/paging" }
 pci = { path = "crates/pci" }
 processor = { path = "crates/processor" }
+svm = { path = "crates/svm" }
 
 # `CPUID` decoding, so no leaf number or feature bit position is written out by
 # hand. No features enabled: the crate is `no_std` as it stands, and the

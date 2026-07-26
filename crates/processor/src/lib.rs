@@ -11,6 +11,12 @@
 //! that something might would put a bit position in the codebase that no code
 //! reads.
 //!
+//! [`svm`] is the deliberate exception. Its leaf is read whole, because those
+//! bits do not merely gate behaviour — they describe which fields the
+//! virtualization structures actually have, and a hypervisor that guesses
+//! wrong there builds a control block the processor reads differently than it
+//! was written.
+//!
 //! # Why one answer serves every processor
 //!
 //! The answer is read on the first call and kept, which is sound because none
@@ -26,10 +32,14 @@
 
 #![no_std]
 
+pub mod svm;
+
 use bitflags::bitflags;
 use log::info;
 use raw_cpuid::{ApmInfo, CpuId, ExtendedProcessorFeatureIdentifiers, FeatureInfo};
 use spin::Once;
+
+pub use crate::svm::{Svm, SvmFeatures, svm};
 
 bitflags! {
     /// The processor features pulzar adapts to or refuses to run without.
