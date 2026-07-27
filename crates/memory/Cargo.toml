@@ -1,0 +1,22 @@
+# `per-package-target` lets this manifest pin its own build target, so the
+# workspace needs no global default and host-side crates coexist with UEFI
+# ones under a plain `cargo build`.
+cargo-features = ["per-package-target"]
+
+[package]
+name = "memory"
+description = "What a guest's addresses mean, and how the hypervisor reaches what is behind them"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+forced-target = "x86_64-unknown-uefi"
+
+[dependencies]
+npt = { workspace = true }
+paging = { workspace = true }
+svm = { workspace = true }
+thiserror = { workspace = true }
+x86_64 = { workspace = true }
+
+[lints]
+workspace = true

@@ -536,6 +536,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory"
+version = "0.1.0"
+dependencies = [
+ "npt",
+ "paging",
+ "svm",
+ "thiserror",
+ "x86_64",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -593,6 +604,7 @@ dependencies = [
 name = "paging"
 version = "0.1.0"
 dependencies = [
+ "bitfield-struct",
  "log",
  "processor",
  "spin",
