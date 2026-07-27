@@ -312,6 +312,54 @@ impl Npt {
         (0..bytes / page).try_for_each(|index| self.interpose(frames, gpa + index * page, trap))
     }
 
+    /// Maps immutable pages of the owned chunk for guest access before first
+    /// entry.
+    ///
+    /// The regular owned-memory rule maps every chunk page to shared zeroes.
+    /// This is the narrow exception for immutable entry code and its
+    /// parameters, whose only job is to transfer from the captured firmware
+    /// state into the preloaded guest. The range remains read-only, so it
+    /// cannot become writable guest-controlled hypervisor memory.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::TrapGeometry`] unless the range is a whole number of pages
+    /// on page boundaries, [`NptError::OutsideOwned`] if it leaves the chunk,
+    /// or an error from building the required nested tables.
+    pub fn expose(
+        &mut self,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+        bytes: u64,
+        exposure: Exposure,
+    ) -> Result<(), NptError> {
+        let page = Level::Page.span();
+        if bytes == 0 || !gpa.as_u64().is_multiple_of(page) || !bytes.is_multiple_of(page) {
+            return Err(NptError::TrapGeometry {
+                gpa: gpa.as_u64(),
+                bytes,
+            });
+        }
+        if !self.owned.contains(gpa) || !self.owned.contains(gpa + bytes - 1) {
+            return Err(NptError::OutsideOwned {
+                gpa: gpa.as_u64(),
+                bytes,
+            });
+        }
+        (0..bytes / page).try_for_each(|index| {
+            let page = gpa + index * page;
+            walk::map(
+                self.window,
+                self.root,
+                page,
+                Level::Page,
+                page,
+                exposure.flags(),
+                frames,
+            )
+        })
+    }
+
     /// Logs the shape of the translation, which is the whole of what a guest's
     /// view of memory is.
     pub fn describe(&self, who: &str) {
@@ -477,6 +525,29 @@ pub enum Resolution {
     Trapped,
 }
 
+/// Access permitted to a guest-visible page owned by the hypervisor.
+///
+/// Writable is intentionally not representable: exposed pages are a narrow
+/// transfer mechanism, never guest-owned memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exposure {
+    /// Readable and non-executable.
+    ReadOnly,
+    /// Readable and executable.
+    ReadExecute,
+}
+
+impl Exposure {
+    /// Nested page-table flags implementing this access.
+    const fn flags(self) -> PageTableFlags {
+        let present = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
+        match self {
+            Self::ReadOnly => present.union(PageTableFlags::NO_EXECUTE),
+            Self::ReadExecute => present,
+        }
+    }
+}
+
 /// Where a guest physical address really is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Translation {
@@ -548,6 +619,14 @@ pub enum NptError {
         /// Where the region begins.
         gpa: u64,
         /// How long it is.
+        bytes: u64,
+    },
+    /// A guest-visible chunk mapping was requested outside the chunk.
+    #[error("guest exposure at {gpa:#x} of {bytes:#x} bytes leaves the hypervisor chunk")]
+    OutsideOwned {
+        /// Guest physical base requested.
+        gpa: u64,
+        /// Bytes requested.
         bytes: u64,
     },
     /// More regions were trapped than these tables have room to remember.
@@ -648,6 +727,15 @@ fn frame(frames: &mut Frames, window: DirectMap) -> Result<PhysAddr, NptError> {
 const _: () = assert!(
     chunk::CHUNK_SIZE.is_multiple_of(Level::Directory.span()),
     "the shadow describes the chunk in whole 2 MiB regions",
+);
+const _: () = assert!(
+    !Exposure::ReadOnly
+        .flags()
+        .contains(PageTableFlags::WRITABLE)
+        && !Exposure::ReadExecute
+            .flags()
+            .contains(PageTableFlags::WRITABLE),
+    "guest-callable portal pages must remain immutable",
 );
 const _: () = assert!(
     chunk::CHUNK_ALIGN.is_multiple_of(Level::Directory.span()),

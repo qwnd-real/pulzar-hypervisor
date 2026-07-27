@@ -52,6 +52,8 @@ pub struct Handoff {
     pub loader_image_base: u64,
     /// Byte length of the loader's image, page-aligned.
     pub loader_image_size: u64,
+    /// Handle of the Windows Boot Manager image firmware loaded for the guest.
+    pub guest_image_handle: Handle,
 
     /// Physical base of the reserved chunk, 2 MiB aligned. This is the only
     /// memory the hypervisor owns.
@@ -149,7 +151,7 @@ impl Handoff {
     pub const MAGIC: u64 = u64::from_le_bytes(*b"PULZARH1");
 
     /// Current protocol version.
-    pub const VERSION: u32 = 5;
+    pub const VERSION: u32 = 6;
 
     /// Validates `ptr` and borrows the handoff behind it.
     ///

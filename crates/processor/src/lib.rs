@@ -38,7 +38,7 @@ use bitflags::bitflags;
 use log::info;
 use raw_cpuid::{
     ApmInfo, CpuId, ExtendedProcessorFeatureIdentifiers, FeatureInfo,
-    ProcessorCapacityAndFeatureInfo,
+    ProcessorCapacityAndFeatureInfo, native_cpuid::cpuid_count,
 };
 use spin::Once;
 
@@ -167,6 +167,35 @@ pub fn physical_address_bits() -> u8 {
                 ProcessorCapacityAndFeatureInfo::physical_address_bits,
             )
     })
+}
+
+/// The four registers returned by one raw `CPUID` query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuidResult {
+    /// Accumulator result.
+    pub eax: u32,
+    /// Base-register result.
+    pub ebx: u32,
+    /// Count-register result.
+    pub ecx: u32,
+    /// Data-register result.
+    pub edx: u32,
+}
+
+/// Executes the raw CPUID leaf and subleaf requested by a guest.
+///
+/// Feature discovery inside the hypervisor uses the cached typed queries
+/// above. This raw form exists for virtualization, where the guest chooses the
+/// leaf and policy edits the returned words before exposing them.
+#[must_use]
+pub fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
+    let result = cpuid_count(leaf, subleaf);
+    CpuidResult {
+        eax: result.eax,
+        ebx: result.ebx,
+        ecx: result.ecx,
+        edx: result.edx,
+    }
 }
 
 /// What a processor whose `CPUID` does not describe its address widths

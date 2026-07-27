@@ -13,6 +13,7 @@ forced-target = "x86_64-unknown-uefi"
 
 [dependencies]
 log = { workspace = true }
+memory = { workspace = true }
 npt = { workspace = true }
 paging = { workspace = true }
 processor = { workspace = true }

@@ -6,6 +6,7 @@ members = [
     "crates/clock",
     "crates/cpu",
     "crates/descriptors",
+    "crates/emulate",
     "crates/handoff",
     "crates/hv-core",
     "crates/hv-loader",
@@ -33,7 +34,7 @@ publish = false
 # crate's own handlers so `hv-loader` needs no boilerplate of its own. The
 # `logger` feature stays off: it would claim the global `log` slot that the
 # serial backend owns.
-uefi = { version = "0.39.0", features = ["panic_handler", "global_allocator"] }
+uefi = { version = "0.39.0", features = ["alloc", "panic_handler", "global_allocator"] }
 
 # The same bindings without any of the runtime: `uefi-raw` is what `uefi` is
 # built on, and it installs neither a panic handler nor a global allocator.
@@ -55,12 +56,14 @@ uefi-raw = "0.15.1"
 # `npt` is the second set of page tables a guest's memory is described by;
 # `memory` is how anything reaches a guest's memory through them, and `vcpu` is
 # what turns the extension on and runs a guest on one processor, and
-# `partition` is the guest those processors are running.
+# `partition` is the guest those processors are running; `emulate` decodes an
+# intercepted instruction when hardware cannot provide its following address.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
 cpu = { path = "crates/cpu" }
 descriptors = { path = "crates/descriptors" }
+emulate = { path = "crates/emulate" }
 handoff = { path = "crates/handoff" }
 ipi = { path = "crates/ipi" }
 memory = { path = "crates/memory" }
@@ -97,6 +100,15 @@ serial = { path = "crates/serial" }
 spin = "0.12"
 thiserror = { version = "2.0", default-features = false }
 x86_64 = "0.15"
+
+# Instruction decoding on the VM-exit path. Only the decoder is built, using
+# iced-x86's no-std table initialization; formatting, encoding and assemblers
+# are not part of the hypervisor image.
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "decoder",
+    "instr_info",
+    "no_std",
+] }
 
 # The allocator `hv-core` installs as its global allocator. Talc keeps its
 # bookkeeping inside the memory it manages and needs nothing from the

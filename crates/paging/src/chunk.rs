@@ -80,8 +80,18 @@ pub const MEMORY_MAP_OFFSET: u64 = WINDOW_STATE_OFFSET + WINDOW_STATE_SIZE;
 /// truncate if a map ever exceeds it.
 pub const MEMORY_MAP_SIZE: u64 = 16 * FRAME_SIZE;
 
+/// Offset of the guest-callable firmware portal.
+///
+/// The first page is position-independent code and the second is immutable
+/// arguments for it. They are metadata rather than allocations because the
+/// guest must be able to find them before any guest allocator exists.
+pub const PORTAL_OFFSET: u64 = MEMORY_MAP_OFFSET + MEMORY_MAP_SIZE;
+
+/// Bytes reserved for the guest-callable firmware portal.
+pub const PORTAL_SIZE: u64 = 2 * FRAME_SIZE;
+
 /// Bytes of the chunk reserved for metadata, never handed out by the allocator.
-pub const METADATA_SIZE: u64 = MEMORY_MAP_OFFSET + MEMORY_MAP_SIZE;
+pub const METADATA_SIZE: u64 = PORTAL_OFFSET + PORTAL_SIZE;
 
 /// Frames of the chunk reserved for metadata.
 pub const METADATA_FRAMES: u64 = METADATA_SIZE / FRAME_SIZE;

@@ -46,6 +46,15 @@ pub enum LoaderError {
     /// path — a directory, most plausibly.
     #[error("the hypervisor image is not a regular file")]
     NotARegularFile,
+    /// No filesystem volume contained Windows Boot Manager.
+    #[error("no filesystem volume contains Windows Boot Manager")]
+    GuestImageMissing,
+    /// Several filesystem volumes contained Windows Boot Manager.
+    #[error("more than one filesystem volume contains Windows Boot Manager")]
+    GuestImageAmbiguous,
+    /// The configured UEFI path could not be represented as a device path.
+    #[error("could not construct the Windows Boot Manager device path")]
+    GuestPath,
     /// Firmware's memory map does not fit the space the chunk sets aside for
     /// it. Truncating it would hand the hypervisor a map that silently omits
     /// memory, so the boot stops instead.

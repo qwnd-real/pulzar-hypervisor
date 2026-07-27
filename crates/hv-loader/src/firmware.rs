@@ -10,14 +10,20 @@
 //! loader ends by jumping into the hypervisor and never returns: no destructor
 //! at the end of `main` will ever run.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 use clock::{Civil, Wall};
 use log::{info, warn};
 use uefi::{
     Handle, Status,
-    boot::{self, AllocateType, MemoryDescriptor, MemoryType, ScopedProtocol},
+    boot::{self, AllocateType, LoadImageSource, MemoryDescriptor, MemoryType, ScopedProtocol},
     cstr16,
     mem::memory_map::MemoryMap,
     proto::{
+        BootPolicy,
+        device_path::{DevicePath, build},
         loaded_image::LoadedImage,
         media::{
             file::{File, FileAttribute, FileMode, RegularFile},
@@ -38,10 +44,14 @@ use crate::{
 /// Path of the hypervisor image on the boot volume.
 const IMAGE_PATH: &uefi::CStr16 = cstr16!("\\pulzar.efi");
 
+/// UEFI path of the image the initial guest starts.
+const GUEST_IMAGE_PATH: &uefi::CStr16 = cstr16!("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
+
 /// The loader's own image, as firmware describes it.
 ///
-/// The hypervisor evicts the loader with these: firmware needs the handle to
-/// unload the image, and the range is what is left to wipe afterwards.
+/// Its handle remains the parent of the preloaded guest image through
+/// `StartImage`, while its range remains part of the firmware snapshot handed
+/// to the guest.
 #[derive(Clone, Copy, Debug)]
 pub struct Loader {
     /// Handle firmware created when it loaded this image.
@@ -55,26 +65,104 @@ pub struct Loader {
     pub size: u64,
 }
 
-/// Registers the unload handler and reports where firmware put this image.
+/// An EFI image that firmware has loaded but not started.
+#[derive(Clone, Copy, Debug)]
+pub struct GuestImage {
+    /// Handle firmware assigned to the loaded image.
+    pub handle: Handle,
+}
+
+/// Finds Windows Boot Manager and asks firmware to load it for the guest.
 ///
-/// Firmware refuses to unload a started image that has no unload handler, so
-/// registering one is what makes the hypervisor's eviction of the loader
-/// possible at all. It is done here, at the start of the boot, rather than
-/// later: there is no point building an address space for an image that could
-/// never get rid of us.
+/// The path is searched on every Simple File System volume because firmware
+/// gives their handles no meaningful order. More than one match is refused: a
+/// boot decision made from handle order would not be reproducible.
+///
+/// # Errors
+///
+/// [`LoaderError::GuestImageMissing`] if no volume contains the configured
+/// path, [`LoaderError::GuestImageAmbiguous`] if several do, or a firmware
+/// error from protocol opening or image loading.
+pub fn load_guest() -> Result<GuestImage, LoaderError> {
+    let mut selected = None;
+    for handle in
+        boot::find_handles::<SimpleFileSystem>().context("enumerate filesystem volumes")?
+    {
+        if !contains_guest(handle)? {
+            continue;
+        }
+        if selected.replace(handle).is_some() {
+            return Err(LoaderError::GuestImageAmbiguous);
+        }
+    }
+    let volume = selected.ok_or(LoaderError::GuestImageMissing)?;
+    Ok(GuestImage {
+        handle: load_from(volume)?,
+    })
+}
+
+/// Whether `volume` contains the configured guest image.
+///
+/// A missing file is the ordinary answer for almost every volume. Any other
+/// firmware error means the volume could not be inspected reliably and stops
+/// the boot rather than making a selection from an incomplete search.
+fn contains_guest(volume: Handle) -> Result<bool, LoaderError> {
+    let mut filesystem = boot::open_protocol_exclusive::<SimpleFileSystem>(volume)
+        .context("open a filesystem volume")?;
+    let mut root = filesystem
+        .open_volume()
+        .context("open a filesystem root directory")?;
+    match root.open(GUEST_IMAGE_PATH, FileMode::Read, FileAttribute::empty()) {
+        Ok(_) => Ok(true),
+        Err(error) if error.status() == Status::NOT_FOUND => Ok(false),
+        Err(error) => Err(LoaderError::Firmware {
+            operation: "inspect a filesystem volume for Windows Boot Manager",
+            status: error.status(),
+        }),
+    }
+}
+
+/// Loads the guest image by its full device path on `volume`.
+///
+/// `LoadImage` needs a device path rather than a filesystem handle. The volume
+/// already publishes its hardware path, so the file node is appended to that
+/// path instead of reconstructing a disk or partition path from guessed
+/// firmware details.
+fn load_from(volume: Handle) -> Result<Handle, LoaderError> {
+    let device = boot::open_protocol_exclusive::<DevicePath>(volume)
+        .context("open the guest volume device path")?;
+    let mut storage = Vec::new();
+    let mut builder = build::DevicePathBuilder::with_vec(&mut storage);
+    for node in device.node_iter() {
+        builder = builder.push(&node).map_err(|_| LoaderError::GuestPath)?;
+    }
+    let path = builder
+        .push(&build::media::FilePath {
+            path_name: GUEST_IMAGE_PATH,
+        })
+        .map_err(|_| LoaderError::GuestPath)?
+        .finalize()
+        .map_err(|_| LoaderError::GuestPath)?;
+    boot::load_image(
+        boot::image_handle(),
+        LoadImageSource::FromDevicePath {
+            device_path: path,
+            boot_policy: BootPolicy::ExactMatch,
+        },
+    )
+    .context("load Windows Boot Manager")
+}
+
+/// Reports where firmware put the loader image.
 ///
 /// # Errors
 ///
 /// [`LoaderError::Firmware`] if the loaded-image protocol cannot be opened,
 /// which would mean firmware did not give us the handle it started us with.
-pub fn claim_self() -> Result<Loader, LoaderError> {
+pub fn loaded_self() -> Result<Loader, LoaderError> {
     let handle = boot::image_handle();
-    let mut image = boot::open_protocol_exclusive::<LoadedImage>(handle)
+    let image = boot::open_protocol_exclusive::<LoadedImage>(handle)
         .context("open the loader's own loaded-image protocol")?;
-    // SAFETY: `unload` is a function in this image's code, which firmware calls
-    // during `UnloadImage` and frees only afterwards, so it is mapped and
-    // executable for as long as it can be called.
-    unsafe { image.set_unload(unload) };
     let (base, size) = image.info();
     Ok(Loader {
         handle,
@@ -397,14 +485,4 @@ pub unsafe fn capture_memory_map(
         top_of_ram,
         entries,
     })
-}
-
-/// The unload handler firmware requires before it will unload a started image.
-///
-/// There is nothing to undo. The chunk is deliberately reserved memory rather
-/// than loader-owned memory, so unloading the loader does not take the
-/// hypervisor's page tables with it, and every firmware object the loader
-/// opened is closed before it jumps.
-extern "efiapi" fn unload(_image_handle: Handle) -> Status {
-    Status::SUCCESS
 }

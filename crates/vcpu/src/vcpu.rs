@@ -46,7 +46,9 @@ use paging::{DirectMap, Frames};
 use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
     control::NestedPagingControl,
-    intercept::{Intercepts2, Intercepts2Flags},
+    intercept::{Intercepts1, Intercepts2, Intercepts2Flags},
+    msr::VM_CR,
+    permissions::{MSRPM_BYTES, MsrPermission, msrpm_position},
 };
 use x86_64::{PhysAddr, structures::paging::PhysFrame};
 
@@ -54,6 +56,12 @@ use crate::{
     Host, Invalid, Registers, VcpuError, invalid,
     registers::{RAX, RSP},
     switch,
+};
+
+/// The permission bits for the one MSR this layer always intercepts.
+const VM_CR_PERMISSION: MsrPermission = match msrpm_position(VM_CR) {
+    Some(permission) => permission,
+    None => panic!("VM_CR must be inside the architectural MSRPM"),
 };
 
 /// What a guest's control block has to be told about the guest before it can
@@ -92,6 +100,7 @@ pub struct Vcpu {
     registers: Registers,
     vmcb: NonNull<Vmcb>,
     vmcb_phys: PhysAddr,
+    msrpm_phys: PhysAddr,
     host: &'static Host,
     dirty: CleanBits,
 }
@@ -131,10 +140,26 @@ impl Vcpu {
             .ok_or(VcpuError::Unreachable {
                 phys: vmcb_phys.as_u64(),
             })?;
+        let msrpm_phys = frames
+            .allocate(1)
+            .ok_or(VcpuError::OutOfFrames)?
+            .start_address();
+        let mut msrpm =
+            window
+                .ptr::<[u8; MSRPM_BYTES]>(msrpm_phys)
+                .ok_or(VcpuError::Unreachable {
+                    phys: msrpm_phys.as_u64(),
+                })?;
+        // SAFETY: the two-page run was just allocated to this VCPU, is zeroed,
+        // and `msrpm` reaches all of it through the direct map.
+        let msrpm = unsafe { msrpm.as_mut() };
+        msrpm[VM_CR_PERMISSION.read.byte] |= VM_CR_PERMISSION.read.mask();
+        msrpm[VM_CR_PERMISSION.write.byte] |= VM_CR_PERMISSION.write.mask();
         let mut vcpu = Self {
             registers: Registers::zeroed(),
             vmcb,
             vmcb_phys,
+            msrpm_phys,
             host,
             // Everything counts as edited until the first entry, so that entry
             // publishes a clean field of zero.
@@ -145,7 +170,9 @@ impl Vcpu {
         // A guest permitted to enter a guest of its own could run one with a
         // control block this hypervisor never inspected, so the architecture
         // refuses to start a guest without this and it is not a policy choice.
+        control.intercept_1 = Intercepts1::MSR_PROT;
         control.intercept_2 = Intercepts2::from_flags(Intercepts2Flags::VMRUN);
+        control.msr_permissions = msrpm_phys.as_u64();
         control.nested_paging = NestedPagingControl::new().with_enabled(true);
         control.nested_cr3 = guest.nested_cr3.as_u64();
         control.asid = guest.asid;
@@ -169,6 +196,7 @@ impl Vcpu {
     /// may be in flight on any processor, and the page is handed to whoever
     /// allocates next.
     pub unsafe fn release(self, frames: &mut Frames) -> Result<(), VcpuError> {
+        frames.release(PhysFrame::containing_address(self.msrpm_phys), 1)?;
         Ok(frames.release(PhysFrame::containing_address(self.vmcb_phys), 0)?)
     }
 

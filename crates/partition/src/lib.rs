@@ -32,10 +32,11 @@
 mod asid;
 
 use log::info;
-use npt::{Npt, NptError, Resolution};
+use memory::{Addressing, Linear, Physical};
+use npt::{Exposure, Npt, NptError, Resolution};
 use paging::{AddressSpace, PagingError};
 use spin::{Mutex, Once};
-use svm::exit::NestedPageFault;
+use svm::{SaveArea, exit::NestedPageFault};
 use thiserror::Error;
 use vcpu::{Guest, Host, Vcpu, VcpuError};
 use x86_64::PhysAddr;
@@ -122,6 +123,46 @@ impl Partition {
         Ok(paging::with(|space| {
             self.npt.lock().fault(space.frames(), gpa, cause)
         })??)
+    }
+
+    /// Makes immutable hypervisor-owned entry code or data visible to the
+    /// guest.
+    ///
+    /// This may be called only while the guest has not run, for the same cache
+    /// coherency reason as [`Npt::expose`]. The partition owns both locks
+    /// required to update the nested tables and allocate any tables needed.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionError::Paging`] if the machine address space is unavailable,
+    /// or [`PartitionError::Npt`] if the requested range cannot be exposed.
+    pub fn expose(
+        &self,
+        space: &mut AddressSpace,
+        gpa: PhysAddr,
+        bytes: u64,
+        exposure: Exposure,
+    ) -> Result<(), PartitionError> {
+        Ok(self
+            .npt
+            .lock()
+            .expose(space.frames(), gpa, bytes, exposure)?)
+    }
+
+    /// Borrows this guest's memory translated by one virtual processor's
+    /// current save area.
+    ///
+    /// The nested tables remain locked for the closure, so every translation
+    /// and read observes one coherent table state. The higher-ranked closure
+    /// prevents the borrowed memory view from escaping that lock.
+    pub fn with_memory<T>(
+        &self,
+        save: &SaveArea,
+        use_memory: impl for<'a> FnOnce(Linear<'a>) -> T,
+    ) -> T {
+        let npt = self.npt.lock();
+        let physical = Physical::new(&npt, npt.window());
+        use_memory(Linear::new(physical, Addressing::from_save(save)))
     }
 
     /// The value a control block names this guest's memory by.

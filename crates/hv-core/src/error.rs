@@ -9,14 +9,16 @@ use apic::ApicError;
 use clock::ClockError;
 use cpu::CpuError;
 use descriptors::DescriptorError;
+use emulate::EmulateError;
 use handoff::HandoffError;
 use ipi::IpiError;
 use paging::PagingError;
 use partition::PartitionError;
 use pci::PciError;
 use thiserror::Error;
-use uefi_raw::Status;
 use vcpu::VcpuError;
+
+use crate::portal::PortalError;
 
 /// A failure during bring-up.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -57,6 +59,15 @@ pub enum CoreError {
     /// The virtualization extension could not be enabled on this processor.
     #[error(transparent)]
     Vcpu(#[from] VcpuError),
+    /// The guest firmware portal could not be placed.
+    #[error(transparent)]
+    Portal(#[from] PortalError),
+    /// Instruction decoding could not be prepared before guest execution.
+    #[error(transparent)]
+    Emulate(#[from] EmulateError),
+    /// Guest execution ended instead of remaining in the run loop.
+    #[error("guest execution stopped after an unhandled VM exit")]
+    GuestStopped,
     /// A processor came up before the boot processor had established the guest,
     /// which the order of bring-up is supposed to rule out.
     #[error("the guest was not established before this processor came up")]
@@ -69,20 +80,6 @@ pub enum CoreError {
         base: u64,
         /// How large it was to be.
         bytes: u64,
-    },
-    /// A boot service refused the operation.
-    #[error("could not {operation}: {status}")]
-    Firmware {
-        /// What was being attempted, as an infinitive.
-        operation: &'static str,
-        /// What firmware reported.
-        status: Status,
-    },
-    /// A table the handoff pointed at is absent or does not identify itself.
-    #[error("the {table} the loader described is not a valid UEFI table")]
-    NotATable {
-        /// Which table failed to check out.
-        table: &'static str,
     },
     /// An address in the handoff is not one this processor can form.
     #[error("{value:#x} is not a usable address")]

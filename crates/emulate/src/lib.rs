@@ -54,7 +54,7 @@ use iced_x86::Instruction;
 use log::info;
 use memory::{Linear, MemoryError};
 use processor::SvmFeatures;
-use svm::exit::NestedPageFault;
+use svm::{Reason, exit::NestedPageFault};
 use thiserror::Error;
 use vcpu::Vcpu;
 use x86_64::PhysAddr;
@@ -230,6 +230,9 @@ fn touched(mmio: &Mmio, vcpu: &Vcpu, guest: Linear<'_>, instruction: &Instructio
 
 /// The address after the instruction, where the processor supplied one.
 fn supplied(vcpu: &Vcpu) -> Option<u64> {
+    if vcpu.reason() == Some(Reason::NestedPageFault) {
+        return None;
+    }
     if !processor::svm()?.features.contains(SvmFeatures::NEXT_RIP) {
         return None;
     }

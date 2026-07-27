@@ -7,12 +7,12 @@
 //! 1. Captures the state firmware was running with, before anything else at
 //!    all. Every register in it is one the steps below overwrite, and none can
 //!    be read back afterwards.
-//! 2. Registers an unload handler on itself, so the hypervisor can evict it
-//!    later. Nothing else works if this does not.
-//! 3. Reserves the one chunk of physical memory pulzar will own. It has to
+//! 2. Reserves the one chunk of physical memory pulzar will own. It has to
 //!    happen before the memory map is captured, so the chunk appears in the map
 //!    as reserved rather than as memory something might hand out again.
-//! 4. Captures firmware's memory map into that chunk, because the address space
+//! 3. Loads Windows Boot Manager without starting it, retaining the resulting
+//!    image handle for the guest portal.
+//! 4. Captures firmware's memory map into the chunk, because the address space
 //!    is sized from it and because firmware's own copy lives in memory the
 //!    hypervisor will lose.
 //! 5. Loads, relocates and maps the hypervisor image at a randomized high-half
@@ -23,10 +23,9 @@
 //!    active.
 //!
 //! The address space it activates is deliberately half firmware's: the lower
-//! half is copied from firmware's own tables, so boot services keep working
-//! across the jump and the hypervisor can still unload this image. Discarding
-//! that half is the hypervisor's job, once it no longer needs anything of
-//! firmware's.
+//! half is copied from firmware's own tables so the hypervisor can take a
+//! coherent snapshot before discarding those host mappings. The guest keeps
+//! firmware's original page tables and reaches them through nested paging.
 //!
 //! Every step is logged over serial before it is relied upon, so a boot that
 //! fails leaves behind the point it failed at.
@@ -139,9 +138,9 @@ fn main() -> Status {
 /// the reserved chunk stays reserved and firmware is left as it was found,
 /// which is what firmware expects of an application that returns an error.
 fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
-    let loader = firmware::claim_self()?;
+    let loader = firmware::loaded_self()?;
     info!(
-        "loader: own image at {:#x}, {:#x} bytes, unload handler registered",
+        "loader: own image at {:#x}, {:#x} bytes",
         loader.base, loader.size
     );
 
@@ -151,6 +150,12 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
         "loader: reserved chunk at {chunk_base:#x}, {:#x} bytes, trampoline page at {:#x}",
         chunk::CHUNK_SIZE,
         reserved.trampoline
+    );
+
+    let guest = firmware::load_guest()?;
+    info!(
+        "loader: Windows Boot Manager loaded as {:#x}",
+        wide(guest.handle.as_ptr() as usize)
     );
 
     let memory = survey_memory(chunk_base)?;
@@ -184,9 +189,15 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
     drop(file);
     space.describe("loader");
 
-    let handoff = publish(
-        &space, reserved, loader, memory, hypervisor, placement, firmware,
-    )?;
+    let inputs = HandoffInputs {
+        reserved,
+        loader,
+        guest,
+        memory,
+        hypervisor,
+        placement,
+    };
+    let handoff = publish(&space, inputs, firmware)?;
     let entry = VirtAddr::new(image.entry(placement.image_base.as_u64()));
     info!(
         "loader: entering hypervisor at {entry:#x}, stack top {:#x}, handoff {handoff:#x}",
@@ -237,6 +248,17 @@ fn probe(file: &mut ImageFile) -> Result<Image, LoaderError> {
 struct Hypervisor {
     stack: Stack,
     image_size: u64,
+}
+
+/// Values collected during loading that become the immutable handoff.
+#[derive(Clone, Copy, Debug)]
+struct HandoffInputs {
+    reserved: Reserved,
+    loader: Loader,
+    guest: firmware::GuestImage,
+    memory: Memory,
+    hypervisor: Hypervisor,
+    placement: Placement,
 }
 
 /// Places the hypervisor image and its stack in the new address space.
@@ -398,17 +420,21 @@ fn map_image(
 /// [`LoaderError::Paging`] if a window does not reach the chunk.
 fn publish(
     space: &AddressSpace,
-    reserved: Reserved,
-    loader: Loader,
-    memory: Memory,
-    hypervisor: Hypervisor,
-    placement: Placement,
+    inputs: HandoffInputs,
     firmware: &FirmwareContext,
 ) -> Result<VirtAddr, LoaderError> {
     let system_table = uefi::table::system_table_raw().ok_or(LoaderError::Firmware {
         operation: "locate the UEFI system table",
         status: Status::NOT_FOUND,
     })?;
+    let HandoffInputs {
+        reserved,
+        loader,
+        guest,
+        memory,
+        hypervisor,
+        placement,
+    } = inputs;
     let chunk_base = reserved.chunk;
     let context = chunk_base + chunk::FIRMWARE_CONTEXT_OFFSET;
     let handoff = Handoff {
@@ -419,6 +445,7 @@ fn publish(
         loader_image_handle: loader.handle.as_ptr(),
         loader_image_base: loader.base,
         loader_image_size: loader.size,
+        guest_image_handle: guest.handle.as_ptr(),
         chunk_base: chunk_base.as_u64(),
         chunk_size: chunk::CHUNK_SIZE,
         page_table_root: space.root().start_address().as_u64(),
