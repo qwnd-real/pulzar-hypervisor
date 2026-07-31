@@ -387,6 +387,51 @@ impl Vcpu {
         unsafe { &mut self.vmcb.as_mut().control }
     }
 
+    /// Makes the guest's reads and writes of these model-specific registers
+    /// exit instead.
+    ///
+    /// Which registers a guest may not have is policy, and policy does not
+    /// belong here — this takes whichever ones the caller names and says
+    /// nothing about what they are for. The one register this layer intercepts
+    /// on its own account is the one saying whether the virtualization
+    /// extension exists, because a guest that saw the truth there could try to
+    /// use it.
+    ///
+    /// An index outside the three ranges the architecture gives the permission
+    /// map is skipped rather than refused: the map cannot express one, so the
+    /// guest reaches it directly, and that is a fact about the architecture
+    /// rather than a mistake by the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`VcpuError::Unreachable`] if the permission map cannot be reached
+    /// through `window`.
+    pub fn intercept_msrs(
+        &mut self,
+        window: DirectMap,
+        msrs: impl IntoIterator<Item = u32>,
+    ) -> Result<(), VcpuError> {
+        let mut map = window
+            .ptr::<[u8; MSRPM_BYTES]>(self.msrpm_phys)
+            .map_err(|_| VcpuError::Unreachable {
+                phys: self.msrpm_phys.as_u64(),
+            })?;
+        // SAFETY: this map belongs to this VCPU, was allocated for it and is
+        // reached through the direct map. The guest is not running: a VCPU is
+        // not `Send`, so the only processor that could have entered it is this
+        // one, and this one is here.
+        let map = unsafe { map.as_mut() };
+        for msr in msrs {
+            let Some(permission) = msrpm_position(msr) else {
+                continue;
+            };
+            map[permission.read.byte] |= permission.read.mask();
+            map[permission.write.byte] |= permission.write.mask();
+        }
+        self.soil(CleanBits::PERMISSION_MAPS);
+        Ok(())
+    }
+
     /// The register state the guest runs with, and stopped in.
     #[must_use]
     pub fn save(&self) -> &SaveArea {

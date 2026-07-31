@@ -368,7 +368,9 @@ name = "exits"
 version = "0.1.0"
 dependencies = [
  "apic",
+ "descriptors",
  "emulate",
+ "inject",
  "log",
  "npt",
  "partition",
@@ -377,6 +379,7 @@ dependencies = [
  "svm",
  "thiserror",
  "vcpu",
+ "vlapic",
  "x86_64",
 ]
 
@@ -474,6 +477,7 @@ dependencies = [
  "thiserror",
  "uefi-raw",
  "vcpu",
+ "vlapic",
  "x86_64",
 ]
 
@@ -508,6 +512,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "inject"
+version = "0.1.0"
+dependencies = [
+ "descriptors",
+ "log",
+ "processor",
+ "svm",
+ "vcpu",
 ]
 
 [[package]]
@@ -673,6 +688,7 @@ dependencies = [
 name = "partition"
 version = "0.1.0"
 dependencies = [
+ "emulate",
  "log",
  "memory",
  "npt",
@@ -1122,6 +1138,25 @@ dependencies = [
  "paging",
  "processor",
  "svm",
+ "thiserror",
+ "x86_64",
+]
+
+[[package]]
+name = "vlapic"
+version = "0.1.0"
+dependencies = [
+ "apic",
+ "bitfield-struct",
+ "bitflags",
+ "cpu",
+ "descriptors",
+ "emulate",
+ "ipi",
+ "log",
+ "processor",
+ "snapshot",
+ "spin 0.12.2",
  "thiserror",
  "x86_64",
 ]

@@ -2,7 +2,7 @@
 
 use log::error;
 use npt::Resolution;
-use partition::Partition;
+use partition::{Addressing, Partition};
 use svm::exit::NestedPageFault;
 use vcpu::{Flow, Vcpu};
 use x86_64::PhysAddr;
@@ -19,14 +19,40 @@ pub(crate) fn exit(vcpu: &mut Vcpu, partition: &Partition) -> Flow {
     match partition.resolve(gpa, cause) {
         Ok(Resolution::Mapped) => Flow::Resume,
         Ok(Resolution::Shadowed) => discard(vcpu, partition, gpa),
-        // A device the hypervisor interposes on, with nothing yet interposing.
-        // Resuming would fault at the same address forever.
-        Ok(Resolution::Trapped) => {
-            error!("exits: no device handles trapped access at {gpa:#x}");
-            Flow::Leave
-        }
+        Ok(Resolution::Trapped) => interposed(vcpu, partition, gpa, cause),
         Err(error) => {
             error!("exits: nested fault at {gpa:#x} could not be resolved: {error}");
+            Flow::Leave
+        }
+    }
+}
+
+/// Lets whatever answers for a region answer this access.
+///
+/// The instruction is performed against the device rather than against the
+/// memory the guest aimed it at, and the guest is stepped past it — except for
+/// a repeated move with repetitions left, which is deliberately left to execute
+/// again.
+fn interposed(
+    vcpu: &mut Vcpu,
+    partition: &Partition,
+    gpa: PhysAddr,
+    cause: NestedPageFault,
+) -> Flow {
+    let Some(devices) = partition.devices() else {
+        // The region is trapped, so something meant to answer for it, but the
+        // set was never sealed. Resuming would fault at the same address
+        // forever.
+        error!("exits: nothing answers for the trapped access at {gpa:#x}");
+        return Flow::Leave;
+    };
+    let addressing = Addressing::from_save(vcpu.save());
+    match partition.with_memory(addressing, |guest| {
+        devices.dispatch(vcpu, guest, gpa, cause)
+    }) {
+        Ok(_) => Flow::Resume,
+        Err(error) => {
+            error!("exits: the access to {gpa:#x} could not be performed: {error}");
             Flow::Leave
         }
     }
@@ -39,7 +65,8 @@ pub(crate) fn exit(vcpu: &mut Vcpu, partition: &Partition) -> Flow {
 /// alone, its write is dropped, and the guest carries on after it — which is
 /// the only alternative to faulting on the same instruction forever.
 fn discard(vcpu: &mut Vcpu, partition: &Partition, gpa: PhysAddr) -> Flow {
-    match partition.with_memory(vcpu.save(), |guest| emulate::next_rip(vcpu, guest)) {
+    let addressing = Addressing::from_save(vcpu.save());
+    match partition.with_memory(addressing, |guest| emulate::next_rip(vcpu, guest)) {
         Ok(next) => {
             vcpu.save_mut().rip = next;
             Flow::Resume

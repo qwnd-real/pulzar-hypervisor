@@ -21,23 +21,24 @@
 //! allocation naming a different page than the one that was reserved, with
 //! nothing in the state to notice.
 //!
-//! So it is validated on the way in and then recorded. Validated: frame-aligned,
-//! and with the whole window `base..base + MAPPING_WINDOW_SIZE` a single run of
-//! canonical addresses — a base near the top of the address space whose window
-//! wraps, or one in the lower half whose window crosses the canonical hole,
-//! would otherwise be accepted here and panic at the first allocation that
-//! formed an address near the end.
+//! So it is validated on the way in and then recorded. Validated:
+//! frame-aligned, and with the whole window `base..base + MAPPING_WINDOW_SIZE`
+//! a single run of canonical addresses — a base near the top of the address
+//! space whose window wraps, or one in the lower half whose window crosses the
+//! canonical hole, would otherwise be accepted here and panic at the first
+//! allocation that formed an address near the end.
 //!
-//! Recorded, because validity is not identity. [`Slots::create`] writes the base
-//! it was given into the chunk beside the allocator state, and [`Slots::adopt`]
-//! refuses any base but that one. The value reaches the second image through the
-//! handoff, which is a structure the first image wrote and nothing has checked
-//! against the memory it describes; the copy in the chunk is written by the same
-//! call that built the state it belongs to, so the two cannot disagree without
-//! one of them having been corrupted. Every other high-half address in the
-//! handoff can be checked against something the machine knows — the direct map
-//! against a walk of the live tables, the root against `CR3`. The window base
-//! maps nothing yet, so this is what it is checked against instead.
+//! Recorded, because validity is not identity. [`Slots::create`] writes the
+//! base it was given into the chunk beside the allocator state, and
+//! [`Slots::adopt`] refuses any base but that one. The value reaches the second
+//! image through the handoff, which is a structure the first image wrote and
+//! nothing has checked against the memory it describes; the copy in the chunk
+//! is written by the same call that built the state it belongs to, so the two
+//! cannot disagree without one of them having been corrupted. Every other
+//! high-half address in the handoff can be checked against something the
+//! machine knows — the direct map against a walk of the live tables, the root
+//! against `CR3`. The window base maps nothing yet, so this is what it is
+//! checked against instead.
 
 use x86_64::{
     PhysAddr, VirtAddr,

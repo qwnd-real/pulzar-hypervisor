@@ -135,7 +135,7 @@ pub(crate) fn place(
 /// any move has, or whatever reading the guest's memory or asking a device
 /// reports.
 pub(crate) fn load(
-    mmio: &mut Mmio,
+    mmio: &Mmio,
     vcpu: &Vcpu,
     guest: Linear<'_>,
     place: Place,
@@ -170,7 +170,7 @@ pub(crate) fn load(
 /// immediate, which no move has, or whatever writing the guest's memory or
 /// asking a device reports.
 pub(crate) fn store(
-    mmio: &mut Mmio,
+    mmio: &Mmio,
     vcpu: &mut Vcpu,
     guest: Linear<'_>,
     place: Place,

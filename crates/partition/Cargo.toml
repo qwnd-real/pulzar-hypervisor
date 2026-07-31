@@ -12,6 +12,7 @@ publish.workspace = true
 forced-target = "x86_64-unknown-uefi"
 
 [dependencies]
+emulate = { workspace = true }
 log = { workspace = true }
 memory = { workspace = true }
 npt = { workspace = true }

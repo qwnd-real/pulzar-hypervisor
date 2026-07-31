@@ -31,6 +31,23 @@
 //! only what should happen to it — reach the hardware unchanged, reach it
 //! changed, or not reach it at all — and the framework performs whichever, at
 //! the guest's own width and offset. No device emulator writes that code.
+//!
+//! # A device is asked by every processor at once
+//!
+//! Both questions are asked through a shared reference, and a [`Device`] must
+//! be [`Sync`]. That is not a restriction imposed for tidiness; it is what a
+//! region's address means. One region is one range of *guest physical*
+//! addresses, and every processor running the guest reaches it — so the thing
+//! answering for it is reached from every processor, concurrently, and the only
+//! honest signature for that is a shared one.
+//!
+//! A device whose registers are per-processor is therefore written the way the
+//! hardware it stands for is built: one device, holding a table indexed by
+//! processor, picking this processor's row out of it. A device that keeps
+//! machine-wide state keeps it in whatever the state's own shape calls for —
+//! atomics for a counter, a lock for a structure — and pays for that only where
+//! it is genuinely shared, rather than paying for a lock around the whole
+//! dispatch path because the signature demanded one.
 
 mod window;
 
@@ -49,15 +66,20 @@ use crate::{
 };
 
 /// What answers for a region instead of the hardware behind it.
-pub trait Device {
+///
+/// Both methods take a shared reference and the trait requires [`Sync`],
+/// because every processor running the guest reaches the same region. A device
+/// that has state to change on an access owns whatever makes that sound — a
+/// per-processor table, atomics, a lock around the part that is really shared.
+pub trait Device: Send + Sync {
     /// What the guest should see.
     ///
     /// Call [`Read::hardware`] for what the device really holds, or do not, and
     /// answer out of whatever state this device keeps.
-    fn read(&mut self, access: Read) -> Data;
+    fn read(&self, access: Read) -> Data;
 
     /// What should become of what the guest wrote.
-    fn write(&mut self, access: Write) -> Commit;
+    fn write(&self, access: Write) -> Commit;
 }
 
 /// A region to be answered for, and by what.
@@ -265,6 +287,11 @@ impl Registrar {
 }
 
 /// The trapped regions of a guest that is allowed to run.
+///
+/// Answered through a shared reference, so one of these serves every processor
+/// running the guest rather than one per processor — which is what the regions
+/// themselves are, since a guest physical address means the same thing on all
+/// of them.
 pub struct Mmio {
     regions: Vec<Interposed>,
 }
@@ -304,7 +331,7 @@ impl Mmio {
     /// began in, or is not aligned to its own width — neither of which is
     /// something a device would ever be asked by real hardware.
     pub(crate) fn read(
-        &mut self,
+        &self,
         index: usize,
         offset: u64,
         gpa: PhysAddr,
@@ -332,7 +359,7 @@ impl Mmio {
     ///
     /// As [`Mmio::read`].
     pub(crate) fn write(
-        &mut self,
+        &self,
         index: usize,
         offset: u64,
         gpa: PhysAddr,
@@ -361,10 +388,22 @@ impl Mmio {
     }
 
     /// One region, by the index [`Mmio::find`] gave.
-    fn at(&mut self, index: usize) -> Result<&mut Interposed, EmulateError> {
+    fn at(&self, index: usize) -> Result<&Interposed, EmulateError> {
         self.regions
-            .get_mut(index)
+            .get(index)
             .ok_or(EmulateError::NoSuchRegion { index })
+    }
+}
+
+impl core::fmt::Debug for Mmio {
+    /// The regions, not the devices: what answers for one is a trait object
+    /// with no more to say about itself than its own address, and printing that
+    /// would be noise.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.regions.iter().map(|region| region.gpa))
+            .finish()
     }
 }
 

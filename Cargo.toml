@@ -11,6 +11,7 @@ members = [
     "crates/handoff",
     "crates/hv-core",
     "crates/hv-loader",
+    "crates/inject",
     "crates/ipi",
     "crates/memory",
     "crates/npt",
@@ -23,6 +24,7 @@ members = [
     "crates/snapshot",
     "crates/svm",
     "crates/vcpu",
+    "crates/vlapic",
     "crates/xtask",
 ]
 
@@ -61,8 +63,9 @@ uefi-raw = "0.15.1"
 # `partition` is the guest those processors are running; `emulate` decodes an
 # intercepted instruction when hardware cannot provide its following address;
 # `portal` is the only hypervisor memory a guest is ever shown, being the pages
-# firmware is entered at and leaves through, and `exits` is what every one of a
-# guest's exits means and what the host does about it.
+# firmware is entered at and leaves through, `vlapic` is the interrupt
+# controller a guest sees in place of the machine's own, and `exits` is what
+# every one of a guest's exits means and what the host does about it.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -71,6 +74,7 @@ descriptors = { path = "crates/descriptors" }
 emulate = { path = "crates/emulate" }
 exits = { path = "crates/exits" }
 handoff = { path = "crates/handoff" }
+inject = { path = "crates/inject" }
 ipi = { path = "crates/ipi" }
 memory = { path = "crates/memory" }
 npt = { path = "crates/npt" }
@@ -82,6 +86,7 @@ processor = { path = "crates/processor" }
 snapshot = { path = "crates/snapshot" }
 svm = { path = "crates/svm" }
 vcpu = { path = "crates/vcpu" }
+vlapic = { path = "crates/vlapic" }
 
 # `CPUID` decoding, so no leaf number or feature bit position is written out by
 # hand. No features enabled: the crate is `no_std` as it stands, and the

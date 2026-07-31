@@ -172,7 +172,7 @@ impl Mmio {
     /// instruction outside the move family, and whatever decoding the
     /// instruction or reaching either end of it reports.
     pub fn dispatch(
-        &mut self,
+        &self,
         vcpu: &mut Vcpu,
         guest: Linear<'_>,
         gpa: PhysAddr,
@@ -196,7 +196,7 @@ impl Mmio {
 
     /// The instruction itself, once it is known what it is.
     fn perform(
-        &mut self,
+        &self,
         vcpu: &mut Vcpu,
         guest: Linear<'_>,
         instruction: &Instruction,

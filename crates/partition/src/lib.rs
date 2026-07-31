@@ -26,17 +26,35 @@
 //! takes them the other way round. That is the whole of the ordering, and it is
 //! stated here because it is the only place in the crate where two are held at
 //! once.
+//!
+//! # The devices belong to the guest, not to a processor
+//!
+//! Which regions of a guest's memory the hypervisor answers for is a property
+//! of the guest: a guest physical address means the same thing on every
+//! processor running it. So the sealed set lives here, filled once by
+//! [`Partition::interpose`] before any processor has entered the guest, and
+//! read through a shared reference by all of them afterwards.
+//!
+//! The registrar never escapes that call. It is built, filled and sealed inside
+//! it, which is what keeps [`emulate`]'s guarantee intact — there is no moment
+//! at which something able to trap a region coexists with a guest that could
+//! have cached a translation of one.
 
 #![no_std]
 
 mod asid;
 
+use emulate::{Mmio, MmioError, Region, Registrar};
 use log::info;
-use memory::{Addressing, Linear, Physical};
+/// How a guest translates its addresses, which is what
+/// [`Partition::with_memory`] needs and what a caller reads out of a virtual
+/// processor before borrowing one.
+pub use memory::Addressing;
+use memory::{Linear, Physical};
 use npt::{Exposure, Npt, NptError, Resolution};
 use paging::{AddressSpace, PagingError};
 use spin::{Mutex, Once};
-use svm::{SaveArea, exit::NestedPageFault};
+use svm::exit::NestedPageFault;
 use thiserror::Error;
 use vcpu::{Guest, Host, Vcpu, VcpuError};
 use x86_64::PhysAddr;
@@ -49,6 +67,7 @@ pub struct Partition {
     npt: Mutex<Npt>,
     nested_cr3: PhysAddr,
     asid: Asid,
+    devices: Once<Mmio>,
 }
 
 impl Partition {
@@ -71,7 +90,55 @@ impl Partition {
             nested_cr3: npt.root(),
             npt: Mutex::new(npt),
             asid,
+            devices: Once::new(),
         })
+    }
+
+    /// Takes over the regions the hypervisor answers for instead of the
+    /// hardware behind them.
+    ///
+    /// Called once, on the boot processor, before any processor has entered the
+    /// guest — which is what trapping a region requires, since reducing what
+    /// the nested tables permit while a guest is running would mean
+    /// discarding every processor's cached translations first.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionError::AlreadyInterposed`] for a second call, or
+    /// [`PartitionError::Mmio`] if a region cannot be taken over — the first
+    /// failure stops the walk, and the regions taken over before it stay taken
+    /// over, because a half-trapped guest is not one to hand back.
+    pub fn interpose(
+        &self,
+        space: &mut AddressSpace,
+        regions: impl IntoIterator<Item = Region>,
+    ) -> Result<(), PartitionError> {
+        let mut outcome = Ok(());
+        let mut sealed = false;
+        self.devices.call_once(|| {
+            sealed = true;
+            let mut registrar = Registrar::new();
+            for region in regions {
+                // The address space first and the tables second, as everywhere
+                // else here.
+                if let Err(error) = registrar.register(space, &mut self.npt.lock(), region) {
+                    outcome = Err(error.into());
+                    break;
+                }
+            }
+            registrar.seal()
+        });
+        if !sealed {
+            return Err(PartitionError::AlreadyInterposed);
+        }
+        outcome
+    }
+
+    /// What answers for the regions this guest is not allowed to reach the
+    /// hardware through, or `None` before [`Partition::interpose`].
+    #[must_use]
+    pub fn devices(&self) -> Option<&Mmio> {
+        self.devices.get()
     }
 
     /// Builds the calling processor's virtual processor for this guest.
@@ -170,20 +237,30 @@ impl Partition {
         })??)
     }
 
-    /// Borrows this guest's memory translated by one virtual processor's
-    /// current save area.
+    /// Borrows this guest's memory translated the way one virtual processor
+    /// currently translates.
     ///
     /// The nested tables remain locked for the closure, so every translation
     /// and read observes one coherent table state. The higher-ranked closure
     /// prevents the borrowed memory view from escaping that lock.
+    ///
+    /// Takes how the guest translates rather than the state-save area it was
+    /// read out of, because [`Addressing`] is a small copied value and a save
+    /// area is not — and because a caller that borrows the save area to make
+    /// this call has borrowed the virtual processor, which is usually the very
+    /// thing the closure needs.
+    ///
+    /// The closure runs with the tables locked, so nothing it calls may ask for
+    /// them again: a device answering an intercepted access must not resolve a
+    /// fault.
     pub fn with_memory<T>(
         &self,
-        save: &SaveArea,
+        addressing: Addressing,
         use_memory: impl for<'a> FnOnce(Linear<'a>) -> T,
     ) -> T {
         let npt = self.npt.lock();
         let physical = Physical::new(&npt, npt.window());
-        use_memory(Linear::new(physical, Addressing::from_save(save)))
+        use_memory(Linear::new(physical, addressing))
     }
 
     /// The value a control block names this guest's memory by.
@@ -203,6 +280,10 @@ impl Partition {
     pub fn describe(&self, who: &str) {
         info!("{who}: partition tagged asid {}", self.asid.number());
         self.npt.lock().describe(who);
+        match self.devices.get() {
+            Some(devices) => devices.describe(who),
+            None => info!("{who}: this guest's trapped regions have not been sealed yet"),
+        }
     }
 }
 
@@ -240,6 +321,13 @@ pub enum PartitionError {
         /// How many the processor supports, the host's own included.
         count: u32,
     },
+    /// The set of trapped regions has already been sealed, and sealing it is
+    /// what makes it safe to enter the guest.
+    #[error("this guest's trapped regions have already been sealed")]
+    AlreadyInterposed,
+    /// A region could not be taken over.
+    #[error(transparent)]
+    Mmio(#[from] MmioError),
     /// The guest's memory could not be described.
     #[error(transparent)]
     Npt(#[from] NptError),

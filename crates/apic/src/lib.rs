@@ -90,7 +90,7 @@ use spin::Once;
 use thiserror::Error;
 use x86_64::PhysAddr;
 
-use crate::register::{Access, Page, Register};
+use crate::register::{Access, MappedRegister, Page, Register};
 pub use crate::{
     capture::{Controller, FirmwareState, LocalState, VECTOR_WORDS, capture},
     icr::{Command, Delivery, Target},
@@ -425,6 +425,114 @@ impl LocalApic {
         Timer::new(self)
     }
 
+    /// Whether the interrupt this processor accepted on `vector` arrived level
+    /// triggered.
+    ///
+    /// The controller records this itself, one bit per vector, as it accepts
+    /// each interrupt: set for level triggered and clear for edge. That makes
+    /// it the one authority on the question that needs nothing else to be
+    /// modelled — a hypervisor that passes the I/O controllers through does not
+    /// know how a line was configured, but the local controller that took the
+    /// interrupt does, and it was told by the same hardware that sent it.
+    ///
+    /// The distinction decides what is owed. An edge-triggered interrupt is
+    /// finished with once it has been taken; a level-triggered one is asserted
+    /// until whoever raised it is dealt with, so acknowledging it before that
+    /// happens delivers it again immediately.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller is not up.
+    pub fn arrived_level(self, vector: Vector) -> Result<bool, ApicError> {
+        let access = register::access()?;
+        let (slot, bit) = trigger_place(vector);
+        Ok(access.read(Register::TRIGGER_MODE.offset_by(slot)) & bit != 0)
+    }
+
+    /// Programs one of the controller's own sources.
+    ///
+    /// What a hypervisor passing the platform through needs in order to hand a
+    /// guest the sources this processor really has: the guest's mask, trigger
+    /// and polarity are its own, and only the vector is not — that is chosen by
+    /// whoever calls this, so that an arrival can be told apart from every
+    /// other interrupt on the machine.
+    ///
+    /// The error entry is deliberately absent from [`Source`]. The controller's
+    /// errors are the host's to notice, and an entry handed to a guest would be
+    /// one the host stopped hearing about.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller is not up, or
+    /// [`ApicError::NoSuchLvt`] if this controller does not have the entry —
+    /// three of them are optional and a controller reports how many it has.
+    pub fn program(self, source: Source, entry: Entry) -> Result<(), ApicError> {
+        let access = register::access()?;
+        let register = source.register();
+        if !register::has_lvt(register, register::lvt_entries(self.version()?)) {
+            return Err(ApicError::NoSuchLvt { which: source });
+        }
+        // SAFETY: the value came from an `Entry`, which can only describe
+        // combinations the architecture defines, and the register was just
+        // established to be one this controller has.
+        unsafe { access.write(register, entry.bits()) };
+        Ok(())
+    }
+
+    /// Sets which logical destinations this processor answers to.
+    ///
+    /// The value belongs to whatever is deciding how interrupts are addressed
+    /// on this machine. A hypervisor passing its I/O controllers through has to
+    /// keep this equal to what its guest believes, because the guest programs
+    /// those controllers directly and hardware matches the destination against
+    /// *this* register — so a disagreement is an interrupt delivered to the
+    /// wrong processor or to none.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller is not up, or
+    /// [`ApicError::NotMapped`] in x2APIC, where the register is derived from
+    /// the identifier by hardware and is not writable at all.
+    pub fn set_logical_destination(self, value: u32) -> Result<(), ApicError> {
+        match register::access()? {
+            // SAFETY: every value of the top byte is a legal set of logical
+            // destinations, and the rest of the register is reserved and
+            // written as zero by the mask.
+            Access::Mapped(page) => unsafe {
+                page.write(
+                    Register::LOGICAL_DESTINATION,
+                    value & LOGICAL_DESTINATION_MASK,
+                );
+                Ok(())
+            },
+            Access::Msr => Err(ApicError::NotMapped),
+        }
+    }
+
+    /// Sets how a logical destination is matched: the flat model or the
+    /// cluster model.
+    ///
+    /// # Errors
+    ///
+    /// As [`LocalApic::set_logical_destination`]. x2APIC has only the cluster
+    /// model, so the register it would select between them does not exist.
+    pub fn set_destination_format(self, value: u32) -> Result<(), ApicError> {
+        match register::access()? {
+            // SAFETY: only the top nibble selects anything and every encoding
+            // of it is one the architecture defines; the reserved remainder is
+            // written as ones, which is its reset value and what the
+            // architecture requires.
+            Access::Mapped(page) => unsafe {
+                page.write(
+                    MappedRegister::DESTINATION_FORMAT,
+                    value | !DESTINATION_FORMAT_MASK,
+                );
+                Ok(())
+            },
+            Access::Msr => Err(ApicError::NotMapped),
+        }
+    }
+
     /// Acknowledges the interrupt this processor is currently servicing.
     ///
     /// Owed for everything the controller delivered, and for nothing else: a
@@ -520,6 +628,80 @@ impl LocalApic {
         let _ = Self::take_errors();
     }
 }
+
+/// One of the controller's own interrupt sources, as something outside this
+/// crate may name it.
+///
+/// The error entry is missing on purpose: it belongs to the host, which is the
+/// only thing that can act on a controller reporting its own errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The controller's own timer.
+    Timer,
+    /// The first local interrupt pin.
+    Lint0,
+    /// The second local interrupt pin.
+    Lint1,
+    /// The thermal sensor.
+    Thermal,
+    /// The performance counters.
+    Performance,
+    /// Corrected machine-check errors.
+    CorrectedMachineCheck,
+}
+
+impl core::fmt::Display for Source {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Self::Timer => "timer",
+            Self::Lint0 => "lint0",
+            Self::Lint1 => "lint1",
+            Self::Thermal => "thermal",
+            Self::Performance => "performance",
+            Self::CorrectedMachineCheck => "corrected machine check",
+        };
+        formatter.write_str(name)
+    }
+}
+
+impl Source {
+    /// Every source that may be programmed from outside this crate.
+    pub const ALL: [Self; 6] = [
+        Self::Timer,
+        Self::Lint0,
+        Self::Lint1,
+        Self::Thermal,
+        Self::Performance,
+        Self::CorrectedMachineCheck,
+    ];
+
+    /// The local vector table entry this source is programmed through.
+    pub(crate) const fn register(self) -> Register {
+        match self {
+            Self::Timer => Register::LVT_TIMER,
+            Self::Lint0 => Register::LVT_LINT0,
+            Self::Lint1 => Register::LVT_LINT1,
+            Self::Thermal => Register::LVT_THERMAL,
+            Self::Performance => Register::LVT_PERFORMANCE,
+            Self::CorrectedMachineCheck => Register::LVT_CORRECTED_MACHINE_CHECK,
+        }
+    }
+}
+
+/// Which of the trigger-mode registers a vector's bit is in, and which bit of
+/// it.
+const fn trigger_place(vector: Vector) -> (u32, u32) {
+    let number = vector.number() as u32;
+    (number / u32::BITS, 1 << (number % u32::BITS))
+}
+
+/// The part of the logical destination register that holds anything: the top
+/// eight bits. The rest is reserved.
+const LOGICAL_DESTINATION_MASK: u32 = 0xFF00_0000;
+
+/// The part of the destination format register that selects anything: the top
+/// four bits. The rest is reserved and reads as ones.
+const DESTINATION_FORMAT_MASK: u32 = 0xF000_0000;
 
 /// Bits the older interface's identifier is shifted by: the top eight of the
 /// register.
@@ -688,6 +870,20 @@ pub enum ApicError {
     /// the mode the machine's registers are named in.
     #[error("this processor's controller has not been enabled")]
     NotEnabled,
+    /// This controller does not have that local vector table entry. Three of
+    /// the seven are optional and a controller says how many it has; touching
+    /// one it does not have is undefined through the page and a fault through
+    /// the model-specific registers.
+    #[error("this controller has no {which} entry")]
+    NoSuchLvt {
+        /// The source that was asked for.
+        which: Source,
+    },
+    /// The register is one only the memory-mapped interface has, and the
+    /// controller is reached through the model-specific registers, where the
+    /// index it would occupy is reserved.
+    #[error("that register exists only in xapic, and this controller is in x2apic mode")]
+    NotMapped,
     /// The processor reports its register page at address zero, which is not
     /// somewhere a controller can be.
     #[error("the processor reports no address for its register page")]

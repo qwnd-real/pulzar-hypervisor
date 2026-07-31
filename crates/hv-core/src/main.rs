@@ -184,6 +184,11 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     apic.describe("core");
     cpu::attach(apic::local()?.id()?)?;
     ipi::install()?;
+    // After the interprocessor interrupts it takes a vector from, and before
+    // any other processor is started: a controller has to exist before anything
+    // can deliver to it, and before the processor it belongs to does.
+    vlapic::install()?;
+    vlapic::claim_processor()?;
 
     // After the block, because enabling virtualization snapshots host state that
     // includes the `GS` base a block is reached through, and before any other
@@ -204,6 +209,10 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
         chunk::FRAME_SIZE,
         Exposure::ReadOnly,
     )?;
+    // Trapped before the guest has ever run, which is what taking a region over
+    // requires: reducing what the nested tables permit while a guest is running
+    // would mean discarding every processor's cached translations first.
+    partition.interpose(&mut space, [vlapic::region()?])?;
     let mut vcpu = virtualize(&mut space, inherited(handoff)?, portal.entry())?;
 
     // Last of the subsystems that take the address space by value, and
@@ -399,6 +408,9 @@ fn virtualize(
         .control()
         .intercept_2
         .with_flags(Intercepts2Flags::VMMCALL);
+    // The guest's own controller answers for every one of these, so none of
+    // them may reach the real one underneath.
+    vcpu.intercept_msrs(window, vlapic::intercepted())?;
     vcpu.describe("core");
     Ok(vcpu)
 }
@@ -610,16 +622,30 @@ fn unclaimed(interrupt: &Interrupt) {
         serial::emergency(format_args!("core: {interrupt}"));
         halt()
     }
+    // Not acknowledged, because nothing holds a non-maskable interrupt in
+    // service and an acknowledgement it did not need would retire whatever
+    // really is. Recorded against this processor's emulated controller so that
+    // its guest is given one on the way back in, which is where the
+    // architecture's blocking rules can be honoured.
     if interrupt.vector() == Vector::NON_MASKABLE {
-        serial::emergency(format_args!("core: ignoring unclaimed {interrupt}"));
+        if vlapic::raise_nmi().is_err() {
+            serial::emergency(format_args!("core: ignoring unclaimed {interrupt}"));
+        }
         return;
     }
-    warn!("core: ignoring unclaimed {interrupt}");
-    if let Err(error) = apic::end_of_interrupt() {
-        error!(
-            "core: could not acknowledge {}: {error}",
-            interrupt.vector()
-        );
+    // Every other unclaimed arrival is the guest's. On a machine whose I/O
+    // controllers are passed through, a vector nothing in the hypervisor
+    // claimed is one the guest programmed a device to send — and whether real
+    // hardware may be acknowledged now depends on how it was triggered, which
+    // is what the controller works out.
+    if let Err(error) = vlapic::arrived(interrupt.vector()) {
+        warn!("core: ignoring unclaimed {interrupt}: {error}");
+        if let Err(error) = apic::end_of_interrupt() {
+            error!(
+                "core: could not acknowledge {}: {error}",
+                interrupt.vector()
+            );
+        }
     }
 }
 

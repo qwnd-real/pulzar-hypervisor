@@ -41,6 +41,7 @@ talc = { workspace = true }
 thiserror = { workspace = true }
 uefi-raw = { workspace = true }
 vcpu = { workspace = true }
+vlapic = { workspace = true }
 x86_64 = { workspace = true }
 
 [lints]

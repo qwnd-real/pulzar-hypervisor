@@ -66,7 +66,7 @@ const DIRECTION: u64 = 1 << 10;
 /// take an address size from, and whatever reading or writing either end
 /// reports.
 pub(crate) fn perform(
-    mmio: &mut Mmio,
+    mmio: &Mmio,
     vcpu: &mut Vcpu,
     guest: Linear<'_>,
     instruction: &Instruction,

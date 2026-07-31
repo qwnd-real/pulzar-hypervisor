@@ -19,6 +19,7 @@ use pci::PciError;
 use portal::PortalError;
 use thiserror::Error;
 use vcpu::VcpuError;
+use vlapic::VlapicError;
 
 /// A failure during bring-up.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -69,6 +70,9 @@ pub enum CoreError {
     /// Instruction decoding could not be prepared before guest execution.
     #[error(transparent)]
     Emulate(#[from] EmulateError),
+    /// The guest's own interrupt controllers could not be built or driven.
+    #[error(transparent)]
+    Vlapic(#[from] VlapicError),
     /// The guest stopped, at an exit nothing could answer for or at a control
     /// block the processor refused.
     #[error(transparent)]

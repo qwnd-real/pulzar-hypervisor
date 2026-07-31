@@ -38,7 +38,8 @@ mod nested;
 
 use core::convert::Infallible;
 
-use log::{error, info};
+use inject::Pending;
+use log::{error, trace};
 use partition::Partition;
 use portal::Portal;
 use svm::Reason;
@@ -57,15 +58,17 @@ use crate::firmware::Firmware;
 pub struct Exits<'a> {
     partition: &'a Partition,
     firmware: Firmware,
+    interrupts: Pending,
 }
 
 impl<'a> Exits<'a> {
     /// What will answer for a guest that is entered at `portal`.
     #[must_use]
-    pub const fn new(partition: &'a Partition, portal: Portal, boot: Boot) -> Self {
+    pub fn new(partition: &'a Partition, portal: Portal, boot: Boot) -> Self {
         Self {
             partition,
             firmware: Firmware::new(portal, boot),
+            interrupts: Pending::new(),
         }
     }
 
@@ -87,6 +90,11 @@ impl<'a> Exits<'a> {
     /// on another processor since this processor last entered it, and the guest
     /// state in it must describe a guest this hypervisor is entitled to run.
     pub unsafe fn run(&mut self, vcpu: &mut Vcpu) -> Result<Infallible, ExitError> {
+        // Interrupts are taken away from the guest before it is ever entered,
+        // rather than at the first exit: one arriving during the first
+        // instruction the guest runs must already be the host's.
+        inject::arm(vcpu);
+        self.enter(vcpu);
         // SAFETY: forwarded to the caller, whose obligations are `Vcpu::run`'s
         // in full.
         unsafe { vcpu.run(|vcpu| self.exit(vcpu)) }?;
@@ -94,23 +102,76 @@ impl<'a> Exits<'a> {
     }
 
     /// Answers one exit.
+    ///
+    /// The order is not a matter of taste. An event whose delivery this exit
+    /// interrupted has to be taken back before anything can overwrite the
+    /// injection field; the guest's task priority has to be read out of the
+    /// control block before anything consults it, because with virtualized
+    /// interrupt masking the guest changes it without exiting; and both have to
+    /// happen before the exit is answered, because answering one can send this
+    /// processor an interrupt.
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
         let reason = vcpu.reason();
-        info!("exits: {reason:?} at rip {:#x}", vcpu.save().rip);
+        // One line per exit, and a guest driving its own controller exits
+        // thousands of times a second — through a lock every processor's
+        // logging shares. Anything louder than this stops the machine more
+        // thoroughly than whatever is being debugged.
+        trace!("exits: {reason:?} at rip {:#x}", vcpu.save().rip);
+        self.interrupts.harvest(vcpu);
+        vlapic::observe_task_priority(vcpu.control().interrupt_control.virtual_tpr());
         // Before the exit is answered rather than after, because answering one
         // can resume the guest and the portal must be gone by the time it runs
         // again.
         self.firmware.retire(vcpu, self.partition);
-        match reason {
+        let flow = match reason {
             Some(Reason::Cpuid) => cpuid::exit(vcpu),
             Some(Reason::MsrAccess) => msr::exit(vcpu),
             Some(Reason::NestedPageFault) => nested::exit(vcpu, self.partition),
             Some(Reason::Vmmcall) => self.firmware.notified(vcpu),
+            // Two exits that are answered by the fact of having happened.
+            //
+            // The first says the guest became willing to take an interrupt: the
+            // window was armed to produce exactly this exit, and what to inject
+            // is decided below for every exit alike. The second says a physical
+            // interrupt arrived while the guest was running — it was taken by
+            // the host at the world switch and has already been given to
+            // whichever controller it was for, and the exit itself carries
+            // nothing further.
+            Some(Reason::VirtualInterrupt | Reason::Interrupt) => Flow::Resume,
+            // The guest left an interrupt handler, which ends the window during
+            // which it takes no further non-maskable interrupt.
+            Some(Reason::Iret) => {
+                self.interrupts.retired_iret();
+                Flow::Resume
+            }
             _ => {
                 error!("exits: unhandled {:?}", vcpu.control().exit_code);
                 Flow::Leave
             }
+        };
+        if flow == Flow::Resume {
+            self.enter(vcpu);
         }
+        flow
+    }
+
+    /// Decides what the guest takes on its way back in.
+    ///
+    /// The store that says this processor is inside the guest happens before
+    /// the last look at the controller, and both are sequentially consistent.
+    /// That pairing is what stops an interrupt being lost to a processor that
+    /// was entering the guest as the interrupt arrived: a deliverer that misses
+    /// the flag is one whose request bit this last look finds.
+    fn enter(&mut self, vcpu: &mut Vcpu) {
+        // A non-maskable interrupt another processor sent this one is held by
+        // the controller, because the processor that sent it could not reach
+        // what this exit loop owns.
+        if vlapic::take_nmi().unwrap_or(false) {
+            self.interrupts.raise_nmi();
+        }
+        let _ = vlapic::set_in_guest(true);
+        let candidate = vlapic::take_deliverable().unwrap_or(None);
+        self.interrupts.commit(vcpu, candidate);
     }
 }
 

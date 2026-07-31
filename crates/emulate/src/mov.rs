@@ -37,7 +37,7 @@ const SOURCE: u32 = 1;
 /// [`EmulateError::Unsupported`] for an instruction outside the family, and
 /// whatever reading or writing either end of the move reports.
 pub(crate) fn perform(
-    mmio: &mut Mmio,
+    mmio: &Mmio,
     vcpu: &mut Vcpu,
     guest: Linear<'_>,
     instruction: &Instruction,

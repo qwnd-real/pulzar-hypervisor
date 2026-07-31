@@ -534,9 +534,9 @@ impl AddressSpace {
     /// large, or [`PagingError::OutOfFrames`] if the chunk cannot back the
     /// stack. A failure part-way through leaves nothing mapped and nothing
     /// reserved, and gives back every frame it had allocated for the stack
-    /// itself — intermediate page tables stay, as everywhere here. Where undoing
-    /// it did not complete it is [`PagingError::CleanupFailed`] instead, and
-    /// whatever could not be proved detached is retired.
+    /// itself — intermediate page tables stay, as everywhere here. Where
+    /// undoing it did not complete it is [`PagingError::CleanupFailed`]
+    /// instead, and whatever could not be proved detached is retired.
     pub fn allocate_stack(&mut self, pages: u64) -> Result<Stack, PagingError> {
         if pages == 0 {
             return Err(PagingError::EmptyRegion);
