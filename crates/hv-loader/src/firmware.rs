@@ -16,11 +16,12 @@ use alloc::vec::Vec;
 
 use clock::{Civil, Wall};
 use log::{info, warn};
+use paging::Ram;
 use uefi::{
     Handle, Status,
     boot::{self, AllocateType, LoadImageSource, MemoryDescriptor, MemoryType, ScopedProtocol},
     cstr16,
-    mem::memory_map::MemoryMap,
+    mem::memory_map::{MemoryMap, MemoryMapMut},
     proto::{
         BootPolicy,
         device_path::{DevicePath, build},
@@ -417,7 +418,23 @@ pub struct Memory {
     pub entries: usize,
 }
 
-/// Copies firmware's memory map into the chunk and finds the top of RAM.
+/// What firmware's memory map told the loader, and the memory it described.
+///
+/// The ranges travel beside the summary rather than inside it because the
+/// summary is `Copy` and ends up in the handoff, while the ranges are only
+/// needed for as long as it takes to build the direct map over them.
+pub struct Survey {
+    /// The two numbers the handoff carries.
+    pub memory: Memory,
+    /// Every run of memory firmware described, ascending and coalesced. What
+    /// the direct map is built over, and nothing else is: the gaps between them
+    /// are physical address space that answers to nothing, or that answers to a
+    /// device, and a cached always-present alias of either is wrong.
+    pub ram: Vec<Ram>,
+}
+
+/// Copies firmware's memory map into the chunk, finds the top of RAM, and
+/// coalesces the runs of memory it describes.
 ///
 /// The copy exists because firmware's own map lives in memory the hypervisor
 /// stops being able to reach: it is allocated from the pool, in the half of the
@@ -429,10 +446,14 @@ pub struct Memory {
 /// allocation this call itself makes and releases is not reflected in it. The
 /// hypervisor uses it to know what memory exists, not what is currently free.
 ///
-/// The top is the end of the highest descriptor that describes memory.
-/// Reserved, unusable and not-yet-accepted ranges all count — they are RAM
-/// whoever owns them, and counting reserved memory is what puts the chunk
-/// itself under the direct map.
+/// The map is sorted first, so the runs come out ascending and adjacent
+/// descriptors of different types coalesce into one range. Both are what the
+/// address space needs of them: it scans the runs to ask whether a whole page
+/// is memory, and a scan wants an order.
+///
+/// Reserved, unusable and not-yet-accepted ranges all count as memory — they
+/// are RAM whoever owns them, and counting reserved memory is what puts the
+/// chunk itself under the direct map.
 ///
 /// Device memory does not count, and that is the point of computing this at
 /// all. The direct map exists to make reads and writes of RAM cheap; a device
@@ -446,9 +467,10 @@ pub struct Memory {
 ///
 /// # Errors
 ///
-/// [`LoaderError::Firmware`] if firmware will not produce a map, or
+/// [`LoaderError::Firmware`] if firmware will not produce a map,
 /// [`LoaderError::MemoryMapTooLarge`] if it is larger than `capacity`
-/// descriptors.
+/// descriptors, or [`LoaderError::Paging`] if a descriptor describes a range
+/// the address space cannot represent.
 ///
 /// # Safety
 ///
@@ -456,7 +478,7 @@ pub struct Memory {
 pub unsafe fn capture_memory_map(
     destination: core::ptr::NonNull<MemoryDescriptor>,
     capacity: usize,
-) -> Result<Memory, LoaderError> {
+) -> Result<Survey, LoaderError> {
     /// Memory types whose descriptors describe something other than RAM.
     const NOT_MEMORY: [MemoryType; 3] = [
         MemoryType::MMIO,
@@ -464,16 +486,34 @@ pub unsafe fn capture_memory_map(
         MemoryType::PAL_CODE,
     ];
 
-    let map = boot::memory_map(MemoryType::LOADER_DATA).context("retrieve the UEFI memory map")?;
+    let mut map =
+        boot::memory_map(MemoryType::LOADER_DATA).context("retrieve the UEFI memory map")?;
+    // Ascending, so the runs below come out in the order the address space
+    // wants to scan them and adjacent descriptors are adjacent here too.
+    map.sort();
     let entries = map.len();
     if entries > capacity {
         return Err(LoaderError::MemoryMapTooLarge { entries, capacity });
     }
     let mut top_of_ram = 0;
+    let mut ram: Vec<Ram> = Vec::new();
     for (index, descriptor) in map.entries().enumerate() {
         if !NOT_MEMORY.contains(&descriptor.ty) {
-            let end = descriptor.phys_start + descriptor.page_count * paging::chunk::FRAME_SIZE;
+            let start = descriptor.phys_start;
+            let end = start + descriptor.page_count * paging::chunk::FRAME_SIZE;
             top_of_ram = top_of_ram.max(end);
+            match ram.last().copied() {
+                // Firmware describes one stretch of memory as many descriptors,
+                // one per owner. They are one range as far as the direct map is
+                // concerned, and joining them here is what keeps it able to use
+                // large pages across them.
+                Some(last) if last.end() == start => {
+                    let joined = Ram::new(last.start(), end)?;
+                    let last = ram.len() - 1;
+                    ram[last] = joined;
+                }
+                _ => ram.push(Ram::new(start, end)?),
+            }
         }
         // SAFETY: `index` is below `entries`, which the check above holds to
         // `capacity`, so this stays inside the region the caller vouched for.
@@ -481,8 +521,11 @@ pub unsafe fn capture_memory_map(
         // memory arrives holding whatever its last owner left.
         unsafe { destination.add(index).write(*descriptor) };
     }
-    Ok(Memory {
-        top_of_ram,
-        entries,
+    Ok(Survey {
+        memory: Memory {
+            top_of_ram,
+            entries,
+        },
+        ram,
     })
 }

@@ -44,16 +44,17 @@
 //! All three tables are per processor. For two of them there is no choice: a
 //! task state segment holds stacks, and a stack cannot be shared — two
 //! processors taking a double fault at once would take it on the same one — and
-//! the global descriptor table holds the descriptor for that task state segment.
+//! the global descriptor table holds the descriptor for that task state
+//! segment.
 //!
-//! The third could in principle be shared, since a gate names an entry point and
-//! a selector rather than anything per processor. It is not, for two reasons.
-//! The selector in a gate is *this* processor's code selector, and this crate
-//! places its code segment at whatever index firmware or the trampoline was
-//! already using, which differs between them. And a table built once by whichever
-//! processor got there first is a table every other processor waits on: if that
-//! one faults mid-construction, the rest wait forever. Four kilobytes per
-//! processor buys the absence of both problems.
+//! The third could in principle be shared, since a gate names an entry point
+//! and a selector rather than anything per processor. It is not, for two
+//! reasons. The selector in a gate is *this* processor's code selector, and
+//! this crate places its code segment at whatever index firmware or the
+//! trampoline was already using, which differs between them. And a table built
+//! once by whichever processor got there first is a table every other processor
+//! waits on: if that one faults mid-construction, the rest wait forever. Four
+//! kilobytes per processor buys the absence of both problems.
 //!
 //! What becomes of an unclaimed interrupt is not a per-processor fact at all:
 //! it is what this hypervisor does. So it is said once, with [`adopt`], and
@@ -102,25 +103,25 @@ use crate::{
     idt::{Idt, Stacks},
 };
 
-/// Everything one processor needs to run on tables of its own, built and not yet
-/// loaded.
+/// Everything one processor needs to run on tables of its own, built and not
+/// yet loaded.
 ///
 /// Holding one of these means the allocation has already happened: the stacks
-/// are backed, the tables are written, and [`Tables::activate`] is a sequence of
-/// register loads that cannot fail. Dropping one instead gives up the tables but
-/// not the stacks behind them, which is why nothing does.
+/// are backed, the tables are written, and [`Tables::activate`] is a sequence
+/// of register loads that cannot fail. Dropping one instead gives up the tables
+/// but not the stacks behind them, which is why nothing does.
 #[derive(Debug)]
 #[must_use = "tables that are never activated hold seven stacks nothing will use"]
 pub struct Tables {
-    /// Kept only so that what was allocated can be given back if a later step of
-    /// the same build fails.
+    /// Kept only so that what was allocated can be given back if a later step
+    /// of the same build fails.
     stacks: [Stack; InterruptStack::COUNT],
     segments: Segments,
     /// The table this processor ends up on.
     table: Box<Idt>,
     /// The table it is on while the segments are being replaced, whose gates
-    /// switch no stacks because the task register does not yet name a task state
-    /// segment that has any.
+    /// switch no stacks because the task register does not yet name a task
+    /// state segment that has any.
     transition: Box<Idt>,
 }
 
@@ -133,14 +134,15 @@ impl Tables {
     ///
     /// # Errors
     ///
-    /// [`DescriptorError::Unadopted`] if nothing has said yet what becomes of an
-    /// unclaimed interrupt, since building tables that would then be loaded
-    /// makes a delivery possible that has no answer;
+    /// [`DescriptorError::Unadopted`] if nothing has said yet what becomes of
+    /// an unclaimed interrupt, since building tables that would then be
+    /// loaded makes a delivery possible that has no answer;
     /// [`DescriptorError::AlreadyInstalled`] if this processor is already
     /// running on tables from here; [`DescriptorError::Stack`] if one of the
-    /// seven interrupt stacks cannot be backed; [`DescriptorError::OutOfMemory`]
-    /// if a table cannot be allocated; or whatever [`Segments::build`] reports
-    /// about the tables being replaced.
+    /// seven interrupt stacks cannot be backed;
+    /// [`DescriptorError::OutOfMemory`] if a table cannot be allocated; or
+    /// whatever [`Segments::build`] reports about the tables being
+    /// replaced.
     pub fn build(space: &mut AddressSpace) -> Result<Self, DescriptorError> {
         if !dispatch::adopted() {
             return Err(DescriptorError::Unadopted);
@@ -149,30 +151,44 @@ impl Tables {
             return Err(DescriptorError::AlreadyInstalled);
         }
         let stacks = gdt::allocate_stacks(space)?;
-        Self::assemble(&stacks).inspect_err(|_| gdt::release_stacks(space, &stacks))
+        match Self::assemble(&stacks) {
+            Ok((segments, table, transition)) => Ok(Self {
+                stacks,
+                segments,
+                table,
+                transition,
+            }),
+            Err(error) => {
+                gdt::release_stacks(space, stacks.into_iter().rev());
+                Err(error)
+            }
+        }
     }
 
     /// Everything after the stacks, which is everything that can only fail by
     /// running out of memory.
-    fn assemble(stacks: &[Stack; InterruptStack::COUNT]) -> Result<Self, DescriptorError> {
+    ///
+    /// The stacks stay with the caller rather than moving in here, because a
+    /// failure below has to give them back and a consumed value cannot be
+    /// returned alongside the error that consumed it.
+    fn assemble(
+        stacks: &[Stack; InterruptStack::COUNT],
+    ) -> Result<(Segments, Box<Idt>, Box<Idt>), DescriptorError> {
         let segments = Segments::build(stacks)?;
         let code = segments.selectors().code;
-        Ok(Self {
-            stacks: *stacks,
-            table: Idt::build(code, Stacks::Own)?,
-            transition: Idt::build(code, Stacks::Interrupted)?,
-            segments,
-        })
+        let table = Idt::build(code, Stacks::Own)?;
+        let transition = Idt::build(code, Stacks::Interrupted)?;
+        Ok((segments, table, transition))
     }
 
     /// Gives everything back without loading any of it.
     ///
     /// The counterpart of [`Tables::build`] for a caller that decides, between
     /// the two steps, that this processor is not going to come up after all.
-    /// Nothing else can return the stacks: they belong to the address space, and
-    /// these tables are the only thing that knows which seven they are.
+    /// Nothing else can return the stacks: they belong to the address space,
+    /// and these tables are the only thing that knows which seven they are.
     pub fn release(self, space: &mut AddressSpace) {
-        gdt::release_stacks(space, &self.stacks);
+        gdt::release_stacks(space, self.stacks.into_iter().rev());
     }
 
     /// Switches this processor onto these tables.
@@ -188,14 +204,14 @@ impl Tables {
     /// 2. The debug registers are disarmed, so that nothing firmware left armed
     ///    can raise `#DB` inside the path that handles `#DB`.
     /// 3. The transition table is loaded. Its gates name the code selector that
-    ///    is live *now*, and switch no stacks, so it is valid before the segments
-    ///    change and valid after — and from this instant every vector reaches
-    ///    this image rather than firmware's handlers.
+    ///    is live *now*, and switch no stacks, so it is valid before the
+    ///    segments change and valid after — and from this instant every vector
+    ///    reaches this image rather than firmware's handlers.
     /// 4. The segments are replaced and the task register is loaded. The code
-    ///    segment lands at the index the live code selector already used and the
-    ///    live stack descriptor is carried over unchanged, so the table loaded in
-    ///    step 3 keeps meaning what it meant, and so does an `IRET` that reloads
-    ///    either register.
+    ///    segment lands at the index the live code selector already used and
+    ///    the live stack descriptor is carried over unchanged, so the table
+    ///    loaded in step 3 keeps meaning what it meant, and so does an `IRET`
+    ///    that reloads either register.
     /// 5. The real table is loaded, and its gates may name interrupt stacks
     ///    because the task register now names the segment holding them.
     /// 6. The interrupt flag goes back to whatever it was on entry.
@@ -287,18 +303,18 @@ impl Descriptors {
     /// # Errors
     ///
     /// [`DescriptorError::AnotherProcessor`] if the caller is not the processor
-    /// these tables were activated on, which would mean unmasking on a processor
-    /// whose own state nothing here has established.
+    /// these tables were activated on, which would mean unmasking on a
+    /// processor whose own state nothing here has established.
     ///
     /// # Safety
     ///
-    /// Nothing that can deliver an interrupt to this processor may be programmed
-    /// with a vector below [`Vector::FIRST_EXTERNAL`]. In particular the legacy
-    /// 8259 controllers, which deliver onto vectors 8 to 15 as firmware leaves
-    /// them at reset, must be masked or absent. An external interrupt on an
-    /// exception's vector arrives without the error code that vector's gate is
-    /// written for, and the handler would return to an address eight bytes from
-    /// the right one.
+    /// Nothing that can deliver an interrupt to this processor may be
+    /// programmed with a vector below [`Vector::FIRST_EXTERNAL`]. In
+    /// particular the legacy 8259 controllers, which deliver onto vectors 8
+    /// to 15 as firmware leaves them at reset, must be masked or absent. An
+    /// external interrupt on an exception's vector arrives without the
+    /// error code that vector's gate is written for, and the handler would
+    /// return to an address eight bytes from the right one.
     pub unsafe fn unmask(&self) -> Result<(), DescriptorError> {
         if live_table() != self.table {
             return Err(DescriptorError::AnotherProcessor);
@@ -398,6 +414,10 @@ pub enum DescriptorError {
     /// would abandon the first with nothing able to reach it.
     #[error("this processor already installed its descriptor tables")]
     AlreadyInstalled,
+    /// Every interrupt stack was allocated and the table they go in still has a
+    /// slot with nothing in it, which the list of stacks says cannot happen.
+    #[error("the interrupt stack table was left with an empty slot")]
+    StackTableIncomplete,
     /// The tables belong to a different processor from the one asking.
     #[error("these descriptor tables belong to another processor")]
     AnotherProcessor,

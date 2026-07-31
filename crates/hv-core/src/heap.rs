@@ -43,7 +43,7 @@
 use core::ptr::NonNull;
 
 use log::info;
-use paging::{AddressSpace, PagingError, as_usize, buddy, chunk::FRAME_SIZE};
+use paging::{AddressSpace, as_usize, buddy, chunk::FRAME_SIZE};
 use talc::{TalcLock, source::Manual};
 use x86_64::VirtAddr;
 
@@ -96,17 +96,11 @@ impl Heap {
     /// bookkeeping.
     pub fn establish(space: &mut AddressSpace) -> Result<Self, CoreError> {
         let order = buddy::order_for(as_usize(HEAP_FRAMES));
-        let frames = space
-            .frames()
-            .allocate(order)
-            .ok_or(PagingError::OutOfFrames { order })?;
+        let frames = space.frames().allocate(order)?;
         let phys = frames.start_address();
-        let base = space
-            .direct_map()
-            .virt(phys)
-            .ok_or(PagingError::Unreachable {
-                phys: phys.as_u64(),
-            })?;
+        // The whole heap, not just its first byte: everything below hands the
+        // allocator a span it will write to the end of.
+        let base = space.direct_map().reach(phys, HEAP_BYTES)?;
 
         // SAFETY: the run was just allocated from the chunk, so this is its only
         // owner and nothing outside the allocator will write to it; it is

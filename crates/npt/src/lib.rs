@@ -767,7 +767,7 @@ const TRAPPED: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::US
 fn frame(frames: &mut Frames, window: DirectMap) -> Result<PhysAddr, NptError> {
     let frame = frames
         .allocate(0)
-        .ok_or(NptError::OutOfFrames)?
+        .map_err(|_| NptError::OutOfFrames)?
         .start_address();
     if window.virt(frame).is_none() {
         return Err(NptError::Unreachable {

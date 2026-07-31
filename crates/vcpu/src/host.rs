@@ -202,7 +202,7 @@ fn permitted(svm: &Svm) -> Result<(), VcpuError> {
 fn page(frames: &mut Frames, window: DirectMap) -> Result<PhysAddr, VcpuError> {
     let frame = frames
         .allocate(0)
-        .ok_or(VcpuError::OutOfFrames)?
+        .map_err(|_| VcpuError::OutOfFrames)?
         .start_address();
     if window.virt(frame).is_none() {
         return Err(VcpuError::Unreachable {

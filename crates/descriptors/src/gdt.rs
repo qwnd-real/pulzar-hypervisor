@@ -19,29 +19,30 @@
 //! # Two descriptors that are not ours
 //!
 //! A table is loaded by one instruction, and from that instruction on every
-//! selector in every register means whatever the *new* table says at that index.
-//! Two of those selectors are still live at that moment and the processor can
-//! still act on them: the code selector, which a gate names and `IRET` restores,
-//! and the stack selector, which `IRET` also restores from the frame. Both of
-//! them at that point are firmware's, or the trampoline's.
+//! selector in every register means whatever the *new* table says at that
+//! index. Two of those selectors are still live at that moment and the
+//! processor can still act on them: the code selector, which a gate names and
+//! `IRET` restores, and the stack selector, which `IRET` also restores from the
+//! frame. Both of them at that point are firmware's, or the trampoline's.
 //!
 //! So both are kept meaningful across the change. The code segment this
 //! hypervisor runs in is placed at *the index the live code selector already
 //! uses*, so a gate or an `IRET` naming that index gets a valid 64-bit ring 0
 //! code segment before the change and after it. The live stack descriptor is
 //! copied to its own index unchanged, so an `IRET` that reloads it finds the
-//! same segment it was written from. Everything this crate adds goes above both.
+//! same segment it was written from. Everything this crate adds goes above
+//! both.
 //!
 //! That is what makes the transition in [`crate::Tables::activate`] have no
 //! window in it. The alternative — our own indices, chosen here — would mean an
-//! interval in which the live interrupt descriptor table names selectors that no
-//! longer describe what they did, and nothing masks the exceptions that would be
-//! delivered through it.
+//! interval in which the live interrupt descriptor table names selectors that
+//! no longer describe what they did, and nothing masks the exceptions that
+//! would be delivered through it.
 //!
 //! The consequence is that the selector *numbers* differ from processor to
-//! processor, because firmware and the trampoline do not agree on where they put
-//! their code segment. Nothing depends on them agreeing: each processor's gates
-//! are written with its own numbers.
+//! processor, because firmware and the trampoline do not agree on where they
+//! put their code segment. Nothing depends on them agreeing: each processor's
+//! gates are written with its own numbers.
 //!
 //! # Building the table by hand
 //!
@@ -53,6 +54,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::mem::offset_of;
 
+use log::warn;
 use paging::{AddressSpace, Stack};
 use x86_64::{
     PrivilegeLevel, VirtAddr,
@@ -91,10 +93,10 @@ const DATA: u64 = match Descriptor::kernel_data_segment() {
 /// Selectors into one processor's global descriptor table.
 ///
 /// Numbers, and nothing more. They index the table of the processor that built
-/// them — which is not the table another processor is running on, and which puts
-/// its code segment wherever firmware happened to put its own. Nothing here
-/// travels: they are reported so that a log says what a processor is running on,
-/// and used by the code that built the table they belong to.
+/// them — which is not the table another processor is running on, and which
+/// puts its code segment wherever firmware happened to put its own. Nothing
+/// here travels: they are reported so that a log says what a processor is
+/// running on, and used by the code that built the table they belong to.
 #[derive(Clone, Copy, Debug)]
 pub struct Selectors {
     /// The 64-bit code segment this hypervisor executes in, at the index the
@@ -136,11 +138,9 @@ impl Segments {
     /// allocated, [`DescriptorError::UnknownStackSegment`] if the live stack
     /// selector points outside the live table — which would mean the processor
     /// is already running on something inconsistent — or
-    /// [`DescriptorError::TooManySegments`] if preserving the live indices would
-    /// need a table larger than a table can be.
-    pub(crate) fn build(
-        stacks: &[Stack; InterruptStack::COUNT],
-    ) -> Result<Self, DescriptorError> {
+    /// [`DescriptorError::TooManySegments`] if preserving the live indices
+    /// would need a table larger than a table can be.
+    pub(crate) fn build(stacks: &[Stack; InterruptStack::COUNT]) -> Result<Self, DescriptorError> {
         let block = Box::try_new(Cpu::new(stacks)).map_err(|_| DescriptorError::OutOfMemory)?;
         let code_index = CS::get_reg().index();
         let borrowed_stack = live_stack_descriptor()?;
@@ -183,12 +183,12 @@ impl Segments {
         self.selectors
     }
 
-    /// Loads this table, points every segment register at it, and loads the task
-    /// register.
+    /// Loads this table, points every segment register at it, and loads the
+    /// task register.
     ///
     /// The table and the block become permanent here: the processor keeps a
-    /// pointer to each for as long as it runs, so from this point on neither may
-    /// move and neither may be dropped.
+    /// pointer to each for as long as it runs, so from this point on neither
+    /// may move and neither may be dropped.
     ///
     /// All five data segment registers are reloaded even though 64-bit mode
     /// consults none of their descriptors, so that none is left naming an index
@@ -197,21 +197,21 @@ impl Segments {
     ///
     /// # Safety
     ///
-    /// - The calling processor must be the one this table was built on, and must
-    ///   not already be running on a table this crate produced: the task
-    ///   descriptor is marked busy by the task register load, and loading a busy
-    ///   one faults.
+    /// - The calling processor must be the one this table was built on, and
+    ///   must not already be running on a table this crate produced: the task
+    ///   descriptor is marked busy by the task register load, and loading a
+    ///   busy one faults.
     /// - Nothing may be relied upon across the call:
     ///   - the visible `FS` and `GS` selectors, which are replaced;
-    ///   - the `FS` and `GS` bases, which loading those selectors sets to zero —
-    ///     including `IA32_KERNEL_GS_BASE`'s counterpart in use, so whatever
+    ///   - the `FS` and `GS` bases, which loading those selectors sets to zero
+    ///     — including `IA32_KERNEL_GS_BASE`'s counterpart in use, so whatever
     ///     needs a base must establish it afterwards;
     ///   - the descriptors behind any selector this table does not preserve,
     ///     which is every index except the live code and stack ones.
     /// - Interrupts must be masked, and the interrupt descriptor table live at
-    ///   the moment of the call must have gates whose selectors this table still
-    ///   describes and must name no stack in a task state segment — a table
-    ///   loaded before the task register is has nowhere to switch to.
+    ///   the moment of the call must have gates whose selectors this table
+    ///   still describes and must name no stack in a task state segment — a
+    ///   table loaded before the task register is has nowhere to switch to.
     pub(crate) unsafe fn activate(self) -> Selectors {
         let Self {
             entries,
@@ -261,24 +261,16 @@ impl Segments {
 pub(crate) fn allocate_stacks(
     space: &mut AddressSpace,
 ) -> Result<[Stack; InterruptStack::COUNT], DescriptorError> {
-    // Every slot starts holding the first stack, which is a real one, and every
-    // slot but its own is overwritten below. That is what keeps this an array of
-    // stacks rather than an array of maybe-stacks with an impossible case left
-    // in it.
-    let mut stacks = match space.allocate_stack(nesting::STACK_PAGES) {
-        Ok(first) => [first; InterruptStack::COUNT],
-        Err(source) => {
-            return Err(DescriptorError::Stack {
-                stack: InterruptStack::ALL[0],
-                source,
-            });
-        }
-    };
-    for (taken, wanted) in InterruptStack::ALL.into_iter().enumerate().skip(1) {
+    // A stack cannot be copied — that is what makes releasing one twice
+    // unrepresentable — so the slots are filled one at a time and the array of
+    // maybe-stacks is turned into an array of stacks once every one of them is
+    // there.
+    let mut taken: [Option<Stack>; InterruptStack::COUNT] = [const { None }; InterruptStack::COUNT];
+    for wanted in InterruptStack::ALL {
         match space.allocate_stack(nesting::STACK_PAGES) {
-            Ok(allocation) => stacks[usize::from(wanted.slot())] = allocation,
+            Ok(stack) => taken[usize::from(wanted.slot())] = Some(stack),
             Err(source) => {
-                release_stacks(space, &stacks[..taken]);
+                release_stacks(space, taken.iter_mut().rev().filter_map(Option::take));
                 return Err(DescriptorError::Stack {
                     stack: wanted,
                     source,
@@ -286,35 +278,59 @@ pub(crate) fn allocate_stacks(
             }
         }
     }
-    Ok(stacks)
+    let [
+        Some(fault),
+        Some(nmi),
+        Some(check),
+        Some(debug),
+        Some(page),
+        Some(protection),
+        Some(segment),
+    ] = taken
+    else {
+        // Unreachable: the loop above filled the slot of every stack in
+        // `InterruptStack::ALL`, and the assertion beside `InterruptStack::slot`
+        // proves at compile time that those are the seven slots. Reported rather
+        // than asserted because there is a caller to report it to.
+        return Err(DescriptorError::StackTableIncomplete);
+    };
+    Ok([fault, nmi, check, debug, page, protection, segment])
 }
 
-/// Gives `stacks` back, in the reverse of the order they were taken.
+/// Gives `stacks` back.
 ///
 /// For the paths where the tables they were allocated for will not exist: a
-/// build that failed after them, or one that failed later on.
-pub(crate) fn release_stacks(space: &mut AddressSpace, stacks: &[Stack]) {
-    for stack in stacks.iter().rev() {
+/// build that failed after them, or one that failed later on. Callers pass them
+/// in the reverse of the order they were taken.
+///
+/// Nothing is reported upwards: this is a rollback path, so a failure here is
+/// already handling a failure and there is nowhere to propagate it to. Whatever
+/// the address space could not prove detached stays allocated rather than being
+/// handed out twice, which is what its own error says.
+pub(crate) fn release_stacks(space: &mut AddressSpace, stacks: impl IntoIterator<Item = Stack>) {
+    for stack in stacks {
         // SAFETY: none of these was ever put in a task state segment, let alone
         // switched to — a stack only becomes reachable when the table naming it
         // is loaded, and on these paths no table ever is.
-        unsafe { space.release_stack(*stack) };
+        if let Err(error) = unsafe { space.release_stack(stack) } {
+            warn!("descriptors: an interrupt stack could not be given back: {error}");
+        }
     }
 }
 
 /// This processor's block, found through the table it is running on.
 ///
-/// The task descriptor is the last thing [`Segments::build`] puts in a table, so
-/// the last two entries of the live table are the descriptor naming this
-/// processor's own block — and the table register is per processor, which is what
-/// makes this answer the running processor's rather than anyone else's.
+/// The task descriptor is the last thing [`Segments::build`] puts in a table,
+/// so the last two entries of the live table are the descriptor naming this
+/// processor's own block — and the table register is per processor, which is
+/// what makes this answer the running processor's rather than anyone else's.
 ///
 /// # Panics
 ///
 /// Never. It is used on the interrupt entry path, so it reads a possible answer
 /// out of the descriptor rather than checking one: a table that is not one of
-/// ours would give an address that is not one either, and there is no state left
-/// to report that from.
+/// ours would give an address that is not one either, and there is no state
+/// left to report that from.
 pub(crate) fn block() -> *mut Cpu {
     let live = tables::sgdt();
     let entries = (usize::from(live.limit) + 1) / size_of::<u64>();
@@ -334,8 +350,8 @@ const TSS_OFFSET: u64 = offset_of!(Cpu, tss) as u64;
 
 /// Disarms every hardware breakpoint the processor might still be carrying.
 ///
-/// Firmware is free to leave a breakpoint armed, and a breakpoint is the one way
-/// a `#DB` can be raised inside the `#DB` path — the case
+/// Firmware is free to leave a breakpoint armed, and a breakpoint is the one
+/// way a `#DB` can be raised inside the `#DB` path — the case
 /// [`crate::nesting`] cannot rule out by reasoning about blocking. Clearing the
 /// register removes it: with no address enabled and general-detect off, nothing
 /// but single-stepping raises `#DB`, and nothing here ever sets that flag.
@@ -360,15 +376,15 @@ fn place(entries: &mut [u64], index: u16, descriptor: Descriptor) {
 /// The live stack descriptor and the index it sits at, or `None` if the stack
 /// selector is null.
 ///
-/// `IRET` reloads `SS` from the frame it pops, so whatever the stack selector is
-/// now has to keep describing the same segment in the table that replaces the
-/// live one. A null selector needs nothing preserved: returning to ring 0 with
-/// one is allowed and describes no segment.
+/// `IRET` reloads `SS` from the frame it pops, so whatever the stack selector
+/// is now has to keep describing the same segment in the table that replaces
+/// the live one. A null selector needs nothing preserved: returning to ring 0
+/// with one is allowed and describes no segment.
 ///
 /// # Errors
 ///
-/// [`DescriptorError::UnknownStackSegment`] if the selector points past the live
-/// table's limit, which cannot happen on a processor that loaded it.
+/// [`DescriptorError::UnknownStackSegment`] if the selector points past the
+/// live table's limit, which cannot happen on a processor that loaded it.
 fn live_stack_descriptor() -> Result<Option<(u16, u64)>, DescriptorError> {
     let selector = SS::get_reg();
     let index = selector.index();

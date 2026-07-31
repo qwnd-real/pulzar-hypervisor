@@ -119,8 +119,8 @@ pub type Unclaimed = fn(&Interrupt);
 /// A copy of what the processor pushed rather than a borrow of it: nothing a
 /// handler keeps refers to the frame on the stack it was entered on, so a
 /// retained copy stays readable and stays what it was. What it is *not* is
-/// current — it is what the processor said at the moment of entry, and the stack
-/// it came from is free to be used again.
+/// current — it is what the processor said at the moment of entry, and the
+/// stack it came from is free to be used again.
 #[derive(Clone, Copy, Debug)]
 pub struct Interrupt {
     vector: Vector,
@@ -156,8 +156,8 @@ impl Interrupt {
     ///
     /// It is the register's value as of entry, which is the faulting address as
     /// long as nothing on the way here faulted too. A fault inside this crate's
-    /// own entry path would replace it, so the read happens before anything else
-    /// does.
+    /// own entry path would replace it, so the read happens before anything
+    /// else does.
     #[must_use]
     pub const fn fault_address(&self) -> Option<u64> {
         self.fault_address
@@ -208,8 +208,8 @@ static HANDLERS: [AtomicPtr<()>; Vector::COUNT] =
     [const { AtomicPtr::new(ptr::null_mut()) }; Vector::COUNT];
 
 /// What becomes of an interrupt no handler claimed. Empty until the hypervisor
-/// says, which is a precondition of any processor loading a table of gates, so a
-/// delivery can never find it unset.
+/// says, which is a precondition of any processor loading a table of gates, so
+/// a delivery can never find it unset.
 static UNCLAIMED: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
 /// Pins `handler` to `vector`.
@@ -266,9 +266,9 @@ pub fn register(vector: Vector, handler: Handler) -> Result<(), DescriptorError>
 ///
 /// [`DescriptorError::RangeReversed`] if `last` is below `first`,
 /// [`DescriptorError::NotExternal`] if the range reaches into the exceptions,
-/// [`DescriptorError::NoVectorFree`] if every vector in it is taken, or whatever
-/// [`register`] reported for a vector that could not be claimed for some other
-/// reason.
+/// [`DescriptorError::NoVectorFree`] if every vector in it is taken, or
+/// whatever [`register`] reported for a vector that could not be claimed for
+/// some other reason.
 pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, DescriptorError> {
     if last < first {
         return Err(DescriptorError::RangeReversed { first, last });

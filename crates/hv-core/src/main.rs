@@ -176,6 +176,10 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // which cannot come before its descriptor tables because loading a segment
     // selector into `GS` zeroes the base a block is reached through.
     cpu::survey(acpi.madt().processors())?;
+    // From here on, "nobody has been told" stops being a safe assumption the
+    // address space may make for itself: it can ask how many processors are
+    // running instead.
+    paging::shootdown::watch(cpu::online_count)?;
     let apic = Apic::install(&mut space, acpi.madt())?;
     apic.describe("core");
     cpu::attach(apic::local()?.id()?)?;
@@ -291,6 +295,15 @@ fn ap_main() -> ! {
 /// The first failure of any step. There is nothing to roll back: a processor
 /// that cannot finish this has nothing to go back to, and the caller stops it.
 fn attach() -> Result<(cpu::ApicId, Descriptors), CoreError> {
+    // Before anything else this processor does with the address space it was
+    // started into. The page attribute table is per-processor state that
+    // survives INIT, so the shared page tables mean whatever this processor's
+    // own copy says they mean — and two processors reading one mapping as two
+    // memory types is an aliasing the architecture leaves undefined. The other
+    // two are the refusals the boot processor already made, made again here
+    // because they are also per-processor.
+    establish_processor_state()?;
+
     // Built while the address space is locked and switched to after it is
     // unlocked: a processor that fell over between the two would otherwise leave
     // that lock held for every processor after it.
@@ -305,6 +318,38 @@ fn attach() -> Result<(cpu::ApicId, Descriptors), CoreError> {
     })??;
     host.describe("core");
     Ok((id, descriptors))
+}
+
+/// Establishes the processor state the address space assumes, on whichever
+/// processor is running this.
+///
+/// The boot processor does this inside `AddressSpace::build` and
+/// `AddressSpace::adopt`, at the point where it is about to make the mappings.
+/// An application processor arrives into an address space that already exists,
+/// so it does it here instead — and it has to, because none of this is machine
+/// state. The page attribute table, `EFER.NXE` and `CR4` are each per logical
+/// processor, and an application processor that skipped this would walk the
+/// same tables under different rules.
+///
+/// # Errors
+///
+/// [`CoreError::Paging`] if this processor cannot run what the address space
+/// needs: no page attribute table, no no-execute bit, 5-level paging, or
+/// process-context identifiers enabled.
+fn establish_processor_state() -> Result<(), CoreError> {
+    paging::cpu::refuse_five_level_paging()?;
+    paging::cpu::refuse_process_context_identifiers()?;
+    paging::cpu::enable_no_execute()?;
+    // SAFETY: this processor is at its entry point. It has mapped nothing of its
+    // own, it has read and written nothing through a mapping whose cache bits
+    // select anything but entry zero, and its code and stack are write-back
+    // mappings the boot processor made.
+    if unsafe { paging::cpu::establish_pat() }? {
+        warn!(
+            "core: an application processor started with a different IA32_PAT; established the policy"
+        );
+    }
+    Ok(())
 }
 
 /// Turns virtualization on for the calling processor and gives it a place in
@@ -468,7 +513,9 @@ fn announce(handoff: &Handoff) {
 fn adopted(handoff: &Handoff) -> Result<Existing, CoreError> {
     let root = phys(handoff.page_table_root)?;
     Ok(Existing {
+        layout: handoff.chunk_layout,
         chunk_base: phys(handoff.chunk_base)?,
+        chunk_size: handoff.chunk_size,
         root: PhysFrame::from_start_address(root).map_err(|_| PagingError::Misaligned {
             value: root.as_u64(),
             align: chunk::FRAME_SIZE,
@@ -476,6 +523,7 @@ fn adopted(handoff: &Handoff) -> Result<Existing, CoreError> {
         direct_map_base: virt(handoff.direct_map_base)?,
         direct_map_size: handoff.direct_map_size,
         mapping_window_base: virt(handoff.mapping_window_base)?,
+        mapping_window_size: handoff.mapping_window_size,
     })
 }
 
@@ -510,9 +558,11 @@ fn self_check(space: &mut AddressSpace, handoff: &Handoff) -> Result<(), CoreErr
     }
 
     let image = virt(handoff.core_image_base)?;
-    let mapped = space.translate(image).ok_or(CoreError::SelfCheckFailed {
-        what: "translating this image's own base",
-    })?;
+    let mapped = space
+        .translate(image)
+        .map_err(|_| CoreError::SelfCheckFailed {
+            what: "translating this image's own base",
+        })?;
     info!("core: self check passed, {image:#x} still translates to {mapped:#x}");
 
     Ok(())

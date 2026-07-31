@@ -60,6 +60,17 @@ pub struct Handoff {
     pub chunk_base: u64,
     /// Byte length of the reserved chunk.
     pub chunk_size: u64,
+    /// Which arrangement of the chunk's metadata the loader wrote, as
+    /// `paging::chunk::LAYOUT`.
+    ///
+    /// The version above protects this structure; this protects the bytes
+    /// inside the chunk that it points at. They are separate questions and they
+    /// change for separate reasons: a field added here moves nothing in the
+    /// chunk, and a metadata region that grows moves everything after it while
+    /// leaving every field here where it was. A pair of images that agreed on
+    /// one and not the other would read each other's allocator bitmaps at the
+    /// wrong offsets and find nothing to complain about.
+    pub chunk_layout: u64,
 
     /// Physical address of the PML4 the loader built and activated.
     pub page_table_root: u64,
@@ -151,7 +162,7 @@ impl Handoff {
     pub const MAGIC: u64 = u64::from_le_bytes(*b"PULZARH1");
 
     /// Current protocol version.
-    pub const VERSION: u32 = 6;
+    pub const VERSION: u32 = 7;
 
     /// Validates `ptr` and borrows the handoff behind it.
     ///

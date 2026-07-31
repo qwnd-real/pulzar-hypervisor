@@ -41,7 +41,7 @@ use core::{arch::asm, convert::Infallible, ptr::NonNull};
 
 use clock::Wall;
 use handoff::Handoff;
-use log::{error, info};
+use log::{error, info, warn};
 use paging::{
     AddressSpace, CacheType, DirectMap, PagingError, Protection, Stack, buddy, chunk,
     kaslr::{self, Entropy, Placement},
@@ -55,7 +55,7 @@ use x86_64::{
 
 use crate::{
     error::LoaderError,
-    firmware::{ImageFile, Loader, Memory, Reserved},
+    firmware::{ImageFile, Loader, Memory, Reserved, Survey},
     image::Image,
 };
 
@@ -158,10 +158,13 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
         wide(guest.handle.as_ptr() as usize)
     );
 
-    let memory = survey_memory(chunk_base)?;
+    let survey = survey_memory(chunk_base)?;
+    let memory = survey.memory;
     info!(
-        "loader: copied {} memory descriptors, physical memory ends at {:#x}",
-        memory.entries, memory.top_of_ram
+        "loader: copied {} memory descriptors in {} runs, physical memory ends at {:#x}",
+        memory.entries,
+        survey.ram.len(),
+        memory.top_of_ram
     );
 
     let mut file = ImageFile::open()?;
@@ -173,15 +176,23 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
     );
 
     let placement = kaslr::place(
-        &mut Entropy::new(),
+        &mut entropy(),
         image.size(),
-        paging::direct_map_size(memory.top_of_ram),
+        paging::direct_map_size(memory.top_of_ram)?,
     )?;
+    info!(
+        "loader: image at {:#x}, direct map at {:#x}, window at {:#x}, entropy {:?}",
+        placement.image_base,
+        placement.direct_map_base,
+        placement.mapping_window_base,
+        placement.source
+    );
     // SAFETY: `chunk_base` is the base of a `CHUNK_SIZE` region firmware just
     // reserved for this image alone, which firmware's still-active address space
-    // maps identically, and `top_of_ram` is one past the highest physical address
-    // firmware's memory map describes.
-    let mut space = unsafe { AddressSpace::build(chunk_base, memory.top_of_ram, placement) }?;
+    // maps identically and which the survey describes as memory; the runs come
+    // from firmware's own map and describe RAM rather than device apertures; and
+    // nothing of pulzar's has been mapped or established on this processor yet.
+    let mut space = unsafe { AddressSpace::build(chunk_base, &survey.ram, placement) }?;
     let hypervisor = load(&mut space, &mut file, &image, placement)?;
 
     // Firmware objects are closed here rather than dropped: the jump below never
@@ -189,6 +200,10 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
     drop(file);
     space.describe("loader");
 
+    // The stack's top is read out before the inputs are assembled: the stack
+    // itself moves into them, and it is not the sort of value that can be left
+    // behind in two places at once.
+    let stack_top = hypervisor.stack.top();
     let inputs = HandoffInputs {
         reserved,
         loader,
@@ -200,15 +215,14 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
     let handoff = publish(&space, inputs, firmware)?;
     let entry = VirtAddr::new(image.entry(placement.image_base.as_u64()));
     info!(
-        "loader: entering hypervisor at {entry:#x}, stack top {:#x}, handoff {handoff:#x}",
-        hypervisor.stack.top()
+        "loader: entering hypervisor at {entry:#x}, stack top {stack_top:#x}, handoff {handoff:#x}"
     );
     // SAFETY: `space` maps the hypervisor's image at `entry` and its stack below
     // `stack.top()`, and its lower half is firmware's own, so the instructions
     // between the `CR3` load and the jump stay mapped where they are executing
     // from. `handoff` is a direct-map address of a `Handoff` this space maps, and
     // the entry point of a UEFI image never returns to its caller.
-    unsafe { enter(space.root(), hypervisor.stack.top(), entry, handoff) }
+    unsafe { enter(space.root(), stack_top, entry, handoff) }
 }
 
 /// Copies firmware's memory map into the chunk's metadata region.
@@ -217,7 +231,7 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
 ///
 /// [`LoaderError::Paging`] if firmware's identity map does not reach the chunk,
 /// or whatever [`firmware::capture_memory_map`] reports.
-fn survey_memory(chunk_base: PhysAddr) -> Result<Memory, LoaderError> {
+fn survey_memory(chunk_base: PhysAddr) -> Result<Survey, LoaderError> {
     let capacity = bytes(chunk::MEMORY_MAP_SIZE) / size_of::<MemoryDescriptor>();
     let destination = identity_ptr::<MemoryDescriptor>(chunk_base + chunk::MEMORY_MAP_OFFSET)?;
     // SAFETY: the destination is the chunk's memory-map region, `MEMORY_MAP_SIZE`
@@ -244,14 +258,18 @@ fn probe(file: &mut ImageFile) -> Result<Image, LoaderError> {
 /// spans, and where its stack ended up. Together rather than separately because
 /// they are one step's output, and because the handoff is assembled from a
 /// bounded list of such outputs.
-#[derive(Clone, Copy, Debug)]
+///
+/// Not `Copy`, because a [`Stack`] is not: the value that names a stack is the
+/// only thing entitled to give it back, and a second copy of it would be a
+/// second entitlement.
+#[derive(Debug)]
 struct Hypervisor {
     stack: Stack,
     image_size: u64,
 }
 
 /// Values collected during loading that become the immutable handoff.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct HandoffInputs {
     reserved: Reserved,
     loader: Loader,
@@ -276,11 +294,7 @@ fn load(
 ) -> Result<Hypervisor, LoaderError> {
     let order = image_order(image.size());
     let span = chunk::FRAME_SIZE << order;
-    let phys = space
-        .frames()
-        .allocate(order)
-        .ok_or(PagingError::OutOfFrames { order })?
-        .start_address();
+    let phys = space.frames().allocate(order)?.start_address();
     info!(
         "loader: image frames at {phys:#x}, {span:#x} bytes for {:#x} bytes of image",
         image.size()
@@ -448,6 +462,7 @@ fn publish(
         guest_image_handle: guest.handle.as_ptr(),
         chunk_base: chunk_base.as_u64(),
         chunk_size: chunk::CHUNK_SIZE,
+        chunk_layout: chunk::LAYOUT,
         page_table_root: space.root().start_address().as_u64(),
         direct_map_base: space.direct_map().base().as_u64(),
         direct_map_size: space.direct_map().size(),
@@ -534,9 +549,7 @@ unsafe fn enter(root: PhysFrame, stack: VirtAddr, entry: VirtAddr, handoff: Virt
 /// [`LoaderError::Paging`] if firmware's identity map does not reach `phys`, or
 /// if `phys` is not aligned for `T`.
 fn identity_ptr<T>(phys: PhysAddr) -> Result<NonNull<T>, LoaderError> {
-    DirectMap::identity()
-        .ptr::<T>(phys)
-        .ok_or_else(|| unreachable(phys))
+    Ok(DirectMap::identity().ptr::<T>(phys)?)
 }
 
 /// Where the direct map the loader built makes `phys` readable.
@@ -549,13 +562,23 @@ fn direct(space: &AddressSpace, phys: PhysAddr) -> Result<VirtAddr, LoaderError>
     space
         .direct_map()
         .virt(phys)
-        .ok_or_else(|| unreachable(phys))
+        .ok_or(LoaderError::Paging(PagingError::Unreachable {
+            phys: phys.as_u64(),
+            len: 1,
+        }))
 }
 
-/// The error for a physical address the current window does not cover.
-fn unreachable(phys: PhysAddr) -> LoaderError {
-    LoaderError::Paging(PagingError::Unreachable {
-        phys: phys.as_u64(),
+/// The source the high-half layout is drawn from.
+///
+/// Hardware entropy where the processor has it, and otherwise a layout that
+/// merely differs between boots — chosen here, deliberately, rather than
+/// substituted underneath the caller. A machine or an emulator without `RDRAND`
+/// still gets a moving layout, and the log says in as many words that it is not
+/// one an attacker cannot predict.
+fn entropy() -> Entropy {
+    Entropy::secure().unwrap_or_else(|error| {
+        warn!("loader: {error}; the high-half layout will not be secure against an attacker");
+        Entropy::best_effort()
     })
 }
 

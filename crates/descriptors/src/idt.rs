@@ -22,8 +22,8 @@
 //!
 //! # The shapes an entry point comes in
 //!
-//! Two facts about a vector change what its entry point must look like, and both
-//! are read off the vector rather than written out per gate.
+//! Two facts about a vector change what its entry point must look like, and
+//! both are read off the vector rather than written out per gate.
 //!
 //! For ten of the exceptions the processor pushes an error code, which changes
 //! the layout of what the handler is entered with; an entry point compiled for
@@ -35,10 +35,11 @@
 //! # What an entry point assumes about who sent it
 //!
 //! The error-code shape is a fact about the processor *raising an exception*.
-//! Nothing else that can be delivered on those numbers pushes an error code: not
-//! an external interrupt, not a `INT n` executed in ring 0, and the processor
-//! offers no way for the handler to tell. An entry point compiled for the coded
-//! shape and entered without one reads its return address off by eight bytes.
+//! Nothing else that can be delivered on those numbers pushes an error code:
+//! not an external interrupt, not a `INT n` executed in ring 0, and the
+//! processor offers no way for the handler to tell. An entry point compiled for
+//! the coded shape and entered without one reads its return address off by
+//! eight bytes.
 //!
 //! So the invariant is upheld on the other side, at every place that could send
 //! one:
@@ -89,8 +90,9 @@ struct Gate {
     offset_low: u16,
     /// The code selector the handler is entered with.
     selector: SegmentSelector,
-    /// Which interrupt stack table slot to switch to, one-based, or zero to stay
-    /// on the interrupted stack. Every other bit of the byte is reserved.
+    /// Which interrupt stack table slot to switch to, one-based, or zero to
+    /// stay on the interrupted stack. Every other bit of the byte is
+    /// reserved.
     stack: u8,
     /// Present, descriptor privilege level, and gate type.
     attributes: u8,
@@ -159,8 +161,8 @@ const _: () = assert!(
     "a table of gates is aligned at least as strictly as one gate"
 );
 
-/// The limit the processor is given for a table, which it reads as one less than
-/// the table's size: sixteen bytes for each of the 256 gates, less one.
+/// The limit the processor is given for a table, which it reads as one less
+/// than the table's size: sixteen bytes for each of the 256 gates, less one.
 const LIMIT: u16 = 16 * 256 - 1;
 
 const _: () = assert!(
@@ -231,9 +233,9 @@ pub(crate) enum Stacks {
 /// # Safety
 ///
 /// `table` must outlive every moment the processor is running with it loaded,
-/// which for the table a processor ends up on means forever. Its gates must name
-/// a code selector the live global descriptor table describes, and if any of
-/// them switches stacks, the task register must already name a task state
+/// which for the table a processor ends up on means forever. Its gates must
+/// name a code selector the live global descriptor table describes, and if any
+/// of them switches stacks, the task register must already name a task state
 /// segment whose slots are filled.
 pub(crate) unsafe fn load(table: &Idt) {
     // SAFETY: the pointer describes `table` itself, with the limit its own size
@@ -245,13 +247,15 @@ pub(crate) unsafe fn load(table: &Idt) {
 /// Writes the gate for one vector.
 ///
 /// Both halves of the gate come from the vector itself: which entry point,
-/// through the shape the processor enters it with and whether it may return, and
-/// which stack, through the conditions that cannot trust the one they
+/// through the shape the processor enters it with and whether it may return,
+/// and which stack, through the conditions that cannot trust the one they
 /// interrupted.
 fn gate<const NUMBER: u8>(table: &mut Idt, selector: SegmentSelector, stacks: Stacks) {
     let vector = Vector::new(NUMBER);
     let stack = match stacks {
-        Stacks::Own => vector.stack().map_or(0, |stack| hardware_slot(stack.slot())),
+        Stacks::Own => vector
+            .stack()
+            .map_or(0, |stack| hardware_slot(stack.slot())),
         Stacks::Interrupted => 0,
     };
     table.0[usize::from(NUMBER)] = Gate::new(entry_point::<NUMBER>(), selector, stack);
@@ -259,9 +263,9 @@ fn gate<const NUMBER: u8>(table: &mut Idt, selector: SegmentSelector, stacks: St
 
 /// The value a gate holds for a slot of the interrupt stack table.
 ///
-/// The table's seven slots are numbered from one in a gate, because zero is what
-/// a gate says to switch no stack at all. Everything else in this crate numbers
-/// them from zero, since that is how they are indexed.
+/// The table's seven slots are numbered from one in a gate, because zero is
+/// what a gate says to switch no stack at all. Everything else in this crate
+/// numbers them from zero, since that is how they are indexed.
 const fn hardware_slot(slot: u16) -> u8 {
     let [low, _] = (slot + 1).to_le_bytes();
     low
@@ -305,9 +309,9 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u
 /// The entry point for `#MC`, which this hypervisor stops on as a policy rather
 /// than because the architecture insists.
 ///
-/// Diverging for the same reason as [`double_fault`]: the policy is in the type,
-/// where nothing can register a handler that quietly overrides it. What it would
-/// take to make a machine check recoverable is set out in
+/// Diverging for the same reason as [`double_fault`]: the policy is in the
+/// type, where nothing can register a handler that quietly overrides it. What
+/// it would take to make a machine check recoverable is set out in
 /// [`Resumption::FailStop`].
 extern "x86-interrupt" fn machine_check(frame: InterruptStackFrame) -> ! {
     dispatch::terminal(Vector::MACHINE_CHECK, &frame, None)

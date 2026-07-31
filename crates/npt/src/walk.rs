@@ -254,7 +254,7 @@ fn child(
     }
     let frame = frames
         .allocate(0)
-        .ok_or(NptError::OutOfFrames)?
+        .map_err(|_| NptError::OutOfFrames)?
         .start_address();
     entry.set_addr(frame, PARENT);
     Ok(frame)
@@ -296,7 +296,7 @@ fn split(
     };
     let frame = frames
         .allocate(0)
-        .ok_or(NptError::OutOfFrames)?
+        .map_err(|_| NptError::OutOfFrames)?
         .start_address();
     let mut table = reach(window, frame)?;
     // SAFETY: the frame was just handed out by the chunk's allocator, so nothing
@@ -328,9 +328,11 @@ fn read(
 
 /// Where a table is readable, through the window onto physical memory.
 fn reach(window: DirectMap, table: PhysAddr) -> Result<NonNull<PageTable>, NptError> {
-    window.ptr::<PageTable>(table).ok_or(NptError::Unreachable {
-        phys: table.as_u64(),
-    })
+    window
+        .ptr::<PageTable>(table)
+        .map_err(|_| NptError::Unreachable {
+            phys: table.as_u64(),
+        })
 }
 
 const _: () = assert!(

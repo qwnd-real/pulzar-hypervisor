@@ -9,26 +9,27 @@
 //!
 //! Most of that is ruled out before it can happen — an `NMI` cannot interrupt
 //! itself, contributory exceptions combine into `#DF` instead of nesting, and
-//! [`crate::gdt`] disarms the debug registers so nothing arms a `#DB` inside the
-//! `#DB` path. But two cases survive that reasoning. An exception raised inside
-//! an `NMI` handler ends with an `IRET` that releases `NMI` blocking while the
-//! first `NMI`'s frame is still live, so a second `NMI` can arrive on top of it.
-//! And a slot shared by two conditions — `NMI` with `#SX` — can be selected by
-//! the second while the first is being handled.
+//! [`crate::gdt`] disarms the debug registers so nothing arms a `#DB` inside
+//! the `#DB` path. But two cases survive that reasoning. An exception raised
+//! inside an `NMI` handler ends with an `IRET` that releases `NMI` blocking
+//! while the first `NMI`'s frame is still live, so a second `NMI` can arrive on
+//! top of it. And a slot shared by two conditions — `NMI` with `#SX` — can be
+//! selected by the second while the first is being handled.
 //!
-//! So each of these stacks is allocated with room for [`LEVELS`] frames, and the
-//! first thing a handler on one of them does is move its own slot's pointer down
-//! a level. A delivery that nests lands on clean memory; the level is given back
-//! when the handler returns. Two windows remain, both of a handful of
-//! instructions and both stated rather than hidden: between the processor
+//! So each of these stacks is allocated with room for [`LEVELS`] frames, and
+//! the first thing a handler on one of them does is move its own slot's pointer
+//! down a level. A delivery that nests lands on clean memory; the level is
+//! given back when the handler returns. Two windows remain, both of a handful
+//! of instructions and both stated rather than hidden: between the processor
 //! pushing the frame and the pointer moving, and between the pointer being
 //! given back and the `IRET` that consumes the frame. Nothing can be delivered
 //! into the first: the events that share a slot are all blocked or impossible
 //! for exactly as long as their own delivery lasts. The second is the same
 //! instant `IRET` would end the frame's life anyway.
 //!
-//! Running out of levels is a stated terminal case. It means an assumption above
-//! is wrong, and continuing would corrupt a live frame rather than report it.
+//! Running out of levels is a stated terminal case. It means an assumption
+//! above is wrong, and continuing would corrupt a live frame rather than report
+//! it.
 
 use paging::{Stack, chunk::FRAME_SIZE};
 use x86_64::{VirtAddr, structures::tss::TaskStateSegment};
@@ -141,7 +142,8 @@ impl Guard {
     /// switches no stack at all.
     ///
     /// Terminal when no level is left: the frame the processor just pushed is
-    /// the last one that fits, and a delivery after it would land on a live one.
+    /// the last one that fits, and a delivery after it would land on a live
+    /// one.
     pub(crate) fn enter(vector: Vector) -> Option<Self> {
         let stack = vector.stack()?;
         let slot = usize::from(stack.slot());
@@ -172,8 +174,8 @@ impl Guard {
 }
 
 impl Drop for Guard {
-    /// Gives the level back, so the next delivery on this slot starts at the top
-    /// again rather than one level lower every time.
+    /// Gives the level back, so the next delivery on this slot starts at the
+    /// top again rather than one level lower every time.
     fn drop(&mut self) {
         // SAFETY: the pointer is the one `enter` took, addressing a block that
         // outlives this processor, and this restores exactly the value that was

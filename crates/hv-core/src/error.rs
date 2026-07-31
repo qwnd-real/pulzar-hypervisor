@@ -29,6 +29,10 @@ pub enum CoreError {
     /// The address space could not be adopted or edited.
     #[error(transparent)]
     Paging(#[from] PagingError),
+    /// The address space was told twice how to reach the other processors, or
+    /// twice how to count them.
+    #[error(transparent)]
+    Shootdown(#[from] paging::shootdown::AlreadyInstalled),
     /// The firmware tables could not be read.
     #[error(transparent)]
     Acpi(#[from] AcpiError),

@@ -72,11 +72,11 @@ use core::ptr::NonNull;
 
 pub use direct::DirectMap;
 pub use frames::Frames;
-pub use global::{adopt, adopted, with};
+pub use global::{adopt, adopted, try_with, with};
 pub use slots::Slots;
-pub use space::{AddressSpace, CacheType, Existing, Mapping, Protection, Stack};
+pub use space::{AddressSpace, CacheType, Existing, Mapping, Protection, Ram, Stack};
 use thiserror::Error;
-use x86_64::PhysAddr;
+use x86_64::{PhysAddr, VirtAddr};
 
 use crate::buddy::BuddyError;
 
@@ -118,10 +118,45 @@ pub(crate) const fn as_u64(value: usize) -> u64 {
 ///
 /// Rounded up to a gigabyte so the map can be described in 1 GiB pages and so
 /// its randomized base needs no size-dependent adjustment.
-#[must_use]
-pub const fn direct_map_size(top_of_ram: u64) -> u64 {
+///
+/// # Errors
+///
+/// [`PagingError::Arithmetic`] if rounding up would leave the range of a `u64`,
+/// which means the memory map described an address space that cannot exist.
+/// Rounding is checked rather than wrapping because the result sizes a mapping:
+/// a `top_of_ram` within a gigabyte of `u64::MAX` would otherwise round to zero
+/// and produce a direct map covering nothing while every caller believed it
+/// covered everything.
+pub const fn direct_map_size(top_of_ram: u64) -> Result<u64, PagingError> {
     const GIB: u64 = 1 << 30;
-    top_of_ram.div_ceil(GIB) * GIB
+    match round_up(top_of_ram, GIB) {
+        Some(size) => Ok(size),
+        None => Err(PagingError::Arithmetic {
+            what: "rounding the top of RAM up to a gigabyte",
+        }),
+    }
+}
+
+/// `value` rounded up to a multiple of `align`, or `None` if that is not
+/// representable.
+///
+/// `u64::next_multiple_of` panics on overflow in a debug build and wraps in a
+/// release one, and neither is an answer this crate can act on: every use of a
+/// rounded size here goes on to size a mapping or a reservation.
+pub(crate) const fn round_up(value: u64, align: u64) -> Option<u64> {
+    value.checked_next_multiple_of(align)
+}
+
+/// One past the last byte of a `len`-byte run starting at `start`.
+///
+/// The single place a half-open range's end is formed, so that no caller
+/// computes `start + len` and finds out at the wrap what it should have found
+/// out before mutating anything.
+pub(crate) const fn end_of(start: u64, len: u64, what: &'static str) -> Result<u64, PagingError> {
+    match start.checked_add(len) {
+        Some(end) => Ok(end),
+        None => Err(PagingError::Arithmetic { what }),
+    }
 }
 
 /// Why an address-space or allocation operation was refused.
@@ -154,13 +189,42 @@ pub enum PagingError {
     /// A zero-length region was asked for.
     #[error("a region must be at least one byte")]
     EmptyRegion,
-    /// The window in use does not reach a physical address the operation needs.
-    /// Before the direct map exists this means firmware's identity map falls
-    /// short; afterwards it means the address is above `top_of_ram`.
-    #[error("physical {phys:#x} is outside the current physical-access window")]
+    /// An address or length calculation could not be carried out over the whole
+    /// range it was asked about: it would have left the range of the type, left
+    /// the canonical address space, or crossed the hole in the middle of it.
+    ///
+    /// Separate from the errors that describe a *reachable* but unsuitable
+    /// address, because this one says the request could not even be formed —
+    /// and because it is always reported before anything has been changed.
+    #[error("{what} is not representable")]
+    Arithmetic {
+        /// What was being computed.
+        what: &'static str,
+    },
+    /// The window in use does not reach every byte of a range the operation
+    /// needs. Before the direct map exists this means firmware's identity map
+    /// falls short; afterwards it means the range reaches above `top_of_ram`.
+    ///
+    /// The whole range is answered for, not just where it starts: a run
+    /// beginning just below the top of a window ends above it.
+    #[error("physical {phys:#x}+{len:#x} is outside the current physical-access window")]
     Unreachable {
-        /// The address that could not be reached.
+        /// Where the range that could not be reached begins.
         phys: u64,
+        /// How many bytes of it were asked for.
+        len: u64,
+    },
+    /// A pointer was asked for at an address that is not aligned for the type,
+    /// or for a type with no bytes to point at.
+    ///
+    /// Distinct from [`PagingError::Unreachable`]: the window does cover the
+    /// address, and the request is the thing that is wrong.
+    #[error("physical {phys:#x} is not a usable address for a {bytes}-byte value")]
+    BadPointer {
+        /// The address in question.
+        phys: u64,
+        /// Bytes the type occupies.
+        bytes: usize,
     },
     /// A frame that did not come from the chunk was offered back to it.
     #[error("physical {phys:#x} is not a frame of the reserved chunk")]
@@ -218,6 +282,18 @@ pub enum PagingError {
         /// The address that was found.
         phys: u64,
     },
+    /// A page table in the hierarchy could not be reached through the window,
+    /// so the walk could not be performed at all.
+    ///
+    /// Deliberately not the same answer as "nothing is mapped there": one says
+    /// the address has no translation, the other says this subsystem can no
+    /// longer read its own tables, which is a broken invariant rather than a
+    /// fact about an address.
+    #[error("the page table at physical {phys:#x} is not reachable through the window")]
+    TableUnreachable {
+        /// Physical address of the table that could not be reached.
+        phys: u64,
+    },
     /// The address space has already been handed over, and every processor is
     /// running in it.
     #[error("an address space has already been adopted")]
@@ -226,31 +302,110 @@ pub enum PagingError {
     /// whole machine shares.
     #[error("no address space has been adopted")]
     NotAdopted,
+    /// The address space lock is held by this processor already, or by another
+    /// one for longer than a caller that would not wait is prepared to.
+    #[error("the address space is in use")]
+    InUse,
     /// Some processor did not acknowledge dropping a translation that no longer
     /// describes anything. What was unmapped is unmapped; what is not known is
     /// whether every processor has stopped believing otherwise.
     #[error("a processor did not acknowledge dropping a stale translation")]
     ShootdownIncomplete,
+    /// An operation failed and undoing what it had already done failed too, so
+    /// the resources involved could not be proved detached and were retired
+    /// instead of returned.
+    ///
+    /// The address space is consistent — nothing is described that should not
+    /// be — but some frames or window addresses are now permanently held. This
+    /// is reported rather than logged because the alternative to retiring them
+    /// is handing out memory that may still be mapped.
+    #[error("cleanup after a failed operation could not complete at {virt:#x}")]
+    CleanupFailed {
+        /// Where cleanup stopped.
+        virt: u64,
+    },
+    /// The processor has no page attribute table, so the cache type a mapping
+    /// asks for cannot be established.
+    #[error("the processor does not support the page attribute table")]
+    PatUnsupported,
+    /// `CR4.PCIDE` is set. Process-context identifiers change what invalidating
+    /// a translation reaches, and this crate's shootdowns do not enumerate
+    /// contexts; running under them would leave stale translations in every
+    /// context but the current one.
+    #[error("process-context identifiers are enabled, which pulzar does not support")]
+    PcidEnabled,
+    /// No source of entropy the placement of the high half may be drawn from.
+    #[error("the processor offers no hardware entropy source")]
+    NoSecureEntropy,
+    /// The hardware entropy source stopped answering part-way through a draw.
+    #[error("the hardware entropy source failed")]
+    EntropyFailed,
+    /// A value the loader recorded about the chunk's layout does not match what
+    /// this image was built for, so nothing in the chunk can be trusted.
+    #[error("{field} is {found:#x}, but this image was built for {expected:#x}")]
+    LayoutMismatch {
+        /// Which value disagreed.
+        field: &'static str,
+        /// What this image expects.
+        expected: u64,
+        /// What the loader recorded.
+        found: u64,
+    },
     /// The buddy allocator underneath refused the operation.
     #[error(transparent)]
     Buddy(#[from] BuddyError),
 }
 
-/// Pointer to a fixed metadata region inside the chunk.
+/// A physical address `offset` bytes past `base`.
+///
+/// `PhysAddr`'s own addition panics on a value the architecture cannot
+/// represent, and a panic is not an answer any caller here can act on: these
+/// offsets come from a handoff another image wrote.
+pub(crate) fn phys_at(
+    base: PhysAddr,
+    offset: u64,
+    what: &'static str,
+) -> Result<PhysAddr, PagingError> {
+    base.as_u64()
+        .checked_add(offset)
+        .and_then(|value| PhysAddr::try_new(value).ok())
+        .ok_or(PagingError::Arithmetic { what })
+}
+
+/// A virtual address `offset` bytes past `base`.
+///
+/// As [`phys_at`], and with the canonical hole to answer for as well: adding to
+/// a lower-half address can land in the hole, which is not an address at all.
+pub(crate) fn virt_at(
+    base: VirtAddr,
+    offset: u64,
+    what: &'static str,
+) -> Result<VirtAddr, PagingError> {
+    base.as_u64()
+        .checked_add(offset)
+        .and_then(|value| VirtAddr::try_new(value).ok())
+        .ok_or(PagingError::Arithmetic { what })
+}
+
+/// Pointer to a fixed metadata region inside the chunk, valid for all `bytes`
+/// of it.
 ///
 /// Requesting the pointer as `u64` is what enforces the eight-byte alignment
 /// the buddy allocator's header needs; the chunk's own alignment and the
 /// layout's frame-aligned offsets guarantee it holds.
+///
+/// The length matters as much as the address. A window that reaches the start
+/// of the frame allocator's state but not its last bitmap word would otherwise
+/// produce a pointer that succeeds here and faults, or corrupts whatever
+/// follows the window, at the first allocation.
 fn state_ptr(
     chunk_base: PhysAddr,
     window: DirectMap,
     offset: u64,
+    bytes: usize,
 ) -> Result<NonNull<u8>, PagingError> {
-    let phys = chunk_base + offset;
+    let phys = phys_at(chunk_base, offset, "the address of an allocator's state")?;
     window
-        .ptr::<u64>(phys)
+        .bytes_ptr::<u64>(phys, bytes)
         .map(NonNull::cast::<u8>)
-        .ok_or(PagingError::Unreachable {
-            phys: phys.as_u64(),
-        })
 }

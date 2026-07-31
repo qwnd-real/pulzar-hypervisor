@@ -142,21 +142,21 @@ impl Vcpu {
     ) -> Result<Self, VcpuError> {
         let vmcb_phys = frames
             .allocate(0)
-            .ok_or(VcpuError::OutOfFrames)?
+            .map_err(|_| VcpuError::OutOfFrames)?
             .start_address();
         let vmcb = window
             .ptr::<Vmcb>(vmcb_phys)
-            .ok_or(VcpuError::Unreachable {
+            .map_err(|_| VcpuError::Unreachable {
                 phys: vmcb_phys.as_u64(),
             })?;
         let msrpm_phys = frames
             .allocate(1)
-            .ok_or(VcpuError::OutOfFrames)?
+            .map_err(|_| VcpuError::OutOfFrames)?
             .start_address();
         let mut msrpm =
             window
                 .ptr::<[u8; MSRPM_BYTES]>(msrpm_phys)
-                .ok_or(VcpuError::Unreachable {
+                .map_err(|_| VcpuError::Unreachable {
                     phys: msrpm_phys.as_u64(),
                 })?;
         // SAFETY: the two-page run was just allocated to this VCPU, is zeroed,

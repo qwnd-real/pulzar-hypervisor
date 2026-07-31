@@ -53,11 +53,15 @@ impl Portal {
     /// if the assembly no longer fits in them.
     pub fn place(window: DirectMap, handoff: &Handoff) -> Result<Self, PortalError> {
         let base = PhysAddr::new(handoff.chunk_base + chunk::PORTAL_OFFSET);
-        let at = window.ptr::<u8>(base).ok_or(PortalError::Unreachable {
-            phys: base.as_u64(),
-        })?;
-        let blob = blob();
         let room = as_usize(chunk::PORTAL_SIZE);
+        // Both pages, not just the first byte of the first: the whole
+        // reservation is cleared and written below.
+        let at = window
+            .bytes_ptr::<u8>(base, room)
+            .map_err(|_| PortalError::Unreachable {
+                phys: base.as_u64(),
+            })?;
+        let blob = blob();
         if data_offset() != as_usize(chunk::FRAME_SIZE) {
             return Err(PortalError::InvalidLayout);
         }
@@ -118,7 +122,7 @@ impl Portal {
     fn fill(self, window: DirectMap, handoff: &Handoff) -> Result<Self, PortalError> {
         let system = window
             .ptr::<SystemTable>(PhysAddr::new_truncate(handoff.system_table as u64))
-            .ok_or(PortalError::Unreachable {
+            .map_err(|_| PortalError::Unreachable {
                 phys: handoff.system_table as u64,
             })?;
         // SAFETY: the handoff pointer is firmware's live system table and the
@@ -126,14 +130,14 @@ impl Portal {
         let boot_services = unsafe { (*system.as_ptr()).boot_services };
         let boot_services = window
             .ptr::<BootServices>(PhysAddr::new_truncate(boot_services as u64))
-            .ok_or(PortalError::MissingBootServices)?;
+            .map_err(|_| PortalError::MissingBootServices)?;
         // SAFETY: firmware's boot-services table remains initialized and
         // readable because the guest has not called ExitBootServices yet.
         let original = unsafe { (*boot_services.as_ptr()).exit_boot_services } as usize as u64;
         let parameters =
             window
                 .ptr::<Parameters>(self.parameters())
-                .ok_or(PortalError::Unreachable {
+                .map_err(|_| PortalError::Unreachable {
                     phys: self.parameters().as_u64(),
                 })?;
         // SAFETY: the second portal page belongs only to this portal and has

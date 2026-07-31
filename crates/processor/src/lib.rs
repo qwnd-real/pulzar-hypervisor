@@ -77,6 +77,12 @@ bitflags! {
         /// instead of a countdown, which is the only one of its modes that is
         /// not quantized to the timer's own divided tick.
         const TSC_DEADLINE = 1 << 6;
+        /// The page attribute table is implemented, so `IA32_PAT` exists and the
+        /// `PWT` and `PCD` bits of a page table entry select one of its entries
+        /// rather than naming a cache type directly. Without it there is no
+        /// register to read or program, and the memory type a mapping asks for
+        /// cannot be established.
+        const PAGE_ATTRIBUTE_TABLE = 1 << 7;
     }
 }
 
@@ -135,6 +141,10 @@ impl Features {
         features.set(
             Self::TSC_DEADLINE,
             basic.as_ref().is_some_and(FeatureInfo::has_tsc_deadline),
+        );
+        features.set(
+            Self::PAGE_ATTRIBUTE_TABLE,
+            basic.as_ref().is_some_and(FeatureInfo::has_pat),
         );
         features
     }

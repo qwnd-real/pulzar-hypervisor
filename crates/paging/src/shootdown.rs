@@ -27,14 +27,35 @@
 //! as one, and it merges with [`Flush::hull`] because several of them can
 //! coalesce into a single delivery.
 //!
-//! # Why an empty slot is an answer and not a gap
+//! # Why an empty slot is sometimes an answer and sometimes a refusal
 //!
 //! Before any other processor has been started there is no other translation
 //! lookaside buffer in the machine, so "tell everyone else" is already true
-//! when nobody has been told. An empty slot therefore reports success rather
-//! than failing or refusing, which is what lets the whole address space
-//! subsystem work unchanged on a machine with one processor — including one
-//! where starting the others was deliberately left out.
+//! when nobody has been told. An empty slot therefore reports success — but
+//! only while this really is the only processor running. Once the machine has
+//! more than one processor online, an empty slot means an invalidation has no
+//! way to reach the others, and reporting success would be reporting that a
+//! stale translation had been dropped when nothing had asked anyone to drop it.
+//!
+//! So the answer is conditioned on the online count rather than assumed, which
+//! is what lets the whole address space subsystem work unchanged on a machine
+//! with one processor — including one where starting the others was
+//! deliberately left out — without the same code silently lying on a machine
+//! where they were started and the hook was never installed.
+//!
+//! # The canonical hole, and why a range may not simply be encoded
+//!
+//! A 64-bit virtual address is canonical only if bits 48 and above copy bit 47,
+//! which leaves a hole in the middle of the address space that no address lies
+//! in. A page number with the sign extension dropped is therefore *not* a
+//! linear coordinate: the last page of the lower half and the first page of the
+//! upper half have adjacent numbers and are half an address space apart.
+//!
+//! Everything here that turns numbers back into addresses answers for that. A
+//! range whose numbering crosses the hole, or that would step past the top of
+//! the address space, is not encoded as a range at all — it degrades to
+//! [`Flush::EVERYTHING`], which is always correct and never forms an address
+//! that does not exist.
 //!
 //! # What the installed function may not do
 //!
@@ -50,9 +71,10 @@ use spin::Once;
 use x86_64::{
     VirtAddr,
     instructions::tlb::{self, Invlpgb},
-    registers::control::{Cr4, Cr4Flags},
     structures::paging::{Page, PageSize, Size2MiB, Size4KiB},
 };
+
+use crate::cpu;
 
 /// What stopped being described, and so what every processor has to drop.
 ///
@@ -80,7 +102,9 @@ pub struct Flush {
     /// Thirty-six bits is the whole of a four-level address space: forty-eight
     /// significant bits, of which the low twelve are the offset within a 4 KiB
     /// page. The bits above that are the sign extension every canonical address
-    /// carries and are restored rather than stored.
+    /// carries and are restored rather than stored — which is why a number here
+    /// is not a coordinate, and why every use of one is checked against the
+    /// canonical hole.
     #[bits(36)]
     first: u64,
     /// How many pages, counted in [`Flush::extent`]'s size. Never zero, and
@@ -91,17 +115,44 @@ pub struct Flush {
     __: u16,
 }
 
-/// The longest run of pages worth invalidating one at a time.
+/// The longest run a single request can encode.
+///
+/// A property of the encoding — the count field is what it is — and
+/// deliberately not the same question as whether stepping a run of a given
+/// length is worth it on a given processor. That second question is
+/// [`worth_stepping`], which the software path asks and the hardware path does
+/// not.
+const MAX_PAGES: u64 = 64;
+
+/// The longest run this crate steps one page at a time on the local processor.
 ///
 /// Past this, one write of the page table root costs less than the
 /// invalidations it replaces — it drops translations that were still good and
 /// they fault back in, which is cheaper than issuing hundreds of instructions
 /// each of which is itself a serializing operation. The exact crossover is a
-/// property of the processor and not worth measuring for: what matters is that
-/// a bounded number of invalidations is never wildly worse than the
-/// alternative, and sixty-four is comfortably inside that on every
-/// implementation.
-const MAX_PAGES: u64 = 64;
+/// property of the processor; sixty-four is inside the range where neither
+/// answer is much worse than the other on any implementation, and it is stated
+/// here as the policy it is rather than being confused with what the encoding
+/// can hold.
+const STEP_LIMIT: u64 = MAX_PAGES;
+
+/// Whether a run of `pages` is short enough to be worth invalidating one page
+/// at a time rather than dropping everything.
+const fn worth_stepping(pages: u64) -> bool {
+    pages <= STEP_LIMIT
+}
+
+/// The bits of a virtual address that say anything: forty-eight, on the
+/// four-level paging this crate builds. Everything above them is the sign
+/// extension.
+const SIGNIFICANT: u64 = (1 << 48) - 1;
+
+/// One past the highest page number of the lower canonical half, at 4 KiB
+/// granularity: the first number on the far side of the canonical hole.
+const HOLE_AT_4KIB: u64 = 1 << (47 - 12);
+
+/// The same boundary at 2 MiB granularity.
+const HOLE_AT_2MIB: u64 = 1 << (47 - 21);
 
 impl Flush {
     /// Every translation this processor has, including the ones marked global.
@@ -117,10 +168,14 @@ impl Flush {
 
     /// A run of `pages` 4 KiB pages starting at `first`.
     ///
-    /// Longer than [`MAX_PAGES`], or empty, and this is [`Flush::EVERYTHING`]:
-    /// the first because that is where invalidating one at a time stops paying,
-    /// the second because a request describing nothing cannot be distinguished
-    /// from no request at all once it is packed into a word.
+    /// This is [`Flush::EVERYTHING`] for a run that is empty, longer than the
+    /// encoding or the stepping policy allows, or that would cross the
+    /// canonical hole or run past the top of the address space: the first
+    /// because a request describing nothing cannot be distinguished from no
+    /// request at all once it is packed into a word, the second because
+    /// that is where invalidating one at a time stops paying, and the third
+    /// because the numbering a range is encoded in is not continuous across
+    /// the hole.
     #[must_use]
     pub fn small(first: Page<Size4KiB>, pages: u64) -> Self {
         Self::bounded(
@@ -137,7 +192,7 @@ impl Flush {
     /// whole translation: stepping such a range in 4 KiB units would issue five
     /// hundred and twelve instructions where one does.
     ///
-    /// As [`Flush::small`] for a run that is empty or too long.
+    /// As [`Flush::small`] for a run this cannot describe.
     #[must_use]
     pub fn large(first: Page<Size2MiB>, pages: u64) -> Self {
         Self::bounded(
@@ -159,7 +214,8 @@ impl Flush {
     /// than being converted into common units. Mixing the two means a large
     /// mapping and a small one were unmapped close enough together that neither
     /// had been acknowledged, which is rare enough that the arithmetic to do
-    /// better would cost more than it saves.
+    /// better would cost more than it saves. So does a hull that would span the
+    /// canonical hole, which is what two runs in opposite halves produce.
     #[must_use]
     pub fn hull(self, other: Self) -> Self {
         let extent = self.extent();
@@ -177,14 +233,13 @@ impl Flush {
     /// The other half of a shootdown: whoever carried the request across is
     /// what calls this, on the processor that was asked.
     pub fn apply(self) {
-        let size = match self.extent() {
-            Extent::Everything => return everything(),
-            Extent::Small => Size4KiB::SIZE,
-            Extent::Large => Size2MiB::SIZE,
+        let Some((base, size, pages)) = self.range() else {
+            return cpu::flush_translations();
         };
-        let base = VirtAddr::new_truncate(self.first() * size);
-        for page in 0..u64::from(self.pages()) {
-            tlb::flush(base + page * size);
+        for page in 0..pages {
+            // The run was proved to stay in one canonical half and inside the
+            // address space when it was encoded, so every address here exists.
+            tlb::flush(VirtAddr::new_truncate(base.as_u64() + page * size));
         }
     }
 
@@ -207,18 +262,43 @@ impl Flush {
 
     /// The request a word carries.
     ///
-    /// Anything the encoding does not define — a zero word above all, and a run
-    /// of no pages with it — reads back as [`Flush::EVERYTHING`]. A word this
-    /// module did not write is one nothing can be concluded from, and dropping
-    /// every translation is the only conclusion that cannot leave a stale one
-    /// behind.
+    /// Anything the encoding does not define — a zero word above all, a run of
+    /// no pages, a count past what the encoding admits, and a run whose
+    /// numbering crosses the canonical hole or leaves the address space — reads
+    /// back as [`Flush::EVERYTHING`]. A word this module did not write is one
+    /// nothing can be concluded from, and dropping every translation is the
+    /// only conclusion that cannot leave a stale one behind.
     #[must_use]
-    pub const fn from_word(word: u64) -> Self {
+    pub fn from_word(word: u64) -> Self {
         let flush = Self::from_bits(word);
         match flush.extent() {
-            Extent::Small | Extent::Large if flush.pages() > 0 => flush,
+            Extent::Small | Extent::Large if flush.range().is_some() => flush,
             _ => Self::EVERYTHING,
         }
+    }
+
+    /// The run this describes, as `(first address, bytes per page, pages)`, or
+    /// `None` where it describes everything or describes nothing usable.
+    ///
+    /// The single place an encoded range is turned back into addresses, so the
+    /// canonical-hole and top-of-space questions are asked once instead of at
+    /// each of the three places that step a range.
+    fn range(self) -> Option<(VirtAddr, u64, u64)> {
+        let (size, hole) = match self.extent() {
+            Extent::Everything => return None,
+            Extent::Small => (Size4KiB::SIZE, HOLE_AT_4KIB),
+            Extent::Large => (Size2MiB::SIZE, HOLE_AT_2MIB),
+        };
+        let pages = u64::from(self.pages());
+        let first = self.first();
+        let end = first.checked_add(pages)?;
+        // A run has to stay on one side of the hole — the numbering is not
+        // continuous across it — and inside the numbering altogether.
+        let same_half = first >= hole || end <= hole;
+        if pages == 0 || !worth_stepping(pages) || !same_half || end > 2 * hole {
+            return None;
+        }
+        Some((VirtAddr::new_truncate(first * size), size, pages))
     }
 
     /// A run, or [`Flush::EVERYTHING`] where one would not describe it.
@@ -226,13 +306,16 @@ impl Flush {
         let Ok(pages) = u16::try_from(pages) else {
             return Self::EVERYTHING;
         };
-        if pages == 0 || u64::from(pages) > MAX_PAGES {
-            return Self::EVERYTHING;
-        }
-        Self::from_bits(0)
+        let flush = Self::from_bits(0)
             .with_extent(extent)
             .with_first(first)
-            .with_pages(pages)
+            .with_pages(pages);
+        // Encoded first and validated after, so that exactly one function
+        // decides what a usable range is and every constructor is held to it.
+        if pages == 0 || u64::from(pages) > MAX_PAGES || flush.range().is_none() {
+            return Self::EVERYTHING;
+        }
+        flush
     }
 }
 
@@ -247,11 +330,6 @@ impl Flush {
 fn page_number(address: VirtAddr, size: u64) -> u64 {
     (address.as_u64() & SIGNIFICANT) / size
 }
-
-/// The bits of a virtual address that say anything: forty-eight, on the
-/// four-level paging this crate builds. Everything above them is the sign
-/// extension.
-const SIGNIFICANT: u64 = (1 << 48) - 1;
 
 /// How much one page of a request covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +373,12 @@ impl Extent {
 /// so it becomes [`PagingError::ShootdownIncomplete`](crate::PagingError).
 pub type Shootdown = fn(Flush) -> bool;
 
+/// How many processors are running.
+///
+/// Answered by whoever counts the machine's processors, and asked on the one
+/// path that has to distinguish "nobody to tell" from "no way to tell anyone".
+pub type OnlineCount = fn() -> usize;
+
 /// Records how this address space reaches the other processors.
 ///
 /// One-shot: the second caller is refused rather than allowed to replace a hook
@@ -310,6 +394,26 @@ pub fn install(hook: Shootdown) -> Result<(), AlreadyInstalled> {
     HOOK.call_once(|| {
         installed = true;
         hook
+    });
+    installed.then_some(()).ok_or(AlreadyInstalled)
+}
+
+/// Records how the number of running processors is asked for.
+///
+/// Separate from [`install`] and installable before it, because the two answer
+/// different questions and become available at different points in bring-up:
+/// the machine's processors are surveyed before anything can reach them. Until
+/// this is set the address space is entitled to believe it is alone, which is
+/// true of the boot processor before it has looked.
+///
+/// # Errors
+///
+/// [`AlreadyInstalled`] if something already installed one.
+pub fn watch(online: OnlineCount) -> Result<(), AlreadyInstalled> {
+    let mut installed = false;
+    ONLINE.call_once(|| {
+        installed = true;
+        online
     });
     installed.then_some(()).ok_or(AlreadyInstalled)
 }
@@ -331,59 +435,50 @@ pub fn in_hardware() -> bool {
 ///
 /// Three ways, in the order they are worth having: the instruction that does it
 /// without involving software at all, then whatever was installed to reach the
-/// other processors, then the observation that a machine which has told nobody
-/// has nobody to tell.
+/// other processors, then the observation that a machine which has started
+/// nobody has nobody to tell.
 pub(crate) fn broadcast(flush: Flush) -> bool {
     if let Some(broadcaster) = broadcaster() {
         flush.broadcast(*broadcaster);
         return true;
     }
-    HOOK.get().is_none_or(|hook| hook(flush))
+    match HOOK.get() {
+        Some(hook) => hook(flush),
+        // No way to reach anyone. That is a complete answer only while there is
+        // nobody to reach; otherwise this invalidation has not happened
+        // everywhere, and saying it has is the one answer that leaves a stale
+        // translation behind believing it does not.
+        None => ONLINE.get().is_none_or(|online| online() <= 1),
+    }
 }
 
 impl Flush {
     /// Issues this as a hardware broadcast and waits for every processor to
     /// have acknowledged it.
+    ///
+    /// Global translations are included in every case, ranged and not. The
+    /// local invalidation this follows drops a global entry as readily as
+    /// any other, and a broadcast that did not would leave the other
+    /// processors holding exactly the entries the local one dropped.
     fn broadcast(self, invlpgb: Invlpgb) {
         let mut builder = invlpgb.build();
-        match self.extent() {
-            Extent::Everything => {
-                builder.include_global();
-                builder.flush();
-            }
-            Extent::Small => {
-                let first = Page::<Size4KiB>::containing_address(VirtAddr::new_truncate(
-                    self.first() * Size4KiB::SIZE,
-                ));
-                builder
-                    .pages(Page::range(first, first + u64::from(self.pages())))
-                    .flush();
-            }
-            Extent::Large => {
-                let first = Page::<Size2MiB>::containing_address(VirtAddr::new_truncate(
-                    self.first() * Size2MiB::SIZE,
-                ));
-                builder
-                    .pages(Page::range(first, first + u64::from(self.pages())))
-                    .flush();
+        builder.include_global();
+        match self.range() {
+            None => builder.flush(),
+            Some((base, size, pages)) => {
+                // Split by extent only to name the page size in the type: the
+                // addresses and the count are the ones `range` already proved
+                // stay inside one canonical half.
+                if size == Size4KiB::SIZE {
+                    let first = Page::<Size4KiB>::containing_address(base);
+                    builder.pages(Page::range(first, first + pages)).flush();
+                } else {
+                    let first = Page::<Size2MiB>::containing_address(base);
+                    builder.pages(Page::range(first, first + pages)).flush();
+                }
             }
         }
         invlpgb.tlbsync();
-    }
-}
-
-/// Drops every translation this processor has, global ones included.
-fn everything() {
-    tlb::flush_all();
-    let cr4 = Cr4::read();
-    if cr4.contains(Cr4Flags::PAGE_GLOBAL) {
-        // SAFETY: clearing `CR4.PGE` invalidates all global translations and is
-        // architecturally permitted at any time; the original value is restored
-        // immediately, so nothing observes the intermediate state.
-        unsafe {
-            Cr4::write(cr4.difference(Cr4Flags::PAGE_GLOBAL));
-            Cr4::write(cr4);
-        }
     }
 }
 
@@ -395,8 +490,11 @@ fn broadcaster() -> Option<&'static Invlpgb> {
     BROADCASTER.call_once(Invlpgb::new).as_ref()
 }
 
-/// How the other processors are reached, or empty while there are none.
+/// How the other processors are reached, or empty while nothing can reach them.
 static HOOK: Once<Shootdown> = Once::new();
+
+/// How many processors are running, or empty while nothing has counted them.
+static ONLINE: Once<OnlineCount> = Once::new();
 
 /// Whether the processor invalidates on every processor by itself, decided the
 /// first time anything asks.

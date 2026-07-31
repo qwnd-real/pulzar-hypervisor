@@ -128,8 +128,14 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
     let startable = startable()?;
 
     let root = paging::with(|space| space.root().start_address())?;
-    let at = paging::with(|space| space.direct_map().ptr::<u8>(trampoline))?
-        .ok_or(ApicError::TrampolineUnreachable { phys: base })?;
+    // The whole page, not just its first byte: the trampoline is written over
+    // all of it below.
+    let at = paging::with(|space| {
+        space
+            .direct_map()
+            .bytes_ptr::<u8>(trampoline, paging::as_usize(PAGE))
+    })?
+    .map_err(|_| ApicError::TrampolineUnreachable { phys: base })?;
 
     // Mapped at its own address, because the instruction after the one that
     // turns paging on is fetched from here.
