@@ -2,11 +2,25 @@
 //! them.
 //!
 //! A vector number decides three things no software choice can change: whether
-//! the processor pushes an error code before entering the handler, whether the
-//! handler may return at all, and — for the exceptions — what the condition is
-//! called. Getting any of them wrong corrupts the handler's stack or silently
-//! resumes a machine that cannot be resumed, so all three are stated once here
-//! and every other part of the crate derives its behaviour from them.
+//! an architectural exception on it pushes an error code, whether a handler may
+//! return at all, and — for the exceptions — what the condition is called.
+//! Getting any of them wrong corrupts the handler's stack or silently resumes a
+//! machine that cannot be resumed, so all three are stated once here and every
+//! other part of the crate derives its behaviour from them.
+//!
+//! One distinction runs through the whole module and is easy to lose. A vector
+//! number fixes what happens when *the processor raises that exception*. It
+//! does not fix what happens when something else is delivered on the same
+//! number: an external interrupt and a `INT n` executed in ring 0 push no error
+//! code whatever number they carry. Nothing in the architecture lets an entry
+//! point tell those apart, so the crate keeps them apart instead — see
+//! [`crate::idt`] for the invariant that makes the distinction unnecessary, and
+//! [`crate::claim`] for where it is enforced.
+//!
+//! The names are AMD's, because the host this runs on is an AMD processor. A
+//! guest may believe it is on something else, and a vector number a guest is
+//! shown means whatever that guest's vendor says it means; nothing here is a
+//! statement about that.
 
 use core::fmt::{self, Display, Formatter};
 
@@ -33,12 +47,6 @@ const PUSHES_ERROR_CODE: u32 = (1 << 8)
     | (1 << 29)
     | (1 << 30);
 
-/// The exceptions the architecture gives no defined way back from, one bit per
-/// vector. A double fault is raised because the processor could not deliver
-/// something else, and a machine check because the hardware itself reported a
-/// failure; in both cases the state a return would restore is already gone.
-const NEVER_RETURNS: u32 = (1 << 8) | (1 << 18);
-
 impl Vector {
     /// How many vectors an interrupt descriptor table has.
     pub const COUNT: usize = 256;
@@ -46,6 +54,18 @@ impl Vector {
     /// The lowest vector the architecture leaves to the platform, and so the
     /// first one an interrupt controller may be told to deliver.
     pub const FIRST_EXTERNAL: Self = Self(EXCEPTIONS);
+
+    /// `#DF`, the one vector the architecture gives no way back from.
+    pub const DOUBLE_FAULT: Self = Self(8);
+
+    /// `#MC`, the one vector this hypervisor stops on by policy.
+    pub const MACHINE_CHECK: Self = Self(18);
+
+    /// The non-maskable interrupt, which no masking holds off and which
+    /// therefore arrives in the middle of whatever this processor was doing —
+    /// including inside a lock it will now never release, and including inside
+    /// another handler.
+    pub const NON_MASKABLE: Self = Self(2);
 
     /// The vector numbered `number`.
     #[must_use]
@@ -66,17 +86,27 @@ impl Vector {
         self.0 < EXCEPTIONS
     }
 
-    /// Whether the processor pushes an error code before entering this vector's
-    /// handler.
+    /// Whether the processor pushes an error code when it raises this vector's
+    /// exception.
+    ///
+    /// This is a statement about the processor raising an exception and nothing
+    /// else. An external interrupt or a software interrupt on one of these
+    /// numbers arrives without an error code, and no handler can tell which
+    /// happened; keeping those off these vectors is what makes the answer here
+    /// usable.
     #[must_use]
     pub const fn pushes_error_code(self) -> bool {
         self.is_exception() && PUSHES_ERROR_CODE & (1 << self.0) != 0
     }
 
-    /// Whether a handler for this vector may return to what it interrupted.
+    /// What may follow this vector's handler.
     #[must_use]
-    pub const fn returns(self) -> bool {
-        !(self.is_exception() && NEVER_RETURNS & (1 << self.0) != 0)
+    pub const fn resumption(self) -> Resumption {
+        match self.0 {
+            8 => Resumption::Impossible,
+            18 => Resumption::FailStop,
+            _ => Resumption::Resume,
+        }
     }
 
     /// The stack the processor switches to before entering this vector's
@@ -90,7 +120,7 @@ impl Vector {
     pub const fn stack(self) -> Option<InterruptStack> {
         match self.0 {
             1 => Some(InterruptStack::Debug),
-            2 => Some(InterruptStack::NonMaskable),
+            2 | 30 => Some(InterruptStack::NonMaskable),
             8 => Some(InterruptStack::DoubleFault),
             10..=12 => Some(InterruptStack::Segment),
             13 => Some(InterruptStack::Protection),
@@ -122,8 +152,7 @@ impl Vector {
             16 => "#MF x87 floating-point error",
             17 => "#AC alignment check",
             18 => "#MC machine check",
-            19 => "#XM SIMD floating-point exception",
-            20 => "#VE virtualization exception",
+            19 => "#XF SIMD floating-point exception",
             21 => "#CP control protection exception",
             28 => "#HV hypervisor injection exception",
             29 => "#VC VMM communication exception",
@@ -146,20 +175,67 @@ impl Display for Vector {
     }
 }
 
+/// What may follow a vector's handler, and why.
+///
+/// Two different facts wear the same shape and are kept apart here, because
+/// conflating them is how a hypervisor ends up claiming the architecture
+/// forbids something the architecture merely makes conditional.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resumption {
+    /// The handler may return, and the processor carries on with what it
+    /// interrupted.
+    Resume,
+    /// The architecture defines no way back. `#DF` is raised because the
+    /// processor could not deliver something else, and what a return would go
+    /// back to is state the processor has already abandoned; there is no status
+    /// to consult and no condition under which it becomes restartable.
+    Impossible,
+    /// The architecture would allow a return under conditions this hypervisor
+    /// does not establish, so it stops instead.
+    ///
+    /// This is `#MC`. Whether a machine check is recoverable is a question
+    /// about `MCG_STATUS` and the error banks: the saved instruction pointer
+    /// may be reliable, the context may be uncorrupted, the error may be
+    /// contained. Answering it needs a subsystem that reads and clears that
+    /// state, and pulzar has none — so every machine check is fatal here as a
+    /// stated policy, not because the processor said so.
+    FailStop,
+}
+
 /// One of the stacks named by the task state segment's interrupt stack table.
 ///
 /// The processor switches to one of these before entering a handler whose gate
-/// names it, whatever the interrupted stack was. Seven slots exist and all
-/// seven are used, so no two of these conditions can land on the same stack —
-/// which matters because each of them is a condition the previous stack may be
-/// the cause of.
+/// names it, whatever the interrupted stack was. Seven slots exist, all seven
+/// are used, and which conditions share one is a decision made per slot below
+/// rather than a consequence of running out.
+///
+/// Sharing is not the only hazard. The processor reloads the *same* stack
+/// pointer on every entry that selects a slot — it does not continue below a
+/// frame that is already there — so a condition reaching its own slot twice
+/// would overwrite the first frame with the second. That is what
+/// [`crate::nesting`] exists for, and why each of these stacks is allocated
+/// with room for more than one frame at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterruptStack {
     /// For `#DF`, raised because the processor could not deliver something
     /// else, which is very often because the stack it would have used is gone.
     DoubleFault,
-    /// For the non-maskable interrupt, which arrives whatever the processor is
-    /// in the middle of, including another handler.
+    /// For the non-maskable interrupt and for `#SX`.
+    ///
+    /// Both arrive from outside and on no instruction of ours in particular:
+    /// the first whatever masking says, the second because firmware can leave
+    /// `VM_CR.R_INIT` set, which turns an external `INIT` into an exception.
+    /// Neither can be held off until the interrupted stack is trustworthy, so
+    /// neither may depend on it.
+    ///
+    /// They share a slot because the alternative is worse. `#SX` on its own
+    /// stack would need an eighth slot, which does not exist; `#SX` with no
+    /// stack of its own would be delivered on whatever `RSP` happened to be,
+    /// which is the hazard being avoided. Nesting between the two is what the
+    /// levels in [`crate::nesting`] cover: an `NMI` cannot interrupt itself, an
+    /// `#SX` arriving inside an `NMI` handler lands one level down, and a depth
+    /// no level is left for is a stated terminal case rather than a silent
+    /// overwrite.
     NonMaskable,
     /// For `#MC`, which the hardware raises asynchronously and for the same
     /// reason must not depend on the interrupted stack.
@@ -172,9 +248,17 @@ pub enum InterruptStack {
     PageFault,
     /// For `#GP`, the fault a non-canonical stack pointer produces.
     Protection,
-    /// For `#TS`, `#NP` and `#SS`: the three faults raised while the processor
-    /// is loading a segment or using the stack segment, which are one family
-    /// and cannot be nested, since none of them is recoverable.
+    /// For `#TS`, `#NP` and `#SS`: the three faults the processor raises while
+    /// loading a segment or using the stack segment.
+    ///
+    /// They share a slot because of the exception-combination rules rather than
+    /// because they are unrecoverable — all three are faults, and all three
+    /// report an instruction that could be restarted. What makes the sharing
+    /// safe is that a second contributory exception raised while the processor
+    /// is delivering one of these becomes `#DF`, which has a slot of its own.
+    /// That is a statement about *contributory* pairs and nothing wider: an
+    /// unrelated exception may perfectly well be raised while one of these
+    /// handlers is running, which is why this slot has levels like every other.
     Segment,
 }
 
@@ -210,5 +294,35 @@ impl InterruptStack {
             Self::Protection => 5,
             Self::Segment => 6,
         }
+    }
+}
+
+const _: () = {
+    let mut index = 0;
+    let mut slot = 0;
+    while index < InterruptStack::COUNT {
+        assert!(
+            InterruptStack::ALL[index].slot() == slot,
+            "every stack occupies the slot its place in the list says, so that one \
+             array can be indexed by either"
+        );
+        index += 1;
+        slot += 1;
+    }
+};
+
+impl Display for InterruptStack {
+    /// What the slot is for, so an allocation failure names the stack that
+    /// could not be backed rather than a number.
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DoubleFault => "the double fault stack",
+            Self::NonMaskable => "the non-maskable interrupt stack",
+            Self::MachineCheck => "the machine check stack",
+            Self::Debug => "the debug stack",
+            Self::PageFault => "the page fault stack",
+            Self::Protection => "the general protection stack",
+            Self::Segment => "the segment fault stack",
+        })
     }
 }
