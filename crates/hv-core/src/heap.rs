@@ -43,11 +43,11 @@
 use core::ptr::NonNull;
 
 use log::info;
-use paging::{AddressSpace, PagingError, buddy, chunk::FRAME_SIZE};
+use paging::{AddressSpace, PagingError, as_usize, buddy, chunk::FRAME_SIZE};
 use talc::{TalcLock, source::Manual};
 use x86_64::VirtAddr;
 
-use crate::{bytes, error::CoreError};
+use crate::error::CoreError;
 
 /// Frames the heap reserves from the chunk.
 ///
@@ -95,7 +95,7 @@ impl Heap {
     /// which can only mean it is too small to hold the allocator's own
     /// bookkeeping.
     pub fn establish(space: &mut AddressSpace) -> Result<Self, CoreError> {
-        let order = buddy::order_for(bytes(HEAP_FRAMES));
+        let order = buddy::order_for(as_usize(HEAP_FRAMES));
         let frames = space
             .frames()
             .allocate(order)
@@ -116,7 +116,7 @@ impl Heap {
         let end = unsafe {
             ALLOCATOR
                 .lock()
-                .claim(base.as_mut_ptr::<u8>(), bytes(HEAP_BYTES))
+                .claim(base.as_mut_ptr::<u8>(), as_usize(HEAP_BYTES))
         }
         .ok_or(CoreError::HeapRefused {
             base: base.as_u64(),

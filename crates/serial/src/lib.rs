@@ -12,8 +12,10 @@
 //! The lock is only ever acquired with interrupts disabled on the acquiring
 //! core (and the interrupt flag restored afterwards), so a handler that logs
 //! cannot deadlock against a lock its own core was holding when the
-//! interrupt arrived. Non-maskable interrupts are the exception: an NMI
-//! handler must not log. Initialization is claimed atomically: a second
+//! interrupt arrived. Non-maskable interrupts are the exception, and so is
+//! anything else masking cannot hold off — a machine check, a fault: those
+//! must not log, and [`emergency`] is what they write through instead, taking
+//! no lock at all. Initialization is claimed atomically: a second
 //! [`init`] — from the same core or a racing one — fails with a clear error
 //! instead of reconfiguring the port underneath whoever is using it.
 //! Nothing here allocates.
@@ -23,8 +25,8 @@
 mod uart;
 
 use core::{
-    fmt::Write,
-    sync::atomic::{AtomicBool, Ordering},
+    fmt::{Arguments, Write},
+    sync::atomic::{AtomicBool, AtomicU16, Ordering},
 };
 
 use log::{LevelFilter, Log, Metadata, Record};
@@ -49,6 +51,14 @@ static UART: Mutex<Option<Uart>> = Mutex::new(None);
 /// Claimed by the first [`init`] call so later calls fail instead of
 /// touching a port that may already be in use.
 static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Base address of the port [`init`] selected, or zero before it did.
+///
+/// The same fact as [`UART`] holds, kept where it can be read without the
+/// lock, which is the whole of what [`emergency`] needs: the port is already
+/// configured by the time this is set, so addressing it again takes nothing
+/// but the number.
+static PORT: AtomicU16 = AtomicU16::new(0);
 
 /// The logger [`init`] installs; it forwards every record to [`UART`].
 static LOGGER: SerialLogger = SerialLogger;
@@ -88,10 +98,37 @@ pub fn init() -> Result<(), InitError> {
         return Err(InitError::AlreadyInitialized);
     }
     let uart = Uart::detect().ok_or(InitError::NoUartFound)?;
+    PORT.store(uart.base(), Ordering::Relaxed);
     interrupts::without_interrupts(|| *UART.lock() = Some(uart));
     log::set_logger(&LOGGER).map_err(|_| InitError::AlreadyInitialized)?;
     log::set_max_level(MAX_LEVEL);
     Ok(())
+}
+
+/// Writes one line to the selected port, taking no lock and allocating
+/// nothing.
+///
+/// For the paths that cannot use [`log`] because of what interrupted them: a
+/// non-maskable interrupt, a machine check, a fault whose handler cannot
+/// return. Every one of those can arrive while the interrupted code on this
+/// very processor holds the logger's lock, and waiting for a lock that only
+/// this processor could release is a processor that never comes back. So this
+/// path waits for nothing.
+///
+/// The cost is that a line may interleave with one another processor is
+/// writing. That is the right trade where it is used: the alternative to
+/// mangled output is no output and a stopped machine.
+///
+/// Does nothing before [`init`] has selected a port, since there is nowhere to
+/// write to.
+pub fn emergency(args: Arguments<'_>) {
+    let base = PORT.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    // The writer cannot fail; an `Err` could only come from a broken `Display`
+    // among the arguments, and there is nowhere left to report it from.
+    let _ = writeln!(Uart::adopt(base), "{args}");
 }
 
 /// Forwards [`log`] records to the locked UART, one whole line per lock

@@ -29,6 +29,13 @@
 //! The first entry publishes a clean field of zero, because a block the
 //! processor has never seen has nothing cached behind it.
 //!
+//! The translation-flush control is handled the same way and for the same
+//! reason. A caller that took permission away in the guest's memory calls
+//! [`Vcpu::flush`], and the next entry turns that into the narrowest command
+//! this processor has for discarding one guest's translations — after which it
+//! goes back to costing nothing, because the field is not one the processor
+//! caches.
+//!
 //! # Two invariants a caller keeps
 //!
 //! The processor identifies its cached copy of a block by the block's *physical
@@ -43,10 +50,11 @@ use core::ptr::NonNull;
 
 use log::info;
 use paging::{DirectMap, Frames};
+use processor::SvmFeatures;
 use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
     control::NestedPagingControl,
-    intercept::{Intercepts1, Intercepts2, Intercepts2Flags},
+    intercept::{Intercepts1, Intercepts2, Intercepts2Flags, TlbControl},
     msr::VM_CR,
     permissions::{MSRPM_BYTES, MsrPermission, msrpm_position},
 };
@@ -103,6 +111,7 @@ pub struct Vcpu {
     msrpm_phys: PhysAddr,
     host: &'static Host,
     dirty: CleanBits,
+    stale: bool,
 }
 
 impl Vcpu {
@@ -164,6 +173,8 @@ impl Vcpu {
             // Everything counts as edited until the first entry, so that entry
             // publishes a clean field of zero.
             dirty: CleanBits::ALL_CACHED,
+            // A guest that has never run has cached no translation of its own.
+            stale: false,
         };
 
         let control = vcpu.control_mut();
@@ -235,8 +246,16 @@ impl Vcpu {
         }
         loop {
             let clean = CleanBits::ALL_CACHED.soil(self.dirty);
-            self.control_mut().clean = clean;
+            let flush = if self.stale {
+                flush_command()
+            } else {
+                TlbControl::DoNothing
+            };
+            let control = self.control_mut();
+            control.clean = clean;
+            control.tlb_control = flush;
             self.dirty = CleanBits::nothing_cached();
+            self.stale = false;
 
             // SAFETY: the block was checked above and after every exit that
             // edited it, `Host::install` enabled the extension and programmed
@@ -282,6 +301,21 @@ impl Vcpu {
     /// the guest on state that is no longer there. When unsure, clear.
     pub const fn soil(&mut self, groups: CleanBits) {
         self.dirty = self.dirty.union(groups);
+    }
+
+    /// Discards this guest's cached translations on the way into the next
+    /// entry.
+    ///
+    /// What a caller calls after taking permission away in the guest's nested
+    /// page tables. The processor may hold a translation those tables no longer
+    /// justify, and nothing but a flush gets rid of it — filling an entry that
+    /// was empty needs none of this, because the walker notices a constraint
+    /// being lifted on its own.
+    ///
+    /// Consumed by the entry it applies to, so one edit costs one flush rather
+    /// than a flush on every entry for the rest of the guest's life.
+    pub const fn flush(&mut self) {
+        self.stale = true;
     }
 
     /// Why the guest stopped, or `None` for a code the architecture does not
@@ -384,6 +418,19 @@ impl Vcpu {
             Some(invalid) => info!("{who}: vcpu would not enter: {invalid}"),
             None => info!("{who}: vcpu would enter"),
         }
+    }
+}
+
+/// The narrowest way this processor can discard one guest's translations.
+///
+/// Flushing by identifier throws away this guest's and nothing else's. A
+/// processor without it has only the instrument that discards every translation
+/// on the machine, the host's included — enormously more expensive, and still
+/// correct, which is what makes it the fallback rather than a refusal.
+fn flush_command() -> TlbControl {
+    match processor::svm() {
+        Some(svm) if svm.features.contains(SvmFeatures::FLUSH_BY_ASID) => TlbControl::FlushGuest,
+        _ => TlbControl::FlushAll,
     }
 }
 

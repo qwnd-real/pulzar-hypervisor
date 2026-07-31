@@ -37,6 +37,13 @@ const DIVISOR: u16 = {
 /// Byte written and read back by both detection tests.
 const PROBE_PATTERN: u8 = 0xA5;
 
+/// Iteration cap on the transmit poll, so a port that stops draining costs a
+/// dropped byte rather than a processor. One byte at [`BAUD`] takes ~260 µs to
+/// clock out and a port read takes ~1 µs, so a device that is working is never
+/// anywhere near this. It matters most on the paths that report a fault: those
+/// run with interrupts masked and must end, whatever the hardware does.
+const TX_POLL_LIMIT: u32 = 100_000;
+
 /// Iteration cap on the loopback receive poll, so probing an absent or
 /// broken device cannot hang the boot. One byte at [`BAUD`] takes ~260 µs
 /// to loop back and a port read takes ~1 µs, so this leaves two orders of
@@ -75,6 +82,9 @@ const LSR_THR_EMPTY: u8 = 0x20;
 
 /// One 16550-compatible UART, addressed through its I/O port registers.
 pub struct Uart {
+    /// Base address the registers below were derived from, kept so a port that
+    /// is already configured can be addressed again without probing it.
+    base: u16,
     /// Transmit/receive buffer; divisor low byte while DLAB is set.
     data: Port<u8>,
     /// Interrupt enable; divisor high byte while DLAB is set.
@@ -98,17 +108,36 @@ impl Uart {
         COM_BASES.into_iter().find_map(Self::probe)
     }
 
-    /// Transmits one byte, blocking until the holding register is free.
+    /// Addresses a port that is already configured, without probing or
+    /// reprogramming it.
+    ///
+    /// This is how a second, lock-free view of the selected UART is made: the
+    /// registers are stateless addresses, so two views of one port differ in
+    /// nothing but who is allowed to write through them.
+    pub const fn adopt(base: u16) -> Self {
+        Self::new(base)
+    }
+
+    /// The base address this UART's registers were derived from.
+    pub const fn base(&self) -> u16 {
+        self.base
+    }
+
+    /// Transmits one byte, waiting for the holding register to drain and
+    /// dropping the byte if it never does.
     pub fn write_byte(&mut self, byte: u8) {
         // SAFETY: Polling the line status register and writing the transmit
         // buffer is the UART's polled-transmit protocol; both accesses go to
         // a device `detect` verified present and touch device state only,
         // never memory.
         unsafe {
-            while self.line_status.read() & LSR_THR_EMPTY == 0 {
+            for _ in 0..TX_POLL_LIMIT {
+                if self.line_status.read() & LSR_THR_EMPTY != 0 {
+                    self.data.write(byte);
+                    return;
+                }
                 core::hint::spin_loop();
             }
-            self.data.write(byte);
         }
     }
 
@@ -123,6 +152,7 @@ impl Uart {
 
     const fn new(base: u16) -> Self {
         Self {
+            base,
             data: Port::new(base),
             interrupt_enable: PortWriteOnly::new(base + 1),
             fifo_control: PortWriteOnly::new(base + 2),

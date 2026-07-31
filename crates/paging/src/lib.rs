@@ -91,15 +91,20 @@ const _: () = assert!(
 
 /// A count or address as `usize`.
 ///
-/// Every such conversion in the crate goes through here, so the width
-/// assumption above is stated once instead of at each call site. `try_from` in
-/// its place would be error handling for a state the assertion rules out, on
-/// paths that must not panic.
+/// Every such conversion goes through here, so the width assumption above is
+/// stated once instead of at each call site. `try_from` in its place would be
+/// error handling for a state the assertion rules out, on paths that must not
+/// panic.
+///
+/// Public because the same conversion is needed wherever a chunk offset or size
+/// from this crate has to be a length in memory, and a second copy of it
+/// elsewhere would be a second place the width assumption lives.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "usize is 64 bits wide on this crate's only target, asserted above"
 )]
-pub(crate) const fn as_usize(value: u64) -> usize {
+#[must_use]
+pub const fn as_usize(value: u64) -> usize {
     value as usize
 }
 

@@ -80,21 +80,22 @@
 //! cacheable; it is the identity element that lets a guest mark its own device
 //! apertures uncacheable and be obeyed.
 //!
-//! # No translation is ever invalidated
+//! # Nothing here invalidates a translation
 //!
 //! Filling only ever turns a not-present entry present, and the architecture
 //! requires no invalidation for that — the walker detects a constraint being
 //! removed on its own. Splitting replaces one entry with a table describing the
 //! same memory the same way, which removes no constraint either.
 //!
-//! [`Npt::protect`] is the one operation here that reduces what an entry
-//! permits, and it needs no invalidation for a different reason: it may only be
-//! called before the guest has ever run. Nothing has walked these tables at
-//! that point, so no processor holds a translation that the tables have stopped
-//! justifying, and there is nothing to flush. That precondition is the whole
-//! reason nothing in this crate touches `TLB_CONTROL`, and it is what would
-//! have to be revisited first if a region ever had to be trapped while a guest
-//! is running.
+//! Two operations here reduce what an entry permits, and neither of them
+//! flushes anything itself. [`Npt::protect`] needs no flush at all, because it
+//! may only be called before the guest has ever run: nothing has walked these
+//! tables at that point, so no processor holds a translation the tables have
+//! stopped justifying. [`Npt::conceal`] is the one that may be called while a
+//! guest is running, and it states in as many words that discarding what the
+//! guest cached is the caller's — the caller is what knows which processors ran
+//! the guest and what makes the next entry, and `TLB_CONTROL` is a field of a
+//! control block this crate does not have.
 
 #![no_std]
 
@@ -333,6 +334,54 @@ impl Npt {
         bytes: u64,
         exposure: Exposure,
     ) -> Result<(), NptError> {
+        self.overlay(frames, gpa, bytes, Some(exposure))
+    }
+
+    /// Takes an exposed range back, leaving it as every other page of the
+    /// hypervisor's memory already is: the shared page of zeroes, read-only.
+    ///
+    /// The counterpart of [`Npt::expose`], for entry code whose work is done.
+    /// Afterwards the range is indistinguishable from the rest of the chunk — a
+    /// guest reading it sees zeroes, and a guest writing it is reported as
+    /// [`Resolution::Shadowed`] like any other write to hypervisor memory.
+    ///
+    /// # The caller discards what the guest cached
+    ///
+    /// This is the one operation here that may be called after a guest has run,
+    /// and it takes permission away rather than granting it — so a processor
+    /// that has entered this guest may hold a translation these tables no
+    /// longer justify. Getting rid of it is the caller's, because it is the
+    /// caller that knows which processors have run the guest and it is the
+    /// caller that makes the next entry.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::TrapGeometry`] unless the range is a whole number of pages
+    /// on page boundaries, [`NptError::OutsideOwned`] if it leaves the chunk,
+    /// or an error from building the required nested tables.
+    pub fn conceal(
+        &mut self,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+        bytes: u64,
+    ) -> Result<(), NptError> {
+        self.overlay(frames, gpa, bytes, None)
+    }
+
+    /// Describes a range of the hypervisor's own memory one page at a time,
+    /// either as itself or as the shared page of zeroes.
+    ///
+    /// One body for both directions, because what the two have to check is
+    /// identical and a range that could be exposed but not concealed — or the
+    /// reverse — would be a way for the two to disagree about what a valid
+    /// range is.
+    fn overlay(
+        &mut self,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+        bytes: u64,
+        exposure: Option<Exposure>,
+    ) -> Result<(), NptError> {
         let page = Level::Page.span();
         if bytes == 0 || !gpa.as_u64().is_multiple_of(page) || !bytes.is_multiple_of(page) {
             return Err(NptError::TrapGeometry {
@@ -348,13 +397,17 @@ impl Npt {
         }
         (0..bytes / page).try_for_each(|index| {
             let page = gpa + index * page;
+            let (frame, flags) = match exposure {
+                Some(exposure) => (page, exposure.flags()),
+                None => (self.zero, SHADOW),
+            };
             walk::map(
                 self.window,
                 self.root,
                 page,
                 Level::Page,
-                page,
-                exposure.flags(),
+                frame,
+                flags,
                 frames,
             )
         })

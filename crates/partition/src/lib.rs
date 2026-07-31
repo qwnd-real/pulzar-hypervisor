@@ -149,6 +149,27 @@ impl Partition {
             .expose(space.frames(), gpa, bytes, exposure)?)
     }
 
+    /// Takes back what [`Partition::expose`] made visible, leaving the range
+    /// reading as zeroes like the rest of the hypervisor's memory.
+    ///
+    /// Unlike exposing, this may be called while the guest is running — it is
+    /// how entry code is retired once the guest is past it. It takes permission
+    /// away, so every processor that has run this guest must discard what it
+    /// cached from these tables before entering it again; with one processor
+    /// running the guest, that is one flush on its next entry.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionError::Paging`] if the address space is not yet the
+    /// machine's, or [`PartitionError::Npt`] if the range cannot be concealed.
+    pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<(), PartitionError> {
+        // The address space first and the tables second, as everywhere else
+        // here.
+        Ok(paging::with(|space| {
+            self.npt.lock().conceal(space.frames(), gpa, bytes)
+        })??)
+    }
+
     /// Borrows this guest's memory translated by one virtual processor's
     /// current save area.
     ///

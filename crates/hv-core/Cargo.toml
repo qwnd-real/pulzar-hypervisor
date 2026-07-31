@@ -24,6 +24,7 @@ clock = { workspace = true }
 cpu = { workspace = true }
 descriptors = { workspace = true }
 emulate = { workspace = true }
+exits = { workspace = true }
 handoff = { workspace = true }
 ipi = { workspace = true }
 log = { workspace = true }
@@ -31,7 +32,7 @@ npt = { workspace = true }
 paging = { workspace = true }
 partition = { workspace = true }
 pci = { workspace = true }
-processor = { workspace = true }
+portal = { workspace = true }
 serial = { workspace = true }
 snapshot = { workspace = true }
 spin = { workspace = true }

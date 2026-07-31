@@ -450,6 +450,38 @@ impl AddressSpace {
         })
     }
 
+    /// Gives a stack from [`AddressSpace::allocate_stack`] back: its pages are
+    /// unmapped, the frames behind them return to the chunk, and the window run
+    /// holding it and its two guards is released.
+    ///
+    /// The counterpart every staged allocation needs. A caller that allocates
+    /// several stacks and fails part-way through has no other way to undo the
+    /// ones that succeeded, and stacks are large enough that leaking them
+    /// exhausts the chunk over a few retries.
+    ///
+    /// Nothing is reported: this is a rollback path, so a failure here is
+    /// already handling a failure and there is nowhere to propagate it to. Each
+    /// step is logged instead, and whatever cannot be given back stays
+    /// accounted for as allocated rather than being handed out twice.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may still be running on the stack, and no processor may still
+    /// name it — in an interrupt stack table, a task state segment, or a saved
+    /// stack pointer. The addresses go straight back to the window allocator,
+    /// so a later mapping may be handed the very same range.
+    pub unsafe fn release_stack(&mut self, stack: Stack) {
+        let (first, order) = stack.run();
+        self.unwind_owned(first + 1, stack.pages);
+        self.release_slots(first, order);
+        if let Err(error) = broadcast(Flush::small(first + 1, stack.pages)) {
+            warn!(
+                "paging: could not announce releasing the stack at {:#x}: {error}",
+                stack.bottom.as_u64()
+            );
+        }
+    }
+
     /// Reduces the direct map's protection over `len` bytes at `phys`.
     ///
     /// The direct map is read-write everywhere by default, which would leave a

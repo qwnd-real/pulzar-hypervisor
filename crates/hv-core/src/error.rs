@@ -10,15 +10,15 @@ use clock::ClockError;
 use cpu::CpuError;
 use descriptors::DescriptorError;
 use emulate::EmulateError;
+use exits::ExitError;
 use handoff::HandoffError;
 use ipi::IpiError;
 use paging::PagingError;
 use partition::PartitionError;
 use pci::PciError;
+use portal::PortalError;
 use thiserror::Error;
 use vcpu::VcpuError;
-
-use crate::portal::PortalError;
 
 /// A failure during bring-up.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -65,9 +65,10 @@ pub enum CoreError {
     /// Instruction decoding could not be prepared before guest execution.
     #[error(transparent)]
     Emulate(#[from] EmulateError),
-    /// Guest execution ended instead of remaining in the run loop.
-    #[error("guest execution stopped after an unhandled VM exit")]
-    GuestStopped,
+    /// The guest stopped, at an exit nothing could answer for or at a control
+    /// block the processor refused.
+    #[error(transparent)]
+    Exit(#[from] ExitError),
     /// A processor came up before the boot processor had established the guest,
     /// which the order of bring-up is supposed to rule out.
     #[error("the guest was not established before this processor came up")]

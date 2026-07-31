@@ -11,9 +11,10 @@
 //! operating-system boot manager and wraps `ExitBootServices`. Only after the
 //! original firmware service returns success does the wrapper notify the host,
 //! which starts the application processors in their temporary wait loop. The
-//! portal pages are the only hypervisor-owned pages visible to the guest;
-//! nested paging otherwise presents the reserved chunk as an immutable zero
-//! page.
+//! portal pages are the only hypervisor-owned pages ever visible to the guest,
+//! and only until the guest has left them behind — nested paging presents the
+//! rest of the reserved chunk as an immutable zero page throughout, and the
+//! portal as one too once it has been taken back.
 //!
 //! The same entry point is also reachable by starting `pulzar.efi` as an
 //! ordinary UEFI application, in which case the first argument is a firmware
@@ -25,38 +26,29 @@
 
 mod error;
 mod heap;
-mod portal;
 
 use core::{convert::Infallible, ffi::c_void, hint::black_box, panic::PanicInfo};
 
 use acpi::Acpi;
 use apic::Apic;
 use clock::{Clock, Wall};
-use descriptors::{Descriptors, Interrupt, halt};
+use descriptors::{Descriptors, Interrupt, Tables, Vector, halt};
+use exits::{Boot, Exits};
 use handoff::{Handoff, HandoffError};
 use log::{error, info, warn};
-use npt::{Exposure, Resolution};
+use npt::Exposure;
 use paging::{AddressSpace, Existing, PagingError, chunk};
 use partition::Partition;
 use pci::Pci;
+use portal::Portal;
 use snapshot::FirmwareContext;
 use spin::Once;
-use svm::{
-    Reason,
-    exit::NestedPageFault,
-    intercept::{Intercepts1, Intercepts2Flags},
-    msr::{VM_CR, VmCr},
-    permissions::MsrAccess,
-};
+use svm::intercept::{Intercepts1, Intercepts2Flags};
 use uefi_raw::Status;
-use vcpu::{Flow, Vcpu};
+use vcpu::Vcpu;
 use x86_64::{PhysAddr, VirtAddr, structures::paging::PhysFrame};
 
-use crate::{
-    error::CoreError,
-    heap::Heap,
-    portal::{EXIT_SUCCEEDED, Portal, START_RETURNED},
-};
+use crate::{error::CoreError, heap::Heap};
 
 /// Bytes of stack the self check writes and reads back after the transition.
 const PROBE_BYTES: usize = 256;
@@ -73,17 +65,6 @@ const PROBE_PATTERN: u8 = 0xA5;
 /// `EFER.SVME`, required in the guest save area even though guest SVM use is
 /// intercepted and hidden from CPUID.
 const EFER_SVME: u64 = 1 << 12;
-
-/// CPUID leaf whose ECX word advertises SVM.
-const EXTENDED_FEATURES: u32 = 0x8000_0001;
-
-/// SVM feature bit in the extended feature leaf.
-const CPUID_SVM: u32 = 1 << 2;
-
-/// Lengths of the intercepted instructions completed by the host.
-const CPUID_BYTES: u64 = 2;
-const MSR_BYTES: u64 = 2;
-const VMMCALL_BYTES: u64 = 3;
 
 /// Stack alignment required at a Microsoft x64 call site.
 const CALL_STACK_ALIGN: u64 = 16;
@@ -170,7 +151,7 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // descriptor tables are one set per processor. Saying the first is what
     // makes the second allowed.
     descriptors::adopt(unclaimed)?;
-    Descriptors::install(&mut space)?.describe("core");
+    Tables::build(&mut space)?.activate()?.describe("core");
     emulate::install()?;
 
     // SAFETY: this space is the active one, physical memory is reached through
@@ -239,7 +220,35 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     ipi::describe("core");
     paging::with(|space| self_check(space, handoff))??;
     info!("core: host bring-up complete, entering the firmware guest");
-    run_guest(&mut vcpu, handoff)
+    run_guest(&mut vcpu, partition, portal, handoff)
+}
+
+/// Enters the guest on the boot processor and stays in its exits until one of
+/// them ends the guest.
+///
+/// # Errors
+///
+/// [`CoreError::Exit`] with whichever exit the guest stopped at, or with the
+/// rule the processor refused its control block for.
+fn run_guest(
+    vcpu: &mut Vcpu,
+    partition: &'static Partition,
+    portal: Portal,
+    handoff: &Handoff,
+) -> Result<Infallible, CoreError> {
+    let mut exits = Exits::new(
+        partition,
+        portal,
+        Boot {
+            trampoline: PhysAddr::new_truncate(handoff.ap_trampoline_base),
+            attach: ap_main,
+        },
+    );
+    // SAFETY: this VCPU was created on this processor and has stayed on it, its
+    // control block has not moved, and its save area holds the captured firmware
+    // state with the portal as its first instruction — a guest this hypervisor
+    // built and is entitled to run.
+    Ok(unsafe { exits.run(vcpu) }?)
 }
 
 /// What every processor other than the boot processor runs, for good.
@@ -251,14 +260,25 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
 /// interrupt controller, which is what its identifier comes from, and only then
 /// a block of its own and the interrupts that reach it.
 fn ap_main() -> ! {
-    match attach() {
-        Ok(id) => info!("core: {id} online"),
+    let descriptors = match attach() {
+        Ok((id, descriptors)) => {
+            info!("core: {id} online");
+            descriptors
+        }
         Err(error) => {
             error!("core: an application processor could not come up: {error}");
             halt()
         }
+    };
+    // SAFETY: nothing can deliver below the first external vector. The boot
+    // processor masked the legacy controllers before it started this one, and it
+    // did so before anything unmasked; every other source on this machine is one
+    // this hypervisor programmed, and a vector for one of those is only ever
+    // handed out by `descriptors::claim`, which refuses the architecture's own.
+    if let Err(error) = unsafe { descriptors.unmask() } {
+        error!("core: an application processor could not take interrupts: {error}");
+        halt()
     }
-    x86_64::instructions::interrupts::enable();
     loop {
         core::hint::spin_loop();
     }
@@ -270,8 +290,11 @@ fn ap_main() -> ! {
 ///
 /// The first failure of any step. There is nothing to roll back: a processor
 /// that cannot finish this has nothing to go back to, and the caller stops it.
-fn attach() -> Result<cpu::ApicId, CoreError> {
-    paging::with(Descriptors::install)??;
+fn attach() -> Result<(cpu::ApicId, Descriptors), CoreError> {
+    // Built while the address space is locked and switched to after it is
+    // unlocked: a processor that fell over between the two would otherwise leave
+    // that lock held for every processor after it.
+    let descriptors = paging::with(Tables::build)??.activate()?;
     let id = apic::LocalApic::enable()?.id()?;
     cpu::attach(id)?;
     let host = paging::with(|space| {
@@ -281,7 +304,7 @@ fn attach() -> Result<cpu::ApicId, CoreError> {
         unsafe { vcpu::Host::install(space.frames(), window) }
     })??;
     host.describe("core");
-    Ok(id)
+    Ok((id, descriptors))
 }
 
 /// Turns virtualization on for the calling processor and gives it a place in
@@ -333,152 +356,6 @@ fn virtualize(
         .with_flags(Intercepts2Flags::VMMCALL);
     vcpu.describe("core");
     Ok(vcpu)
-}
-
-/// Enters the BSP guest and services the exits required for firmware boot.
-fn run_guest(vcpu: &mut Vcpu, handoff: &Handoff) -> Result<Infallible, CoreError> {
-    let mut aps_started = false;
-    // SAFETY: this VCPU was created and remains on the boot processor, its save
-    // area is the captured firmware context, and its nested tables expose only
-    // the immutable portal pages from host-owned memory.
-    unsafe {
-        vcpu.run(|vcpu| dispatch(vcpu, handoff, &mut aps_started))?;
-    }
-    Err(CoreError::GuestStopped)
-}
-
-/// Handles one firmware or Windows VM exit.
-fn dispatch(vcpu: &mut Vcpu, handoff: &Handoff, aps_started: &mut bool) -> Flow {
-    let reason = vcpu.reason();
-    info!("core: vmexit {:?} at rip {:#x}", reason, vcpu.save().rip);
-    match reason {
-        Some(Reason::Cpuid) => cpuid_exit(vcpu),
-        Some(Reason::MsrAccess) => msr_exit(vcpu),
-        Some(Reason::NestedPageFault) => nested_fault(vcpu),
-        Some(Reason::Vmmcall) => {
-            match vcpu.registers().rdx {
-                START_RETURNED => {
-                    error!(
-                        "core: firmware StartImage returned status {:#x}",
-                        vcpu.save().rax
-                    );
-                    return Flow::Leave;
-                }
-                EXIT_SUCCEEDED => {}
-                marker => {
-                    error!("core: guest issued VMMCALL with unknown marker {marker:#x}");
-                    return Flow::Leave;
-                }
-            }
-            if !*aps_started {
-                match apic::start(PhysAddr::new_truncate(handoff.ap_trampoline_base), ap_main) {
-                    Ok(started) => {
-                        *aps_started = true;
-                        info!(
-                            "core: ExitBootServices succeeded; {} of {} processors online",
-                            started.online, started.startable
-                        );
-                    }
-                    Err(error) => {
-                        error!("core: application processors could not start: {error}");
-                        return Flow::Leave;
-                    }
-                }
-            }
-            advance(vcpu, VMMCALL_BYTES);
-            Flow::Resume
-        }
-        _ => {
-            error!("core: unhandled VM exit {:?}", vcpu.control().exit_code);
-            Flow::Leave
-        }
-    }
-}
-
-/// Returns host CPUID data while hiding nested virtualization.
-fn cpuid_exit(vcpu: &mut Vcpu) -> Flow {
-    let leaf = low_word(vcpu.save().rax);
-    let subleaf = low_word(vcpu.registers().rcx);
-    let mut result = processor::cpuid(leaf, subleaf);
-    if leaf == EXTENDED_FEATURES {
-        result.ecx &= !CPUID_SVM;
-    }
-    vcpu.save_mut().rax = u64::from(result.eax);
-    let registers = vcpu.registers_mut();
-    registers.rbx = u64::from(result.ebx);
-    registers.rcx = u64::from(result.ecx);
-    registers.rdx = u64::from(result.edx);
-    advance(vcpu, CPUID_BYTES);
-    Flow::Resume
-}
-
-/// Low architectural word of a general-purpose register.
-fn low_word(value: u64) -> u32 {
-    u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default()
-}
-
-/// Presents `VM_CR.SVMDIS=1` to the guest without changing the host register.
-fn msr_exit(vcpu: &mut Vcpu) -> Flow {
-    if vcpu.registers().rcx != u64::from(VM_CR) {
-        error!(
-            "core: unexpected intercepted MSR {:#x}",
-            vcpu.registers().rcx
-        );
-        return Flow::Leave;
-    }
-    match MsrAccess::from_exit_info(vcpu.control().exit_info_1) {
-        MsrAccess::Read => {
-            let value = VmCr::new().with_svm_disabled(true).into_bits();
-            vcpu.save_mut().rax = value & u64::from(u32::MAX);
-            vcpu.registers_mut().rdx = value >> u32::BITS;
-        }
-        MsrAccess::Write => {}
-    }
-    advance(vcpu, MSR_BYTES);
-    Flow::Resume
-}
-
-/// Resolves a lazy mapping or skips a write to hidden hypervisor memory.
-fn nested_fault(vcpu: &mut Vcpu) -> Flow {
-    let cause = NestedPageFault::from_bits(vcpu.control().exit_info_1);
-    let gpa = PhysAddr::new_truncate(vcpu.control().exit_info_2);
-    let Some(partition) = PARTITION.get() else {
-        error!("core: nested fault before the partition existed");
-        return Flow::Leave;
-    };
-    match partition.resolve(gpa, cause) {
-        Ok(Resolution::Mapped) => Flow::Resume,
-        Ok(Resolution::Shadowed) => {
-            match partition.with_memory(vcpu.save(), |guest| emulate::next_rip(vcpu, guest)) {
-                Ok(next) => {
-                    vcpu.save_mut().rip = next;
-                    Flow::Resume
-                }
-                Err(error) => {
-                    error!("core: could not skip shadowed write at {gpa:#x}: {error}");
-                    Flow::Leave
-                }
-            }
-        }
-        Ok(Resolution::Trapped) => {
-            error!("core: no device handles trapped access at {gpa:#x}");
-            Flow::Leave
-        }
-        Err(error) => {
-            error!("core: nested fault at {gpa:#x} could not be resolved: {error}");
-            Flow::Leave
-        }
-    }
-}
-
-/// Moves past an intercepted instruction the host completed.
-fn advance(vcpu: &mut Vcpu, fallback: u64) {
-    let next = vcpu.control().next_rip;
-    vcpu.save_mut().rip = if next == 0 {
-        vcpu.save().rip.wrapping_add(fallback)
-    } else {
-        next
-    };
 }
 
 /// Establishes the timebase from whichever counter the machine turned out to
@@ -659,16 +536,33 @@ fn self_check(space: &mut AddressSpace, handoff: &Handoff) -> Result<(), CoreErr
 /// address space or of the descriptor tables is already broken, which is not
 /// something to continue past: it stops here, with everything the processor
 /// said about it on the record.
+///
 /// Dropping one also means acknowledging it. The local interrupt controller
 /// holds an interrupt in service until it is told otherwise, and goes on
 /// refusing everything of that priority or lower until it is — so a processor
 /// that ignored one without saying so would quietly stop accepting a whole
 /// class of interrupts for the rest of its life. Reinjecting into a guest is
-/// what will take this over, and acknowledging is part of that too.
+/// what will take this over, and acknowledging is part of that too. The
+/// non-maskable interrupt is the one arrival that is not acknowledged: nothing
+/// holds it in service, and an acknowledgement it did not need would end
+/// whatever interrupt actually is.
+///
+/// # What this may not do
+///
+/// It is entered from the interrupt path, so it takes no lock the interrupted
+/// code could be holding. For everything masking holds off, [`log`] is such a
+/// lock and is safe to take, because the backend masks interrupts for a whole
+/// line. For the two kinds that arrive anyway — an exception, and the
+/// non-maskable interrupt — it is not, and the report goes straight to the port
+/// through [`serial::emergency`] instead.
 fn unclaimed(interrupt: &Interrupt) {
     if interrupt.vector().is_exception() {
-        error!("core: {interrupt}");
+        serial::emergency(format_args!("core: {interrupt}"));
         halt()
+    }
+    if interrupt.vector() == Vector::NON_MASKABLE {
+        serial::emergency(format_args!("core: ignoring unclaimed {interrupt}"));
+        return;
     }
     warn!("core: ignoring unclaimed {interrupt}");
     if let Err(error) = apic::end_of_interrupt() {
@@ -717,17 +611,6 @@ fn inherited(handoff: &Handoff) -> Result<&'static FirmwareContext, CoreError> {
     // address is a direct-map one, which is what keeps it mapped now that the
     // firmware half of the address space is gone.
     Ok(unsafe { &*address.as_ptr::<FirmwareContext>() })
-}
-
-/// A byte count as a `usize`.
-///
-/// # Panics
-///
-/// Never on this target, where `usize` is as wide as the `u64` the paging
-/// subsystem uses. Heap establishment is early bring-up, where stopping is the
-/// correct response if that target invariant changes.
-pub(crate) fn bytes(value: u64) -> usize {
-    usize::try_from(value).expect("a byte count must fit a usize on this target")
 }
 
 /// Logs a panic and stops.
