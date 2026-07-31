@@ -299,6 +299,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "paging",
+ "serial",
  "spin 0.12.2",
  "thiserror",
  "x86_64",
@@ -360,6 +361,23 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exits"
+version = "0.1.0"
+dependencies = [
+ "apic",
+ "emulate",
+ "log",
+ "npt",
+ "partition",
+ "portal",
+ "processor",
+ "svm",
+ "thiserror",
+ "vcpu",
+ "x86_64",
 ]
 
 [[package]]
@@ -439,6 +457,7 @@ dependencies = [
  "cpu",
  "descriptors",
  "emulate",
+ "exits",
  "handoff",
  "ipi",
  "log",
@@ -446,7 +465,7 @@ dependencies = [
  "paging",
  "partition",
  "pci",
- "processor",
+ "portal",
  "serial",
  "snapshot",
  "spin 0.12.2",
@@ -685,6 +704,17 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "portal"
+version = "0.1.0"
+dependencies = [
+ "handoff",
+ "paging",
+ "thiserror",
+ "uefi-raw",
+ "x86_64",
+]
 
 [[package]]
 name = "proc-macro2"

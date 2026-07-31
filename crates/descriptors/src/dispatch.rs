@@ -24,22 +24,40 @@
 //! of those is not a case to be silently absorbed — it is the hypervisor
 //! finding out something about the machine it did not know — so it reaches the
 //! same callback and is reported with everything the processor said about it.
+//!
+//! The two vectors nothing may return from never reach either. Their entry
+//! points do not come back, so there is nothing for a callback to answer; they
+//! are reported through [`crate::fatal`] and the processor stops.
+//!
+//! # Publication
+//!
+//! A slot holds a function pointer and is written once, with one compare and
+//! exchange. There is no interval in which a registration is half-done: a
+//! delivery either finds nothing claiming the vector or finds the handler that
+//! claimed it, and the losing racer is told so rather than silently replacing
+//! the winner. Reading one is a load and a comparison, which is what an entry
+//! path can afford — a registry behind a lock would let one processor's
+//! registration stall another processor's interrupt.
 
-use core::fmt::{self, Display, Formatter};
+use core::{
+    fmt::{self, Display, Formatter},
+    ptr,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
-use spin::Once;
 use x86_64::{registers::control::Cr2, structures::idt::InterruptStackFrameValue};
 
-use crate::{DescriptorError, Vector};
+use crate::{DescriptorError, Resumption, Vector, fatal, nesting::Guard};
 
 /// What a handler decided about the interrupt it was shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disposition {
-    /// The hypervisor caused this interrupt and has dealt with it. Nothing
-    /// else happens and the interrupted code resumes.
+    /// The hypervisor caused this interrupt and has dealt with it, including
+    /// acknowledging it to the controller that delivered it. Nothing else
+    /// happens and the interrupted code resumes.
     Consumed,
-    /// The interrupt was not the hypervisor's. What becomes of it is the
-    /// hypervisor's decision, not the handler's.
+    /// The interrupt was not the hypervisor's, and has not been acknowledged.
+    /// What becomes of it is the hypervisor's decision, not the handler's.
     Passed,
 }
 
@@ -49,6 +67,34 @@ pub enum Disposition {
 /// It runs with interrupts masked, on whichever stack the vector's gate names,
 /// and it must not assume anything about what it interrupted: the answer to
 /// "was this mine?" has to come from the handler's own state.
+///
+/// # What a handler may not do
+///
+/// The interrupted code is this same processor, stopped mid-instruction. It may
+/// hold any lock, be inside the allocator, be halfway through publishing
+/// something. So a handler:
+///
+/// - must not block, and must not wait for anything a processor has to run to
+///   provide — a lock this processor may already hold is the common case, and
+///   waiting for it is a processor that never comes back;
+/// - must not take a lock the interrupted code could be holding, which for a
+///   maskable interrupt means any lock only ever taken with interrupts masked,
+///   and for `NMI` and the exceptions means any lock at all. [`log`] is such a
+///   lock: it is safe from a maskable handler, because the backend masks
+///   interrupts for the whole of a line, and it is not safe from anything
+///   masking cannot hold off, which must use [`serial::emergency`] instead;
+/// - must not allocate, since the allocator is one of those locks;
+/// - must not panic or unwind: there is no unwinding through an interrupt
+///   entry, and a panic on this path is a fault inside a fault;
+/// - must not unmask interrupts, which would let a second arrival nest inside
+///   the first on the same stack;
+/// - must return promptly, because everything else on this processor is stopped
+///   until it does;
+/// - must acknowledge the interrupt exactly once before answering
+///   [`Disposition::Consumed`], and must not acknowledge it when answering
+///   [`Disposition::Passed`]: a local controller holds an interrupt in service
+///   until it is told otherwise, and an acknowledgement by the wrong owner ends
+///   an interrupt somebody else is still handling.
 pub type Handler = fn(&Interrupt) -> Disposition;
 
 /// What the hypervisor does with an interrupt no handler claimed.
@@ -57,12 +103,24 @@ pub type Handler = fn(&Interrupt) -> Disposition;
 /// into a guest will do once there is a guest to reinject into. Until then
 /// there is nothing an unclaimed interrupt can belong to, so the honest
 /// implementation reports it and stops.
+///
+/// Everything [`Handler`] may not do, this may not do either, and one of those
+/// restrictions binds harder here: this is the callback an unclaimed `NMI`
+/// reaches, so it can be entered while the interrupted code on this processor
+/// holds the logger's lock. It is also reached by every exception no handler
+/// claimed, none of which masking held off.
+///
+/// It is never entered for a vector nothing may return from. Those do not come
+/// back at all, so there would be nothing to do with an answer.
 pub type Unclaimed = fn(&Interrupt);
 
 /// One interrupt, as its handler sees it.
 ///
-/// A copy of what the processor pushed rather than a borrow of it, so that
-/// nothing a handler keeps can outlive the stack the interrupt was taken on.
+/// A copy of what the processor pushed rather than a borrow of it: nothing a
+/// handler keeps refers to the frame on the stack it was entered on, so a
+/// retained copy stays readable and stays what it was. What it is *not* is
+/// current — it is what the processor said at the moment of entry, and the stack
+/// it came from is free to be used again.
 #[derive(Clone, Copy, Debug)]
 pub struct Interrupt {
     vector: Vector,
@@ -95,9 +153,28 @@ impl Interrupt {
     /// Read raw rather than as a virtual address, because the register holds
     /// whatever the faulting access named and that is free to be a value no
     /// address can be.
+    ///
+    /// It is the register's value as of entry, which is the faulting address as
+    /// long as nothing on the way here faulted too. A fault inside this crate's
+    /// own entry path would replace it, so the read happens before anything else
+    /// does.
     #[must_use]
     pub const fn fault_address(&self) -> Option<u64> {
         self.fault_address
+    }
+
+    /// Everything the processor said about one arrival, taken as early as
+    /// anything on this path can take it.
+    fn new(vector: Vector, frame: &InterruptStackFrameValue, error_code: Option<u64>) -> Self {
+        Self {
+            vector,
+            frame: *frame,
+            error_code,
+            // Read first and only here: the register keeps the address of the
+            // last fault, so anything this path did that faulted would replace
+            // it.
+            fault_address: (vector == PAGE_FAULT).then(Cr2::read_raw),
+        }
     }
 }
 
@@ -108,12 +185,13 @@ impl Display for Interrupt {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} at rip {:#x}, cs {:#06x}, rflags {:#x}, rsp {:#x}",
+            "{} at rip {:#x}, cs {:#06x}, rflags {:#x}, rsp {:#x}, ss {:#06x}",
             self.vector,
             self.frame.instruction_pointer,
             self.frame.code_segment.0,
             self.frame.cpu_flags.bits(),
             self.frame.stack_pointer,
+            self.frame.stack_segment.0,
         )?;
         if let Some(code) = self.error_code {
             write!(formatter, ", error code {code:#x}")?;
@@ -126,20 +204,13 @@ impl Display for Interrupt {
 }
 
 /// One slot per vector, holding the handler that claimed it or nothing.
-///
-/// Write-once cells rather than anything behind a lock: this is read on every
-/// interrupt, and a delivery path that could block on a lock another processor
-/// holds would turn a contended registry into a stalled machine. Reading one is
-/// a load and a comparison, and a slot being written is indistinguishable from
-/// one nothing has claimed — which is the right answer while a registration is
-/// in flight, since nothing can be arriving on a vector that has not finished
-/// being claimed.
-static HANDLERS: [Once<Handler>; Vector::COUNT] = [const { Once::new() }; Vector::COUNT];
+static HANDLERS: [AtomicPtr<()>; Vector::COUNT] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; Vector::COUNT];
 
-/// What becomes of an interrupt no handler claimed. Empty until the tables are
-/// installed, which happens before the table naming these entry points is
-/// loaded, so a delivery can never find it unset.
-static UNCLAIMED: Once<Unclaimed> = Once::new();
+/// What becomes of an interrupt no handler claimed. Empty until the hypervisor
+/// says, which is a precondition of any processor loading a table of gates, so a
+/// delivery can never find it unset.
+static UNCLAIMED: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
 /// Pins `handler` to `vector`.
 ///
@@ -148,27 +219,34 @@ static UNCLAIMED: Once<Unclaimed> = Once::new();
 /// registration silently replacing the first would be worse still, so the
 /// second is refused.
 ///
+/// The vector must be quiesced until this returns: a source that can deliver
+/// while the slot is still empty gets the [`Unclaimed`] treatment, which for
+/// something the hypervisor caused is the wrong answer. Every caller in this
+/// workspace registers before switching its source on, which is the ordering
+/// this asks for.
+///
 /// # Errors
 ///
-/// [`DescriptorError::VectorTaken`] if something already claimed the vector, or
-/// [`DescriptorError::NotReturnable`] for a vector the architecture gives no
-/// way back from — consuming one of those would mean resuming a machine whose
-/// state the processor has already declared lost.
+/// [`DescriptorError::VectorTaken`] if something already claimed the vector,
+/// [`DescriptorError::NotReturnable`] for the vector the architecture gives no
+/// way back from, or [`DescriptorError::FailStop`] for the one this hypervisor
+/// chooses not to return from. Consuming either would mean resuming a machine
+/// whose state nothing here can vouch for.
 pub fn register(vector: Vector, handler: Handler) -> Result<(), DescriptorError> {
-    if !vector.returns() {
-        return Err(DescriptorError::NotReturnable { vector });
+    match vector.resumption() {
+        Resumption::Resume => {}
+        Resumption::Impossible => return Err(DescriptorError::NotReturnable { vector }),
+        Resumption::FailStop => return Err(DescriptorError::FailStop { vector }),
     }
-    // The cell runs the closure for the one caller that fills it and for no
-    // other, so whether it ran is exactly whether this call is the one that
-    // claimed the vector.
-    let mut installed = false;
-    HANDLERS[usize::from(vector.number())].call_once(|| {
-        installed = true;
-        handler
-    });
-    installed
-        .then_some(())
-        .ok_or(DescriptorError::VectorTaken { vector })
+    HANDLERS[usize::from(vector.number())]
+        .compare_exchange(
+            ptr::null_mut(),
+            erase(handler),
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .map(drop)
+        .map_err(|_| DescriptorError::VectorTaken { vector })
 }
 
 /// Pins `handler` to the highest free vector in `first..=last`.
@@ -179,17 +257,34 @@ pub fn register(vector: Vector, handler: Handler) -> Result<(), DescriptorError>
 /// Highest first, because on this architecture a vector's high nibble *is* its
 /// priority.
 ///
+/// The range must be one an interrupt controller may be told to deliver, which
+/// means it may not reach below [`Vector::FIRST_EXTERNAL`]. An exception vector
+/// handed to a controller would arrive without the error code its gate is
+/// written for; see [`crate::idt`].
+///
 /// # Errors
 ///
-/// [`DescriptorError::NoVectorFree`] if every vector in the range is taken, or
-/// whatever [`register`] reports for a range that includes a vector nothing may
-/// claim.
+/// [`DescriptorError::RangeReversed`] if `last` is below `first`,
+/// [`DescriptorError::NotExternal`] if the range reaches into the exceptions,
+/// [`DescriptorError::NoVectorFree`] if every vector in it is taken, or whatever
+/// [`register`] reported for a vector that could not be claimed for some other
+/// reason.
 pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, DescriptorError> {
-    (first.number()..=last.number())
-        .rev()
-        .map(Vector::new)
-        .find(|vector| register(*vector, handler).is_ok())
-        .ok_or(DescriptorError::NoVectorFree { first, last })
+    if last < first {
+        return Err(DescriptorError::RangeReversed { first, last });
+    }
+    if first.is_exception() {
+        return Err(DescriptorError::NotExternal { vector: first });
+    }
+    for number in (first.number()..=last.number()).rev() {
+        let vector = Vector::new(number);
+        match register(vector, handler) {
+            Ok(()) => return Ok(vector),
+            Err(DescriptorError::VectorTaken { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(DescriptorError::NoVectorFree { first, last })
 }
 
 /// Records what becomes of an unclaimed interrupt.
@@ -197,8 +292,7 @@ pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, De
 /// One answer for the whole machine, given once and before any processor loads
 /// a table of gates, so that no delivery can happen while there is nothing to
 /// give it to. That ordering is enforced from the other side:
-/// [`Descriptors::install`](crate::Descriptors::install) refuses until this has
-/// run.
+/// [`Tables::build`](crate::Tables::build) refuses until this has run.
 ///
 /// # Errors
 ///
@@ -206,50 +300,94 @@ pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, De
 /// interrupts are being delivered through it would change what happens to a
 /// guest's interrupts underneath the guest.
 pub fn adopt(unclaimed: Unclaimed) -> Result<(), DescriptorError> {
-    // As in `register`: the closure runs for the caller that fills the cell and
-    // for no other.
-    let mut installed = false;
-    UNCLAIMED.call_once(|| {
-        installed = true;
-        unclaimed
-    });
-    installed
-        .then_some(())
-        .ok_or(DescriptorError::AlreadyAdopted)
+    UNCLAIMED
+        .compare_exchange(
+            ptr::null_mut(),
+            erase(unclaimed),
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .map(drop)
+        .map_err(|_| DescriptorError::AlreadyAdopted)
 }
 
 /// Whether anything has said what becomes of an unclaimed interrupt.
 pub(crate) fn adopted() -> bool {
-    UNCLAIMED.is_completed()
+    !UNCLAIMED.load(Ordering::Acquire).is_null()
 }
 
-/// Where every entry point ends up.
+/// Where the entry point of every vector that may return ends up.
 ///
 /// `vector` and the presence of `error_code` both come from the entry point the
 /// vector's own gate names, so neither can disagree with what the processor
 /// actually delivered.
 pub(crate) fn deliver(vector: Vector, frame: &InterruptStackFrameValue, error_code: Option<u64>) {
-    let interrupt = Interrupt {
-        vector,
-        frame: *frame,
-        error_code,
-        // Read first and only here: the register keeps the address of the last
-        // fault, so anything this path did that faulted would replace it.
-        fault_address: (vector == PAGE_FAULT).then(Cr2::read_raw),
-    };
-    if HANDLERS[usize::from(vector.number())]
-        .get()
-        .is_some_and(|handler| handler(&interrupt) == Disposition::Consumed)
-    {
+    // First, before anything else on this stack: it is what a second arrival on
+    // the same stack lands below instead of on top of.
+    let _level = Guard::enter(vector);
+    let interrupt = Interrupt::new(vector, frame, error_code);
+    if claimed(vector).is_some_and(|handler| handler(&interrupt) == Disposition::Consumed) {
         return;
     }
-    match UNCLAIMED.get() {
+    match unclaimed() {
         Some(unclaimed) => unclaimed(&interrupt),
-        // Unreachable: the table naming this entry point is loaded only after
-        // the callback is recorded. Stopping rather than returning is what keeps
-        // a machine that proves otherwise from taking the same interrupt forever.
-        None => crate::halt(),
+        // Unreachable: a table of gates naming this entry point is loaded only
+        // after the callback is recorded. Reporting and stopping rather than
+        // returning is what keeps a machine that proves otherwise from taking the
+        // same interrupt forever.
+        None => fatal::unanswered(&interrupt),
     }
+}
+
+/// Where the entry point of a vector nothing may return from ends up.
+///
+/// No handler and no callback: registration refuses these vectors, and the
+/// hypervisor's answer for an unclaimed interrupt is a function that returns,
+/// which is the one thing that must not happen here. It is reported through the
+/// path that depends on no lock and no allocation, since what raised it may be
+/// the reason either is unavailable.
+pub(crate) fn terminal(
+    vector: Vector,
+    frame: &InterruptStackFrameValue,
+    error_code: Option<u64>,
+) -> ! {
+    fatal::interrupt(&Interrupt::new(vector, frame, error_code))
+}
+
+/// The handler that claimed `vector`, if one did.
+fn claimed(vector: Vector) -> Option<Handler> {
+    restore(HANDLERS[usize::from(vector.number())].load(Ordering::Acquire))
+}
+
+/// The hypervisor's answer for an interrupt nothing claimed, if it has given
+/// one.
+fn unclaimed() -> Option<Unclaimed> {
+    restore(UNCLAIMED.load(Ordering::Acquire))
+}
+
+/// A function pointer as the value a slot holds.
+fn erase<T>(function: T) -> *mut ()
+where
+    T: Copy,
+{
+    // SAFETY: `T` is one of this module's function pointer types — the two
+    // callers are the two `register`/`adopt` pairs — so it is one pointer wide
+    // and a pointer is what comes out.
+    unsafe { core::mem::transmute_copy(&function) }
+}
+
+/// What [`erase`] erased, or `None` for a slot nothing has written.
+fn restore<T>(slot: *mut ()) -> Option<T>
+where
+    T: Copy,
+{
+    if slot.is_null() {
+        return None;
+    }
+    // SAFETY: the slot is not null, so it holds what `erase` put there: a
+    // function pointer of this very type, since each slot is written by exactly
+    // one `register` or `adopt` and read back as the type that wrote it.
+    Some(unsafe { core::mem::transmute_copy(&slot) })
 }
 
 /// The vector whose faulting address the processor reports in `CR2`.

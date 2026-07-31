@@ -4,22 +4,18 @@
 cargo-features = ["per-package-target"]
 
 [package]
-name = "descriptors"
-description = "Host descriptor tables and interrupt dispatch for the pulzar hypervisor"
+name = "portal"
+description = "The guest-callable pages that transfer firmware into the operating system"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 forced-target = "x86_64-unknown-uefi"
 
 [dependencies]
-log = { workspace = true }
+handoff = { workspace = true }
 paging = { workspace = true }
-# The logging backend, not just the facade: a fault or a non-maskable interrupt
-# can arrive while the interrupted code on this very processor holds the
-# logger's lock, and only the backend can offer a path that takes no lock.
-serial = { workspace = true }
-spin = { workspace = true }
 thiserror = { workspace = true }
+uefi-raw = { workspace = true }
 x86_64 = { workspace = true }
 
 [lints]

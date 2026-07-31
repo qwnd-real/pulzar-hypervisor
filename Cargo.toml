@@ -7,6 +7,7 @@ members = [
     "crates/cpu",
     "crates/descriptors",
     "crates/emulate",
+    "crates/exits",
     "crates/handoff",
     "crates/hv-core",
     "crates/hv-loader",
@@ -16,6 +17,7 @@ members = [
     "crates/paging",
     "crates/partition",
     "crates/pci",
+    "crates/portal",
     "crates/processor",
     "crates/serial",
     "crates/snapshot",
@@ -57,13 +59,17 @@ uefi-raw = "0.15.1"
 # `memory` is how anything reaches a guest's memory through them, and `vcpu` is
 # what turns the extension on and runs a guest on one processor, and
 # `partition` is the guest those processors are running; `emulate` decodes an
-# intercepted instruction when hardware cannot provide its following address.
+# intercepted instruction when hardware cannot provide its following address;
+# `portal` is the only hypervisor memory a guest is ever shown, being the pages
+# firmware is entered at and leaves through, and `exits` is what every one of a
+# guest's exits means and what the host does about it.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
 cpu = { path = "crates/cpu" }
 descriptors = { path = "crates/descriptors" }
 emulate = { path = "crates/emulate" }
+exits = { path = "crates/exits" }
 handoff = { path = "crates/handoff" }
 ipi = { path = "crates/ipi" }
 memory = { path = "crates/memory" }
@@ -71,6 +77,7 @@ npt = { path = "crates/npt" }
 paging = { path = "crates/paging" }
 partition = { path = "crates/partition" }
 pci = { path = "crates/pci" }
+portal = { path = "crates/portal" }
 processor = { path = "crates/processor" }
 snapshot = { path = "crates/snapshot" }
 svm = { path = "crates/svm" }

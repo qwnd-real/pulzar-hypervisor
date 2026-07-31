@@ -3,6 +3,9 @@
 /target/
 **/target/
 
+# Temp
+/tmp/
+
 # Cargo.lock is intentionally NOT ignored. This workspace only produces
 # binaries/firmware images, never a published library, so the lockfile is
 # committed for reproducible builds.
