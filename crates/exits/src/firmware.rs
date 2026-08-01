@@ -50,6 +50,16 @@ enum Stage {
 
 /// The guest's way out of firmware: the pages it goes through, and how far
 /// along them it is.
+///
+/// One of these exists on one processor: the one the guest is entered on, which
+/// is the only one that ever sees the portal. Every other processor joins a
+/// guest that is already past firmware — it exists *because* `ExitBootServices`
+/// succeeded — and has nothing here to keep track of.
+///
+/// That is why this is not shared state despite describing the guest rather
+/// than a processor. Both things a stage decides are questions only the boot
+/// processor can be asked: whether the instruction pointer *it* stopped at is
+/// still inside the portal, and whether *it* has run the wrapper yet.
 #[derive(Debug)]
 pub(crate) struct Firmware {
     portal: Portal,

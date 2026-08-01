@@ -361,6 +361,34 @@ pub fn halt() -> ! {
     }
 }
 
+/// Stops this processor until an interrupt reaches it, unless `ready` says
+/// there is already something to do.
+///
+/// What a processor with nothing to run calls instead of spinning. Unlike
+/// [`halt`] it comes back — the interrupt that woke the processor is what it
+/// was waiting for, and its handler has already run by the time this returns.
+///
+/// # The mask is the whole of the point
+///
+/// A processor that tested a condition, found nothing, and then halted would
+/// have a window between the two in which the interrupt announcing the
+/// condition can arrive, be handled, and leave the processor to halt anyway —
+/// waiting for a second announcement that nothing is going to send. So the test
+/// happens with interrupts masked, and the wait begins in the same instruction
+/// that unmasks them: an interrupt that arrives after the test cannot be taken
+/// before the wait, so it wakes the processor rather than being lost to it.
+///
+/// Returns with interrupts unmasked, which is the only state a caller could
+/// usefully have called it in.
+pub fn wait_until(ready: impl FnOnce() -> bool) {
+    interrupts::disable();
+    if ready() {
+        interrupts::enable();
+        return;
+    }
+    interrupts::enable_and_hlt();
+}
+
 /// The interrupt descriptor table of every processor that has activated one.
 ///
 /// A processor cannot be asked which it is this early — it has no block of its

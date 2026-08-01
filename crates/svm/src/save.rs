@@ -374,7 +374,142 @@ impl SaveArea {
             reserved_0x7c8: [0; 0x438],
         }
     }
+
+    /// The state a processor is in the instant a start-up message naming `page`
+    /// has released it.
+    ///
+    /// Two architectural states in one, because a processor only ever reaches
+    /// the second through the first. `INIT` leaves every register below at the
+    /// value written here — real mode, no paging, protection off, each segment
+    /// sixty-four kibibytes long from address zero, and the descriptor-table
+    /// registers likewise. A start-up message then changes exactly three
+    /// things: the code segment's selector and base, which the message's
+    /// vector gives the page number of, and the instruction pointer, which
+    /// becomes zero. So execution begins at the very start of the page the
+    /// message named.
+    ///
+    /// The one deliberate departure is the code segment's limit and the data
+    /// segments', which the architecture leaves at sixty-four kibibytes even
+    /// though the base can be anywhere in the first megabyte. That is real
+    /// mode, not an approximation of it: sixteen-bit code addresses nothing
+    /// beyond its own segment.
+    ///
+    /// Not on its own a control block a guest can be entered from. The extended
+    /// feature register is zero here because that is what reset leaves it, and
+    /// a guest whose virtualization-enable bit is clear is one the
+    /// processor refuses — supplying it is the caller's, along with
+    /// anything else the hypervisor rather than the architecture decides.
+    #[must_use]
+    pub fn started_at(page: u8) -> Self {
+        let mut save = Self::zeroed();
+        save.cs = Segment {
+            selector: u16::from(page) << STARTUP_SELECTOR_SHIFT,
+            attributes: CODE_SEGMENT,
+            limit: REAL_MODE_LIMIT,
+            base: u64::from(page) << STARTUP_BASE_SHIFT,
+        };
+        let data = Segment {
+            selector: 0,
+            attributes: DATA_SEGMENT,
+            limit: REAL_MODE_LIMIT,
+            base: 0,
+        };
+        save.ds = data;
+        save.es = data;
+        save.fs = data;
+        save.gs = data;
+        save.ss = data;
+        // Neither descriptor-table register has a selector or attributes at
+        // all; only the base and the low half of the limit exist.
+        save.gdtr.limit = REAL_MODE_LIMIT;
+        save.idtr.limit = REAL_MODE_LIMIT;
+        save.ldtr = Segment {
+            selector: 0,
+            attributes: LOCAL_DESCRIPTOR_TABLE,
+            limit: REAL_MODE_LIMIT,
+            base: 0,
+        };
+        save.tr = Segment {
+            selector: 0,
+            attributes: TASK_STATE_SEGMENT,
+            limit: REAL_MODE_LIMIT,
+            base: 0,
+        };
+        save.cr0 = CR0_AT_RESET;
+        save.dr6 = DR6_AT_RESET;
+        save.dr7 = DR7_AT_RESET;
+        save.rflags = RFLAGS_AT_RESET;
+        save.rip = 0;
+        save
+    }
 }
+
+/// Bits a start-up message's vector is shifted by to give the code segment's
+/// selector.
+const STARTUP_SELECTOR_SHIFT: u16 = 8;
+
+/// Bits it is shifted by to give the code segment's base, which is the address
+/// of the page it names.
+const STARTUP_BASE_SHIFT: u32 = 12;
+
+/// How long every segment is coming out of reset: sixty-four kibibytes, which
+/// is the whole of what sixteen-bit code can address within one.
+const REAL_MODE_LIMIT: u32 = 0xFFFF;
+
+/// The code segment a processor comes out of reset with: readable code, present
+/// and sixteen-bit.
+const CODE_SEGMENT: SegmentAttributes = SegmentAttributes::new()
+    .with_kind(CODE_READABLE_ACCESSED)
+    .with_descriptor(true)
+    .with_present(true);
+
+/// Every other segment: writable data, present and sixteen-bit.
+const DATA_SEGMENT: SegmentAttributes = SegmentAttributes::new()
+    .with_kind(DATA_WRITABLE_ACCESSED)
+    .with_descriptor(true)
+    .with_present(true);
+
+/// The local descriptor table register, which names a system segment rather
+/// than a code or data one.
+const LOCAL_DESCRIPTOR_TABLE: SegmentAttributes = SegmentAttributes::new()
+    .with_kind(SYSTEM_LDT)
+    .with_present(true);
+
+/// The task register, whose reset value names a busy sixteen-bit task — busy
+/// because nothing has switched away from it.
+const TASK_STATE_SEGMENT: SegmentAttributes = SegmentAttributes::new()
+    .with_kind(SYSTEM_BUSY_TSS_16)
+    .with_present(true);
+
+/// A code segment that may be read as well as executed, and has been accessed.
+const CODE_READABLE_ACCESSED: u8 = 0xB;
+
+/// A data segment that may be written, and has been accessed.
+const DATA_WRITABLE_ACCESSED: u8 = 0x3;
+
+/// The system-segment type naming a local descriptor table.
+const SYSTEM_LDT: u8 = 0x2;
+
+/// The system-segment type naming a busy sixteen-bit task state segment.
+const SYSTEM_BUSY_TSS_16: u8 = 0x3;
+
+/// The first control register at reset: caching off, write-through off, and the
+/// bit that has meant "a coprocessor is present" since it stopped being
+/// optional.
+///
+/// Caching disabled *and* write-through disabled together, which matters: the
+/// other way round — caching on with write-through off — is a combination the
+/// processor refuses to enter a guest in.
+const CR0_AT_RESET: u64 = 0x6000_0010;
+
+/// The debug status register at reset, whose every defined bit reads inverted.
+const DR6_AT_RESET: u64 = 0xFFFF_0FF0;
+
+/// The debug control register at reset, which arms no breakpoint.
+const DR7_AT_RESET: u64 = 0x0000_0400;
+
+/// The flags at reset: nothing but the bit that is always set.
+const RFLAGS_AT_RESET: u64 = 0x2;
 
 layout! {
     SaveArea, size = SAVE_AREA_BYTES,

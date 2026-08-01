@@ -224,6 +224,44 @@ impl Timer {
         Ok(())
     }
 
+    /// Starts the timer counting down from `from`, delivering nothing when it
+    /// gets there.
+    ///
+    /// The mask bit of a local vector table entry suppresses the interrupt and
+    /// nothing else. The count still runs and software can still read it, and
+    /// that is not a corner of the architecture worth being approximate about:
+    /// masking the entry, writing a count and watching it fall against a clock
+    /// it already trusts is how software measures what the timer's rate *is*.
+    /// A timer that stopped counting because its entry was masked would leave
+    /// that measurement waiting forever for a register that never moves.
+    ///
+    /// [`Timer::calibrate`] is this and a measurement around it. This is the
+    /// same thing without the measurement, for a caller doing the watching
+    /// itself — or, for a hypervisor, for a guest doing it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Timer::arm`], less the vector: nothing is delivered, so there is no
+    /// vector to be illegal.
+    pub fn count_down(self, mode: Mode, divisor: Divisor, from: u32) -> Result<(), ApicError> {
+        if matches!(mode, Mode::Deadline) {
+            return Err(ApicError::WrongTimerMode);
+        }
+        if from == 0 {
+            return Err(ApicError::ZeroCount);
+        }
+        let access = crate::register::access()?;
+        // SAFETY: as `arm`, and one obligation lighter — a masked entry
+        // delivers nothing whatever the count reaches, so no gate has to exist
+        // for anything. The order is the same and for the same reason.
+        unsafe {
+            access.write(Register::TIMER_DIVIDE, divisor.bits());
+            access.write(Register::LVT_TIMER, Entry::masked().bits() | mode.bits());
+            access.write(Register::TIMER_INITIAL_COUNT, from);
+        }
+        Ok(())
+    }
+
     /// Arms the timer to fire on `vector` when the timestamp counter passes
     /// `deadline`.
     ///

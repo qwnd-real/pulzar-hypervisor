@@ -69,7 +69,7 @@ pub struct Vlapic {
     deferred: Bitmap,
     startup: AtomicU8,
     sipi_vector: AtomicU32,
-    in_guest: AtomicBool,
+    away: AtomicBool,
     nmi: AtomicBool,
     owned: AtomicBool,
 }
@@ -97,7 +97,7 @@ impl Vlapic {
             deferred: Bitmap::new(),
             startup: AtomicU8::new(Startup::Running as u8),
             sipi_vector: AtomicU32::new(NO_SIPI),
-            in_guest: AtomicBool::new(false),
+            away: AtomicBool::new(false),
             nmi: AtomicBool::new(false),
             owned: AtomicBool::new(false),
         };
@@ -476,6 +476,14 @@ impl Vlapic {
         self.deferred.set(vector);
     }
 
+    /// Takes one vector real hardware is owed an acknowledgement for, if any.
+    ///
+    /// For the case where the acknowledgement will never come from the guest,
+    /// because the guest that was going to give it no longer exists.
+    pub(crate) fn take_deferred(&self) -> Option<Vector> {
+        self.deferred.take_highest()
+    }
+
     /// How many interrupts are requested and not yet taken.
     pub(crate) fn requested_count(&self) -> u32 {
         self.request.count()
@@ -491,15 +499,21 @@ impl Vlapic {
         !self.deferred.is_empty()
     }
 
-    /// Whether this processor is inside the guest.
+    /// Whether this processor has stopped looking at this controller.
     ///
-    /// Read by a processor about to deliver an interrupt here, to decide
-    /// whether the target has to be interrupted to notice it.
-    pub(crate) fn in_guest(&self) -> bool {
-        self.in_guest.load(Ordering::SeqCst)
+    /// True while it is inside the guest, and true while it is halted waiting
+    /// to be started — the two states in which nothing it does will notice a
+    /// bit being set here until something interrupts it. False while it is
+    /// answering an exit, because it consults this controller before it goes
+    /// back in.
+    ///
+    /// Read by a processor about to deliver something here, to decide whether
+    /// the target has to be interrupted to notice.
+    pub(crate) fn away(&self) -> bool {
+        self.away.load(Ordering::SeqCst)
     }
 
-    /// Records whether this processor is inside the guest.
+    /// Records whether this processor has stopped looking at this controller.
     ///
     /// Sequentially consistent, and it has to be. This store and the load of a
     /// request bit that follows it must not be reordered against a deliverer's
@@ -508,8 +522,8 @@ impl Vlapic {
     /// needed while this processor decided nothing was pending, and the
     /// interrupt would be lost until something unrelated happened to cause an
     /// exit.
-    pub(crate) fn set_in_guest(&self, inside: bool) {
-        self.in_guest.store(inside, Ordering::SeqCst);
+    pub(crate) fn set_away(&self, away: bool) {
+        self.away.store(away, Ordering::SeqCst);
     }
 
     /// Records that this processor's guest is owed a non-maskable interrupt.
@@ -517,8 +531,13 @@ impl Vlapic {
     /// Set by whichever processor sent it, and drained by this one at its next
     /// exit — which is why it lives here and not with the rest of what that
     /// processor's exit loop owns.
+    ///
+    /// Sequentially consistent for the reason [`Vlapic::signalled`] gives: this
+    /// store and the sender's read of [`Vlapic::away`] pair with the target's
+    /// store of that flag and its read of this one, and a weaker ordering lets
+    /// both sides miss.
     pub(crate) fn raise_nmi(&self) {
-        self.nmi.store(true, Ordering::Release);
+        self.nmi.store(true, Ordering::SeqCst);
     }
 
     /// Takes the outstanding non-maskable interrupt, if there is one.
@@ -546,16 +565,39 @@ impl Vlapic {
         Startup::from_bits(self.startup.load(Ordering::Acquire))
     }
 
+    /// Whether this processor's guest is running rather than reset.
+    pub(crate) fn running(&self) -> bool {
+        self.startup() == Startup::Running
+    }
+
+    /// Whether a startup message has arrived that this processor has not
+    /// applied yet.
+    ///
+    /// What a processor halted with nothing to run tests before it halts again.
+    /// Sequentially consistent, and paired with [`Vlapic::set_away`]: the
+    /// sender stores the message and then reads whether this processor is away,
+    /// this processor stores that it is away and then reads for a message, and
+    /// the total order over those four is what guarantees at least one of them
+    /// sees the other. Without it a message could arrive between the test and
+    /// the halt and be answered by nobody.
+    pub(crate) fn signalled(&self) -> bool {
+        self.startup.load(Ordering::SeqCst) != Startup::WaitingForSipi as u8
+            || self.sipi_vector.load(Ordering::SeqCst) != NO_SIPI
+    }
+
     /// Puts this processor into the state an INIT leaves it in, from any state.
     ///
     /// The vector a start-up message would have carried is cleared as part of
     /// the same transition, so that an INIT always wins a race against a
     /// start-up message already on its way: the target applies the reset and
     /// then finds nothing to start with.
+    ///
+    /// Both stores are sequentially consistent for the reason
+    /// [`Vlapic::signalled`] gives.
     pub(crate) fn request_init(&self) {
-        self.sipi_vector.store(NO_SIPI, Ordering::Release);
+        self.sipi_vector.store(NO_SIPI, Ordering::SeqCst);
         self.startup
-            .store(Startup::InitRequested as u8, Ordering::Release);
+            .store(Startup::InitRequested as u8, Ordering::SeqCst);
     }
 
     /// Offers a start-up vector, which takes only if this processor is waiting
@@ -564,7 +606,7 @@ impl Vlapic {
         if self.startup() != Startup::WaitingForSipi {
             return false;
         }
-        self.sipi_vector.store(u32::from(vector), Ordering::Release);
+        self.sipi_vector.store(u32::from(vector), Ordering::SeqCst);
         true
     }
 

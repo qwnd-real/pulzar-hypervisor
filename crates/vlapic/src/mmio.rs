@@ -88,6 +88,7 @@ impl Device for Page {
             Access::WriteOnly | Access::Absent => 0,
             Access::ReadOnly | Access::ReadWrite => access::read(vlapic, register),
         };
+        log::error!("DEBUGR off {:#x} -> {:#x}", register.offset(), value);
         Data::from_u64(u64::from(value), width)
     }
 
@@ -111,6 +112,7 @@ impl Device for Page {
             reason = "the access was established to be exactly four bytes wide by `decode`"
         )]
         let value = access.value().as_u64() as u32;
+        log::error!("DEBUGW off {:#x} <- {:#x}", register.offset(), value);
         crate::acted(vlapic, access::write(vlapic, register, value));
         // Nothing the guest writes here reaches the hardware behind the page.
         // The page a guest sees is this hypervisor's answer, and the real

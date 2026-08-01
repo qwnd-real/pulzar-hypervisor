@@ -9,14 +9,15 @@
 //!
 //! Accepting an interrupt into another processor's controller is a bit set in
 //! an atomic, and it costs nothing. What costs something is that the target may
-//! be inside the guest, where it will not look at its controller until
-//! something makes it leave — so a real interrupt is sent to force an exit.
+//! have stopped looking at its controller — inside the guest, or halted waiting
+//! to be started — and will not look again until something makes it. So a real
+//! interrupt is sent to force one.
 //!
 //! That pairing is where a lost wakeup would live, and the order on both sides
 //! is what stops one:
 //!
-//! - Here: set the request bit, *then* read whether the target is in the guest.
-//! - There: store that it is in the guest, *then* re-read the request bits.
+//! - Here: set the request bit, *then* read whether the target is away.
+//! - There: store that it is away, *then* re-read what has been left for it.
 //!
 //! Both stores are sequentially consistent, so at least one side sees the
 //! other. If this side misses the flag, the target's re-read finds the bit; if
@@ -36,9 +37,13 @@
 //! the processor starts exactly as it would have bare metal.
 //!
 //! Once a processor is running the hypervisor's own code, forwarding would
-//! reset the *host*. From then on both are emulated: the target's controller is
-//! reset in software and its virtual processor is parked until a start-up
-//! vector arrives.
+//! reset the *host*. From then on both are emulated, and neither is applied by
+//! the processor that sent it: an INIT and a start-up vector are left where the
+//! target will find them, and the target applies them to itself at an exit
+//! boundary. That is what makes resetting a controller's whole register file
+//! safe without a lock — the only processor that ever does it is the one that
+//! owns it, and it does it at a point where it is not part-way through anything
+//! else.
 
 use apic::{Command as HardwareCommand, Delivery as HardwareDelivery, Target};
 use descriptors::Vector;
@@ -124,14 +129,17 @@ fn accept(from: &Vlapic, target: &Vlapic, vector: Vector, trigger: Trigger) {
     nudge(from, target);
 }
 
-/// Forces a target out of the guest, if it is in one, so that it looks at its
-/// controller.
+/// Makes a target that has stopped looking at its controller look at it again.
+///
+/// Two states need this and they need it for the same reason: a processor
+/// inside the guest, and one halted waiting to be started. Neither will notice
+/// a bit that has just been set until something interrupts it.
 ///
 /// The sender never needs one of these for itself: it is already outside the
 /// guest — it is executing this — and it consults its own controller before it
 /// goes back in.
 fn nudge(from: &Vlapic, target: &Vlapic) {
-    if target.index() == from.index() || !target.in_guest() {
+    if target.index() == from.index() || !target.away() {
         return;
     }
     if let Err(error) = crate::doorbell(target.index()) {
@@ -380,42 +388,69 @@ const DESTINATION_FORMAT_SHIFT: u32 = 28;
 /// The encoding that selects the flat model.
 const FLAT_MODEL: u32 = 0xF;
 
-/// Where a processor waiting to be started begins executing: the vector names
-/// the page.
-pub(crate) const fn startup_address(vector: u8) -> u64 {
-    (vector as u64) << STARTUP_VECTOR_SHIFT
-}
-
-/// Bits a start-up vector is shifted by to give the address it names.
-const STARTUP_VECTOR_SHIFT: u32 = 12;
-
-/// Whether this processor is waiting to be started.
-pub(crate) fn waiting(vlapic: &Vlapic) -> bool {
-    vlapic.startup() == Startup::WaitingForSipi
-}
-
 /// Applies whatever startup message arrived for this processor, and says what
 /// it should do now.
 ///
 /// Called by a processor about itself, at an exit boundary, which is what makes
 /// the reset safe: nothing else is looking at this controller's registers, and
 /// this processor is not part-way through injecting anything.
+///
+/// The two transitions are separate steps deliberately. Applying an `INIT`
+/// leaves the processor waiting, and it stays waiting across however many exits
+/// it takes for a start-up message to arrive — including none at all, which is
+/// what an operating system that never uses a processor leaves it doing for the
+/// rest of its life.
 pub(crate) fn settle(vlapic: &Vlapic) -> Resumption {
     if vlapic.startup() == Startup::InitRequested {
+        discharge(vlapic);
         // Exactly what hardware leaves behind: the identifier and the face
         // survive, everything else is as it was at reset.
         vlapic.reset_registers();
         vlapic.set_startup(Startup::WaitingForSipi);
+        trace!("vlapic: {} reset by an init and waiting", vlapic.index());
     }
-    if !waiting(vlapic) {
+    if vlapic.startup() != Startup::WaitingForSipi {
         return Resumption::Carry;
     }
     match vlapic.take_sipi() {
-        Some(vector) => {
+        Some(page) => {
             vlapic.set_startup(Startup::Running);
-            Resumption::StartAt(startup_address(vector))
+            trace!("vlapic: {} started at page {page:#x}", vlapic.index());
+            Resumption::StartAt(page)
         }
         None => Resumption::Wait,
+    }
+}
+
+/// Settles everything real hardware is owed an acknowledgement for, because the
+/// guest that owed it is about to stop existing.
+///
+/// A level-triggered interrupt's real acknowledgement is deliberately withheld
+/// until the guest acknowledges its own — that is what stops the same interrupt
+/// arriving again the instant it is taken. A guest that has just been reset
+/// will never acknowledge anything, and the real controller would go on holding
+/// those vectors in service, refusing everything of their priority or lower on
+/// this processor for the rest of the machine's life. So the debt is settled
+/// here, which is the one place it is known that nobody else will settle it.
+///
+/// Called by the processor about itself, which is what makes acknowledging
+/// legitimate: an acknowledgement is to whichever controller the processor
+/// issuing it is running on.
+fn discharge(vlapic: &Vlapic) {
+    while let Some(vector) = vlapic.take_deferred() {
+        match apic::local().and_then(apic::LocalApic::end_of_interrupt) {
+            Ok(()) => trace!(
+                "vlapic: {} acknowledged {vector} on behalf of a guest that was reset",
+                vlapic.index()
+            ),
+            Err(error) => {
+                warn!(
+                    "vlapic: {} could not acknowledge {vector} for a guest that was reset: {error}",
+                    vlapic.index()
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -424,8 +459,9 @@ pub(crate) fn settle(vlapic: &Vlapic) -> Resumption {
 pub enum Resumption {
     /// Carry on running the guest.
     Carry,
-    /// Reset and held. Do not enter the guest.
+    /// Reset and held, with no start-up message yet. Do not enter the guest.
     Wait,
-    /// Begin executing the guest in real mode at this address.
-    StartAt(u64),
+    /// Begin executing the guest in real mode at the start of this page, which
+    /// is what a start-up message names.
+    StartAt(u8),
 }

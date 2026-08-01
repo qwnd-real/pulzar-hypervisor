@@ -10,11 +10,12 @@
 //! Its first instruction is a two-page portal that starts the already-loaded
 //! operating-system boot manager and wraps `ExitBootServices`. Only after the
 //! original firmware service returns success does the wrapper notify the host,
-//! which starts the application processors in their temporary wait loop. The
-//! portal pages are the only hypervisor-owned pages ever visible to the guest,
-//! and only until the guest has left them behind — nested paging presents the
-//! rest of the reserved chunk as an immutable zero page throughout, and the
-//! portal as one too once it has been taken back.
+//! which is where the other processors are started. Each of them joins the same
+//! guest and waits there to be started by it, exactly as a processor still in
+//! reset would. The portal pages are the only hypervisor-owned pages ever
+//! visible to the guest, and only until the guest has left them behind — nested
+//! paging presents the rest of the reserved chunk as an immutable zero page
+//! throughout, and the portal as one too once it has been taken back.
 //!
 //! The same entry point is also reachable by starting `pulzar.efi` as an
 //! ordinary UEFI application, in which case the first argument is a firmware
@@ -46,6 +47,7 @@ use spin::Once;
 use svm::intercept::{Intercepts1, Intercepts2Flags};
 use uefi_raw::Status;
 use vcpu::Vcpu;
+use vlapic::Joining;
 use x86_64::{PhysAddr, VirtAddr, structures::paging::PhysFrame};
 
 use crate::{error::CoreError, heap::Heap};
@@ -188,7 +190,9 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // any other processor is started: a controller has to exist before anything
     // can deliver to it, and before the processor it belongs to does.
     vlapic::install()?;
-    vlapic::claim_processor()?;
+    // Running, because this is the processor the guest is entered on. Every
+    // other one joins the guest held, however long it has been executing.
+    vlapic::claim_processor(Joining::Running)?;
 
     // After the block, because enabling virtualization snapshots host state that
     // includes the `GS` base a block is reached through, and before any other
@@ -213,7 +217,9 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // requires: reducing what the nested tables permit while a guest is running
     // would mean discarding every processor's cached translations first.
     partition.interpose(&mut space, [vlapic::region()?])?;
-    let mut vcpu = virtualize(&mut space, inherited(handoff)?, portal.entry())?;
+    let mut vcpu = virtualize(&mut space)?;
+    seed(&mut vcpu, inherited(handoff)?, portal.entry());
+    vcpu.describe("core");
 
     // Last of the subsystems that take the address space by value, and
     // deliberately so. It maps and releases a range per bus, which costs nothing
@@ -272,6 +278,13 @@ fn run_guest(
 /// before that point is a triple fault and a reset machine. Then its own
 /// interrupt controller, which is what its identifier comes from, and only then
 /// a block of its own and the interrupts that reach it.
+///
+/// Once it is one of the machine's it joins the guest, held: the hypervisor has
+/// been running on this processor since `ExitBootServices`, but the *guest* has
+/// never started it, and it stays held until the guest does. That is not a
+/// contrivance to fill the time — it is what the guest sees on any machine with
+/// more than one processor, and starting them is what an operating system does
+/// with its own startup messages.
 fn ap_main() -> ! {
     let descriptors = match attach() {
         Ok((id, descriptors)) => {
@@ -292,9 +305,40 @@ fn ap_main() -> ! {
         error!("core: an application processor could not take interrupts: {error}");
         halt()
     }
-    loop {
-        core::hint::spin_loop();
+    match join_guest() {
+        // `join_guest` only ever returns by failing; its success type is
+        // uninhabited.
+        Ok(never) => match never {},
+        Err(error) => {
+            error!("core: an application processor left the guest: {error}");
+            halt()
+        }
     }
+}
+
+/// Gives an application processor a place in the guest and leaves it there.
+///
+/// The guest already exists — the boot processor established it before this
+/// processor was started — so there is nothing here but this processor's own
+/// side of it: a control block, and the exit loop that holds it until the guest
+/// starts it.
+///
+/// # Errors
+///
+/// [`CoreError::NoPartition`] if this processor came up before the guest
+/// existed, [`CoreError::Paging`] if the machine's address space cannot be
+/// reached, [`CoreError::Vcpu`] or [`CoreError::Partition`] if it cannot be
+/// given a control block, or [`CoreError::Exit`] with whatever ended the guest.
+fn join_guest() -> Result<Infallible, CoreError> {
+    let partition = PARTITION.get().ok_or(CoreError::NoPartition)?;
+    let mut vcpu = paging::with(virtualize)??;
+    vcpu.describe("core");
+    let mut exits = Exits::joining(partition);
+    // SAFETY: this VCPU was created on this processor and has stayed on it, its
+    // control block has not moved, and it holds no guest state at all — the exit
+    // loop will not enter it until a startup message from the guest has put the
+    // state of a processor coming out of reset into it.
+    Ok(unsafe { exits.run(&mut vcpu) }?)
 }
 
 /// Everything an application processor does before it is one of the machine's.
@@ -319,13 +363,12 @@ fn attach() -> Result<(cpu::ApicId, Descriptors), CoreError> {
     let descriptors = paging::with(Tables::build)??.activate()?;
     let id = apic::LocalApic::enable()?.id()?;
     cpu::attach(id)?;
-    let host = paging::with(|space| {
-        let window = space.direct_map();
-        // SAFETY: this processor installed its descriptors and attached just
-        // above, and it changes none of the host state `Host::install` captures.
-        unsafe { vcpu::Host::install(space.frames(), window) }
-    })??;
-    host.describe("core");
+    // The moment this processor can answer for itself, and not a step later: a
+    // startup message the guest sends before this is forwarded to real hardware,
+    // and real hardware would reset the host out from under whatever this
+    // processor is doing. Held rather than running, because the guest has not
+    // started this processor and does not know it exists.
+    vlapic::claim_processor(Joining::WaitingForSipi)?;
     Ok((id, descriptors))
 }
 
@@ -370,13 +413,12 @@ fn establish_processor_state() -> Result<(), CoreError> {
 /// the two steps before it. A snapshot taken any earlier would be restored on
 /// every exit, faithfully, and be wrong.
 ///
-/// The control block this produces holds no guest state: no instruction
-/// pointer, no stack pointer, no segments, nothing to run. So it is built,
-/// reported on and handed straight back, which exercises every step of the path
-/// — the chunk finding a page, the window reaching it, the block being
-/// programmed, the entry rules being checked — without leaving a page allocated
-/// for a guest that does not exist yet. Its report says in as many words that
-/// it would not be entered, and which rule says so.
+/// The control block this produces holds no guest state at all: no instruction
+/// pointer, no stack pointer, no segments, nothing to run. It says where a
+/// guest would run rather than describing one, and [`Vcpu::describe`] will say
+/// in as many words that it would not be entered. What fills it in is a
+/// separate step and a different one on each processor — [`seed`] for the one
+/// entered at the portal, and a startup message from the guest for every other.
 ///
 /// # Errors
 ///
@@ -384,11 +426,7 @@ fn establish_processor_state() -> Result<(), CoreError> {
 /// existed, [`CoreError::Vcpu`] if the extension cannot be enabled — a
 /// processor without it, or firmware having turned it off — or
 /// [`CoreError::Partition`] if the chunk cannot back a control block.
-fn virtualize(
-    space: &mut AddressSpace,
-    firmware: &FirmwareContext,
-    entry: PhysAddr,
-) -> Result<Vcpu, CoreError> {
+fn virtualize(space: &mut AddressSpace) -> Result<Vcpu, CoreError> {
     let partition = PARTITION.get().ok_or(CoreError::NoPartition)?;
     let window = space.direct_map();
     // SAFETY: this processor has installed its descriptor tables and attached,
@@ -399,10 +437,6 @@ fn virtualize(
     host.describe("core");
 
     let mut vcpu = partition.attach(host, space)?;
-    *vcpu.save_mut() = firmware.cpu;
-    vcpu.save_mut().rip = entry.as_u64();
-    vcpu.save_mut().rsp &= !(CALL_STACK_ALIGN - 1);
-    vcpu.save_mut().efer |= EFER_SVME;
     vcpu.control_mut().intercept_1 |= Intercepts1::CPUID;
     vcpu.control_mut().intercept_2 = vcpu
         .control()
@@ -411,8 +445,28 @@ fn virtualize(
     // The guest's own controller answers for every one of these, so none of
     // them may reach the real one underneath.
     vcpu.intercept_msrs(window, vlapic::intercepted())?;
-    vcpu.describe("core");
     Ok(vcpu)
+}
+
+/// Puts the state firmware was running with into a virtual processor, with the
+/// portal as its first instruction.
+///
+/// The one processor that reaches the guest this way. Every other one is
+/// started by the guest itself and gets the state a processor coming out of
+/// reset has, which is nothing of firmware's at all.
+///
+/// Three edits to what was captured, and each of them is required rather than
+/// chosen. The instruction pointer becomes the portal's, because that is where
+/// the guest is being entered. The stack pointer is realigned, because the
+/// capture happened part-way through a call and the portal makes calls of its
+/// own. And the virtualization-enable bit is set, without which the processor
+/// refuses to enter a guest — guest use of the extension is intercepted and
+/// hidden from `CPUID` regardless, so nothing comes of the guest seeing it.
+fn seed(vcpu: &mut Vcpu, firmware: &FirmwareContext, entry: PhysAddr) {
+    *vcpu.save_mut() = firmware.cpu;
+    vcpu.save_mut().rip = entry.as_u64();
+    vcpu.save_mut().rsp &= !(CALL_STACK_ALIGN - 1);
+    vcpu.save_mut().efer |= EFER_SVME;
 }
 
 /// Establishes the timebase from whichever counter the machine turned out to

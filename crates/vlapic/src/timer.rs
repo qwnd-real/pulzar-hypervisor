@@ -56,34 +56,44 @@ pub(crate) fn remaining(vlapic: &Vlapic) -> u32 {
 /// that writes the registers in an order nothing anticipated.
 ///
 /// Disarming rather than failing is the answer to everything unprogrammable
-/// here. A masked entry, a zero count, a mode the hardware does not offer — all
-/// of them mean the guest is owed no interrupt, and a timer left running would
-/// deliver one.
+/// here: a zero count, a mode the hardware does not offer, a deadline nobody
+/// has written. All of them mean there is nothing to count, and a timer left
+/// running would deliver an interrupt the guest is not owed.
+///
+/// # A masked entry still counts
+///
+/// The mask bit suppresses the interrupt and nothing else, and getting that
+/// wrong stops an operating system dead. Masking the entry, writing a count and
+/// watching it fall against a clock it already trusts is exactly how software
+/// measures what its timer's rate is — it is the first thing an operating
+/// system does with the timer and it wants no interrupt while doing it. So a
+/// masked entry is programmed onto the hardware masked rather than disarmed,
+/// and the count the guest reads back is the real one falling at the real rate.
 pub(crate) fn reprogram(vlapic: &Vlapic, vector: Vector) {
     let Ok(timer) = apic::local().map(apic::LocalApic::timer) else {
         return;
     };
     let entry = vlapic.lvt(Entry::Timer);
     let count = vlapic.timer_initial();
-    let outcome = match mode_of(vlapic) {
-        // A masked entry delivers nothing, and neither should the hardware.
-        _ if entry.masked() => timer.disarm(),
+    let outcome = match counting(vlapic) {
         // Deadline mode is armed by the model-specific register rather than by
         // a count, so there is nothing to start here — but the entry still has
-        // to say deadline before a write to that register means anything.
-        Some(TimerMode::Deadline) => arm_deadline(vlapic, vector),
+        // to say deadline before a write to that register means anything. A
+        // masked one is left disarmed, because unlike the counting modes it
+        // leaves the guest nothing to read: the current count reads zero in
+        // deadline mode whatever the timer is doing.
+        None if mode_of(vlapic) == Some(TimerMode::Deadline) && !entry.masked() => {
+            arm_deadline(vlapic, vector)
+        }
+        // Deadline mode with nothing to deliver to, or the fourth encoding,
+        // which the architecture reserves and a controller given it does
+        // nothing with.
+        None => timer.disarm(),
         // A zero count stops the timer in both counting modes rather than
         // firing immediately.
-        _ if count == 0 => timer.disarm(),
-        Some(TimerMode::OneShot) => {
-            timer.arm(vector, HardwareMode::OneShot, divisor(vlapic), count)
-        }
-        Some(TimerMode::Periodic) => {
-            timer.arm(vector, HardwareMode::Periodic, divisor(vlapic), count)
-        }
-        // The architecture reserves the fourth encoding, and a controller given
-        // it does nothing.
-        None => timer.disarm(),
+        Some(_) if count == 0 => timer.disarm(),
+        Some(mode) if entry.masked() => timer.count_down(mode, divisor(vlapic), count),
+        Some(mode) => timer.arm(vector, mode, divisor(vlapic), count),
     };
     if let Err(error) = outcome {
         warn!(
@@ -106,6 +116,17 @@ fn arm_deadline(vlapic: &Vlapic, vector: Vector) -> Result<(), apic::ApicError> 
 /// the architecture reserves.
 fn mode_of(vlapic: &Vlapic) -> Option<TimerMode> {
     TimerMode::from_bits(vlapic.lvt(Entry::Timer).timer_mode())
+}
+
+/// Which mode the hardware should count in, or `None` where there is no count
+/// at all — deadline mode, which is armed by a register rather than by a
+/// number, and the encoding the architecture reserves.
+fn counting(vlapic: &Vlapic) -> Option<HardwareMode> {
+    match mode_of(vlapic)? {
+        TimerMode::OneShot => Some(HardwareMode::OneShot),
+        TimerMode::Periodic => Some(HardwareMode::Periodic),
+        TimerMode::Deadline => None,
+    }
 }
 
 /// How far the guest asked for the clock to be divided.

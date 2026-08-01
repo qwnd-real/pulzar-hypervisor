@@ -207,25 +207,9 @@ impl Mmio {
             let width = mov::repetition(instruction).ok_or(EmulateError::Width { rip })?;
             return string::perform(self, vcpu, guest, instruction, width);
         }
-        mov::perform(self, vcpu, guest, instruction)?;
-        // Checked after the fact rather than before, because which operand is
-        // interposed on is only known once both have been worked out — and
-        // working them out is most of performing the move. Reaching here having
-        // touched no trapped region means this exit was not what it appeared to
-        // be, which is worth saying rather than stepping quietly over.
-        if !touched(self, vcpu, guest, instruction) {
-            return Err(EmulateError::NotTrapped { gpa: gpa.as_u64() });
-        }
+        mov::perform(self, vcpu, guest, instruction, gpa)?;
         Ok(Outcome::Stepped)
     }
-}
-
-/// Whether either end of the move was a region something answers for.
-fn touched(mmio: &Mmio, vcpu: &Vcpu, guest: Linear<'_>, instruction: &Instruction) -> bool {
-    (0..instruction.op_count()).any(|operand| {
-        operand::place(mmio, vcpu, guest, instruction, operand)
-            .is_ok_and(operand::Place::interposed)
-    })
 }
 
 /// The address after the instruction, where the processor supplied one.

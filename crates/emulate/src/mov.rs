@@ -22,6 +22,7 @@
 use iced_x86::{Instruction, Mnemonic};
 use memory::Linear;
 use vcpu::Vcpu;
+use x86_64::PhysAddr;
 
 use crate::{EmulateError, mmio::Mmio, operand, value::Width};
 
@@ -32,15 +33,22 @@ const SOURCE: u32 = 1;
 
 /// Performs a move on the guest's behalf.
 ///
+/// `gpa` is the guest physical address the exit was reported at, which is only
+/// used to say which access this was if it turns out to have reached no trapped
+/// region.
+///
 /// # Errors
 ///
-/// [`EmulateError::Unsupported`] for an instruction outside the family, and
-/// whatever reading or writing either end of the move reports.
+/// [`EmulateError::Unsupported`] for an instruction outside the family,
+/// [`EmulateError::NotTrapped`] if neither end of the move is a region anything
+/// answers for, and whatever reading or writing either end of the move
+/// reports.
 pub(crate) fn perform(
     mmio: &Mmio,
     vcpu: &mut Vcpu,
     guest: Linear<'_>,
     instruction: &Instruction,
+    gpa: PhysAddr,
 ) -> Result<(), EmulateError> {
     let rip = vcpu.save().rip;
     let widen = match instruction.mnemonic() {
@@ -82,6 +90,22 @@ pub(crate) fn perform(
         operand::place(mmio, vcpu, guest, instruction, SOURCE)?,
         operand::place(mmio, vcpu, guest, instruction, DESTINATION)?,
     );
+    // Asked here, between working the two ends out and moving anything between
+    // them, and neither side of that is negotiable. It cannot be asked earlier
+    // because which end is interposed on is only known once both have been
+    // worked out, and working them out is most of performing the move. It
+    // cannot be asked afterwards because a move writes one of the registers the
+    // other end was computed from: `mov eax, [rdx+rax]` against a device
+    // register leaves `RAX` holding what was read, so re-deriving the source
+    // address after the fact derives it from a register that is no longer an
+    // address.
+    //
+    // Reaching here having touched no trapped region means this exit was not
+    // what it appeared to be, and saying so beats performing a move the guest
+    // could have performed itself against memory nobody answers for.
+    if !from.interposed() && !to.interposed() {
+        return Err(EmulateError::NotTrapped { gpa: gpa.as_u64() });
+    }
     let source = operand::width(instruction, SOURCE).ok_or(EmulateError::Width { rip })?;
     let destination =
         operand::width(instruction, DESTINATION).ok_or(EmulateError::Width { rip })?;

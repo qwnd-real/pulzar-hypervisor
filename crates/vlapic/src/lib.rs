@@ -247,9 +247,14 @@ pub fn describe(who: &str) {
     };
     for vlapic in page.all() {
         info!(
-            "{who}: {} {} in {}{}, task priority {}, {} requested, {} in service{}",
+            "{who}: {} {} {} in {}{}, task priority {}, {} requested, {} in service{}",
             vlapic.index(),
             vlapic.apic_id(),
+            if vlapic.running() {
+                "running"
+            } else {
+                "waiting to be started"
+            },
             vlapic.mode(),
             if vlapic.base().bootstrap() {
                 " as the bootstrap processor"
@@ -278,14 +283,45 @@ pub fn describe(who: &str) {
 /// Records that this hypervisor now runs this processor, so that a startup
 /// message aimed at it is emulated rather than forwarded to real hardware.
 ///
-/// Called by each processor as it comes up, after it has a controller and
-/// before anything can be sent to it.
+/// Called by each processor as it comes up, as early as it can be: until it has
+/// been called, a startup message the guest aims at this processor is sent to
+/// real hardware, and real hardware would reset the host out from under it.
+///
+/// `joining` is where the guest's own view of this processor stands, which is
+/// not the same question as whether the processor is running. Every processor
+/// but the one the guest was entered on has never been started *by the guest*,
+/// however long it has been executing the hypervisor's own code.
 ///
 /// # Errors
 ///
 /// As [`read_msr`].
-pub fn claim_processor() -> Result<(), VlapicError> {
-    current().map(Vlapic::take_ownership)
+pub fn claim_processor(joining: Joining) -> Result<(), VlapicError> {
+    current().map(|vlapic| {
+        vlapic.set_startup(joining.startup());
+        vlapic.take_ownership();
+    })
+}
+
+/// Where a processor's guest stands at the moment the hypervisor takes the
+/// processor over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Joining {
+    /// Already executing the guest, which is true of exactly one processor: the
+    /// one the guest was entered on.
+    Running,
+    /// Never started by the guest, so it holds until the guest starts it —
+    /// exactly as a processor still in reset would.
+    WaitingForSipi,
+}
+
+impl Joining {
+    /// The startup state this is.
+    const fn startup(self) -> state::Startup {
+        match self {
+            Self::Running => state::Startup::Running,
+            Self::WaitingForSipi => state::Startup::WaitingForSipi,
+        }
+    }
 }
 
 /// What this processor should do before entering the guest again, having
@@ -296,6 +332,44 @@ pub fn claim_processor() -> Result<(), VlapicError> {
 /// As [`read_msr`].
 pub fn settle() -> Result<Resumption, VlapicError> {
     current().map(delivery::settle)
+}
+
+/// Waits, without running the guest, until a startup message arrives for this
+/// processor.
+///
+/// What a processor whose guest has been reset does instead of spinning: there
+/// is nothing to run, and there will be nothing to run until another processor
+/// starts this one, which may never happen. The processor halts, and the
+/// interrupt that wakes it is either the doorbell that says a message arrived
+/// or something unrelated — so a caller consults [`settle`] again rather than
+/// assuming the wait ended for the reason it was entered.
+///
+/// # Errors
+///
+/// As [`read_msr`].
+pub fn hold() -> Result<(), VlapicError> {
+    let vlapic = current()?;
+    // Said before the message is looked for, and the reason is the whole of why
+    // this is not a bare halt: a sender that misses this flag is one whose
+    // message the test below finds, and a test that misses the message is one
+    // the sender's doorbell wakes.
+    vlapic.set_away(true);
+    descriptors::wait_until(|| vlapic.signalled());
+    vlapic.set_away(false);
+    Ok(())
+}
+
+/// Whether this processor's guest is running, rather than reset and waiting to
+/// be started again.
+///
+/// Consulted on the exit path, where a startup message that arrived while the
+/// guest was running is a reason to stop running it.
+///
+/// # Errors
+///
+/// As [`read_msr`].
+pub fn running() -> Result<bool, VlapicError> {
+    current().map(Vlapic::running)
 }
 
 /// The highest-priority interrupt this processor's guest should take now, moved
@@ -361,18 +435,20 @@ pub fn observe_task_priority(priority: u8) {
     }
 }
 
-/// Records whether this processor is inside the guest.
+/// Records whether this processor has stopped looking at its controller.
 ///
 /// The second half of the protocol that stops an interrupt being lost to a
 /// processor that was entering the guest as it arrived. A caller must store
 /// `true` and then consult [`take_deliverable`] once more before it actually
-/// enters, abandoning the entry if something appeared in between.
+/// enters, abandoning the entry if something appeared in between — and store
+/// `false` on the way out, because a processor answering an exit will consult
+/// its controller again on its own and needs nothing to remind it.
 ///
 /// # Errors
 ///
 /// As [`read_msr`].
-pub fn set_in_guest(inside: bool) -> Result<(), VlapicError> {
-    current().map(|vlapic| vlapic.set_in_guest(inside))
+pub fn set_away(away: bool) -> Result<(), VlapicError> {
+    current().map(|vlapic| vlapic.set_away(away))
 }
 
 /// Interrupts a processor that is inside the guest, so that it looks at its

@@ -58,7 +58,7 @@ use svm::{
     msr::VM_CR,
     permissions::{MSRPM_BYTES, MsrPermission, msrpm_position},
 };
-use x86_64::{PhysAddr, structures::paging::PhysFrame};
+use x86_64::{PhysAddr, registers::control::EferFlags, structures::paging::PhysFrame};
 
 use crate::{
     Host, Invalid, Registers, VcpuError, invalid,
@@ -432,6 +432,43 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Puts this virtual processor into the state a real one is in when a
+    /// start-up message naming `page` has released it.
+    ///
+    /// What a hypervisor does when the guest starts one of its own processors.
+    /// Nothing is edited: the whole state-save area is replaced, because a
+    /// processor coming out of reset keeps nothing of what it was doing before,
+    /// and an edit would leave whatever this virtual processor was last running
+    /// showing through wherever the reset state happens to agree with zero.
+    ///
+    /// Two values the architecture would leave at reset are supplied anyway,
+    /// and both are forced rather than chosen. The virtualization-enable bit,
+    /// without which the processor refuses to enter the guest at all. And the
+    /// guest's page-attribute table, which under nested paging is what its page
+    /// tables are interpreted through — left at its own reset value of zero,
+    /// every one of the guest's mappings would be uncacheable, which is correct
+    /// and slow enough to look like a machine that has stopped.
+    ///
+    /// The cached copy of the block is abandoned in full, and so are this
+    /// guest's cached translations on this processor: everything the processor
+    /// remembers about this virtual processor describes one that no longer
+    /// exists.
+    pub fn start_at(&mut self, page: u8) {
+        let mut save = SaveArea::started_at(page);
+        save.efer |= EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE.bits();
+        save.g_pat = paging::cpu::PAT_POLICY;
+        *self.save_mut() = save;
+        // Reset clears every general-purpose register but one: the data register
+        // holds the processor's own family, model and stepping, which is how
+        // sixteen-bit code that predates `CPUID` identified what it was running
+        // on. It is this processor's signature because that is the processor the
+        // guest is running on.
+        self.registers = Registers::zeroed();
+        self.registers.rdx = u64::from(processor::cpuid(FEATURE_LEAF, 0).eax);
+        self.soil(CleanBits::ALL_CACHED);
+        self.flush();
+    }
+
     /// The register state the guest runs with, and stopped in.
     #[must_use]
     pub fn save(&self) -> &SaveArea {
@@ -485,6 +522,10 @@ fn flush_command() -> TlbControl {
 /// is four bits wide, so a wider value is not a register that this does not
 /// know about — it is bits that were never part of the number.
 const NUMBER: u8 = 0xF;
+
+/// The `CPUID` leaf whose accumulator result is the processor's signature,
+/// which is what reset leaves in the data register.
+const FEATURE_LEAF: u32 = 1;
 
 const _: () = assert!(
     RSP == 4 && RAX == 0,

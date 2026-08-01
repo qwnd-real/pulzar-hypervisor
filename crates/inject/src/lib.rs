@@ -131,6 +131,40 @@ impl Pending {
         self.nmi_blocked = false;
     }
 
+    /// Forgets everything the guest was owed, which is what resetting the
+    /// processor means.
+    ///
+    /// An interrupt owed to a guest that has since been reset is owed to
+    /// nobody: the handler that would have taken it belongs to an operating
+    /// system this processor is no longer running. So the control block is
+    /// cleared as well as the bookkeeping — an injection field left valid
+    /// across a reset would deliver, through the reset guest's own
+    /// descriptor table, an event that predates it.
+    ///
+    /// The window and the non-maskable blocking are both withdrawn outright
+    /// rather than through [`Pending::arm_window`], because one of them is not
+    /// something that function has any business clearing: a processor reset
+    /// part-way through a non-maskable interrupt would otherwise carry the
+    /// blocking flag into its next life and take no further one, ever.
+    pub fn reset(&mut self, vcpu: &mut Vcpu) {
+        self.interrupted = None;
+        self.nmi = false;
+        self.nmi_blocked = false;
+        self.window = false;
+        let control = vcpu.control_mut();
+        control.event_injection = Event::none();
+        control.interrupt_control = control
+            .interrupt_control
+            .with_virtual_irq_pending(false)
+            .with_virtual_vector(0)
+            .with_virtual_priority(0)
+            .with_virtual_nmi_masked(false);
+        control
+            .intercept_1
+            .remove(Intercepts1::VINTR | Intercepts1::IRET);
+        vcpu.soil(CleanBits::INTERRUPT | CleanBits::INTERCEPTS);
+    }
+
     /// Whether anything at all is owed, which is what decides whether a guest
     /// that halted should be woken.
     #[must_use]
