@@ -58,7 +58,10 @@ use svm::{
     msr::VM_CR,
     permissions::{MSRPM_BYTES, MsrPermission, msrpm_position},
 };
-use x86_64::{PhysAddr, registers::control::EferFlags, structures::paging::PhysFrame};
+use x86_64::{
+    PhysAddr, instructions::interrupts, registers::control::EferFlags,
+    structures::paging::PhysFrame,
+};
 
 use crate::{
     Host, Invalid, Registers, VcpuError, invalid,
@@ -213,11 +216,13 @@ impl Vcpu {
 
     /// Runs the guest until `exits` says to stop.
     ///
-    /// `exits` is called once per exit, with the global interrupt flag set and
-    /// the host's own state back in the processor, so it may do anything the
-    /// hypervisor can normally do — including taking an interrupt, which is how
-    /// an interrupt that arrived while the guest was running reaches the host's
-    /// handler.
+    /// `exits` is called once per exit, with the host's own state back in the
+    /// processor and both interrupt flags — the global one and the ordinary
+    /// one — set, so it may do anything the hypervisor can normally do,
+    /// including taking an interrupt, which is how an interrupt that arrived
+    /// while the guest was running reaches the host's handler. The ordinary
+    /// flag is also left set when this returns, because it was set to enter
+    /// the loop and nothing here clears it again.
     ///
     /// # Errors
     ///
@@ -244,6 +249,7 @@ impl Vcpu {
         if let Some(invalid) = self.validate() {
             return Err(VcpuError::Invalid(invalid));
         }
+
         loop {
             let clean = CleanBits::ALL_CACHED.soil(self.dirty);
             let flush = if self.stale {
@@ -263,7 +269,15 @@ impl Vcpu {
             // comes from that same call on this same processor. The caller
             // guarantees the block has not moved and has not been entered
             // elsewhere.
-            unsafe { switch::enter(&mut self.registers, self.vmcb_phys, self.host.snapshot()) };
+            //
+            // Interrupts are masked for the crossing and restored the moment
+            // the host is back, so an interrupt that arrived while the guest
+            // was running is taken right here, on the host's own descriptor
+            // table, by the handler this hypervisor registered for it — before
+            // the exit is even looked at.
+            interrupts::without_interrupts(|| unsafe {
+                switch::enter(&mut self.registers, self.vmcb_phys, self.host.snapshot());
+            });
 
             if self.control().exit_code == ExitCode::INVALID {
                 // No guest instruction ran, so resuming would produce this exit

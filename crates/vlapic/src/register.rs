@@ -135,51 +135,6 @@ impl Register {
         Some(((self.0 - first.0) / STRIDE) as usize)
     }
 
-    /// The register's name, for a log line.
-    ///
-    /// A guest probing its controller produces a log full of offsets, and an
-    /// offset is a number to look up; this is the lookup done. A register that
-    /// is one slot of a bank is named for its bank, since the offset a caller
-    /// logged beside it names the slot.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::ID => "id",
-            Self::VERSION => "version",
-            Self::TASK_PRIORITY => "task-priority",
-            Self::ARBITRATION_PRIORITY => "arbitration-priority",
-            Self::PROCESSOR_PRIORITY => "processor-priority",
-            Self::END_OF_INTERRUPT => "eoi",
-            Self::REMOTE_READ => "remote-read",
-            Self::LOGICAL_DESTINATION => "logical-destination",
-            Self::DESTINATION_FORMAT => "destination-format",
-            Self::SPURIOUS => "spurious",
-            Self::ERROR_STATUS => "error-status",
-            Self::COMMAND_LOW => "command-low",
-            Self::COMMAND_HIGH => "command-high",
-            Self::TIMER_INITIAL_COUNT => "timer-initial-count",
-            Self::TIMER_CURRENT_COUNT => "timer-current-count",
-            Self::TIMER_DIVIDE => "timer-divide",
-            Self::SELF_IPI => "self-ipi",
-            other => match other.bank() {
-                Some((Bank::InService, _)) => "in-service",
-                Some((Bank::TriggerMode, _)) => "trigger-mode",
-                Some((Bank::InterruptRequest, _)) => "request",
-                None => match Entry::of(other) {
-                    Some(entry) => match entry {
-                        Entry::Timer => "lvt-timer",
-                        Entry::Lint0 => "lvt-lint0",
-                        Entry::Lint1 => "lvt-lint1",
-                        Entry::Error => "lvt-error",
-                        Entry::Performance => "lvt-performance",
-                        Entry::Thermal => "lvt-thermal",
-                        Entry::CorrectedMachineCheck => "lvt-corrected-machine-check",
-                    },
-                    None => "reserved",
-                },
-            },
-        }
-    }
-
     /// Which bank of one-bit-per-vector registers this is in, and which of its
     /// eight slots, if it is in one at all.
     pub(crate) const fn bank(self) -> Option<(Bank, usize)> {

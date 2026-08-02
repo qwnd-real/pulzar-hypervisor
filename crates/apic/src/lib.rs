@@ -83,7 +83,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use acpi::{Madt, NmiTarget};
 use cpu::{ApicId, CpuError};
 use descriptors::{DescriptorError, Disposition, Interrupt, Vector};
-use log::{info, trace, warn};
+use log::{info, warn};
 use paging::{AddressSpace, CacheType, PagingError, Protection};
 use processor::Features;
 use spin::Once;
@@ -911,10 +911,6 @@ static CONTROLLER_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// arrival and cannot be told apart from the inside; nothing in the delivery
 /// carries its origin.
 fn spurious(interrupt: &Interrupt) -> Disposition {
-    trace!(
-        "apic: an arrival on the spurious vector {}",
-        interrupt.vector()
-    );
     if LocalApic(())
         .in_service(interrupt.vector())
         .unwrap_or(false)
@@ -947,7 +943,6 @@ fn spurious(interrupt: &Interrupt) -> Disposition {
 /// direction: a real error arriving alongside an interrupt something else sent
 /// on this vector reads as ours, and that arrival is consumed.
 fn errors(_: &Interrupt) -> Disposition {
-    trace!("apic: an arrival on the controller-error vector");
     let errors = LocalApic::take_errors();
     if errors == 0 {
         return Disposition::Passed;

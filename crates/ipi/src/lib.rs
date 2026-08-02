@@ -64,7 +64,7 @@ use core::num::NonZeroU64;
 use apic::{ApicError, Command, Delivery, Target};
 use cpu::{CpuError, CpuIndex};
 use descriptors::{DescriptorError, Disposition, Interrupt, Vector};
-use log::{info, trace};
+use log::info;
 use spin::Once;
 use thiserror::Error;
 
@@ -385,11 +385,6 @@ fn arrived(interrupt: &Interrupt) -> Disposition {
     let Some(claim) = mailbox.claim() else {
         return Disposition::Passed;
     };
-
-    trace!(
-        "ipi: {index} received {vector}, payload {:#x}",
-        claim.payload()
-    );
 
     handler(Request {
         payload: NonZeroU64::new(claim.payload()),

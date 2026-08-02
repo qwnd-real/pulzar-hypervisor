@@ -62,6 +62,7 @@ use svm::{CleanBits, Reason};
 use thiserror::Error;
 use vcpu::{Flow, Vcpu, VcpuError};
 use vlapic::{Resumption, VlapicError};
+use x86_64::instructions::interrupts;
 
 pub use crate::firmware::Boot;
 use crate::firmware::Firmware;
@@ -135,6 +136,8 @@ impl<'a> Exits<'a> {
         // rather than at the first exit: one arriving during the first
         // instruction the guest runs must already be the host's.
         inject::arm(vcpu);
+        interrupts::enable();
+
         loop {
             // Waiting is not idleness: a processor whose guest has been reset
             // has nothing to run until another one starts it, which may never
@@ -168,10 +171,7 @@ impl<'a> Exits<'a> {
     fn startable(&mut self, vcpu: &mut Vcpu) -> Result<bool, ExitError> {
         match vlapic::settle()? {
             Resumption::Carry => Ok(true),
-            Resumption::Wait => {
-                trace!("exits: this processor's guest is reset, holding");
-                Ok(false)
-            }
+            Resumption::Wait => Ok(false),
             Resumption::StartAt(page) => {
                 info!("exits: the guest started this processor at page {page:#x}");
                 vcpu.start_at(page);
@@ -192,24 +192,6 @@ impl<'a> Exits<'a> {
     /// processor an interrupt.
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
         let reason = vcpu.reason();
-        // One line per exit, and a guest driving its own controller exits
-        // thousands of times a second — through a lock every processor's
-        // logging shares. Anything louder than this stops the machine more
-        // thoroughly than whatever is being debugged.
-        //
-        // The line carries everything the control block said about the exit:
-        // the raw code (which is all there is when `reason` is unknown), the
-        // two information fields the code is decoded against, and the
-        // interrupted-event field, whose valid bit is the record of a delivery
-        // this exit cut short.
-        trace!(
-            "exits: {reason:?} code {:#x} rip {:#x} info1 {:#x} info2 {:#x} int {:#x}",
-            vcpu.control().exit_code.bits(),
-            vcpu.save().rip,
-            vcpu.control().exit_info_1,
-            vcpu.control().exit_info_2,
-            vcpu.control().exit_interrupt_info.into_bits(),
-        );
         // This processor is out of the guest and consults its controller below
         // before going back in, so nothing needs to interrupt it to make it
         // look.
