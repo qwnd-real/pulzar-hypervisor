@@ -28,6 +28,7 @@
 .vscode/
 .idea/
 *.swp
+.workbuddy/
 
 # OS noise.
 .DS_Store
