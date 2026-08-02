@@ -62,10 +62,12 @@ pulzar/
   boot media and staging are exercised end to end. The real hypervisor core
   will move to a custom freestanding target with `-Z build-std` — this is why
   the toolchain is nightly.
-- There is no workspace-wide default target: the UEFI crates pin
+- There is no workspace-wide default target: the two UEFI applications pin
   `x86_64-unknown-uefi` via `forced-target` (nightly `per-package-target`
-  feature) and `xtask` builds for the host, so plain `cargo build` compiles
-  every crate for its correct target.
+  feature) and pull every library crate in as a UEFI dependency, while the
+  libraries themselves are target-agnostic `no_std` crates that plain
+  `cargo build` compiles for the host too — which is what lets
+  `cargo test -p <crate>` run natively. `xtask` builds for the host as well.
 
 ## 3. Toolchain and build
 

@@ -1,7 +1,9 @@
-# No workspace-wide default target is set: the UEFI crates pin
+# No workspace-wide default target is set: the two UEFI applications pin
 # `x86_64-unknown-uefi` themselves via `forced-target` in their manifests
-# (nightly `per-package-target` feature), so host-side and firmware crates
-# both build correctly under a plain `cargo build`.
+# (nightly `per-package-target` feature) and pull the library crates in as
+# UEFI dependencies, while the libraries and `xtask` build for the host —
+# so firmware and host-side builds coexist under a plain `cargo build`, and
+# `cargo test -p <crate>` runs natively.
 
 [alias]
 xtask = "run --package xtask --"
