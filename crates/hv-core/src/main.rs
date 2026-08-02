@@ -36,7 +36,7 @@ use clock::{Clock, Wall};
 use descriptors::{Descriptors, Interrupt, Tables, Vector, halt};
 use exits::{Boot, Exits};
 use handoff::{Handoff, HandoffError};
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 use npt::Exposure;
 use paging::{AddressSpace, Existing, PagingError, chunk};
 use partition::Partition;
@@ -692,6 +692,7 @@ fn unclaimed(interrupt: &Interrupt) {
     // claimed is one the guest programmed a device to send — and whether real
     // hardware may be acknowledged now depends on how it was triggered, which
     // is what the controller works out.
+    trace!("core: unclaimed {interrupt}");
     if let Err(error) = vlapic::arrived(interrupt.vector()) {
         warn!("core: ignoring unclaimed {interrupt}: {error}");
         if let Err(error) = apic::end_of_interrupt() {

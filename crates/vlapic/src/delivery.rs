@@ -64,6 +64,12 @@ use crate::{
 /// hardware would also do nothing useful with — so it is recorded and dropped,
 /// which is what a controller does with a message nobody accepts.
 pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
+    trace!(
+        "vlapic: {} sending command {:#x} as {:?}",
+        from.index(),
+        command.bits(),
+        command.shorthand(),
+    );
     let mode = from.mode();
     let Some(delivery) = command.delivery(mode) else {
         // Lowest priority is the one reserved encoding with an error of its own:
@@ -173,15 +179,23 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
 /// here, because whether a controller is accepting is the target's own state
 /// and may change between the two.
 fn accept(from: &Vlapic, target: &Vlapic, vector: Vector, trigger: Trigger) {
-    if matches!(target.accept(vector, trigger), Accepted::Refused) {
-        trace!(
-            "vlapic: {} offered {vector} to {}, which is not accepting",
-            from.index(),
-            target.index()
-        );
-        return;
+    match target.accept(vector, trigger) {
+        Accepted::Refused => {
+            trace!(
+                "vlapic: {} offered {vector} to {}, which is not accepting",
+                from.index(),
+                target.index()
+            );
+        }
+        outcome => {
+            trace!(
+                "vlapic: {} delivered {vector} to {} ({outcome:?})",
+                from.index(),
+                target.index()
+            );
+            nudge(from, target);
+        }
     }
-    nudge(from, target);
 }
 
 /// Makes a target that has stopped looking at its controller look at it again.
@@ -206,7 +220,14 @@ fn nudge(from: &Vlapic, target: &Vlapic) {
     }
     for _ in 0..DOORBELL_ATTEMPTS {
         match crate::doorbell(target.index()) {
-            Ok(()) => return,
+            Ok(()) => {
+                trace!(
+                    "vlapic: {} rang {}'s doorbell",
+                    from.index(),
+                    target.index()
+                );
+                return;
+            }
             Err(error) => trace!(
                 "vlapic: {} could not interrupt {}, trying again: {error}",
                 from.index(),

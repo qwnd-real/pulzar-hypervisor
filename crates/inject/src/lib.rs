@@ -56,7 +56,7 @@
 #![no_std]
 
 use descriptors::Vector;
-use log::warn;
+use log::{trace, warn};
 use processor::SvmFeatures;
 use svm::{CleanBits, Event, EventKind, intercept::Intercepts1};
 use vcpu::Vcpu;
@@ -108,9 +108,11 @@ impl Pending {
         // the rest of this type keeps.
         if event.kind() == EventKind::Nmi {
             self.nmi = true;
+            trace!("inject: an nmi delivery was interrupted; it stays owed");
             return;
         }
         self.interrupted = Some(event);
+        trace!("inject: took back an interrupted {event:?}");
     }
 
     /// Records that this processor took a non-maskable interrupt the guest is
@@ -198,26 +200,34 @@ impl Pending {
         // entry never happened — the processor refused the control block, or
         // the exit came before delivery. Overwriting it would lose that event.
         if vcpu.control().event_injection.valid() {
+            trace!("inject: the injection field still holds a valid event; nothing new goes in");
             return Injected::Nothing;
         }
         // Ahead of everything, because this is not a new event: the guest was
         // already taking it.
         if let Some(event) = self.interrupted.take() {
             Self::inject(vcpu, event);
+            trace!("inject: requeued interrupted {event:?}");
             return Injected::Requeued;
         }
         if self.nmi && self.nmi_deliverable(vcpu) {
             self.nmi = false;
             self.block_nmi(vcpu);
             Self::inject(vcpu, Event::nmi());
+            trace!("inject: injecting the owed non-maskable interrupt");
             return Injected::Nmi;
         }
         match candidate {
             Some(vector) if window_open(vcpu) => {
                 Self::inject(vcpu, Event::interrupt(vector));
+                trace!("inject: injecting {vector}");
                 Injected::Interrupt(vector)
             }
-            _ => Injected::Nothing,
+            Some(vector) => {
+                trace!("inject: declining {vector}; the guest's interrupt window is shut");
+                Injected::Nothing
+            }
+            None => Injected::Nothing,
         }
     }
 
@@ -275,7 +285,18 @@ impl Pending {
         if waiting == self.window && !iret {
             return;
         }
+        // The window itself only changed if the answer differs from the one
+        // already written; the `iret` case re-asserts the return intercept
+        // without changing it, so only a real change is worth a line.
+        let changed = waiting != self.window;
         self.window = waiting;
+        if changed {
+            if let Some(vector) = candidate.filter(|_| waiting) {
+                trace!("inject: arming the interrupt window with {vector} pending");
+            } else {
+                trace!("inject: withdrawing the interrupt window");
+            }
+        }
         let control = vcpu.control_mut();
         control.interrupt_control = match candidate.filter(|_| waiting) {
             Some(vector) => control

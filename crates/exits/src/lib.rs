@@ -58,7 +58,7 @@ use inject::{Injected, Pending};
 use log::{error, info, trace};
 use partition::Partition;
 use portal::Portal;
-use svm::Reason;
+use svm::{CleanBits, Reason};
 use thiserror::Error;
 use vcpu::{Flow, Vcpu, VcpuError};
 use vlapic::{Resumption, VlapicError};
@@ -168,7 +168,10 @@ impl<'a> Exits<'a> {
     fn startable(&mut self, vcpu: &mut Vcpu) -> Result<bool, ExitError> {
         match vlapic::settle()? {
             Resumption::Carry => Ok(true),
-            Resumption::Wait => Ok(false),
+            Resumption::Wait => {
+                trace!("exits: this processor's guest is reset, holding");
+                Ok(false)
+            }
             Resumption::StartAt(page) => {
                 info!("exits: the guest started this processor at page {page:#x}");
                 vcpu.start_at(page);
@@ -193,7 +196,20 @@ impl<'a> Exits<'a> {
         // thousands of times a second — through a lock every processor's
         // logging shares. Anything louder than this stops the machine more
         // thoroughly than whatever is being debugged.
-        trace!("exits: {reason:?} at rip {:#x}", vcpu.save().rip);
+        //
+        // The line carries everything the control block said about the exit:
+        // the raw code (which is all there is when `reason` is unknown), the
+        // two information fields the code is decoded against, and the
+        // interrupted-event field, whose valid bit is the record of a delivery
+        // this exit cut short.
+        trace!(
+            "exits: {reason:?} code {:#x} rip {:#x} info1 {:#x} info2 {:#x} int {:#x}",
+            vcpu.control().exit_code.bits(),
+            vcpu.save().rip,
+            vcpu.control().exit_info_1,
+            vcpu.control().exit_info_2,
+            vcpu.control().exit_interrupt_info.into_bits(),
+        );
         // This processor is out of the guest and consults its controller below
         // before going back in, so nothing needs to interrupt it to make it
         // look.
@@ -237,6 +253,25 @@ impl<'a> Exits<'a> {
             self.left = Left::Stopped;
             return flow;
         }
+        // The guest's task priority is one register reached through two doors:
+        // the control block's virtual task priority, which the processor
+        // answers a guest's `CR8` access from, and the emulated register the
+        // guest writes through the page or a model-specific register. The exit
+        // above already read the first into the second; a guest that instead
+        // wrote the second has just changed it here, and the first has to be
+        // brought back into agreement before the guest runs again — otherwise
+        // the two halves of one register disagree, and a guest that lowered
+        // its priority through the page would find its own `CR8` read still
+        // answering the old value. Only the class is held in the control
+        // block, which is the upper nibble of the emulated byte.
+        if let Ok(priority) = vlapic::task_priority() {
+            let class = priority >> TPR_CLASS_SHIFT;
+            if vcpu.control().interrupt_control.virtual_tpr() != class {
+                let control = vcpu.control_mut();
+                control.interrupt_control = control.interrupt_control.with_virtual_tpr(class);
+                vcpu.soil(CleanBits::INTERRUPT);
+            }
+        }
         self.enter(vcpu)
     }
 
@@ -270,6 +305,7 @@ impl<'a> Exits<'a> {
         // what this exit loop owns.
         if vlapic::take_nmi().unwrap_or(false) {
             self.interrupts.raise_nmi();
+            trace!("exits: this processor was owed a non-maskable interrupt");
         }
         // A startup message is not something an entry can carry: it says this
         // processor's guest no longer exists, so the loop takes the processor
@@ -287,7 +323,9 @@ impl<'a> Exits<'a> {
         // guest's interrupt window may be shut — and a controller that had
         // already consumed the request would have thrown the interrupt away.
         let candidate = vlapic::select().unwrap_or(None);
-        if let Injected::Interrupt(vector) = self.interrupts.commit(vcpu, candidate) {
+        let injected = self.interrupts.commit(vcpu, candidate);
+        trace!("exits: entering with candidate {candidate:?}, injected {injected:?}");
+        if let Injected::Interrupt(vector) = injected {
             let _ = vlapic::committed(vector);
         }
         Flow::Resume
@@ -320,6 +358,11 @@ pub enum ExitError {
     #[error(transparent)]
     Vlapic(#[from] VlapicError),
 }
+
+/// How far a task-priority byte is shifted to leave its interrupt-priority
+/// class, which is the half of it the control block's virtual task priority
+/// holds.
+const TPR_CLASS_SHIFT: u8 = 4;
 
 /// Moves the guest past an intercepted instruction the host has completed.
 ///

@@ -47,6 +47,7 @@
 
 use core::ptr;
 
+use log::trace;
 use spin::Once;
 use x86_64::{VirtAddr, registers::model_specific::Msr};
 
@@ -131,6 +132,51 @@ impl Register {
     /// twenty-four offsets from being written out by hand.
     pub(crate) const fn offset_by(self, slots: u32) -> Self {
         Self(self.0 + slots * STRIDE)
+    }
+
+    /// The register's name, for a log line.
+    ///
+    /// A line naming a register beats a line naming an offset, which is a
+    /// number to look up. A register that is one slot of a bank is named for
+    /// its bank, since the offset a caller logged beside it names the slot.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::ID => "id",
+            Self::VERSION => "version",
+            Self::TASK_PRIORITY => "task-priority",
+            Self::PROCESSOR_PRIORITY => "processor-priority",
+            Self::END_OF_INTERRUPT => "eoi",
+            Self::LOGICAL_DESTINATION => "logical-destination",
+            Self::SPURIOUS => "spurious",
+            Self::ERROR_STATUS => "error-status",
+            Self::LVT_CORRECTED_MACHINE_CHECK => "lvt-corrected-machine-check",
+            Self::COMMAND_LOW => "command-low",
+            Self::LVT_TIMER => "lvt-timer",
+            Self::LVT_THERMAL => "lvt-thermal",
+            Self::LVT_PERFORMANCE => "lvt-performance",
+            Self::LVT_LINT0 => "lvt-lint0",
+            Self::LVT_LINT1 => "lvt-lint1",
+            Self::LVT_ERROR => "lvt-error",
+            Self::TIMER_INITIAL_COUNT => "timer-initial-count",
+            Self::TIMER_CURRENT_COUNT => "timer-current-count",
+            Self::TIMER_DIVIDE => "timer-divide",
+            other => {
+                let offset = other.0;
+                if (Self::IN_SERVICE.0..Self::IN_SERVICE.0 + VECTOR_BANK_BYTES).contains(&offset) {
+                    "in-service"
+                } else if (Self::TRIGGER_MODE.0..Self::TRIGGER_MODE.0 + VECTOR_BANK_BYTES)
+                    .contains(&offset)
+                {
+                    "trigger-mode"
+                } else if (Self::INTERRUPT_REQUEST.0..Self::INTERRUPT_REQUEST.0 + VECTOR_BANK_BYTES)
+                    .contains(&offset)
+                {
+                    "request"
+                } else {
+                    "reserved"
+                }
+            }
+        }
     }
 
     /// The model-specific register x2APIC puts this register in.
@@ -234,6 +280,13 @@ const X2APIC_BASE_MSR: u32 = 0x800;
 /// into a model-specific register index.
 const STRIDE: u32 = 16;
 
+/// Bytes one one-bit-per-vector bank spans: eight 32-bit registers.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a vector bank is eight 32-bit registers, so its byte span fits a u32"
+)]
+const VECTOR_BANK_BYTES: u32 = VECTOR_SLOTS as u32 * STRIDE;
+
 /// The single model-specific register x2APIC gives the interrupt command, in
 /// place of the two the older interface splits it across.
 const X2APIC_COMMAND_MSR: u32 = 0x830;
@@ -310,14 +363,21 @@ pub(crate) enum Access {
 impl Access {
     /// Reads a register.
     pub(crate) fn read(self, register: Register) -> u32 {
-        match self {
+        let value = match self {
             Self::Mapped(page) => page.read(register),
             // SAFETY: the register exists because this variant is only chosen
             // once x2APIC has been enabled on this processor, and reading any of
             // the controller's registers has no side effect the architecture
             // does not document as one of its uses.
             Self::Msr => truncate(unsafe { Msr::new(register.msr()).read() }),
-        }
+        };
+        trace!(
+            "apic: {} read {} ({:#x}) = {value:#x}",
+            self.face(),
+            register.name(),
+            register.offset(),
+        );
+        value
     }
 
     /// Writes a register.
@@ -328,6 +388,12 @@ impl Access {
     /// from a general protection fault, for a reserved bit in a model-specific
     /// register, to an interrupt arriving somewhere nothing expects it.
     pub(crate) unsafe fn write(self, register: Register, value: u32) {
+        trace!(
+            "apic: {} write {} ({:#x}) = {value:#x}",
+            self.face(),
+            register.name(),
+            register.offset(),
+        );
         match self {
             // SAFETY: the caller vouches for the value.
             Self::Mapped(page) => unsafe { page.write(register, value) },
@@ -378,6 +444,7 @@ impl Access {
     /// to interrupt a processor, and a malformed one can hold a processor in
     /// reset or deliver to a vector nothing is prepared for.
     pub(crate) unsafe fn send(self, command: u64) -> Result<(), ApicError> {
+        trace!("apic: {} sending command {command:#x}", self.face());
         match self {
             Self::Mapped(page) => {
                 self.settle()?;
@@ -405,16 +472,28 @@ impl Access {
     /// bus cycles, and a controller that has not finished after this many
     /// reads is not going to.
     fn settle(self) -> Result<(), ApicError> {
-        let Self::Mapped(_) = self else {
+        let Self::Mapped(page) = self else {
             return Ok(());
         };
+        // Read through the page rather than through `Access::read`, so that a
+        // stuck delivery is not answered with one log line per poll. The
+        // caller's own line says a command is being sent; this loop only waits
+        // for it to leave.
         for _ in 0..COMMAND_POLLS {
-            if self.read(Register::COMMAND_LOW) & DELIVERY_PENDING == 0 {
+            if page.read(Register::COMMAND_LOW) & DELIVERY_PENDING == 0 {
                 return Ok(());
             }
             core::hint::spin_loop();
         }
         Err(ApicError::CommandStuck)
+    }
+
+    /// Which of the two interfaces this is, for a log line.
+    const fn face(self) -> &'static str {
+        match self {
+            Self::Mapped(_) => "xapic",
+            Self::Msr => "x2apic",
+        }
     }
 }
 

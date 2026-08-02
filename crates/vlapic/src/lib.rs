@@ -176,10 +176,15 @@ pub fn region() -> Result<Region, VlapicError> {
 /// should take a general protection fault for the access.
 pub fn read_msr(index: u32) -> Result<u64, VlapicError> {
     let vlapic = current()?;
-    msr::read(vlapic, index).map_err(|fault| {
+    let value = msr::read(vlapic, index).map_err(|fault| {
         warn!("vlapic: refusing a read of {index:#x}: {fault:?}");
         VlapicError::Fault
-    })
+    })?;
+    trace!(
+        "vlapic: {} x2apic read {index:#x} = {value:#x}",
+        vlapic.index()
+    );
+    Ok(value)
 }
 
 /// What a write to one of the controller's model-specific registers does.
@@ -193,6 +198,10 @@ pub fn write_msr(index: u32, value: u64) -> Result<(), VlapicError> {
         warn!("vlapic: refusing a write of {value:#x} to {index:#x}: {fault:?}");
         VlapicError::Fault
     })?;
+    trace!(
+        "vlapic: {} x2apic write {index:#x} = {value:#x}",
+        vlapic.index()
+    );
     acted(vlapic, written);
     Ok(())
 }
@@ -229,21 +238,32 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     if !local.arrived_level(vector)? {
         vlapic.accept(vector, Trigger::Edge);
         local.end_of_interrupt()?;
+        trace!(
+            "vlapic: {} received edge {vector}, acknowledged and requested it",
+            vlapic.index()
+        );
         return Ok(());
     }
     // The debt is recorded before the guest is given the interrupt, so that a
     // guest which acknowledges immediately finds the debt already there.
     vlapic.ledger().owe(vector);
-    if !matches!(
-        vlapic.accept(vector, Trigger::Level),
-        Accepted::Requested | Accepted::Coalesced
-    ) {
-        // The guest was not given it and will therefore never acknowledge it,
-        // so the only thing that could ever have discharged the debt does not
-        // exist. Settling here is what stops a refused interrupt occupying a
-        // real in-service slot for the life of the machine, blocking everything
-        // of its priority or lower on this processor.
-        vlapic.ledger().release(vector);
+    match vlapic.accept(vector, Trigger::Level) {
+        Accepted::Requested | Accepted::Coalesced => trace!(
+            "vlapic: {} received level {vector}, owing real hardware an acknowledgement",
+            vlapic.index()
+        ),
+        refused => {
+            // The guest was not given it and will therefore never acknowledge
+            // it, so the only thing that could ever have discharged the debt
+            // does not exist. Settling here is what stops a refused interrupt
+            // occupying a real in-service slot for the life of the machine,
+            // blocking everything of its priority or lower on this processor.
+            vlapic.ledger().release(vector);
+            trace!(
+                "vlapic: {} received level {vector} but is not accepting it: {refused:?}",
+                vlapic.index()
+            );
+        }
     }
     Ok(())
 }
@@ -479,6 +499,20 @@ pub fn observe_task_priority(priority: u8) {
     if let Ok(vlapic) = current() {
         vlapic.observe_task_priority(priority);
     }
+}
+
+/// The task priority this processor's guest has set.
+///
+/// The value the exit loop pushes into the control block's virtual task
+/// priority, so that a guest which wrote the emulated register through the
+/// page or a model-specific register finds its `CR8` answering the same
+/// number — the two are one register on real hardware and must stay one.
+///
+/// # Errors
+///
+/// As [`read_msr`].
+pub fn task_priority() -> Result<u8, VlapicError> {
+    current().map(|vlapic| vlapic.task_priority().get())
 }
 
 /// Records whether this processor has stopped looking at its controller.
