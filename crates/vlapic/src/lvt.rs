@@ -29,7 +29,7 @@
 use bitfield_struct::bitfield;
 use descriptors::Vector;
 
-use crate::register::Register;
+use crate::{model::Model, register::Register};
 
 #[bitfield(u32)]
 #[derive(PartialEq, Eq)]
@@ -112,10 +112,14 @@ pub(crate) enum Delivery {
 impl Delivery {
     /// The mode this encoding names, or `None` for one no entry accepts.
     ///
-    /// Refusing rather than substituting is the point: a reserved delivery mode
-    /// written into a real controller has undefined behaviour, so a guest that
-    /// writes one is told nothing was stored rather than quietly given a mode
-    /// it did not ask for.
+    /// A reserved encoding is retained rather than rejected: the field is
+    /// writable in every entry that has one, so a guest that writes a reserved
+    /// mode reads it back, exactly as it would from hardware. What refuses it
+    /// is everything downstream — nothing decodes it to a mode, and a
+    /// source holding one is programmed masked rather than programmed with
+    /// a delivery mode real hardware calls undefined. Every caller of this
+    /// therefore has to handle `None`, and handling it means delivering
+    /// nothing.
     pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
         match bits {
             0b000 => Some(Self::Fixed),
@@ -179,19 +183,26 @@ pub(crate) enum Entry {
 }
 
 impl Entry {
-    /// How many entries the local vector table has.
+    /// How many entries the local vector table has at most.
+    ///
+    /// How many a particular controller has is [`Model::max_lvt`]'s to say, and
+    /// is usually fewer: three of these are optional. This is the size of the
+    /// array they are stored in and the largest a model may claim.
     pub(crate) const COUNT: usize = 7;
 
-    /// One less than [`Entry::COUNT`], which is the form the version register
-    /// reports it in — so that a controller always has at least one entry and
-    /// the field cannot wrap. Written as a byte because that is the width of
-    /// the field, and checked against the count below.
-    pub(crate) const MAX_INDEX: u8 = 6;
+    /// How few a controller may have.
+    ///
+    /// The version register reports one less than the count, so a controller
+    /// with none could not describe itself. Every controller has at least the
+    /// timer.
+    pub(crate) const FEWEST: usize = 1;
 
     /// Every entry, in the order the architecture counts them.
     ///
-    /// The version register reports one less than this length, so the position
-    /// of an entry here is architectural rather than an implementation detail.
+    /// A controller has exactly the first however-many of these, so the
+    /// position of an entry here is architectural rather than an
+    /// implementation detail — it is what decides whether a given
+    /// controller has the entry at all.
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Timer,
         Self::Lint0,
@@ -236,45 +247,50 @@ impl Entry {
             .find(|entry| entry.register() == register)
     }
 
-    /// Which bits of this entry software may set. Everything else is reserved
-    /// in it and is dropped from a write rather than stored.
+    /// Which bits of this entry software may set, in this model. Everything
+    /// else is reserved in it and is dropped from a write rather than
+    /// stored.
     ///
     /// The delivery-status and remote-IRR bits are absent from every answer:
     /// both are the controller's to report, and letting a guest write either
     /// would let it claim a delivery that never happened or retire one that is
     /// still outstanding.
-    pub(crate) const fn writable(self) -> u32 {
+    ///
+    /// The error entry is the one whose shape depends on the model rather than
+    /// only on the entry, which is why this takes one: its message type is
+    /// writable on AMD and reserved on Intel.
+    pub(crate) const fn writable(self, model: Model) -> u32 {
+        let delivery = if model.has_delivery(self) {
+            WRITABLE_DELIVERY
+        } else {
+            0
+        };
         WRITABLE_COMMON
+            | delivery
             | match self {
                 Self::Timer => WRITABLE_TIMER_MODE,
-                Self::Lint0 | Self::Lint1 => WRITABLE_DELIVERY | WRITABLE_PIN,
-                Self::Error => 0,
-                Self::Performance | Self::Thermal | Self::CorrectedMachineCheck => {
-                    WRITABLE_DELIVERY
-                }
+                Self::Lint0 | Self::Lint1 => WRITABLE_PIN,
+                _ => 0,
             }
     }
 
-    /// Whether this entry accepts that delivery mode.
+    /// Whether a register names a local vector table entry this model does not
+    /// have.
     ///
-    /// [`Delivery::Init`] and [`Delivery::External`] are refused everywhere but
-    /// the two pins. Both describe something arriving over a wire from outside
-    /// the processor, and neither means anything for a source the controller
-    /// raises itself.
-    pub(crate) const fn allows(self, delivery: Delivery) -> bool {
-        match delivery {
-            Delivery::Fixed => true,
-            Delivery::SystemManagement | Delivery::NonMaskable => self.has_delivery(),
-            Delivery::Init | Delivery::External => matches!(self, Self::Lint0 | Self::Lint1),
-        }
+    /// Asked of a register rather than of an entry because it is what decides
+    /// whether the register exists at all, and the answer has to be `false` for
+    /// every register that is not one of these to begin with.
+    pub(crate) fn absent(register: Register, model: Model) -> bool {
+        Self::of(register).is_some_and(|entry| !model.has(entry))
     }
 
-    /// Whether this entry has a delivery-mode field at all.
+    /// Whether this entry describes a wire into the processor.
     ///
-    /// The timer and error entries do not: bits 10:8 are reserved in them and
-    /// their delivery is fixed by the architecture.
-    pub(crate) const fn has_delivery(self) -> bool {
-        !matches!(self, Self::Timer | Self::Error)
+    /// The two pins do, and nothing else does, which is what decides whether
+    /// the polarity and trigger-mode fields mean anything — and whether a
+    /// guest's trigger mode may be carried onto real hardware at all.
+    pub(crate) const fn is_pin(self) -> bool {
+        matches!(self, Self::Lint0 | Self::Lint1)
     }
 }
 
@@ -303,22 +319,23 @@ const DELIVERY_FIELD: u8 = 0b111;
 /// The same for the two-bit timer-mode field.
 const TIMER_MODE_FIELD: u8 = 0b11;
 
-/// Checks the parts of the layout that are silent when wrong: an entry that
-/// comes out of reset unmasked, a reserved encoding accepted as a delivery
-/// mode, or a reserved field left writable all produce a working controller
-/// that delivers the wrong thing.
-/// The reported entry count has to be the real one.
+/// Every entry the architecture defines has to be in the order it counts them,
+/// because a model with fewer than all of them keeps exactly the first however
+/// many — so a table shorter than the list would silently hand a guest an entry
+/// its controller does not have.
 const _: () = assert!(
-    Entry::MAX_INDEX as usize + 1 == Entry::COUNT,
-    "the version register must report the number of entries the table has"
+    Entry::ALL.len() == Entry::COUNT && Entry::FEWEST >= 1,
+    "the table must list every entry, and a controller must have at least one"
 );
 
 #[cfg(test)]
 mod tests {
     use descriptors::Vector;
 
-    use super::{Delivery, Entry, Lvt, TimerMode, WRITABLE_DELIVERY, WRITABLE_TIMER_MODE};
-    use crate::register::Register;
+    use super::{
+        Delivery, Entry, Lvt, TimerMode, WRITABLE_DELIVERY, WRITABLE_PIN, WRITABLE_TIMER_MODE,
+    };
+    use crate::{model, register::Register};
 
     #[test]
     fn reset_is_masked_and_nothing_more() {
@@ -355,29 +372,59 @@ mod tests {
     }
 
     #[test]
-    fn corrected_machine_check_refuses_init_and_external() {
-        let entry = Entry::CorrectedMachineCheck;
-        assert!(entry.allows(Delivery::Fixed));
-        assert!(entry.allows(Delivery::SystemManagement));
-        assert!(entry.allows(Delivery::NonMaskable));
-        assert!(!entry.allows(Delivery::Init));
-        assert!(!entry.allows(Delivery::External));
-    }
-
-    #[test]
-    fn the_timer_carries_no_delivery_mode() {
-        assert!(!Entry::Timer.has_delivery());
-        assert!(!Entry::Error.has_delivery());
-        assert_eq!(Entry::Timer.writable() & WRITABLE_DELIVERY, 0);
-        assert!(Entry::Timer.allows(Delivery::Fixed));
-        assert!(!Entry::Timer.allows(Delivery::NonMaskable));
+    fn only_the_pins_describe_a_wire() {
+        for entry in Entry::ALL {
+            assert_eq!(
+                entry.is_pin(),
+                matches!(entry, Entry::Lint0 | Entry::Lint1),
+                "{entry:?}"
+            );
+            let held = entry.writable(model::tests::AMD) & WRITABLE_PIN;
+            assert_eq!(held == WRITABLE_PIN, entry.is_pin(), "{entry:?}");
+        }
     }
 
     #[test]
     fn only_the_timer_may_set_the_timer_mode() {
         for entry in Entry::ALL {
-            let held = entry.writable() & WRITABLE_TIMER_MODE;
+            let held = entry.writable(model::tests::AMD) & WRITABLE_TIMER_MODE;
             assert_eq!(held == WRITABLE_TIMER_MODE, matches!(entry, Entry::Timer));
         }
+    }
+
+    #[test]
+    fn the_timer_carries_no_delivery_mode_on_either_vendor() {
+        for model in [model::tests::AMD, model::tests::INTEL] {
+            assert!(!model.has_delivery(Entry::Timer));
+            assert_eq!(Entry::Timer.writable(model) & WRITABLE_DELIVERY, 0);
+            assert!(model.allows(Entry::Timer, Delivery::Fixed));
+            assert!(!model.allows(Entry::Timer, Delivery::NonMaskable));
+        }
+    }
+
+    #[test]
+    fn the_error_entry_takes_a_message_type_on_amd_alone() {
+        let amd = model::tests::AMD;
+        let intel = model::tests::INTEL;
+        assert_eq!(Entry::Error.writable(amd) & WRITABLE_DELIVERY, {
+            WRITABLE_DELIVERY
+        });
+        assert_eq!(Entry::Error.writable(intel) & WRITABLE_DELIVERY, 0);
+        assert!(amd.allows(Entry::Error, Delivery::NonMaskable));
+        assert!(!intel.allows(Entry::Error, Delivery::NonMaskable));
+        // Neither vendor lets the error entry reach for a wire's modes.
+        assert!(!amd.allows(Entry::Error, Delivery::External));
+        assert!(!amd.allows(Entry::Error, Delivery::Init));
+    }
+
+    #[test]
+    fn corrected_machine_check_refuses_init_and_external() {
+        let model = model::tests::AMD;
+        let entry = Entry::CorrectedMachineCheck;
+        assert!(model.allows(entry, Delivery::Fixed));
+        assert!(model.allows(entry, Delivery::SystemManagement));
+        assert!(model.allows(entry, Delivery::NonMaskable));
+        assert!(!model.allows(entry, Delivery::Init));
+        assert!(!model.allows(entry, Delivery::External));
     }
 }

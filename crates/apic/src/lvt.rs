@@ -85,8 +85,15 @@ bitflags! {
     /// The bits of a local vector table entry that are not a field.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Bits: u32 {
+        /// A delivery from this source has been accepted and has not completed.
+        /// The controller's to set and clear; software cannot write it.
+        const SEND_PENDING = 1 << 12;
         /// The source asserts low rather than high. Only the two pins have it.
         const ACTIVE_LOW = 1 << 13;
+        /// A level-triggered interrupt from this pin is accepted and not yet
+        /// acknowledged. Only the two pins have it, and the controller
+        /// maintains it.
+        const REMOTE_IRR = 1 << 14;
         /// The source is level triggered rather than edge triggered. Only the
         /// two pins have it.
         const LEVEL = 1 << 15;
@@ -132,6 +139,61 @@ impl Entry {
         if matches!(trigger, Trigger::Level) {
             bits |= Bits::LEVEL.bits();
         }
+        Self(bits)
+    }
+
+    /// The same entry, delivering or not.
+    ///
+    /// Masking this way rather than by writing [`Entry::masked`] is what keeps
+    /// the rest of the entry — the delivery mode, the vector, and for the timer
+    /// the counting mode — in place across the change. A caller that only wants
+    /// a source to stop delivering must not also relinquish how it was
+    /// configured, because putting it back would then be a reconstruction
+    /// rather than a restoration.
+    #[must_use]
+    pub const fn delivering(self, delivering: bool) -> Self {
+        if delivering {
+            Self(self.0 & !Bits::MASKED.bits())
+        } else {
+            Self(self.0 | Bits::MASKED.bits())
+        }
+    }
+
+    /// Whether a delivery from this source is still in flight.
+    ///
+    /// The controller sets this from the moment it accepts the interrupt until
+    /// delivery completes, and software cannot write it. Anything reporting an
+    /// entry's state to somebody else has to read it from here rather than
+    /// remember it, because nothing tells software when it clears.
+    #[must_use]
+    pub const fn pending(self) -> bool {
+        self.0 & Bits::SEND_PENDING.bits() != 0
+    }
+
+    /// Whether a level-triggered interrupt from this pin has been accepted and
+    /// not yet acknowledged.
+    ///
+    /// Meaningless outside the two pins, and the controller's to maintain in
+    /// both: it is set when the interrupt is accepted and cleared by the
+    /// acknowledgement.
+    #[must_use]
+    pub const fn remote_irr(self) -> bool {
+        self.0 & Bits::REMOTE_IRR.bits() != 0
+    }
+
+    /// Whether this entry delivers nothing.
+    ///
+    /// Worth asking of an entry read back rather than one built here: hardware
+    /// sets this bit itself on the performance-counter source when the counter
+    /// it watches overflows, so an entry that was armed can be found masked
+    /// without anything having written it.
+    #[must_use]
+    pub const fn is_masked(self) -> bool {
+        self.0 & Bits::MASKED.bits() != 0
+    }
+
+    /// The entry a register holds.
+    pub(crate) const fn from_bits(bits: u32) -> Self {
         Self(bits)
     }
 

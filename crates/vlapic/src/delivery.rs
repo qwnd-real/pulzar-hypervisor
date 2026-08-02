@@ -50,8 +50,11 @@ use descriptors::Vector;
 use log::{trace, warn};
 
 use crate::{
+    error::Errors,
     icr::{Command, Delivery, DestinationMode, Shorthand, Trigger},
-    state::{Startup, Vlapic},
+    model::Arbitration,
+    priority, sources,
+    state::{Accepted, Startup, Vlapic},
 };
 
 /// Delivers a command the guest wrote to its interrupt command register.
@@ -63,6 +66,12 @@ use crate::{
 pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
     let mode = from.mode();
     let Some(delivery) = command.delivery(mode) else {
+        // Lowest priority is the one reserved encoding with an error of its own:
+        // the architecture has a controller that cannot send a redirectable
+        // interrupt say so, rather than merely doing nothing.
+        if command.wants_lowest_priority() {
+            from.errors().record(Errors::REDIRECTABLE_IPI);
+        }
         warn!(
             "vlapic: {} sent a command with a reserved delivery mode: {:#x}",
             from.index(),
@@ -70,6 +79,17 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
         );
         return;
     };
+    // Judged whole, before a single processor is named. A command the
+    // architecture does not define must not have reset, started or interrupted
+    // half the machine by the time that is noticed.
+    if !command.legal(mode) {
+        warn!(
+            "vlapic: {} sent a command no processor would send: {:#x}",
+            from.index(),
+            command.bits()
+        );
+        return;
+    }
     // A synchronisation message that reloads arbitration identifiers and does
     // nothing else. No processor this hypervisor runs on arbitrates over a bus,
     // so there is nothing for it to reload.
@@ -80,52 +100,87 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
         );
         return;
     }
+    // A vector no controller may deliver is the *sender's* error, and is caught
+    // before the targets are worked out. Recording it on the receivers instead
+    // would put the error on the wrong controllers — and on every one of them
+    // for a single malformed broadcast, so that one guest mistake contaminated
+    // the error status of the whole machine.
+    if matches!(delivery, Delivery::Fixed | Delivery::LowestPriority)
+        && !priority::legal(command.vector())
+    {
+        from.errors().record(Errors::SEND_ILLEGAL_VECTOR);
+        return;
+    }
 
-    let targets = resolve(from, lapics, command);
     match delivery {
-        // The chipset picks, and it picks by priority. Choosing the least busy
-        // of the named processors is what the architecture describes, and doing
-        // it here rather than declining is what keeps a guest that uses it from
-        // silently losing interrupts.
+        // The chipset picks, and it picks by priority. Which priority, and how a
+        // tie is broken, is the guest's own processor's rule rather than a
+        // universal one.
         Delivery::LowestPriority => {
-            if let Some(target) = least_busy(&targets) {
+            if let Some(target) = least_busy(from, targets(from, lapics, command)) {
                 accept(from, target, command.vector(), command.trigger());
             }
         }
         Delivery::Fixed => {
-            for target in targets.iter() {
+            for target in targets(from, lapics, command) {
                 accept(from, target, command.vector(), command.trigger());
             }
         }
+        // A non-maskable interrupt reaches a controller that is switched off or
+        // software-disabled, which is the whole of what makes it non-maskable —
+        // so it deliberately does not go through the acceptance that would
+        // refuse it.
         Delivery::NonMaskable => {
-            for target in targets.iter() {
+            for target in targets(from, lapics, command) {
                 target.raise_nmi();
                 nudge(from, target);
             }
         }
         Delivery::Init => {
-            for target in targets.iter() {
+            for target in targets(from, lapics, command) {
                 initialize(from, target);
             }
         }
         Delivery::Startup => {
-            for target in targets.iter() {
+            for target in targets(from, lapics, command) {
                 start(from, target, command.vector().number());
             }
         }
-        // Taking a processor into system-management mode is not something this
-        // hypervisor models, and a guest that asks for it is asking for
-        // firmware behaviour it cannot see the results of anyway.
+        // Deliberately not delivered, and this is a limitation of the machine
+        // Pulzar presents rather than an oversight.
+        //
+        // Forwarding one to the real processor would take the *host* into
+        // system-management mode over host state, running firmware's handler
+        // against a context it was not written for, and the guest would see
+        // nothing of it either way. Emulating one would need virtual
+        // system-management machinery — a separate mode, its own save state, its
+        // own memory aperture — that nothing in this hypervisor has.
+        //
+        // So the guest's interrupt command register cannot send this one thing,
+        // and a guest whose firmware or operating system relies on an SMI
+        // rendezvous will not get one.
         Delivery::SystemManagement => warn!(
-            "vlapic: {} sent a system-management interrupt, which is not delivered",
+            "vlapic: {} sent a system-management interrupt, which this machine does not deliver",
             from.index()
         ),
     }
 }
 
 /// Gives one processor an interrupt, and makes sure it notices.
+///
+/// A controller that is switched off or software-disabled refuses it, which is
+/// what a real one does — and it is refused at the target rather than filtered
+/// here, because whether a controller is accepting is the target's own state
+/// and may change between the two.
 fn accept(from: &Vlapic, target: &Vlapic, vector: Vector, trigger: Trigger) {
-    target.accept(vector, trigger);
+    if matches!(target.accept(vector, trigger), Accepted::Refused) {
+        trace!(
+            "vlapic: {} offered {vector} to {}, which is not accepting",
+            from.index(),
+            target.index()
+        );
+        return;
+    }
     nudge(from, target);
 }
 
@@ -138,18 +193,41 @@ fn accept(from: &Vlapic, target: &Vlapic, vector: Vector, trigger: Trigger) {
 /// The sender never needs one of these for itself: it is already outside the
 /// guest — it is executing this — and it consults its own controller before it
 /// goes back in.
+///
+/// A doorbell that could not be sent is retried, because the alternative is a
+/// processor that stalls until something unrelated happens to wake it — for a
+/// halted one, possibly never. The retry is bounded and the failure is recorded
+/// against the sender's error status afterwards: the architecture's nearest
+/// equivalent is a message no processor accepted, which is exactly what this
+/// is.
 fn nudge(from: &Vlapic, target: &Vlapic) {
     if target.index() == from.index() || !target.away() {
         return;
     }
-    if let Err(error) = crate::doorbell(target.index()) {
-        warn!(
-            "vlapic: {} could not interrupt {}: {error}",
-            from.index(),
-            target.index()
-        );
+    for _ in 0..DOORBELL_ATTEMPTS {
+        match crate::doorbell(target.index()) {
+            Ok(()) => return,
+            Err(error) => trace!(
+                "vlapic: {} could not interrupt {}, trying again: {error}",
+                from.index(),
+                target.index()
+            ),
+        }
     }
+    // The request itself is left published. It is real — the target will act on
+    // it at its next exit — and what has been lost is only the prompt that would
+    // have made that exit happen sooner.
+    from.errors().record(Errors::SEND_ACCEPT);
+    warn!(
+        "vlapic: {} left {} un-interrupted; it will not act until it exits for another reason",
+        from.index(),
+        target.index()
+    );
 }
+
+/// How many times a doorbell is tried before the target is left to notice on
+/// its own.
+const DOORBELL_ATTEMPTS: u32 = 3;
 
 /// Resets a processor and leaves it waiting to be started.
 fn initialize(from: &Vlapic, target: &Vlapic) {
@@ -213,44 +291,61 @@ fn forward(from: &Vlapic, target: &Vlapic, delivery: HardwareDelivery) {
     }
 }
 
-/// Which of the named processors is running at the lowest priority.
-fn least_busy<'a>(targets: &Targets<'a>) -> Option<&'a Vlapic> {
-    targets
-        .iter()
-        .min_by_key(|target| target.processor_priority().get())
+/// Which of the named processors a redirectable interrupt should go to.
+///
+/// The rule is the guest processor's own, and the two vendors disagree about
+/// both halves of it. AMD compares arbitration priorities, which count what a
+/// processor has merely been sent as well as what it is servicing, and gives a
+/// tie to the highest identifier. Intel's chipsets compared processor
+/// priorities, which count only what is in service, and left a tie to whichever
+/// answered first.
+///
+/// Neither picks a processor that is not accepting: a controller that is
+/// switched off or software-disabled would refuse the interrupt, and selecting
+/// it would lose the delivery for every eligible processor as well.
+fn least_busy<'a>(from: &Vlapic, targets: impl Iterator<Item = &'a Vlapic>) -> Option<&'a Vlapic> {
+    let eligible = targets.filter(|target| target.accepting());
+    match from.model().arbitration() {
+        Arbitration::AmdArbitrationPriority => eligible.min_by(|left, right| {
+            left.arbitration_priority()
+                .cmp(&right.arbitration_priority())
+                // A tie goes to the highest identifier, so the ordering is
+                // reversed on the key that breaks it: the minimum of the pair
+                // has to be the one that wins.
+                .then_with(|| right.apic_id().get().cmp(&left.apic_id().get()))
+        }),
+        Arbitration::ProcessorPriority => {
+            eligible.min_by_key(|target| target.processor_priority().get())
+        }
+    }
 }
 
 /// Which processors a command names.
 ///
+/// Streamed rather than collected, which is what lets a command name every
+/// processor on the machine however many there are. A fixed array would have to
+/// be sized for the largest machine and would silently drop targets on anything
+/// larger — a partial broadcast, which for a shootdown or a rendezvous is worse
+/// than none at all because the sender has no way to know.
+///
 /// A shorthand answers without looking at the destination field at all, which
 /// is the architecture's rule and not a shortcut: the destination *mode* is
 /// ignored too whenever one is used.
-fn resolve<'a>(from: &Vlapic, lapics: &'a [Vlapic], command: Command) -> Targets<'a> {
-    let mut targets = Targets::new();
-    match command.shorthand() {
-        Shorthand::Myself => {
-            if let Some(here) = lapics.get(from.index().get()) {
-                targets.push(here);
-            }
-        }
-        Shorthand::All => targets.extend(lapics.iter()),
-        Shorthand::Others => {
-            targets.extend(
-                lapics
-                    .iter()
-                    .filter(|target| target.index() != from.index()),
-            );
-        }
-        Shorthand::None => {
-            let destination = command.destination(from.mode());
-            targets.extend(
-                lapics
-                    .iter()
-                    .filter(|target| addresses(target, destination, command.destination_mode())),
-            );
-        }
-    }
-    targets
+fn targets<'a>(
+    from: &Vlapic,
+    lapics: &'a [Vlapic],
+    command: Command,
+) -> impl Iterator<Item = &'a Vlapic> {
+    let shorthand = command.shorthand();
+    let here = from.index();
+    let destination = command.destination(from.mode());
+    let mode = command.destination_mode();
+    lapics.iter().filter(move |target| match shorthand {
+        Shorthand::Myself => target.index() == here,
+        Shorthand::All => true,
+        Shorthand::Others => target.index() != here,
+        Shorthand::None => addresses(target, destination, mode),
+    })
 }
 
 /// Whether a destination names this processor.
@@ -317,55 +412,6 @@ fn broadcast(target: &Vlapic) -> u32 {
     }
 }
 
-/// The processors one command names.
-///
-/// A fixed array rather than a heap allocation, because this is built on the
-/// path a guest sends an interrupt on and that path must not allocate. Sized by
-/// the most processors this hypervisor will address, which a command naming
-/// more than is simply truncated at — and that is worth knowing about, so it is
-/// reported.
-struct Targets<'a> {
-    targets: [Option<&'a Vlapic>; MAX_TARGETS],
-    count: usize,
-}
-
-impl<'a> Targets<'a> {
-    /// No processors named yet.
-    const fn new() -> Self {
-        Self {
-            targets: [None; MAX_TARGETS],
-            count: 0,
-        }
-    }
-
-    /// Names one more.
-    fn push(&mut self, target: &'a Vlapic) {
-        if self.count >= MAX_TARGETS {
-            warn!(
-                "vlapic: a command named more than {MAX_TARGETS} processors; the rest are dropped"
-            );
-            return;
-        }
-        self.targets[self.count] = Some(target);
-        self.count += 1;
-    }
-
-    /// Names all of them.
-    fn extend(&mut self, named: impl Iterator<Item = &'a Vlapic>) {
-        for target in named {
-            self.push(target);
-        }
-    }
-
-    /// The processors named, in the order they were named.
-    fn iter(&self) -> impl Iterator<Item = &'a Vlapic> {
-        self.targets[..self.count].iter().copied().flatten()
-    }
-}
-
-/// How many processors one command may name.
-const MAX_TARGETS: usize = 256;
-
 /// Bits an x2APIC logical identifier's cluster is shifted by.
 const CLUSTER_SHIFT: u32 = 16;
 
@@ -422,36 +468,37 @@ pub(crate) fn settle(vlapic: &Vlapic) -> Resumption {
     }
 }
 
-/// Settles everything real hardware is owed an acknowledgement for, because the
-/// guest that owed it is about to stop existing.
+/// Quiets the machine behind a controller whose guest is being reset, and
+/// settles everything real hardware is owed.
 ///
-/// A level-triggered interrupt's real acknowledgement is deliberately withheld
-/// until the guest acknowledges its own — that is what stops the same interrupt
-/// arriving again the instant it is taken. A guest that has just been reset
-/// will never acknowledge anything, and the real controller would go on holding
-/// those vectors in service, refusing everything of their priority or lower on
-/// this processor for the rest of the machine's life. So the debt is settled
-/// here, which is the one place it is known that nobody else will settle it.
+/// Both halves matter and they are separate failures. A source left armed goes
+/// on delivering into a virtual processor that is reset and held — arrivals
+/// nothing will ever take, against a register file that has been cleared. And a
+/// level-triggered interrupt's real acknowledgement is deliberately withheld
+/// until the guest acknowledges its own, so a guest that has just been reset
+/// leaves debts nobody else will ever pay; the real controller would go on
+/// holding those vectors in service, refusing everything of their priority or
+/// lower on this processor for the rest of the machine's life.
 ///
 /// Called by the processor about itself, which is what makes acknowledging
 /// legitimate: an acknowledgement is to whichever controller the processor
 /// issuing it is running on.
 fn discharge(vlapic: &Vlapic) {
-    while let Some(vector) = vlapic.take_deferred() {
-        match apic::local().and_then(apic::LocalApic::end_of_interrupt) {
-            Ok(()) => trace!(
-                "vlapic: {} acknowledged {vector} on behalf of a guest that was reset",
-                vlapic.index()
-            ),
-            Err(error) => {
-                warn!(
-                    "vlapic: {} could not acknowledge {vector} for a guest that was reset: {error}",
-                    vlapic.index()
-                );
-                return;
-            }
-        }
+    let quiet = sources::quiesce(vlapic) & crate::timer::disarm(vlapic);
+    let settled = vlapic.ledger().settle();
+    if quiet && settled {
+        trace!(
+            "vlapic: {} quieted its sources and settled its debts for a guest that was reset",
+            vlapic.index()
+        );
+        return;
     }
+    warn!(
+        "vlapic: {} was reset with sources {} and acknowledgements {}",
+        vlapic.index(),
+        if quiet { "quiet" } else { "still armed" },
+        if settled { "settled" } else { "still owed" },
+    );
 }
 
 /// What a processor should do after its startup state has been settled.

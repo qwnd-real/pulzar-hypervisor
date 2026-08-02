@@ -7,6 +7,16 @@
 //! and picks this processor's row out of it on each access rather than there
 //! being one device per processor.
 //!
+//! # This face exists only while the controller is in the older mode
+//!
+//! The page is trapped once, before any guest runs, and cannot be untrapped
+//! while processors are executing — so the aperture outlives the mode it
+//! belongs to. Everything reaching it is therefore gated on the controller
+//! actually being in that mode, before an offset is decoded or an error
+//! recorded. A guest that has switched its controller off, or moved it to the
+//! model-specific registers, must not find a second way to reach the same
+//! registers.
+//!
 //! # What this face does that the other does not
 //!
 //! Nothing here can fault. Reaching a reserved address through the page is not
@@ -33,6 +43,7 @@ use emulate::{Commit, Data, Device, Read, Width, Write};
 
 use crate::{
     access,
+    base::Mode,
     register::{Access, Register},
     state::Vlapic,
 };
@@ -73,34 +84,27 @@ impl Page {
 
 impl Device for Page {
     fn read(&self, access: Read) -> Data {
-        let Some(vlapic) = self.current() else {
-            return Data::from_u64(0, access.width());
-        };
         let width = access.width();
-        let Some(register) = decode(vlapic, access.offset(), width) else {
+        let Some((vlapic, register)) = self.decode(access.offset(), width) else {
             return Data::from_u64(0, width);
         };
         // A write-only register answers zero rather than recording an error:
         // the architecture defines no error for reading one through this face,
         // and inventing one would be a guest told about something that did not
         // happen.
-        let value = match Access::of(register, vlapic.mode()) {
+        let value = match Access::of(register, vlapic.mode(), vlapic.model()) {
             Access::WriteOnly | Access::Absent => 0,
             Access::ReadOnly | Access::ReadWrite => access::read(vlapic, register),
         };
-        log::error!("DEBUGR off {:#x} -> {:#x}", register.offset(), value);
         Data::from_u64(u64::from(value), width)
     }
 
     fn write(&self, access: Write) -> Commit {
-        let Some(vlapic) = self.current() else {
-            return Commit::Discard;
-        };
-        let Some(register) = decode(vlapic, access.offset(), access.width()) else {
+        let Some((vlapic, register)) = self.decode(access.offset(), access.width()) else {
             return Commit::Discard;
         };
         if !matches!(
-            Access::of(register, vlapic.mode()),
+            Access::of(register, vlapic.mode(), vlapic.model()),
             Access::ReadWrite | Access::WriteOnly
         ) {
             // Writing a read-only register through this face does nothing and
@@ -112,7 +116,6 @@ impl Device for Page {
             reason = "the access was established to be exactly four bytes wide by `decode`"
         )]
         let value = access.value().as_u64() as u32;
-        log::error!("DEBUGW off {:#x} <- {:#x}", register.offset(), value);
         crate::acted(vlapic, access::write(vlapic, register, value));
         // Nothing the guest writes here reaches the hardware behind the page.
         // The page a guest sees is this hypervisor's answer, and the real
@@ -121,20 +124,47 @@ impl Device for Page {
     }
 }
 
-/// Which register an access names, or `None` if it names none.
-///
-/// A malformed access — one that is not four bytes, or not on a 128-bit
-/// boundary, or at an offset no register sits at — is one the architecture
-/// leaves undefined or explicitly calls an illegal register address. Both are
-/// answered the same way here, because the error the guest is entitled to be
-/// told about is the same one.
-fn decode(vlapic: &Vlapic, offset: u64, width: Width) -> Option<Register> {
-    let register = (width == Width::Long)
-        .then(|| Register::at(offset))
-        .flatten()
-        .filter(|register| Access::of(*register, vlapic.mode()) != Access::Absent);
-    if register.is_none() {
-        access::illegal_register(vlapic, Register::at(offset));
+impl Page {
+    /// Whose controller an access is for and which register it names, or `None`
+    /// if this face answers for it at all.
+    ///
+    /// The face itself is gated before any register is decoded, and that comes
+    /// first for a reason. This aperture is trapped once, before any guest
+    /// runs, and stays trapped for the life of the machine — but the
+    /// registers behind it exist only while the controller is in the older
+    /// mode. A guest that has switched its controller off, or moved it to
+    /// the model-specific registers, has no memory-mapped face at all, and
+    /// one that still answered would be two programming interfaces to one
+    /// controller at once: a globally disabled guest could go on sending
+    /// interprocessor interrupts, acknowledging real hardware and
+    /// reprogramming physical sources through a page the architecture says
+    /// is not there.
+    ///
+    /// Nothing is recorded for an access outside that mode either. The
+    /// illegal-register-address error belongs to a controller that has a
+    /// register page and was given a bad offset in it; a controller with no
+    /// page has not been given a bad offset, and inventing the error would
+    /// tell the guest about a fault in a face it is not using.
+    ///
+    /// A malformed access within the face — one that is not four bytes, or not
+    /// on a 128-bit boundary, or at an offset no register sits at — is one the
+    /// architecture leaves undefined or explicitly calls an illegal register
+    /// address. Both are answered the same way, because the error the guest is
+    /// entitled to be told about is the same one.
+    fn decode(&self, offset: u64, width: Width) -> Option<(&Vlapic, Register)> {
+        let vlapic = self.current()?;
+        if vlapic.mode() != Mode::XApic {
+            return None;
+        }
+        let register = (width == Width::Long)
+            .then(|| Register::at(offset))
+            .flatten()
+            .filter(|register| {
+                Access::of(*register, vlapic.mode(), vlapic.model()) != Access::Absent
+            });
+        if register.is_none() {
+            access::illegal_register(vlapic, Register::at(offset));
+        }
+        register.map(|register| (vlapic, register))
     }
-    register
 }

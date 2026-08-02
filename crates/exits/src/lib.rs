@@ -54,7 +54,7 @@ mod nested;
 
 use core::convert::Infallible;
 
-use inject::Pending;
+use inject::{Injected, Pending};
 use log::{error, info, trace};
 use partition::Partition;
 use portal::Portal;
@@ -279,8 +279,17 @@ impl<'a> Exits<'a> {
             self.left = Left::Held;
             return Flow::Leave;
         }
-        let candidate = vlapic::take_deliverable().unwrap_or(None);
-        self.interrupts.commit(vcpu, candidate);
+        // Selected and committed as two steps, because only the second knows
+        // whether the guest was actually given anything. The controller
+        // nominates the highest-priority vector it has and keeps it requested;
+        // the injection may then be declined — an event already part-way
+        // through delivery goes first, a non-maskable interrupt outranks it, the
+        // guest's interrupt window may be shut — and a controller that had
+        // already consumed the request would have thrown the interrupt away.
+        let candidate = vlapic::select().unwrap_or(None);
+        if let Injected::Interrupt(vector) = self.interrupts.commit(vcpu, candidate) {
+            let _ = vlapic::committed(vector);
+        }
         Flow::Resume
     }
 }

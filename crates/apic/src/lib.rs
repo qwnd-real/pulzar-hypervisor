@@ -449,6 +449,90 @@ impl LocalApic {
         Ok(access.read(Register::TRIGGER_MODE.offset_by(slot)) & bit != 0)
     }
 
+    /// Whether this processor has accepted `vector` and not yet acknowledged
+    /// it.
+    ///
+    /// The in-service bank is the controller's own record of what it is
+    /// holding, and it is the only authority on the question. Two callers
+    /// need it and they need it for opposite reasons: one that has withheld
+    /// an acknowledgement must know whether the vector it owes is still the
+    /// highest one held, because the acknowledgement register carries no
+    /// vector and retires whatever is; and a handler on a vector the
+    /// controller also uses for something of its own can tell a genuinely
+    /// accepted interrupt from a withdrawn one, since a withdrawn one is
+    /// never accepted and sets no bit here.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller is not up.
+    pub fn in_service(self, vector: Vector) -> Result<bool, ApicError> {
+        let access = register::access()?;
+        let (slot, bit) = trigger_place(vector);
+        Ok(access.read(Register::IN_SERVICE.offset_by(slot)) & bit != 0)
+    }
+
+    /// The highest-priority vector this processor is holding in service, if
+    /// any.
+    ///
+    /// Which is the one an acknowledgement would retire: the register takes no
+    /// vector, and the controller answers it by retiring the highest bit it
+    /// holds. Anything withholding an acknowledgement has to compare against
+    /// this before issuing one, or it retires an interrupt belonging to
+    /// somebody else.
+    ///
+    /// Highest-numbered is highest-priority, so one descending scan answers it.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller is not up.
+    pub fn in_service_top(self) -> Result<Option<Vector>, ApicError> {
+        let access = register::access()?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "eight slots of thirty-two bits is the whole of a vector's range, so neither the slot nor the bit can leave a byte"
+        )]
+        Ok((0..register::VECTOR_SLOTS).rev().find_map(|slot| {
+            let slot = slot as u32;
+            let word = access.read(Register::IN_SERVICE.offset_by(slot));
+            (word != 0).then(|| {
+                let bit = u32::BITS - 1 - word.leading_zeros();
+                Vector::new((slot * u32::BITS + bit) as u8)
+            })
+        }))
+    }
+
+    /// One of the controller's own sources, as the controller currently holds
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller is not up, or
+    /// [`ApicError::NoSuchLvt`] if this controller does not have the entry.
+    pub fn source(self, source: Source) -> Result<Entry, ApicError> {
+        let access = register::access()?;
+        let register = source.register();
+        if !register::has_lvt(register, register::lvt_entries(self.version()?)) {
+            return Err(ApicError::NoSuchLvt { which: source });
+        }
+        Ok(Entry::from_bits(access.read(register)))
+    }
+
+    /// How many local vector table entries this controller has.
+    ///
+    /// Between one and seven, and a controller with fewer than seven does not
+    /// merely leave the rest unused: the registers are absent, and naming one
+    /// is undefined through the page and a fault through the model-specific
+    /// registers. Anything describing this controller to somebody else — a
+    /// hypervisor handing a guest a local controller, above all — has to report
+    /// this number rather than the largest the architecture allows.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller is not up.
+    pub fn entries(self) -> Result<u32, ApicError> {
+        self.version().map(register::lvt_entries)
+    }
+
     /// Programs one of the controller's own sources.
     ///
     /// What a hypervisor passing the platform through needs in order to hand a
@@ -809,12 +893,30 @@ static CONTROLLER_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// What arrives when the controller withdraws an interrupt it had already begun
 /// to deliver.
 ///
-/// Always ours, whatever else the machine is doing: this vector is in the
-/// controller's own spurious vector register and nothing else can be told to
-/// deliver on it. It is deliberately not acknowledged, because it was never
+/// Not necessarily ours, and that is the whole of the care taken here. This
+/// vector is in the controller's own spurious vector register, but on a machine
+/// whose I/O controllers are passed through it is also a number something else
+/// may have been programmed to send — and the two are told apart by the one
+/// thing that distinguishes them in hardware. A withdrawn interrupt was never
+/// accepted, so it sets no in-service bit; anything that did set one was
+/// genuinely accepted and belongs to whoever programmed it.
+///
+/// A withdrawn one is deliberately not acknowledged, because it was never
 /// accepted — an acknowledgement here would retire whatever really is in
-/// service.
-fn spurious(_: &Interrupt) -> Disposition {
+/// service. One that was accepted is passed on, and acknowledging it is part of
+/// giving it to whoever it was for.
+///
+/// The two coinciding — a real withdrawal while an interrupt on the same vector
+/// is in service — reads as accepted and is passed on. That misattributes one
+/// arrival and cannot be told apart from the inside; nothing in the delivery
+/// carries its origin.
+fn spurious(interrupt: &Interrupt) -> Disposition {
+    if LocalApic(())
+        .in_service(interrupt.vector())
+        .unwrap_or(false)
+    {
+        return Disposition::Passed;
+    }
     if SPURIOUS_ARRIVALS.fetch_add(1, Ordering::Relaxed) == 0 {
         warn!("apic: spurious interrupt, counting any others");
     }
@@ -829,10 +931,22 @@ fn spurious(_: &Interrupt) -> Disposition {
 /// interprocessor interrupts silently is exactly the kind of fault that is
 /// impossible to find afterwards.
 ///
-/// The register is read on every arrival even where nothing is logged, because
-/// reading is what makes it report the next fault rather than the first one.
+/// As with [`spurious`], the vector is not exclusively ours on a machine that
+/// passes its I/O controllers through, and the discriminator is the error
+/// status register: an error latches it before the interrupt it raises is
+/// delivered, so an arrival finding nothing latched is one this controller did
+/// not raise. The register is read on every arrival even where nothing is
+/// logged, because reading is what makes it report the next fault rather than
+/// the first one.
+///
+/// The same coincidence [`spurious`] describes applies here in the other
+/// direction: a real error arriving alongside an interrupt something else sent
+/// on this vector reads as ours, and that arrival is consumed.
 fn errors(_: &Interrupt) -> Disposition {
     let errors = LocalApic::take_errors();
+    if errors == 0 {
+        return Disposition::Passed;
+    }
     if CONTROLLER_ERRORS.fetch_add(1, Ordering::Relaxed) == 0 {
         warn!("apic: controller reported errors {errors:#010b}, counting any others");
     }

@@ -37,6 +37,12 @@ pub(crate) struct Bitmap {
 }
 
 impl Bitmap {
+    /// How many vectors one of these describes, which is all of them.
+    ///
+    /// Worth naming because it bounds every loop that consumes bits: a caller
+    /// draining one cannot go round more times than there are bits to clear.
+    pub(crate) const CAPACITY: usize = SLOTS * PER_SLOT as usize;
+
     /// All clear, which is what reset leaves these.
     pub(crate) const fn new() -> Self {
         Self {
@@ -61,6 +67,12 @@ impl Bitmap {
         self.slots[slot].fetch_and(!bit, Ordering::AcqRel) & bit != 0
     }
 
+    /// Whether a vector's bit is set.
+    pub(crate) fn get(&self, vector: Vector) -> bool {
+        let (slot, bit) = place(vector);
+        self.slots[slot].load(Ordering::Acquire) & bit != 0
+    }
+
     /// The highest-priority vector with its bit set, if any.
     ///
     /// Highest-numbered is highest-priority: the upper nibble of a vector is
@@ -75,9 +87,22 @@ impl Bitmap {
 
     /// Takes the highest-priority vector with its bit set, clearing it.
     ///
-    /// One read-modify-write per attempt rather than a scan and then a clear,
-    /// because between those two another processor may set a higher bit and a
-    /// separate clear would take the wrong one.
+    /// A scan followed by a separate clear, retried until the clear is the one
+    /// that took the bit. The two are not one read-modify-write and cannot be:
+    /// finding the highest set bit spans eight independent words, and no single
+    /// atomic operation covers them. What the retry establishes is only that
+    /// the vector answered was really taken by this call and not by a
+    /// concurrent one; it does not establish that the vector answered was
+    /// the highest at any single instant, because a higher bit set during
+    /// the scan may be missed.
+    ///
+    /// That weaker guarantee is enough for the two callers this has, and both
+    /// rely on the same precondition: exactly one processor consumes from a
+    /// given bitmap, and nothing resets it concurrently. The in-service
+    /// register is consumed only by the processor the controller belongs
+    /// to, and the ledger only by the processor whose hardware owes the
+    /// debt. A second consumer, or a reset racing a take, would need a
+    /// different structure.
     pub(crate) fn take_highest(&self) -> Option<Vector> {
         loop {
             let vector = self.highest()?;

@@ -43,8 +43,10 @@ mod base;
 mod delivery;
 mod error;
 mod icr;
+mod ledger;
 mod lvt;
 mod mmio;
+mod model;
 mod msr;
 mod priority;
 mod register;
@@ -59,7 +61,7 @@ use core::num::NonZeroU64;
 use cpu::{CpuError, CpuIndex};
 use descriptors::{DescriptorError, Vector};
 use emulate::{Commit, Data, Device, Read, Region, Trap, Write};
-use log::{info, warn};
+use log::{info, trace, warn};
 use spin::Once;
 use thiserror::Error;
 use x86_64::PhysAddr;
@@ -67,10 +69,11 @@ use x86_64::PhysAddr;
 use crate::{
     access::Written,
     base::ApicBase,
+    error::Errors,
     icr::Trigger,
-    lvt::Entry,
     mmio::Page,
-    state::{Retired, Vlapic},
+    model::Model,
+    state::{Accepted, Transition, Vlapic},
 };
 pub use crate::{
     delivery::Resumption,
@@ -90,11 +93,19 @@ pub use crate::{
 /// the roster has not been taken, or [`VlapicError::Descriptors`] if no vector
 /// is free for the sources this crate programs onto real hardware.
 pub fn install() -> Result<(), VlapicError> {
+    // Asked before anything is acquired so that a second call is cheap and
+    // leaves nothing behind. It is not what makes this safe against two callers
+    // at once — nothing is, and nothing needs to be: this runs on the boot
+    // processor before any other processor exists.
+    if LAPICS.is_completed() {
+        return Err(VlapicError::AlreadyInstalled);
+    }
     let roster = cpu::roster()?;
     // Firmware lists the boot processor first, and the bootstrap flag in the
     // base register records which processor the machine came up on. Nothing
     // else in the roster distinguishes it.
     let bootstrap = roster.entries().first().map(cpu::Entry::apic_id);
+    let model = Model::of_machine();
     let lapics = roster
         .entries()
         .iter()
@@ -103,9 +114,17 @@ pub fn install() -> Result<(), VlapicError> {
                 entry.index(),
                 entry.apic_id(),
                 Some(entry.apic_id()) == bootstrap,
+                model,
             )
         })
         .collect();
+
+    // Everything that can fail happens before either cell is published. A page
+    // installed without a doorbell is a machine that can deliver an interrupt
+    // to a processor inside the guest and has no way to make it look — and
+    // because both cells are written once and never cleared, a failure between
+    // them would be permanent and a retry would find the page already there.
+    let doorbell = ipi::register(rung, merge)?;
 
     let mut built = false;
     let page = LAPICS.call_once(|| {
@@ -120,12 +139,11 @@ pub fn install() -> Result<(), VlapicError> {
     if !built {
         return Err(VlapicError::AlreadyInstalled);
     }
-    let doorbell = ipi::register(rung, merge)?;
     DOORBELL.call_once(|| doorbell);
     info!(
         "vlapic: {} emulated controllers, reported as version {:#x}",
         page.all().len(),
-        Vlapic::version()
+        page.all().first().map_or(0, Vlapic::version)
     );
     Ok(())
 }
@@ -203,33 +221,29 @@ pub fn write_msr(index: u32, value: u64) -> Result<(), VlapicError> {
 pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     let vlapic = current()?;
     let local = apic::local()?;
-    // One of the controller's own sources, which this crate programmed with a
-    // vector of its own precisely so that this test is possible. What the guest
-    // is owed is its vector for that entry, not the one it arrived on — and
-    // nothing at all if the guest has the entry masked, since it asked not to
-    // be told.
-    let guest = match sources::arrived_on(vector) {
-        Some(entry) => {
-            let programmed = vlapic.lvt(entry);
-            if programmed.masked() {
-                local.end_of_interrupt()?;
-                return Ok(());
-            }
-            programmed.vector()
-        }
-        None => vector,
-    };
-    let level = local.arrived_level(vector)?;
-    if level {
-        // The debt is recorded against the vector the *guest* will acknowledge,
-        // because that acknowledgement is what discharges it — and recorded
-        // before the guest is given the interrupt, so that a guest which
-        // acknowledges immediately finds the debt already there.
-        vlapic.defer_acknowledgement(guest);
-        vlapic.accept(guest, Trigger::Level);
-    } else {
-        vlapic.accept(guest, Trigger::Edge);
+    // Nothing is translated, and nothing has to be. Every source the guest can
+    // reach is programmed onto real hardware with the guest's own vector, so
+    // the number an interrupt arrived on is already the number the guest is
+    // owed — and a source the guest has masked was programmed masked and did
+    // not deliver at all.
+    if !local.arrived_level(vector)? {
+        vlapic.accept(vector, Trigger::Edge);
         local.end_of_interrupt()?;
+        return Ok(());
+    }
+    // The debt is recorded before the guest is given the interrupt, so that a
+    // guest which acknowledges immediately finds the debt already there.
+    vlapic.ledger().owe(vector);
+    if !matches!(
+        vlapic.accept(vector, Trigger::Level),
+        Accepted::Requested | Accepted::Coalesced
+    ) {
+        // The guest was not given it and will therefore never acknowledge it,
+        // so the only thing that could ever have discharged the debt does not
+        // exist. Settling here is what stops a refused interrupt occupying a
+        // real in-service slot for the life of the machine, blocking everything
+        // of its priority or lower on this processor.
+        vlapic.ledger().release(vector);
     }
     Ok(())
 }
@@ -264,10 +278,10 @@ pub fn describe(who: &str) {
             vlapic.task_priority(),
             vlapic.requested_count(),
             vlapic.in_service_count(),
-            if vlapic.owes_acknowledgement() {
-                ", owing hardware an acknowledgement"
-            } else {
+            if vlapic.ledger().is_empty() {
                 ""
+            } else {
+                ", owing hardware an acknowledgement"
             },
         );
         if let Some(vector) = vlapic.requested() {
@@ -372,18 +386,50 @@ pub fn running() -> Result<bool, VlapicError> {
     current().map(Vlapic::running)
 }
 
-/// The highest-priority interrupt this processor's guest should take now, moved
-/// from requested to in service.
+/// The highest-priority interrupt this processor's guest should take now, left
+/// where it is.
 ///
-/// Answers `None` when nothing is requested, or when what is requested does not
-/// outrank what the guest is already servicing. The caller must actually
-/// deliver whatever it is given: a vector taken here has already been moved.
+/// Answers `None` when nothing is requested, when what is requested does not
+/// outrank what the guest is already servicing, or when the controller is not
+/// in a state that delivers anything.
+///
+/// Nothing is consumed. Whether the guest can actually be given this is not the
+/// controller's to know — the processor may already have an event part-way
+/// through delivery, or a non-maskable interrupt that goes first, or an
+/// interrupt window that is shut — so the caller decides, and reports back
+/// through [`committed`]. A controller that moved a vector out of the request
+/// register for an injection that then did not happen would have thrown the
+/// interrupt away, and for a level-triggered one would have stranded the real
+/// acknowledgement owed for it as well.
 ///
 /// # Errors
 ///
 /// As [`read_msr`].
-pub fn take_deliverable() -> Result<Option<Vector>, VlapicError> {
-    current().map(Vlapic::take_deliverable)
+pub fn select() -> Result<Option<Vector>, VlapicError> {
+    current().map(Vlapic::select)
+}
+
+/// Records that the guest really has been given `vector`, moving it from
+/// requested to in service.
+///
+/// The other half of [`select`], and the only thing that consumes a request.
+/// Called once an injection is known to have happened.
+///
+/// # Errors
+///
+/// As [`read_msr`].
+pub fn committed(vector: Vector) -> Result<(), VlapicError> {
+    current().map(|vlapic| {
+        if !vlapic.committed(vector) {
+            // The request was withdrawn between the two halves, which a reset
+            // arriving in that window does. Nothing is put in service: the
+            // interrupt belonged to a guest that no longer exists.
+            trace!(
+                "vlapic: {} was given {vector}, which its controller no longer had requested",
+                vlapic.index()
+            );
+        }
+    })
 }
 
 /// Whether this processor's guest is owed a non-maskable interrupt, taking it
@@ -493,43 +539,80 @@ fn current() -> Result<&'static Vlapic, VlapicError> {
 pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
     match written {
         Written::Nothing => {}
-        Written::EndOfInterrupt => retire(vlapic),
-        Written::Timer => timer::reprogram(vlapic, sources::hardware_vector(Entry::Timer)),
-        Written::LocalVectorTable => sources::reprogram(vlapic),
-        Written::LogicalDestination => mirror_logical_destination(vlapic),
-        Written::ModeChanged => {
-            info!("vlapic: {} entered {}", vlapic.index(), vlapic.mode());
+        // The architecture defines acknowledging nothing as doing nothing, and
+        // discharging whatever real hardware was owed for it is part of the
+        // acknowledgement rather than something done after it.
+        Written::EndOfInterrupt => {
+            vlapic.end_of_interrupt();
         }
+        Written::Timer => {
+            timer::reprogram(vlapic);
+        }
+        // The one write that starts a counting timer. What it delivers and in
+        // which mode was settled when those registers were written, so this
+        // does not reconfigure anything — reconfiguring here is what would move
+        // the phase of a periodic tick on every unrelated write.
+        Written::TimerStarted => timer::reload(vlapic),
+        Written::TimerDeadline(deadline) => timer::arm_deadline(vlapic, deadline),
+        Written::LocalVectorTable => {
+            sources::reprogram(vlapic);
+        }
+        // Software-disabling masked every stored entry, and the timer is
+        // programmed from its own entry rather than with the rest, so both have
+        // to follow. Neither is disarmed: masking suppresses delivery and does
+        // not stop a count the guest may still be reading.
+        Written::Disabled => {
+            sources::reprogram(vlapic);
+            timer::reprogram(vlapic);
+        }
+        Written::LogicalDestination => mirror_logical_destination(vlapic),
+        Written::ModeChanged(transition) => entered(vlapic, transition),
         Written::Command(command) => match lapics() {
             Ok(page) => delivery::send(vlapic, page.all(), command),
             Err(error) => warn!("vlapic: a command could not be delivered: {error}"),
         },
+        // A guest sending itself an interrupt is the sender, so a vector no
+        // controller may deliver is its error to be told about rather than the
+        // receiver's — even though the two are the same controller here.
         Written::SelfIpi(vector) => {
-            vlapic.accept(vector, Trigger::Edge);
+            if priority::legal(vector) {
+                vlapic.accept(vector, Trigger::Edge);
+            } else {
+                vlapic.errors().record(Errors::SEND_ILLEGAL_VECTOR);
+            }
         }
     }
 }
 
-/// Retires the interrupt the guest says it has finished with, acknowledging
-/// real hardware if it was waiting for exactly this.
-fn retire(vlapic: &Vlapic) {
-    let Some(Retired {
-        vector,
-        acknowledge_hardware,
-    }) = vlapic.end_of_interrupt()
-    else {
-        // The architecture defines acknowledging nothing as doing nothing.
+/// Brings real hardware across a change of face, and says so.
+///
+/// The virtual half of the transition has already happened: sources were
+/// quieted, debts settled, and whatever the architecture does not preserve was
+/// reset. What is left is to program the machine from whatever the controller
+/// now holds — which for a controller that was reset means putting every source
+/// back to masked, and for one that merely changed how it is addressed means
+/// re-establishing the logical routing that passed-through interrupts are
+/// matched against.
+fn entered(vlapic: &Vlapic, transition: Transition) {
+    let Transition::Changed { quiet, settled } = transition else {
         return;
     };
-    if !acknowledge_hardware {
-        return;
-    }
-    if let Err(error) = apic::local().and_then(apic::LocalApic::end_of_interrupt) {
+    if !quiet || !settled {
+        // Worth a line rather than a trace: real hardware was left holding
+        // something across a boundary the guest believes cleared it, and that is
+        // a state nothing later in the guest's life will explain.
         warn!(
-            "vlapic: {} could not acknowledge {vector}: {error}",
-            vlapic.index()
+            "vlapic: {} changed face without fully settling hardware: sources {}, \
+             acknowledgements {}",
+            vlapic.index(),
+            if quiet { "quiet" } else { "still armed" },
+            if settled { "settled" } else { "still owed" },
         );
     }
+    mirror_logical_destination(vlapic);
+    sources::reprogram(vlapic);
+    timer::reprogram(vlapic);
+    info!("vlapic: {} entered {}", vlapic.index(), vlapic.mode());
 }
 
 /// Tells the real controller which logical destinations this processor answers

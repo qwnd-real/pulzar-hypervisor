@@ -23,7 +23,7 @@
 //! because their indices are reserved, and the self-interrupt register exists
 //! only in x2APIC because there is no offset it would sit at.
 
-use crate::base::Mode;
+use crate::{base::Mode, lvt::Entry, model::Model};
 
 /// One of the controller's registers, named by its offset in the memory-mapped
 /// page.
@@ -185,9 +185,15 @@ impl Access {
     /// be describing a machine this hypervisor cannot then deliver to — every
     /// passed-through interrupt is routed by the *real* identifier, which is
     /// not the guest's to move.
-    pub(crate) const fn of(register: Register, mode: Mode) -> Self {
+    pub(crate) fn of(register: Register, mode: Mode, model: Model) -> Self {
         let x2apic = matches!(mode, Mode::X2Apic);
         match register {
+            // An entry this controller does not have is not a register at all.
+            // Three of the seven are optional, the model takes its count from
+            // the hardware the sources actually live on, and a guest reaching
+            // one it was never told about must find nothing there rather than a
+            // register it can program and no source behind it.
+            _ if Entry::absent(register, model) => Self::Absent,
             Register::ID
             | Register::VERSION
             | Register::PROCESSOR_PRIORITY

@@ -25,8 +25,9 @@ use crate::{
     error::Errors,
     icr::Command,
     lvt::Entry,
+    priority,
     register::{Bank, Register},
-    state::Vlapic,
+    state::{Transition, Vlapic},
     timer,
 };
 
@@ -38,7 +39,7 @@ use crate::{
 pub(crate) fn read(vlapic: &Vlapic, register: Register) -> u32 {
     match register {
         Register::ID => vlapic.id_register(),
-        Register::VERSION => Vlapic::version(),
+        Register::VERSION => vlapic.version(),
         Register::TASK_PRIORITY => u32::from(vlapic.task_priority().get()),
         Register::ARBITRATION_PRIORITY => u32::from(vlapic.arbitration_priority().get()),
         Register::PROCESSOR_PRIORITY => u32::from(vlapic.processor_priority().get()),
@@ -85,11 +86,15 @@ pub(crate) fn write(vlapic: &Vlapic, register: Register, value: u32) -> Written 
             Written::LogicalDestination
         }
         Register::SPURIOUS => {
-            vlapic.set_spurious(value);
-            // Software-disabling a controller masks every entry, and the
-            // entries are programmed into real hardware, so the two have to be
-            // brought back into agreement.
-            Written::LocalVectorTable
+            // Software-disabling a controller is a transition rather than a
+            // flag: it masks every stored entry, and those entries are what
+            // real hardware is programmed from, so the sources and the timer
+            // both have to be brought back into agreement with them.
+            if vlapic.set_spurious(value) {
+                Written::Disabled
+            } else {
+                Written::LocalVectorTable
+            }
         }
         Register::END_OF_INTERRUPT => Written::EndOfInterrupt,
         Register::ERROR_STATUS => {
@@ -104,10 +109,21 @@ pub(crate) fn write(vlapic: &Vlapic, register: Register, value: u32) -> Written 
             Written::Nothing
         }
         Register::SELF_IPI => Written::SelfIpi(Vector::new(vector_of(value))),
+        // The write the architecture defines as starting a counting timer, and
+        // the only one that does. Ignored entirely in deadline mode, where the
+        // count registers stop meaning anything.
         Register::TIMER_INITIAL_COUNT => {
-            vlapic.set_timer_initial(value);
-            Written::Timer
+            if vlapic.set_timer_initial(value) {
+                Written::TimerStarted
+            } else {
+                Written::Nothing
+            }
         }
+        // How fast the timer counts, which is configuration and not a start. A
+        // guest that rewrites the divide — including writing back the value
+        // already there, which operating systems do — has not asked for the
+        // count to be reloaded, and reloading it would let a guest postpone its
+        // own expiry indefinitely by touching an unrelated register.
         Register::TIMER_DIVIDE => {
             vlapic.set_timer_divide(value);
             Written::Timer
@@ -126,24 +142,33 @@ fn read_indexed(vlapic: &Vlapic, register: Register) -> u32 {
             Bank::InterruptRequest => vlapic.request_slot(slot),
         };
     }
-    Entry::of(register).map_or(0, |entry| vlapic.lvt(entry).into_bits())
+    Entry::of(register)
+        .filter(|entry| vlapic.model().has(*entry))
+        .map_or(0, |entry| vlapic.lvt_readback(entry).into_bits())
 }
 
 /// As [`read_indexed`]. Only the local-vector-table entries are writable; the
 /// three banks are read-only and the faces above refuse a write to them.
 fn write_indexed(vlapic: &Vlapic, register: Register, value: u32) -> Written {
-    match Entry::of(register) {
-        Some(entry) => {
-            vlapic.write_lvt(entry, value);
-            match entry {
-                // The timer's entry carries the mode it counts in, so writing
-                // it can change what the real timer is doing — though not, on
-                // its own, start it.
-                Entry::Timer => Written::Timer,
-                _ => Written::LocalVectorTable,
-            }
-        }
-        None => Written::Nothing,
+    let Some(entry) = Entry::of(register).filter(|entry| vlapic.model().has(*entry)) else {
+        return Written::Nothing;
+    };
+    vlapic.write_lvt(entry, value);
+    // An illegal vector is an error the architecture reports whether or not the
+    // entry is masked — but only for an entry that would actually deliver one.
+    // Every other delivery mode is an event the processor takes by its own
+    // entry point and reads no vector for, so the field holds a number nothing
+    // will ever look at, and reporting an error about it would be reporting one
+    // the guest cannot act on and hardware would not have raised.
+    if vlapic.delivers_a_vector(entry) && !priority::legal(vlapic.lvt(entry).vector()) {
+        vlapic.errors().record(Errors::RECEIVE_ILLEGAL_VECTOR);
+    }
+    match entry {
+        // The timer's entry carries the mode it counts in, so writing it can
+        // change what the real timer is doing — though not, on its own, start
+        // it.
+        Entry::Timer => Written::Timer,
+        _ => Written::LocalVectorTable,
     }
 }
 
@@ -177,16 +202,27 @@ pub(crate) enum Written {
     /// The local vector table has changed and real hardware has to be brought
     /// into agreement with it.
     LocalVectorTable,
-    /// The timer's configuration has changed.
+    /// The guest software-disabled its controller, which masked every entry it
+    /// has and must now stop every source and the timer.
+    Disabled,
+    /// The timer's configuration has changed — what it delivers, in which mode,
+    /// at what rate. Not a request to start it.
     Timer,
+    /// The guest wrote the timer's initial count, which is the write that
+    /// starts a counting timer.
+    TimerStarted,
+    /// The guest armed its timer at a deadline.
+    TimerDeadline(u64),
     /// Which logical destinations this processor answers to has changed, and
     /// the real controller has to be told, because hardware matches passed
     /// through interrupts against the real register rather than against this
     /// one.
     LogicalDestination,
-    /// The guest changed which face it reaches its controller through, which
-    /// reset every register and may mean the real controller has to follow.
-    ModeChanged,
+    /// The guest changed which face it reaches its controller through. The
+    /// virtual half of the transition is done; what it says is how much of the
+    /// physical half succeeded, and that real hardware now has to be programmed
+    /// from whatever the controller was left holding.
+    ModeChanged(Transition),
 }
 
 /// Records that the guest named a register the older face reserves.

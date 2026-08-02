@@ -24,16 +24,23 @@
 //!
 //! A guest may write any sixty-four bits it likes, and most of what the
 //! architecture says about them is of the form "this combination is not a
-//! command". Those rules are applied where the bits are decoded, so that a
-//! caller matching on [`Command::delivery`] has no invalid case left to handle:
-//! the two reserved delivery modes, lowest priority in x2APIC where it is
-//! reserved as well, and a start-up addressed to the processor that would have
-//! to send it all answer with nothing. Fields the hardware reads past are
-//! answered the same way — [`Command::trigger`] reports [`Trigger::Edge`] for
-//! everything but the one message above, [`Command::vector`] reports zero for
-//! the delivery modes that carry no vector, and [`Command::destination_mode`]
-//! reports [`DestinationMode::Physical`] whenever a shorthand has already named
-//! the targets.
+//! command". Those rules are applied here rather than at every caller, and they
+//! are in two places because they are two different kinds of rule.
+//!
+//! [`Command::delivery`] decodes the field: the two reserved encodings and
+//! lowest priority in x2APIC answer with nothing, because no mode is named.
+//! [`Command::legal`] judges the whole command — which shorthands a mode may be
+//! addressed with, which fields it must leave clear — and is asked before a
+//! single target is worked out. That order is the point of it: a command
+//! resolved first and judged afterwards has already reset or started some of
+//! the processors it named.
+//!
+//! Fields the hardware reads past are answered the same way.
+//! [`Command::trigger`] reports [`Trigger::Edge`] for everything but the one
+//! message above, [`Command::vector`] reports zero for the delivery modes that
+//! carry no vector, and [`Command::destination_mode`] reports
+//! [`DestinationMode::Physical`] whenever a shorthand has already named the
+//! targets.
 
 use descriptors::Vector;
 
@@ -65,6 +72,77 @@ impl Command {
         | LEVEL.mask()
         | TRIGGER.mask()
         | SHORTHAND.mask();
+
+    /// Which bits of the high half software may set through the memory-mapped
+    /// face.
+    ///
+    /// The destination is the top byte and everything below it is reserved. A
+    /// guest that writes one of those must read it back as zero, and the
+    /// destination arithmetic reads only the top byte anyway — so storing the
+    /// rest would be state that is wrong without being consulted, which is the
+    /// kind that survives until something starts consulting it.
+    pub(crate) const WRITABLE_HIGH: u32 = DESTINATION_XAPIC.mask();
+
+    /// Which bits the whole register may hold in x2APIC.
+    ///
+    /// Narrower than the memory-mapped face in exactly the places where the
+    /// older one kept bus-era fields. The delivery-status bit is gone, because
+    /// an x2APIC write does not return until the command has been accepted and
+    /// there is nothing to report; and level and trigger mode are gone with the
+    /// bus they described, which is why the INIT de-assert cannot be expressed
+    /// here at all.
+    ///
+    /// Reserved here means `RsvdZ`: writing a non-zero value into one is a
+    /// general protection fault rather than something quietly dropped.
+    pub(crate) const WRITABLE_X2APIC: u64 =
+        (VECTOR.mask() | DELIVERY.mask() | DESTINATION_MODE.mask() | SHORTHAND.mask()) as u64
+            | (u32::MAX as u64) << HALF;
+
+    /// Whether the command asks for a redirectable interrupt, whether or not
+    /// this face can send one.
+    ///
+    /// Asked separately from [`Command::delivery`] because the interesting case
+    /// is exactly the one that decodes to nothing: a controller in x2APIC has
+    /// no lowest-priority delivery, and the architecture has it record an
+    /// error of its own rather than treat the request as an unrecognised
+    /// encoding.
+    pub(crate) const fn wants_lowest_priority(self) -> bool {
+        DELIVERY.get(self.low()) == LOWEST_PRIORITY
+    }
+
+    /// Whether this is a command the architecture defines at all.
+    ///
+    /// Applied to the whole command before any target is worked out, which is
+    /// the difference between rejecting a command and half-performing one.
+    /// Every combination below is one the architecture either forbids
+    /// outright or leaves undefined, and a controller that resolved targets
+    /// for it first would have already reset, started or interrupted some
+    /// of them by the time it noticed.
+    pub(crate) const fn legal(self, mode: Mode) -> bool {
+        let Some(delivery) = self.delivery(mode) else {
+            return false;
+        };
+        match delivery {
+            // Both are events with no vector, and the architecture requires the
+            // field to be written as zero rather than merely ignoring it.
+            Delivery::SystemManagement | Delivery::Init
+                if VECTOR.get(self.low()) != 0 && !self.is_init_deassert() =>
+            {
+                false
+            }
+            // The synchronisation message is defined only as a broadcast to
+            // every processor including the sender. Addressed anywhere else it
+            // is not that message and is not anything else either.
+            Delivery::Init if self.is_init_deassert() => {
+                matches!(self.shorthand(), Shorthand::All)
+            }
+            // A start-up cannot be addressed to the processor that would have to
+            // send it, and the shorthands that include the sender are how that
+            // is expressed.
+            Delivery::Startup => !matches!(self.shorthand(), Shorthand::Myself | Shorthand::All),
+            _ => true,
+        }
+    }
 
     /// The command sixty-four bits describe, as x2APIC presents them.
     pub(crate) const fn from_bits(bits: u64) -> Self {
@@ -115,17 +193,13 @@ impl Command {
     /// something this mode cannot send.
     ///
     /// Two encodings are reserved outright and lowest priority is reserved in
-    /// x2APIC as well. A start-up is refused for a different reason: its
-    /// shorthand may only be none or all-excluding-self, since the processor a
-    /// start-up would reach is in no state to have sent one.
+    /// x2APIC as well. Everything else about whether the command makes sense —
+    /// which shorthands a mode may be addressed with, which fields it must
+    /// leave clear — belongs to [`Command::legal`], so that this stays a
+    /// decoding of the field rather than half of a rule stated in two
+    /// places.
     pub(crate) const fn delivery(self, mode: Mode) -> Option<Delivery> {
-        match (
-            Delivery::decode(DELIVERY.get(self.low()), mode),
-            self.shorthand(),
-        ) {
-            (Some(Delivery::Startup), Shorthand::Myself | Shorthand::All) => None,
-            (decoded, _) => decoded,
-        }
+        Delivery::decode(DELIVERY.get(self.low()), mode)
     }
 
     /// Which processors the command names without naming any.
@@ -503,18 +577,68 @@ mod tests {
         assert_eq!(others.shorthand(), Shorthand::Others);
         assert_eq!(others.destination_mode(), DestinationMode::Physical);
         assert_eq!(others.delivery(Mode::XApic), Some(Delivery::Fixed));
+    }
 
-        // A start-up may not be addressed to the processor sending it.
-        let myself = Command::from_bits(0x0004_0630);
-        assert_eq!(myself.shorthand(), Shorthand::Myself);
-        assert_eq!(myself.delivery(Mode::XApic), None);
-
-        let all = Command::from_bits(0x0008_0630);
-        assert_eq!(all.shorthand(), Shorthand::All);
-        assert_eq!(all.delivery(Mode::XApic), None);
+    #[test]
+    fn a_start_up_may_not_be_addressed_to_whoever_sends_it() {
+        for bits in [0x0004_0630, 0x0008_0630] {
+            let command = Command::from_bits(bits);
+            // Still decodes: what it asks for is a start-up either way, and it
+            // is the whole command that is refused rather than the field.
+            assert_eq!(command.delivery(Mode::XApic), Some(Delivery::Startup));
+            assert!(!command.legal(Mode::XApic));
+        }
 
         let rest = Command::from_bits(0x000C_0630);
         assert_eq!(rest.delivery(Mode::XApic), Some(Delivery::Startup));
+        assert!(rest.legal(Mode::XApic));
+    }
+
+    #[test]
+    fn the_vectorless_modes_must_be_sent_with_the_field_clear() {
+        // A system-management interrupt and an INIT, each carrying a vector the
+        // architecture requires to be zero.
+        for bits in [0x0000_0230_u64, 0x0000_0530] {
+            assert!(!Command::from_bits(bits).legal(Mode::XApic));
+        }
+        // The same two with the field clear.
+        for bits in [0x0000_0200_u64, 0x0000_0500] {
+            assert!(Command::from_bits(bits).legal(Mode::XApic));
+        }
+        // A non-maskable interrupt reads past the field rather than requiring
+        // it clear, so one carrying a number is still a command.
+        assert!(Command::from_bits(0x0000_0430).legal(Mode::XApic));
+    }
+
+    #[test]
+    fn the_synchronisation_message_is_only_ever_a_broadcast() {
+        // INIT de-assert addressed to everyone, which is the one form it has.
+        let all = Command::from_bits(0x0008_8500);
+        assert!(all.is_init_deassert());
+        assert!(all.legal(Mode::XApic));
+
+        // The same message addressed any other way is not that message.
+        for bits in [0x0000_8500_u64, 0x0004_8500, 0x000C_8500] {
+            let command = Command::from_bits(bits);
+            assert!(command.is_init_deassert());
+            assert!(!command.legal(Mode::XApic));
+        }
+    }
+
+    #[test]
+    fn the_wide_face_reserves_the_bus_era_fields() {
+        // Level and trigger mode, which x2APIC does not have.
+        assert_eq!(Command::WRITABLE_X2APIC & (1 << 14 | 1 << 15), 0);
+        // The delivery-status bit, which it does not have either.
+        assert_eq!(Command::WRITABLE_X2APIC & (1 << 12), 0);
+        // What it does have: vector, delivery mode, destination mode,
+        // shorthand, and the whole of the upper half for the destination.
+        assert_eq!(Command::WRITABLE_X2APIC, 0xFFFF_FFFF_000C_0FFF);
+    }
+
+    #[test]
+    fn the_high_half_keeps_only_the_destination() {
+        assert_eq!(Command::WRITABLE_HIGH, 0xFF00_0000);
     }
 
     #[test]

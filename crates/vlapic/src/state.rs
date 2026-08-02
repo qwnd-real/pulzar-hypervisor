@@ -25,6 +25,24 @@
 //!   register, or writes any of the registers its guest programs — because
 //!   those writes come out of that guest, which runs nowhere else.
 //!
+//! # Reset is the one thing that is not a single field
+//!
+//! Clearing the register file touches four bitmaps and a dozen registers, and
+//! it happens while other processors may be delivering into it. Without
+//! something to order them against each other, a level-triggered interrupt
+//! accepted half-way through could end up with its request bit surviving and
+//! its trigger-mode bit cleared — which is a level interrupt that will be
+//! treated as an edge one, and so a real acknowledgement that is never issued
+//! and a line that never fires again.
+//!
+//! [`Vlapic::epoch`] is what orders them. It counts resets, and is odd exactly
+//! while one is in progress. A deliverer publishes into the register file and
+//! then checks that the count did not move underneath it; if it did, it
+//! publishes again into the state the reset left. That is deliberately a retry
+//! rather than a withdrawal: an interrupt racing a reset arrived at a moment
+//! nothing distinguishes from just after it, and just after it is when the new
+//! guest is entitled to see it.
+//!
 //! # What the guest may not change
 //!
 //! The identifier is read-only, and not merely because recent processors made
@@ -42,8 +60,11 @@ use crate::{
     base::{ApicBase, BaseFault, Mode},
     error::{ErrorStatus, Errors},
     icr::{Command, Trigger},
-    lvt::{Entry, Lvt, TimerMode},
+    ledger::Ledger,
+    lvt::{Delivery, Entry, Lvt, TimerMode},
+    model::Model,
     priority::{self, Priority},
+    sources,
     vectors::Bitmap,
 };
 
@@ -52,6 +73,7 @@ use crate::{
 pub struct Vlapic {
     index: CpuIndex,
     apic_id: ApicId,
+    model: Model,
     base: AtomicU64,
     request: Bitmap,
     in_service: Bitmap,
@@ -63,10 +85,10 @@ pub struct Vlapic {
     lvt: [AtomicU32; Entry::COUNT],
     timer_divide: AtomicU32,
     timer_initial: AtomicU32,
-    timer_deadline: AtomicU64,
     command: AtomicU64,
     errors: ErrorStatus,
-    deferred: Bitmap,
+    ledger: Ledger,
+    epoch: AtomicU64,
     startup: AtomicU8,
     sipi_vector: AtomicU32,
     away: AtomicBool,
@@ -76,10 +98,11 @@ pub struct Vlapic {
 
 impl Vlapic {
     /// A controller as a processor finds it coming out of reset.
-    pub(crate) fn new(index: CpuIndex, apic_id: ApicId, bootstrap: bool) -> Self {
+    pub(crate) fn new(index: CpuIndex, apic_id: ApicId, bootstrap: bool, model: Model) -> Self {
         let this = Self {
             index,
             apic_id,
+            model,
             base: AtomicU64::new(ApicBase::reset(bootstrap).bits()),
             request: Bitmap::new(),
             in_service: Bitmap::new(),
@@ -91,10 +114,10 @@ impl Vlapic {
             lvt: [const { AtomicU32::new(Entry::RESET) }; Entry::COUNT],
             timer_divide: AtomicU32::new(0),
             timer_initial: AtomicU32::new(0),
-            timer_deadline: AtomicU64::new(0),
             command: AtomicU64::new(0),
             errors: ErrorStatus::new(),
-            deferred: Bitmap::new(),
+            ledger: Ledger::new(),
+            epoch: AtomicU64::new(0),
             startup: AtomicU8::new(Startup::Running as u8),
             sipi_vector: AtomicU32::new(NO_SIPI),
             away: AtomicBool::new(false),
@@ -116,6 +139,11 @@ impl Vlapic {
         self.apic_id
     }
 
+    /// The controller this guest was told it has.
+    pub(crate) const fn model(&self) -> Model {
+        self.model
+    }
+
     /// Which face the guest is reaching this controller through.
     pub(crate) fn mode(&self) -> Mode {
         self.base().mode()
@@ -126,25 +154,61 @@ impl Vlapic {
         ApicBase::from_bits(self.base.load(Ordering::Acquire))
     }
 
-    /// Takes a write to the base register, and says what changed.
+    /// Takes a write to the base register, and says what it became.
     ///
-    /// A change of face is not merely a different way of naming the same
-    /// registers: the architecture keeps only the identifier across it and
-    /// leaves everything else to be programmed again. So the register file is
-    /// reset here, exactly as hardware would.
+    /// A change of face is a lifecycle boundary rather than a different way of
+    /// naming the same registers, and the physical hardware standing behind
+    /// this controller has to be brought across it before any virtual state
+    /// is touched. Sources are quieted and the timer stopped first, because
+    /// an entry left armed goes on delivering into a controller the guest
+    /// believes is switched off or freshly programmed; and every
+    /// acknowledgement real hardware is owed is settled first, because the
+    /// tokens that would have discharged them are about to be deleted.
+    ///
+    /// Which virtual state survives depends on which transition it is, and the
+    /// two are not alike. Entering x2APIC from the older face preserves
+    /// everything the architecture says it preserves — the priorities, what is
+    /// requested and in service, the table, the errors — because a guest doing
+    /// it is changing how it addresses its controller and not asking for a new
+    /// one. Switching the controller off is the other thing entirely, and
+    /// leaves the register file as reset leaves it.
     ///
     /// # Errors
     ///
     /// Whatever the transition refused: a reserved bit, a state that cannot be
     /// reached from this one, or an attempt to move the register page.
-    pub(crate) fn write_base(&self, value: u64) -> Result<Mode, BaseFault> {
+    pub(crate) fn write_base(&self, value: u64) -> Result<Transition, BaseFault> {
         let current = self.base();
-        let next = current.written(value)?;
+        let next = current.written(value, self.model)?;
+        if next.mode() == current.mode() {
+            // Not a transition. Software that reads the register, changes a
+            // field it is entitled to and writes it back has asked for nothing
+            // to happen, and nothing does.
+            self.base.store(next.bits(), Ordering::Release);
+            return Ok(Transition::Unchanged);
+        }
+        // Before anything virtual moves, and in this order: a source that is
+        // still armed can deliver into whatever comes next, and a debt that is
+        // still outstanding needs the register file that records it.
+        let quiet = sources::quiesce(self) & crate::timer::disarm(self);
+        let settled = self.ledger.settle();
+
         self.base.store(next.bits(), Ordering::Release);
-        if next.mode() != current.mode() {
+        if matches!(
+            (current.mode(), next.mode()),
+            (Mode::XApic, Mode::X2Apic) | (Mode::X2Apic, Mode::XApic)
+        ) {
+            // The two exceptions the architecture names. The logical destination
+            // stops being stored at all — x2APIC derives it from the identifier
+            // — and the destination half of the command register has no
+            // equivalent to carry over.
+            self.logical_destination.store(0, Ordering::Release);
+            self.command
+                .store(self.command().low().into(), Ordering::Release);
+        } else {
             self.reset_registers();
         }
-        Ok(next.mode())
+        Ok(Transition::Changed { quiet, settled })
     }
 
     /// The identifier register, in whichever shape the face in use gives it.
@@ -160,6 +224,11 @@ impl Vlapic {
 
     /// The version register.
     ///
+    /// The entry count is the real controller's, because the sources behind
+    /// those entries are the real ones. A guest told it has an entry its
+    /// hardware does not would be told about a source that can never fire and
+    /// handed a register that cannot be programmed.
+    ///
     /// End-of-interrupt broadcast suppression is deliberately reported as
     /// unsupported. The bit would let a guest ask that acknowledging a
     /// level-triggered interrupt not be broadcast to the I/O controllers — but
@@ -167,8 +236,8 @@ impl Vlapic {
     /// performed by real hardware when the real acknowledgement is issued, and
     /// nothing here can suppress it. Reporting it unsupported is what stops a
     /// guest asking for something that would then silently not happen.
-    pub(crate) const fn version() -> u32 {
-        (Entry::MAX_INDEX as u32) << MAX_LVT_SHIFT | VERSION_NUMBER
+    pub(crate) const fn version(&self) -> u32 {
+        self.model.max_lvt() << MAX_LVT_SHIFT | VERSION_NUMBER
     }
 
     /// Which logical destinations this controller answers to.
@@ -214,20 +283,52 @@ impl Vlapic {
         self.spurious.load(Ordering::Acquire)
     }
 
-    /// Takes a write to the spurious-interrupt vector register.
-    pub(crate) fn set_spurious(&self, value: u32) {
+    /// Takes a write to the spurious-interrupt vector register, and says
+    /// whether it switched the controller off.
+    ///
+    /// Software-disabling a controller is a transition and not a flag. The
+    /// architecture has it mask every local vector table entry, and it means
+    /// the stored entries themselves: a guest that disables its controller
+    /// and reads an entry back must see the mask bit set, and a guest that
+    /// re-enables it must have to unmask what it wants rather than finding
+    /// its old sources live again. Doing it to the stored values is also
+    /// what keeps real hardware honest, since that is what every source is
+    /// programmed from.
+    ///
+    /// What is deliberately kept is everything already requested or in service.
+    /// A disabled controller stops accepting; it does not retract what it has
+    /// already taken.
+    pub(crate) fn set_spurious(&self, value: u32) -> bool {
+        let was = self.software_enabled();
         self.spurious
             .store(value & SPURIOUS_WRITABLE, Ordering::Release);
+        let disabled = was && !self.software_enabled();
+        if disabled {
+            for entry in &self.lvt {
+                entry.fetch_or(MASKED, Ordering::AcqRel);
+            }
+        }
+        disabled
     }
 
     /// Whether the guest has software-enabled its controller.
     ///
     /// A software-disabled controller holds every local-vector-table entry
-    /// masked and refuses to unmask one, but keeps whatever is already
-    /// requested or in service and goes on answering interprocessor
-    /// interrupts.
+    /// masked and refuses to unmask one, and stops accepting anything new —
+    /// while keeping whatever is already requested or in service.
     pub(crate) fn software_enabled(&self) -> bool {
         self.spurious() & SOFTWARE_ENABLE != 0
+    }
+
+    /// Whether this controller is in a state that accepts interrupts at all.
+    ///
+    /// Both switches have to be on. A controller whose guest has cleared the
+    /// global enable has no controller as far as its guest is concerned, and
+    /// one that is merely software-disabled has stopped accepting — in both
+    /// cases an interrupt offered to it is one it must refuse rather than
+    /// hold.
+    pub(crate) fn accepting(&self) -> bool {
+        self.mode() != Mode::Disabled && self.software_enabled()
     }
 
     /// The task priority the guest has set.
@@ -263,8 +364,11 @@ impl Vlapic {
     }
 
     /// The arbitration priority, which exists only in the older face.
+    ///
+    /// Computed by the rule the guest's own processor follows, which is not the
+    /// same rule on both vendors and is visible to a guest that reads it.
     pub(crate) fn arbitration_priority(&self) -> Priority {
-        priority::arbitration_priority(
+        self.model.arbitration_priority(
             self.task_priority(),
             self.in_service.highest(),
             self.request.highest(),
@@ -272,8 +376,41 @@ impl Vlapic {
     }
 
     /// One local-vector-table entry as the guest last wrote it.
+    ///
+    /// What the guest programmed, which is what every source is programmed onto
+    /// real hardware from. A guest *reading* the register gets
+    /// [`Vlapic::lvt_readback`] instead, because three of the bits in it are
+    /// hardware's to report rather than software's to set.
     pub(crate) fn lvt(&self, entry: Entry) -> Lvt {
         Lvt::from_bits(self.lvt[entry.index()].load(Ordering::Acquire))
+    }
+
+    /// One local-vector-table entry as the guest reads it.
+    ///
+    /// Three bits of an entry are the controller's and not software's, and all
+    /// three are answered from the real entry rather than from anything stored
+    /// here — because the source behind the entry is the real one, and the real
+    /// controller is what maintains them.
+    ///
+    /// The delivery-status bit says a delivery from this source is still in
+    /// flight. The remote-IRR bit says a level-triggered interrupt from this
+    /// pin has been accepted and not yet acknowledged. And the mask bit is
+    /// not purely software's either: hardware sets it itself on the
+    /// performance-counter entry when the counter overflows, so a guest that
+    /// armed that source and reads it back unmasked would be told a source is
+    /// live that hardware has already stopped.
+    pub(crate) fn lvt_readback(&self, entry: Entry) -> Lvt {
+        let stored = self.lvt(entry);
+        let Some(source) = sources::source_of(entry) else {
+            return stored;
+        };
+        let Ok(real) = apic::local().and_then(|local| local.source(source)) else {
+            return stored;
+        };
+        stored
+            .with_send_pending(real.pending())
+            .with_remote_irr(entry.is_pin() && real.remote_irr())
+            .with_masked(stored.masked() || real.is_masked())
     }
 
     /// Takes a write to a local-vector-table entry, and answers with what the
@@ -283,19 +420,24 @@ impl Vlapic {
     /// bits the entry reserves are dropped rather than stored, and while the
     /// controller is software-disabled the mask bit cannot be cleared.
     pub(crate) fn write_lvt(&self, entry: Entry, value: u32) -> Lvt {
-        let mut kept = value & entry.writable();
+        let mut kept = value & entry.writable(self.model);
         if !self.software_enabled() {
             kept |= MASKED;
         }
-        // An illegal vector in an entry that delivers one is an error the
-        // architecture reports whether or not the entry is masked and whether
-        // or not anything ever arrives on it.
-        let written = Lvt::from_bits(kept);
-        if entry.has_delivery() && !priority::legal(written.vector()) {
-            self.errors.record(Errors::RECEIVE_ILLEGAL_VECTOR);
-        }
         self.lvt[entry.index()].store(kept, Ordering::Release);
-        written
+        Lvt::from_bits(kept)
+    }
+
+    /// Whether an entry, as it stands, would actually deliver a vector.
+    ///
+    /// Which is the only condition under which its vector field means anything.
+    /// Every other delivery mode is an event the processor takes by its own
+    /// architectural entry point and reads no vector for, so a number left in
+    /// the field is not a vector at all and reporting it as an illegal one
+    /// would be reporting an error about a field nothing reads.
+    pub(crate) fn delivers_a_vector(&self, entry: Entry) -> bool {
+        !self.model.has_delivery(entry)
+            || Delivery::from_bits(self.lvt(entry).delivery()) == Some(Delivery::Fixed)
     }
 
     /// How far the bus clock is divided before the timer counts it.
@@ -314,31 +456,26 @@ impl Vlapic {
         self.timer_initial.load(Ordering::Acquire)
     }
 
-    /// Sets what the timer counts down from, which is also what starts it.
-    pub(crate) fn set_timer_initial(&self, value: u32) {
-        self.timer_initial.store(value, Ordering::Release);
-    }
-
-    /// The timestamp the guest asked its timer to fire at.
+    /// Sets what the timer counts down from, and says whether the write took.
     ///
-    /// Meaningful only while the timer's entry selects deadline mode. In the
-    /// other two modes the architecture has this read as zero and ignores
-    /// writes, which is what [`Vlapic::set_timer_deadline`] enforces.
-    pub(crate) fn timer_deadline(&self) -> u64 {
-        self.timer_deadline.load(Ordering::Acquire)
-    }
-
-    /// Sets the timestamp the timer fires at, and says whether the write took.
-    ///
-    /// Refused unless the timer's entry selects deadline mode. Hardware ignores
-    /// the write in that case rather than faulting, so this is not an error.
-    pub(crate) fn set_timer_deadline(&self, value: u64) -> bool {
-        let deadline =
-            TimerMode::from_bits(self.lvt(Entry::Timer).timer_mode()) == Some(TimerMode::Deadline);
-        if deadline {
-            self.timer_deadline.store(value, Ordering::Release);
+    /// Refused in deadline mode, where the architecture has the count registers
+    /// stop meaning anything and ignores writes to them. Ignored rather than
+    /// faulted, and ignored completely: the value is not stored either, so a
+    /// guest that writes a count in deadline mode and later selects a counting
+    /// mode does not find the count it wrote waiting to start a timer it never
+    /// asked for.
+    pub(crate) fn set_timer_initial(&self, value: u32) -> bool {
+        if self.timer_mode() == Some(TimerMode::Deadline) {
+            return false;
         }
-        deadline
+        self.timer_initial.store(value, Ordering::Release);
+        true
+    }
+
+    /// Which mode the timer's entry selects, or `None` for the encoding the
+    /// architecture reserves.
+    pub(crate) fn timer_mode(&self) -> Option<TimerMode> {
+        TimerMode::from_bits(self.lvt(Entry::Timer).timer_mode())
     }
 
     /// The interrupt command register as it stands.
@@ -352,10 +489,16 @@ impl Vlapic {
     }
 
     /// Sets the destination half, which sends nothing on its own.
+    ///
+    /// Everything below the top byte is reserved in this half, and is dropped
+    /// rather than stored: a guest reading the register back must not find bits
+    /// the architecture says read as zero.
     pub(crate) fn set_command_high(&self, value: u32) {
         let low = self.command().low();
-        self.command
-            .store(Command::from_halves(low, value).bits(), Ordering::Release);
+        self.command.store(
+            Command::from_halves(low, value & Command::WRITABLE_HIGH).bits(),
+            Ordering::Release,
+        );
     }
 
     /// Sets the half whose write sends the command, and answers with the whole
@@ -377,6 +520,11 @@ impl Vlapic {
     /// The error status register and its write-then-read protocol.
     pub(crate) const fn errors(&self) -> &ErrorStatus {
         &self.errors
+    }
+
+    /// What real hardware is holding in service on this guest's behalf.
+    pub(crate) const fn ledger(&self) -> &Ledger {
+        &self.ledger
     }
 
     /// One slot of the interrupt-request register, as the guest reads it.
@@ -403,9 +551,16 @@ impl Vlapic {
     /// two decides whether an acknowledgement is owed to real hardware, and
     /// getting it wrong is a line that never fires again.
     ///
-    /// Answers whether the interrupt was newly requested. A vector already
-    /// requested and not yet accepted collapses into the one bit, exactly as
-    /// hardware does, and is not a second interrupt.
+    /// Both are published against the reset count, and republished if a reset
+    /// moved it. An interrupt that raced a reset is one whose moment is
+    /// indistinguishable from just after it, and just after it is when the
+    /// guest the reset produced is entitled to see it — so the retry
+    /// converges on the new state rather than leaving a half-written event
+    /// in the old one.
+    ///
+    /// Answers what became of it. A vector already requested and not yet
+    /// accepted collapses into the one bit, exactly as hardware does, and is
+    /// not a second interrupt.
     pub(crate) fn accept(&self, vector: Vector, trigger: Trigger) -> Accepted {
         // The controller never sets a request bit in the illegal range, and
         // records that it was asked to.
@@ -413,35 +568,76 @@ impl Vlapic {
             self.errors.record(Errors::RECEIVE_ILLEGAL_VECTOR);
             return Accepted::Illegal;
         }
-        match trigger {
-            Trigger::Level => self.trigger_mode.set(vector),
-            Trigger::Edge => self.trigger_mode.clear(vector),
-        };
-        if self.request.set(vector) {
-            Accepted::Coalesced
-        } else {
-            Accepted::Requested
+        // A controller that is switched off or software-disabled does not accept
+        // interrupts. The special messages that reach a disabled controller
+        // anyway — INIT, start-up, a non-maskable interrupt — do not come
+        // through here.
+        if !self.accepting() {
+            return Accepted::Refused;
+        }
+        loop {
+            let Some(epoch) = self.settled_epoch() else {
+                // A reset that never finishes is a broken invariant rather than
+                // contention, and spinning in a delivery path would take the
+                // sender down with it.
+                return Accepted::Refused;
+            };
+            match trigger {
+                Trigger::Level => self.trigger_mode.set(vector),
+                Trigger::Edge => self.trigger_mode.clear(vector),
+            };
+            let coalesced = self.request.set(vector);
+            if self.epoch.load(Ordering::SeqCst) == epoch {
+                return if coalesced {
+                    Accepted::Coalesced
+                } else {
+                    Accepted::Requested
+                };
+            }
         }
     }
 
-    /// The highest-priority interrupt the guest should take now, moved from
-    /// requested to in service.
+    /// The highest-priority interrupt the guest should take now, left where it
+    /// is.
+    ///
+    /// Deliberately does not consume anything. Whether the guest can actually
+    /// be given an interrupt is not this controller's to know — the
+    /// processor may have an event already being delivered, or a
+    /// non-maskable interrupt that outranks this, or a closed interrupt
+    /// window — and a controller that moved a vector out of the request
+    /// register for an injection that then did not happen would have lost
+    /// it. So this only nominates, and [`Vlapic::committed`] is what
+    /// accounts for one that went in.
     ///
     /// Answers `None` when nothing is requested, or when what is requested does
     /// not outrank what the guest is already servicing — in which case the
     /// request stays pending, which is what makes a task priority a filter
     /// rather than a discard.
-    ///
-    /// Called only by the processor this controller belongs to, which is the
-    /// only one that ever clears a request bit.
-    pub(crate) fn take_deliverable(&self) -> Option<Vector> {
-        let vector = self.request.highest()?;
-        if !priority::deliverable(vector, self.processor_priority()) {
+    pub(crate) fn select(&self) -> Option<Vector> {
+        if !self.accepting() {
             return None;
         }
-        self.request.clear(vector);
+        let vector = self.request.highest()?;
+        priority::deliverable(vector, self.processor_priority()).then_some(vector)
+    }
+
+    /// Records that the guest really has been given `vector`, moving it from
+    /// requested to in service.
+    ///
+    /// Called only after the injection has been established to have happened,
+    /// and only by the processor this controller belongs to — which is the only
+    /// one that ever clears a request bit.
+    ///
+    /// The request bit is cleared before the in-service bit is set, so that a
+    /// reader never sees the vector in neither register. Answers whether the
+    /// vector really was still requested: a reset between the selection and the
+    /// commitment leaves nothing to move, and nothing is then put in service.
+    pub(crate) fn committed(&self, vector: Vector) -> bool {
+        if !self.request.clear(vector) {
+            return false;
+        }
         self.in_service.set(vector);
-        Some(vector)
+        true
     }
 
     /// Whether anything is requested at all, whatever its priority.
@@ -449,39 +645,22 @@ impl Vlapic {
         self.request.highest()
     }
 
-    /// Acknowledges the interrupt the guest is servicing, and says whether real
-    /// hardware is still owed an acknowledgement for it.
+    /// Acknowledges the interrupt the guest is servicing, and says which it
+    /// was.
     ///
     /// Retires the highest in-service bit, which is the one the guest must have
     /// been handling: interrupts nest by priority, so the most recently taken
     /// is always the highest.
     ///
-    /// The answer is the whole of why level-triggered interrupts need care. An
-    /// edge-triggered interrupt was finished with the moment it was taken, and
-    /// the real controller was acknowledged then. A level-triggered one is
-    /// asserted until the guest's driver deals with whatever raised it, so the
-    /// real acknowledgement was deliberately withheld until now — and now is
-    /// when it is owed.
-    pub(crate) fn end_of_interrupt(&self) -> Option<Retired> {
+    /// Releasing the debt is part of the same operation rather than something a
+    /// caller does afterwards, because the two must not come apart: a guest's
+    /// acknowledgement is exactly the event that makes an acknowledgement to
+    /// real hardware permissible, and nothing else ever will be.
+    pub(crate) fn end_of_interrupt(&self) -> Option<Vector> {
         let vector = self.in_service.take_highest()?;
-        Some(Retired {
-            vector,
-            acknowledge_hardware: self.deferred.clear(vector),
-        })
-    }
-
-    /// Records that real hardware still holds `vector` in service, waiting for
-    /// this guest to finish with it.
-    pub(crate) fn defer_acknowledgement(&self, vector: Vector) {
-        self.deferred.set(vector);
-    }
-
-    /// Takes one vector real hardware is owed an acknowledgement for, if any.
-    ///
-    /// For the case where the acknowledgement will never come from the guest,
-    /// because the guest that was going to give it no longer exists.
-    pub(crate) fn take_deferred(&self) -> Option<Vector> {
-        self.deferred.take_highest()
+        self.trigger_mode.clear(vector);
+        self.ledger.release(vector);
+        Some(vector)
     }
 
     /// How many interrupts are requested and not yet taken.
@@ -492,11 +671,6 @@ impl Vlapic {
     /// How many the guest has taken and not yet acknowledged.
     pub(crate) fn in_service_count(&self) -> u32 {
         self.in_service.count()
-    }
-
-    /// Whether real hardware is owed an acknowledgement for anything.
-    pub(crate) fn owes_acknowledgement(&self) -> bool {
-        !self.deferred.is_empty()
     }
 
     /// Whether this processor has stopped looking at this controller.
@@ -545,11 +719,11 @@ impl Vlapic {
         self.nmi.swap(false, Ordering::AcqRel)
     }
 
-    /// Whether this hypervisor has taken this processor over.
+    /// Whether this hypervisor runs the processor this controller belongs to.
     ///
-    /// Until it has, the processor is running firmware's own code on real
+    /// Until it does, the processor is running firmware's own code on real
     /// hardware and a startup message aimed at it belongs on the real
-    /// controller. Once it has, the same message must be emulated, because
+    /// controller. Once it does, the same message must be emulated, because
     /// forwarding it would reset the host.
     pub(crate) fn owned(&self) -> bool {
         self.owned.load(Ordering::Acquire)
@@ -628,14 +802,17 @@ impl Vlapic {
     /// Everything an INIT leaves behind, which is everything but the
     /// identifier, the version and the face in use.
     ///
-    /// Also what a change of face leaves behind, for the same reason: the
-    /// architecture preserves the identifier across one and requires software
-    /// to program the rest again.
+    /// Bracketed by the reset count so that everything cleared here is cleared
+    /// as one step as far as any deliverer is concerned. A processor delivering
+    /// into this controller while it runs publishes against the count, sees it
+    /// move, and publishes again — so no interrupt is left with its request bit
+    /// set and its trigger mode cleared, which is the state that costs a real
+    /// acknowledgement and kills a line.
     pub(crate) fn reset_registers(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.request.reset();
         self.in_service.reset();
         self.trigger_mode.reset();
-        self.deferred.reset();
         self.task_priority.store(0, Ordering::Release);
         self.logical_destination.store(0, Ordering::Release);
         self.destination_format
@@ -646,10 +823,48 @@ impl Vlapic {
         }
         self.timer_divide.store(0, Ordering::Release);
         self.timer_initial.store(0, Ordering::Release);
-        self.timer_deadline.store(0, Ordering::Release);
         self.command.store(0, Ordering::Release);
         self.errors.reset();
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
+
+    /// The reset count, once no reset is in progress.
+    ///
+    /// Odd means one is running. `None` says one has been running for longer
+    /// than a reset can take, which is a broken invariant rather than
+    /// contention: a reset is a few dozen stores by a processor that is not
+    /// part-way through anything else.
+    fn settled_epoch(&self) -> Option<u64> {
+        (0..EPOCH_SPINS).find_map(|_| {
+            let epoch = self.epoch.load(Ordering::SeqCst);
+            if epoch.is_multiple_of(2) {
+                return Some(epoch);
+            }
+            core::hint::spin_loop();
+            None
+        })
+    }
+}
+
+/// How many times a deliverer re-reads a reset count that says a reset is
+/// running before giving up on it.
+const EPOCH_SPINS: u32 = 100_000;
+
+/// What a write to the base register did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transition {
+    /// The write named the state the register was already in, so nothing
+    /// happened and nothing has to be reconciled.
+    Unchanged,
+    /// The controller changed face, and the physical hardware behind it was
+    /// brought across.
+    Changed {
+        /// Whether every source really was quieted first.
+        quiet: bool,
+        /// Whether every acknowledgement real hardware was owed really was
+        /// settled first.
+        settled: bool,
+    },
 }
 
 /// What became of an interrupt offered to a controller.
@@ -661,16 +876,8 @@ pub(crate) enum Accepted {
     Coalesced,
     /// Named a vector no controller may deliver, and was refused.
     Illegal,
-}
-
-/// An interrupt the guest has finished with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Retired {
-    /// Which vector it was.
-    pub(crate) vector: Vector,
-    /// Whether the real controller is still holding it in service and is now
-    /// owed an acknowledgement.
-    pub(crate) acknowledge_hardware: bool,
+    /// Offered to a controller that is not accepting interrupts.
+    Refused,
 }
 
 /// What a processor is doing about being started and stopped.

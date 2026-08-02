@@ -176,126 +176,144 @@ impl Timer {
         Ok(())
     }
 
-    /// Arms the timer to fire on `vector` after `count` of its own ticks, once
-    /// or over and over.
+    /// Says what the timer delivers, in which mode, at which rate — and starts
+    /// nothing.
     ///
-    /// The entry is written before the count, because writing the count is what
-    /// starts it: the other order leaves a window in which the timer is running
-    /// towards an entry that still says whatever it said before.
+    /// Configuration and starting are separate operations because the
+    /// architecture makes them separate, and conflating them is not a shortcut
+    /// but a different timer. Writing the initial count is what starts a
+    /// counting timer, and writing the deadline is what arms a deadline one;
+    /// the entry and the divide say only what happens when whichever of
+    /// those is reached. Software that changes a vector, masks a source, or
+    /// selects a mode has not asked for the timer to restart, and a caller
+    /// that restarted it would move the phase of a periodic tick every time
+    /// the guest touched an unrelated field.
     ///
-    /// # Errors
-    ///
-    /// [`ApicError::IllegalVector`] for a vector no controller may deliver;
-    /// [`ApicError::ZeroCount`] for a count of zero, which the architecture
-    /// reads as "stopped" rather than as "immediately" and which would leave a
-    /// caller waiting for an interrupt that never comes;
-    /// [`ApicError::WrongTimerMode`] if [`Mode::Deadline`] was asked for, which
-    /// takes a deadline rather than a count; or [`ApicError::NotInstalled`] if
-    /// this processor's controller is not up.
-    pub fn arm(
-        self,
-        vector: Vector,
-        mode: Mode,
-        divisor: Divisor,
-        count: u32,
-    ) -> Result<(), ApicError> {
-        if !crate::deliverable(vector) {
-            return Err(ApicError::IllegalVector { vector });
-        }
-        if matches!(mode, Mode::Deadline) {
-            return Err(ApicError::WrongTimerMode);
-        }
-        if count == 0 {
-            return Err(ApicError::ZeroCount);
-        }
-        let access = crate::register::access()?;
-        // SAFETY: the divisor's encoding comes from the architecture's own
-        // table, the entry names a vector that has a gate like every other, and
-        // the count is a plain 32-bit value the timer counts down. The order is
-        // what keeps the timer from running against a stale entry.
-        unsafe {
-            access.write(Register::TIMER_DIVIDE, divisor.bits());
-            access.write(
-                Register::LVT_TIMER,
-                Entry::new(Delivery::Fixed(vector)).bits() | mode.bits(),
-            );
-            access.write(Register::TIMER_INITIAL_COUNT, count);
-        }
-        Ok(())
-    }
-
-    /// Starts the timer counting down from `from`, delivering nothing when it
-    /// gets there.
-    ///
-    /// The mask bit of a local vector table entry suppresses the interrupt and
-    /// nothing else. The count still runs and software can still read it, and
-    /// that is not a corner of the architecture worth being approximate about:
-    /// masking the entry, writing a count and watching it fall against a clock
-    /// it already trusts is how software measures what the timer's rate *is*.
-    /// A timer that stopped counting because its entry was masked would leave
-    /// that measurement waiting forever for a register that never moves.
-    ///
-    /// [`Timer::calibrate`] is this and a measurement around it. This is the
-    /// same thing without the measurement, for a caller doing the watching
-    /// itself — or, for a hypervisor, for a guest doing it.
-    ///
-    /// # Errors
-    ///
-    /// As [`Timer::arm`], less the vector: nothing is delivered, so there is no
-    /// vector to be illegal.
-    pub fn count_down(self, mode: Mode, divisor: Divisor, from: u32) -> Result<(), ApicError> {
-        if matches!(mode, Mode::Deadline) {
-            return Err(ApicError::WrongTimerMode);
-        }
-        if from == 0 {
-            return Err(ApicError::ZeroCount);
-        }
-        let access = crate::register::access()?;
-        // SAFETY: as `arm`, and one obligation lighter — a masked entry
-        // delivers nothing whatever the count reaches, so no gate has to exist
-        // for anything. The order is the same and for the same reason.
-        unsafe {
-            access.write(Register::TIMER_DIVIDE, divisor.bits());
-            access.write(Register::LVT_TIMER, Entry::masked().bits() | mode.bits());
-            access.write(Register::TIMER_INITIAL_COUNT, from);
-        }
-        Ok(())
-    }
-
-    /// Arms the timer to fire on `vector` when the timestamp counter passes
-    /// `deadline`.
+    /// `delivery` says both whether the entry delivers and what it delivers on.
+    /// `None` masks it, which suppresses the interrupt and nothing else: the
+    /// count goes on running and software can still read it, which is exactly
+    /// how software measures what the timer's rate is. A masked entry still
+    /// carries a vector, because a masked entry naming vector zero is a
+    /// configuration some processors report as an error, so the lowest vector
+    /// the platform may assign stands in and nothing is ever delivered on it.
     ///
     /// # Errors
     ///
     /// [`ApicError::IllegalVector`] for a vector no controller may deliver,
-    /// [`ApicError::NoTscDeadline`] if the processor does not implement the
-    /// mode, or [`ApicError::NotInstalled`] if this processor's controller is
-    /// not up.
-    pub fn arm_deadline(self, vector: Vector, deadline: u64) -> Result<(), ApicError> {
-        if !crate::deliverable(vector) {
+    /// [`ApicError::NoTscDeadline`] if [`Mode::Deadline`] was asked for on a
+    /// processor that does not implement it, or [`ApicError::NotInstalled`] if
+    /// this processor's controller is not up.
+    pub fn configure(
+        self,
+        delivery: Option<Vector>,
+        mode: Mode,
+        divisor: Divisor,
+    ) -> Result<(), ApicError> {
+        if let Some(vector) = delivery
+            && !crate::deliverable(vector)
+        {
             return Err(ApicError::IllegalVector { vector });
         }
+        if matches!(mode, Mode::Deadline) && !processor::features().contains(Features::TSC_DEADLINE)
+        {
+            return Err(ApicError::NoTscDeadline);
+        }
+        let entry = match delivery {
+            Some(vector) => Entry::new(Delivery::Fixed(vector)),
+            None => Entry::masked(),
+        };
+        let access = crate::register::access()?;
+        // SAFETY: the divisor's encoding comes from the architecture's own
+        // table, and the entry either names a vector that has a gate like every
+        // other or is masked and delivers nothing. Neither write starts
+        // anything: the count and the deadline are left exactly as they were.
+        unsafe {
+            access.write(Register::TIMER_DIVIDE, divisor.bits());
+            access.write(Register::LVT_TIMER, entry.bits() | mode.bits());
+        }
+        Ok(())
+    }
+
+    /// Starts a counting timer from `count`, against whatever
+    /// [`Timer::configure`] last said.
+    ///
+    /// This is the write the architecture defines as starting the timer, which
+    /// is why it is the only thing here that does. A count of zero stops it,
+    /// which is the architecture's own spelling and not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if this processor's controller is not up.
+    pub fn reload(self, count: u32) -> Result<(), ApicError> {
+        let access = crate::register::access()?;
+        // SAFETY: the count is a plain 32-bit value the timer counts down, and
+        // zero is the architectural way to say stopped. What it delivers when it
+        // gets there was settled by the entry, which this does not touch.
+        unsafe { access.write(Register::TIMER_INITIAL_COUNT, count) };
+        Ok(())
+    }
+
+    /// Arms the deadline the timer fires at, against whatever
+    /// [`Timer::configure`] last said.
+    ///
+    /// Zero is the architecture's way of spelling no deadline at all, and
+    /// disarms without disturbing the entry. Any other value is a moment; one
+    /// already past fires at once, which is defined and is the caller's to
+    /// intend.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NoTscDeadline`] if the processor does not implement the
+    /// mode.
+    pub fn set_deadline(self, deadline: u64) -> Result<(), ApicError> {
         if !processor::features().contains(Features::TSC_DEADLINE) {
             return Err(ApicError::NoTscDeadline);
         }
-        let access = crate::register::access()?;
-        // SAFETY: the entry names a vector with a gate, in a mode this processor
-        // reports implementing.
-        unsafe {
-            access.write(
-                Register::LVT_TIMER,
-                Entry::new(Delivery::Fixed(vector)).bits() | Mode::Deadline.bits(),
-            );
-        }
-        // Written after the entry, and it is what arms the timer: the
-        // architecture starts the deadline running on this write. A fence first,
-        // because the entry has to be in place before the deadline can be
-        // reached, and nothing but the ordering of these two guarantees it.
+        // The entry has to be in place before the deadline can be reached, and
+        // nothing but the ordering of the two guarantees it: this write is what
+        // starts the deadline running.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        // SAFETY: any value is a valid deadline; one already in the past fires
-        // at once, which is a defined outcome and the caller's to intend.
+        // SAFETY: any value is a valid deadline, and the processor was just
+        // established to implement the register.
         unsafe { Msr::new(IA32_TSC_DEADLINE).write(deadline) };
         Ok(())
+    }
+
+    /// The deadline the timer is counting towards, or zero if it is counting
+    /// towards none.
+    ///
+    /// Hardware clears the register when the deadline fires, so this is also
+    /// how to ask whether a deadline that was armed has since expired —
+    /// which is a question nothing else can answer, since the expiry
+    /// arrives as an ordinary interrupt carrying nothing about where it
+    /// came from.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NoTscDeadline`] if the processor does not implement the
+    /// mode.
+    pub fn deadline(self) -> Result<u64, ApicError> {
+        if !processor::features().contains(Features::TSC_DEADLINE) {
+            return Err(ApicError::NoTscDeadline);
+        }
+        // SAFETY: the processor was just established to implement the register,
+        // and reading it has no effect on what the timer is doing.
+        Ok(unsafe { Msr::new(IA32_TSC_DEADLINE).read() })
+    }
+
+    /// Which mode the timer is currently in, or `None` for the encoding the
+    /// architecture reserves.
+    ///
+    /// Read back rather than remembered because the answer decides whether a
+    /// deadline still means anything: changing the mode disarms the timer, so a
+    /// caller reconfiguring it has to know whether it is leaving deadline mode
+    /// in order to put the deadline register down as well.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if this processor's controller is not up.
+    pub fn mode(self) -> Result<Option<Mode>, ApicError> {
+        crate::register::access().map(|access| Mode::of(access.read(Register::LVT_TIMER)))
     }
 
     /// What the timer has left to count.

@@ -22,8 +22,11 @@ use descriptors::Vector;
 use crate::{
     access::{self, Written},
     base::ApicBase,
+    icr::Command,
+    lvt::{Entry, TimerMode},
     register::{Access, Register, X2APIC_BASE_MSR, X2APIC_LAST_MSR},
     state::Vlapic,
+    timer,
 };
 
 /// The timestamp counter deadline the timer fires at, which the architecture
@@ -54,11 +57,17 @@ pub(crate) fn read(vlapic: &Vlapic, index: u32) -> Result<u64, Fault> {
         return Ok(vlapic.base().bits());
     }
     if index == TSC_DEADLINE_MSR {
-        return Ok(vlapic.timer_deadline());
+        // Absent unless the processor reports it, and `CPUID` is passed through
+        // — so a guest told the feature does not exist finds the register does
+        // not exist either.
+        if !vlapic.model().deadline() {
+            return Err(Fault::NoSuchRegister);
+        }
+        return Ok(timer::deadline(vlapic));
     }
     let register = addressable(vlapic, index)?;
     if !matches!(
-        Access::of(register, vlapic.mode()),
+        Access::of(register, vlapic.mode(), vlapic.model()),
         Access::ReadOnly | Access::ReadWrite
     ) {
         return Err(Fault::WriteOnly);
@@ -82,23 +91,38 @@ pub(crate) fn write(vlapic: &Vlapic, index: u32, value: u64) -> Result<Written, 
     if index == ApicBase::MSR {
         return vlapic
             .write_base(value)
-            .map(|_| Written::ModeChanged)
+            .map(Written::ModeChanged)
             .map_err(Fault::Base);
     }
     if index == TSC_DEADLINE_MSR {
+        if !vlapic.model().deadline() {
+            return Err(Fault::NoSuchRegister);
+        }
         // Hardware ignores this write outside deadline mode rather than
-        // faulting, so a refusal here is not an error.
-        vlapic.set_timer_deadline(value);
-        return Ok(Written::Timer);
+        // faulting, so a refusal here is not an error — but it has to be a
+        // refusal and nothing else. Reporting a timer action for an ignored
+        // write is what would let a `WRMSR` the architecture discards go on to
+        // re-arm a timer.
+        if vlapic.timer_mode() != Some(TimerMode::Deadline) {
+            return Ok(Written::Nothing);
+        }
+        return Ok(Written::TimerDeadline(value));
     }
     let register = addressable(vlapic, index)?;
     if !matches!(
-        Access::of(register, vlapic.mode()),
+        Access::of(register, vlapic.mode(), vlapic.model()),
         Access::ReadWrite | Access::WriteOnly
     ) {
         return Err(Fault::ReadOnly);
     }
+    // The one register that is genuinely 64 bits wide, and the one whose
+    // reserved fields have to be judged before anything is stored: a write that
+    // must raise a fault must not first have sent an interrupt, reset a
+    // processor, or changed what a guest reads back.
     if register == Register::COMMAND_LOW {
+        if value & !Command::WRITABLE_X2APIC != 0 {
+            return Err(Fault::Reserved);
+        }
         return Ok(Written::Command(vlapic.set_command(value)));
     }
     // Everything else is a 32-bit register whose upper half is reserved.
@@ -110,20 +134,45 @@ pub(crate) fn write(vlapic: &Vlapic, index: u32, value: u64) -> Result<Written, 
         reason = "the upper half was just established to be zero"
     )]
     let narrow = value as u32;
-    // Two registers take a value at all only if it is zero, and fault on
-    // anything else. Acknowledging is not a value and neither is re-arming the
-    // error register; the architecture spells both as a write of zero.
-    if matches!(
-        register,
-        Register::END_OF_INTERRUPT | Register::ERROR_STATUS
-    ) && narrow != 0
-    {
+    // Reserved bits within the low half fault here rather than being dropped,
+    // which is the whole difference between the two faces: through the page a
+    // stray bit is quietly discarded, and through a model-specific register it
+    // is a general protection fault. Judged before the write, for the same
+    // reason the command register is.
+    if narrow & !writable(vlapic, register) != 0 {
         return Err(Fault::Reserved);
     }
     if register == Register::SELF_IPI {
         return Ok(Written::SelfIpi(Vector::new(vector_of(narrow))));
     }
     Ok(access::write(vlapic, register, narrow))
+}
+
+/// Which bits of a register's low half a guest in x2APIC may set.
+///
+/// Every one of these is `RsvdZ`, so this is the mask a write is judged against
+/// rather than masked with. Where the older face silently drops what software
+/// may not set, this face has to fault — and faulting requires knowing exactly
+/// which bits those are, per register, rather than only checking the upper
+/// half.
+fn writable(vlapic: &Vlapic, register: Register) -> u32 {
+    match register {
+        // Acknowledging is not a value and neither is re-arming the error
+        // register. The architecture spells both as a write of zero, so every
+        // bit of them is reserved.
+        Register::END_OF_INTERRUPT | Register::ERROR_STATUS => 0,
+        // Only the priority byte; the rest of the register is reserved.
+        Register::TASK_PRIORITY => TASK_PRIORITY,
+        // The vector and the bit that software-enables the controller.
+        Register::SPURIOUS => SPURIOUS,
+        // A vector, and nothing else: the delivery mode is fixed, the
+        // destination is this processor, and there is no shorthand to name.
+        Register::SELF_IPI => VECTOR,
+        // Three bits that are not adjacent — the middle one is reserved.
+        Register::TIMER_DIVIDE => TIMER_DIVIDE,
+        Register::TIMER_INITIAL_COUNT => u32::MAX,
+        other => Entry::of(other).map_or(u32::MAX, |entry| entry.writable(vlapic.model())),
+    }
 }
 
 /// The register an index names, if the guest may name it at all.
@@ -135,11 +184,26 @@ fn addressable(vlapic: &Vlapic, index: u32) -> Result<Register, Fault> {
         return Err(Fault::NotX2Apic);
     }
     let register = Register::from_msr(index).ok_or(Fault::NoSuchRegister)?;
-    match Access::of(register, vlapic.mode()) {
+    match Access::of(register, vlapic.mode(), vlapic.model()) {
         Access::Absent => Err(Fault::NoSuchRegister),
         _ => Ok(register),
     }
 }
+
+/// Only the priority byte of the task priority register holds anything.
+const TASK_PRIORITY: u32 = 0xFF;
+
+/// The spurious vector register's vector and its software-enable bit. Focus
+/// checking and end-of-interrupt broadcast suppression are both refused, and
+/// the version register reports the second unsupported.
+const SPURIOUS: u32 = 0x1FF;
+
+/// A vector is the low eight bits of whatever register carries one.
+const VECTOR: u32 = 0xFF;
+
+/// The timer's divide configuration: three bits with a reserved one between
+/// them.
+const TIMER_DIVIDE: u32 = 0b1011;
 
 /// The vector an eight-bit field of a wider value names.
 #[expect(

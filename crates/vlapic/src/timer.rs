@@ -1,33 +1,59 @@
 //! The guest's timer, which is the real timer.
 //!
 //! The local controller's timer is the one part of it that is not emulated at
-//! all. The guest's divide, count and mode are programmed straight onto the
-//! hardware and the hardware counts them, because there is nothing to be gained
-//! by counting them again in software: a timer is a decrementing register and a
-//! comparison, and this hypervisor has no reason to lie about either.
+//! all. The guest's vector, divide, count and mode are programmed straight onto
+//! the hardware and the hardware counts them, because there is nothing to be
+//! gained by counting them again in software: a timer is a decrementing
+//! register and a comparison, and this hypervisor has no reason to lie about
+//! either.
 //!
-//! # The vector is not the guest's
+//! Nothing else on the machine uses this processor's timer, which is what makes
+//! handing it over wholesale possible — and what makes the hardware registers
+//! the honest place to read the guest's timer state back from.
 //!
-//! What is *not* passed through is the vector. The real entry is programmed
-//! with a vector this hypervisor claimed for itself, and the guest's own vector
-//! is injected when one arrives.
+//! # Configuring a timer is not starting one
 //!
-//! That indirection is the whole reason the arrival is unambiguous. Vectors on
-//! this machine are shared between the guest's devices, the hypervisor's own
-//! interprocessor interrupts, and the controller's spurious and error vectors —
-//! so an interrupt arriving on a number the guest chose says nothing about who
-//! it was for. An interrupt arriving on a number only this module ever
-//! programmed says exactly one thing.
+//! The distinction runs through this whole module and it is the architecture's,
+//! not a refinement of it. Writing the entry says what the timer delivers and
+//! in which mode; writing the divide says how fast it counts; and neither
+//! starts anything. A counting timer starts when the initial count is written,
+//! and a deadline timer arms when the deadline is written.
 //!
-//! # Deadline mode
+//! Conflating them breaks a guest in ways that are hard to see and impossible
+//! to work around. A guest that masks its timer, or changes its vector, or
+//! writes the same divide back, has not asked for the count to restart — but a
+//! hypervisor that reprogrammed everything on every touch would move the phase
+//! of a periodic tick each time, resurrect a one-shot that had already fired,
+//! and re-arm a deadline the hardware had already cleared. Operating systems
+//! touch these registers constantly and rely on the ones they did not write
+//! standing still.
 //!
-//! In deadline mode the count registers stop meaning anything: writes to the
-//! initial count are ignored and the current count reads as zero. The deadline
-//! itself is a model-specific register the guest writes, which is intercepted
-//! and passed through, and the hardware disarms itself when it fires.
+//! # Masking is not cancelling
+//!
+//! The mask bit suppresses the interrupt and nothing else. The count still runs
+//! and software can still read it, and that is not a corner worth being
+//! approximate about: masking the entry, writing a count and watching it fall
+//! against a clock it already trusts is exactly how an operating system
+//! measures what its timer's rate is, and it is one of the first things it
+//! does.
+//!
+//! A masked deadline is the same rule seen from the other side. The deadline
+//! keeps running towards a moment that is fixed in absolute time; masking says
+//! only that nothing is delivered if it arrives while masked. A hypervisor that
+//! cleared the deadline register instead would lose an appointment the guest
+//! cannot re-derive.
+//!
+//! # Deadline mode reads and writes through hardware
+//!
+//! The deadline is not mirrored in this crate. Hardware clears the register
+//! when the deadline fires, and nothing about that expiry is visible anywhere
+//! else — the interrupt arrives as an ordinary vector carrying no hint of where
+//! it came from. A software copy would therefore go stale exactly once per
+//! expiry and would then be re-armed by the next reconfiguration, firing
+//! immediately from a moment already in the past. Reading the register is both
+//! simpler and the only thing that is correct.
 
-use apic::{Divisor, TimerMode as HardwareMode};
-use descriptors::Vector;
+use apic::{Divisor, LocalApic, TimerMode as HardwareMode};
 use log::warn;
 
 use crate::{
@@ -48,85 +74,133 @@ pub(crate) fn remaining(vlapic: &Vlapic) -> u32 {
         .unwrap_or(0)
 }
 
-/// Brings the real timer into agreement with what the guest has programmed.
+/// The deadline the guest's timer is counting towards.
 ///
-/// Called whenever the guest touches the timer's entry, its divide or its
-/// count. Which of those it touched does not matter: the whole configuration is
-/// short, and reprogramming all of it is both simpler and immune to a guest
-/// that writes the registers in an order nothing anticipated.
+/// Zero outside deadline mode, which is what the architecture requires of the
+/// read: the register means nothing in the counting modes and a guest reading
+/// it there must not be handed a value it could act on. Zero, too, once the
+/// deadline has fired, because that is what hardware leaves behind.
+pub(crate) fn deadline(vlapic: &Vlapic) -> u64 {
+    if mode_of(vlapic) != Some(TimerMode::Deadline) {
+        return 0;
+    }
+    apic::local()
+        .and_then(|local| local.timer().deadline())
+        .unwrap_or(0)
+}
+
+/// Brings the real timer's configuration into agreement with the guest's,
+/// starting nothing.
 ///
-/// Disarming rather than failing is the answer to everything unprogrammable
-/// here: a zero count, a mode the hardware does not offer, a deadline nobody
-/// has written. All of them mean there is nothing to count, and a timer left
-/// running would deliver an interrupt the guest is not owed.
+/// Called whenever the guest writes the timer's entry or its divide. What is
+/// deliberately absent is any write to the count or to the deadline: those are
+/// what start a timer, and neither of the registers this answers for is a
+/// request to start one.
 ///
-/// # A masked entry still counts
+/// The one thing it does put down is a deadline the guest has left behind by
+/// changing mode. A deadline belongs to deadline mode; carried across a mode
+/// change it would be a moment in the past waiting to fire the instant the
+/// guest came back.
 ///
-/// The mask bit suppresses the interrupt and nothing else, and getting that
-/// wrong stops an operating system dead. Masking the entry, writing a count and
-/// watching it fall against a clock it already trusts is exactly how software
-/// measures what its timer's rate is — it is the first thing an operating
-/// system does with the timer and it wants no interrupt while doing it. So a
-/// masked entry is programmed onto the hardware masked rather than disarmed,
-/// and the count the guest reads back is the real one falling at the real rate.
-pub(crate) fn reprogram(vlapic: &Vlapic, vector: Vector) {
-    let Ok(timer) = apic::local().map(apic::LocalApic::timer) else {
-        return;
+/// Answers whether the hardware agrees with the guest's entry afterwards.
+pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
+    let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        return false;
     };
     let entry = vlapic.lvt(Entry::Timer);
-    let count = vlapic.timer_initial();
-    let outcome = match counting(vlapic) {
-        // Deadline mode is armed by the model-specific register rather than by
-        // a count, so there is nothing to start here — but the entry still has
-        // to say deadline before a write to that register means anything. A
-        // masked one is left disarmed, because unlike the counting modes it
-        // leaves the guest nothing to read: the current count reads zero in
-        // deadline mode whatever the timer is doing.
-        None if mode_of(vlapic) == Some(TimerMode::Deadline) && !entry.masked() => {
-            arm_deadline(vlapic, vector)
-        }
-        // Deadline mode with nothing to deliver to, or the fourth encoding,
-        // which the architecture reserves and a controller given it does
-        // nothing with.
-        None => timer.disarm(),
-        // A zero count stops the timer in both counting modes rather than
-        // firing immediately.
-        Some(_) if count == 0 => timer.disarm(),
-        Some(mode) if entry.masked() => timer.count_down(mode, divisor(vlapic), count),
-        Some(mode) => timer.arm(vector, mode, divisor(vlapic), count),
+    let asked = mode_of(vlapic);
+    let was = timer.mode().unwrap_or(None);
+    let mode = match asked {
+        Some(TimerMode::OneShot) => HardwareMode::OneShot,
+        Some(TimerMode::Periodic) => HardwareMode::Periodic,
+        Some(TimerMode::Deadline) => HardwareMode::Deadline,
+        // The encoding the architecture reserves. A controller given it does
+        // nothing defined, so the timer is stopped and left delivering nothing.
+        None => return disarm(vlapic),
     };
-    if let Err(error) = outcome {
+    // Entering deadline mode leaves the timer disarmed until the guest writes a
+    // deadline, and leaving it puts down whatever was outstanding. Both are the
+    // same rule: a deadline only means something while the mode it belongs to is
+    // selected.
+    if (mode == HardwareMode::Deadline) != (was == Some(HardwareMode::Deadline))
+        && let Err(error) = timer.set_deadline(0)
+    {
         warn!(
-            "vlapic: {} could not program its timer: {error}",
+            "vlapic: {} could not put down its timer deadline: {error}",
+            vlapic.index()
+        );
+    }
+    let delivery = (!entry.masked())
+        .then(|| entry.vector())
+        .filter(|vector| crate::sources::arms(*vector));
+    match timer.configure(delivery, mode, divisor(vlapic)) {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                "vlapic: {} could not program its timer: {error}",
+                vlapic.index()
+            );
+            false
+        }
+    }
+}
+
+/// Starts the guest's timer counting from what it last wrote.
+///
+/// The one operation that starts a counting timer, and it is reached only from
+/// a write to the initial count — which is the write the architecture defines
+/// as starting one. A count of zero stops the timer rather than firing it,
+/// which is the architecture's own spelling and needs no special case here.
+pub(crate) fn reload(vlapic: &Vlapic) {
+    let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        return;
+    };
+    if let Err(error) = timer.reload(vlapic.timer_initial()) {
+        warn!(
+            "vlapic: {} could not start its timer: {error}",
             vlapic.index()
         );
     }
 }
 
-/// Arms the deadline the guest last wrote, if it has written one.
-fn arm_deadline(vlapic: &Vlapic, vector: Vector) -> Result<(), apic::ApicError> {
-    let timer = apic::local()?.timer();
-    match vlapic.timer_deadline() {
-        0 => timer.disarm(),
-        deadline => timer.arm_deadline(vector, deadline),
+/// Arms the guest's timer at the deadline it just wrote.
+pub(crate) fn arm_deadline(vlapic: &Vlapic, deadline: u64) {
+    let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        return;
+    };
+    if let Err(error) = timer.set_deadline(deadline) {
+        warn!(
+            "vlapic: {} could not arm its timer deadline: {error}",
+            vlapic.index()
+        );
     }
 }
 
-/// Which counting mode the guest's entry selects, or `None` for the encoding
-/// the architecture reserves.
-fn mode_of(vlapic: &Vlapic) -> Option<TimerMode> {
+/// Stops the guest's timer and stops it delivering.
+///
+/// What a controller transition needs: an old timer left running would deliver
+/// into a guest that has been reset, or after the controller it belonged to was
+/// switched off.
+pub(crate) fn disarm(vlapic: &Vlapic) -> bool {
+    let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        return false;
+    };
+    match timer.disarm() {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                "vlapic: {} could not disarm its timer: {error}",
+                vlapic.index()
+            );
+            false
+        }
+    }
+}
+
+/// Which mode the guest's entry selects, or `None` for the encoding the
+/// architecture reserves.
+pub(crate) fn mode_of(vlapic: &Vlapic) -> Option<TimerMode> {
     TimerMode::from_bits(vlapic.lvt(Entry::Timer).timer_mode())
-}
-
-/// Which mode the hardware should count in, or `None` where there is no count
-/// at all — deadline mode, which is armed by a register rather than by a
-/// number, and the encoding the architecture reserves.
-fn counting(vlapic: &Vlapic) -> Option<HardwareMode> {
-    match mode_of(vlapic)? {
-        TimerMode::OneShot => Some(HardwareMode::OneShot),
-        TimerMode::Periodic => Some(HardwareMode::Periodic),
-        TimerMode::Deadline => None,
-    }
 }
 
 /// How far the guest asked for the clock to be divided.
