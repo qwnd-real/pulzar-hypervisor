@@ -899,33 +899,48 @@ impl AddressSpace {
     /// it is a write-back alias of a range some other mapping describes as
     /// uncached, which is an architecturally undefined conflict rather than
     /// a mistake with a defined outcome.
+    ///
+    /// The runs are walked rather than the address space probed, so the cost
+    /// tracks how much memory there is instead of how high it ends: a machine
+    /// whose RAM ends a terabyte up costs the same as one whose RAM ends at
+    /// four gigabytes with the same amount of it. The alternative — asking of
+    /// every span in the whole direct map whether it is memory — is work
+    /// proportional to the address space, most of it spent re-asking about
+    /// holes.
     fn build_direct_map(&mut self, ram: &RamMap) -> Result<(), PagingError> {
         let flags = Protection::ReadWrite.flags() | CacheType::WriteBack.flags();
         let owned = self.frames.chunk_base().as_u64();
         let owned = owned..owned + chunk::CHUNK_SIZE;
-        let size = self.direct_map.size();
-        for gib in (0..size).step_by(as_usize(Size1GiB::SIZE)) {
-            let holds_chunk = gib < owned.end && owned.start < gib + Size1GiB::SIZE;
-            if self.features.contains(Features::GIB_PAGES)
-                && !holds_chunk
-                && ram.covers(gib, gib + Size1GiB::SIZE)
-            {
-                self.map_direct::<Size1GiB>(gib, flags)?;
-                continue;
+        for range in ram.ranges {
+            let end = range.end();
+            let mut at = range.start();
+            // The run's two edges rarely sit on large-page boundaries and are
+            // described in 4 KiB pages: the frames before the first aligned
+            // 2 MiB span...
+            let first_two = end.min(at.div_ceil(Size2MiB::SIZE) * Size2MiB::SIZE);
+            while at < first_two {
+                self.map_direct::<Size4KiB>(at, flags)?;
+                at += FRAME_SIZE;
             }
-            for two in (gib..gib + Size1GiB::SIZE).step_by(as_usize(Size2MiB::SIZE)) {
-                if ram.covers(two, two + Size2MiB::SIZE) {
-                    self.map_direct::<Size2MiB>(two, flags)?;
+            // ...the whole 2 MiB spans of the middle, promoted to 1 GiB pages
+            // wherever a whole GiB is memory and does not hold the chunk...
+            while at + Size2MiB::SIZE <= end {
+                let full_gib = at.is_multiple_of(Size1GiB::SIZE) && at + Size1GiB::SIZE <= end;
+                if self.features.contains(Features::GIB_PAGES)
+                    && full_gib
+                    && !(at < owned.end && owned.start < at + Size1GiB::SIZE)
+                {
+                    self.map_direct::<Size1GiB>(at, flags)?;
+                    at += Size1GiB::SIZE;
                     continue;
                 }
-                // A large page's worth of address space that is only partly
-                // memory: describe the frames that are, and leave the rest
-                // absent.
-                for frame in (two..two + Size2MiB::SIZE).step_by(as_usize(FRAME_SIZE)) {
-                    if ram.covers(frame, frame + FRAME_SIZE) {
-                        self.map_direct::<Size4KiB>(frame, flags)?;
-                    }
-                }
+                self.map_direct::<Size2MiB>(at, flags)?;
+                at += Size2MiB::SIZE;
+            }
+            // ...and the frames past the last aligned 2 MiB span.
+            while at < end {
+                self.map_direct::<Size4KiB>(at, flags)?;
+                at += FRAME_SIZE;
             }
         }
         Ok(())
@@ -1391,12 +1406,11 @@ impl Ram {
 
 /// Every run of RAM in the machine, ascending and disjoint.
 ///
-/// Ordered because the answer to "is all of this memory" is a scan, and a scan
-/// over an unordered list either sorts it — which needs somewhere to put the
-/// result, and there is no allocator underneath this — or is quadratic in the
-/// number of descriptors firmware reports. Disjoint because two ranges
-/// describing the same frame would make the answer depend on which was
-/// consulted.
+/// Ascending because the answer to "how high does memory end" is the last
+/// range, and disjoint because two ranges describing the same frame would make
+/// the direct map's coverage depend on which was consulted. The direct map is
+/// built by walking the ranges, so both properties keep that walk from ever
+/// describing a byte twice.
 struct RamMap<'a> {
     ranges: &'a [Ram],
 }
@@ -1427,13 +1441,6 @@ impl<'a> RamMap<'a> {
     /// One past the highest address any of them reaches.
     fn top(&self) -> u64 {
         self.ranges.last().map_or(0, Ram::end)
-    }
-
-    /// Whether every byte of `start..end` is memory.
-    fn covers(&self, start: u64, end: u64) -> bool {
-        self.ranges
-            .iter()
-            .any(|range| range.start <= start && end <= range.end)
     }
 }
 
