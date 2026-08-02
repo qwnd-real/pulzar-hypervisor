@@ -914,16 +914,18 @@ impl AddressSpace {
         for range in ram.ranges {
             let end = range.end();
             let mut at = range.start();
-            // The run's two edges rarely sit on large-page boundaries and are
-            // described in 4 KiB pages: the frames before the first aligned
-            // 2 MiB span...
+
+            // The run's two edges rarely sit on large-page boundaries, so the
+            // frames before the first aligned 2 MiB span are described in
+            // 4 KiB pages.
             let first_two = end.min(at.div_ceil(Size2MiB::SIZE) * Size2MiB::SIZE);
             while at < first_two {
                 self.map_direct::<Size4KiB>(at, flags)?;
                 at += FRAME_SIZE;
             }
-            // ...the whole 2 MiB spans of the middle, promoted to 1 GiB pages
-            // wherever a whole GiB is memory and does not hold the chunk...
+
+            // The whole 2 MiB spans of the middle are promoted to 1 GiB pages
+            // wherever a whole GiB is memory and does not hold the chunk.
             while at + Size2MiB::SIZE <= end {
                 let full_gib = at.is_multiple_of(Size1GiB::SIZE) && at + Size1GiB::SIZE <= end;
                 if self.features.contains(Features::GIB_PAGES)
@@ -937,7 +939,9 @@ impl AddressSpace {
                 self.map_direct::<Size2MiB>(at, flags)?;
                 at += Size2MiB::SIZE;
             }
-            // ...and the frames past the last aligned 2 MiB span.
+
+            // The frames past the last aligned 2 MiB span are described in
+            // 4 KiB pages.
             while at < end {
                 self.map_direct::<Size4KiB>(at, flags)?;
                 at += FRAME_SIZE;
