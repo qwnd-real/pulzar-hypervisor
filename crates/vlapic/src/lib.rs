@@ -60,7 +60,7 @@ use core::num::NonZeroU64;
 
 use cpu::{CpuError, CpuIndex};
 use descriptors::{DescriptorError, Vector};
-use emulate::{Commit, Data, Device, Read, Region, Trap, Write};
+use emulate::{Capability, Commit, Data, Device, Read, Region, Trap, Write};
 use log::{info, trace, warn};
 use spin::Once;
 use thiserror::Error;
@@ -677,11 +677,15 @@ fn lapics() -> Result<&'static Page, VlapicError> {
 struct Aperture(&'static Page);
 
 impl Device for Aperture {
-    fn read(&self, access: Read) -> Data {
+    fn capability(&self) -> Capability {
+        self.0.capability()
+    }
+
+    fn read(&self, access: Read<'_>) -> Data {
         self.0.read(access)
     }
 
-    fn write(&self, access: Write) -> Commit {
+    fn write(&self, access: Write<'_>) -> Commit {
         self.0.write(access)
     }
 }

@@ -341,12 +341,14 @@ dependencies = [
 name = "emulate"
 version = "0.1.0"
 dependencies = [
+ "descriptors",
  "iced-x86",
  "log",
  "memory",
  "npt",
  "paging",
  "processor",
+ "spin 0.12.2",
  "svm",
  "thiserror",
  "vcpu",

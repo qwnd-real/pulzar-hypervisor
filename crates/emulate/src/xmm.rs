@@ -14,20 +14,46 @@
 //! write back afterwards — a store into the register *is* the guest's register
 //! changing.
 //!
-//! # The two instructions here are the only vector instructions in the image
+//! # Why each access is a call and not an assembly block
 //!
-//! Everything below is assembly for that reason. It is also why
-//! [`available`] exists: a processor executing `movdqu` needs the operating
-//! system's vector support switched on, and this operating system has no vector
-//! support and never enabled any. The bits are checked, and the one that can be
-//! set is set, before anything here is reached.
+//! A register the compiler cannot see is still a register the compiler has
+//! rules about. An `asm!` block naming `xmm3` in its template and nowhere in
+//! its operands tells rustc nothing about the register it reads or writes:
+//! templates are opaque, so the effect is invisible and the code is outside the
+//! language's defined semantics whatever the target's feature string says.
+//! Being outside it happens to work today, which is the worst place for a
+//! hypervisor to be.
+//!
+//! So every access crosses a real function boundary with a declared calling
+//! convention. The System V convention makes all sixteen vector registers
+//! caller-saved, so a call to one of these routines is *already* a call that
+//! may clobber every one of them as far as rustc is concerned — the effect is
+//! declared, by the ABI, at each call site. What the routine does inside is its
+//! own business, which is what `naked` means: no prologue, no epilogue, nothing
+//! the compiler generated, and so nothing for it to have assumed.
+//!
+//! The target's feature string is still load-bearing — it is why the value read
+//! is the *guest's* rather than something the compiler spilled there — but it
+//! is no longer doing the soundness argument's work on its own.
+//!
+//! # Nothing here reaches a device
+//!
+//! A vector move against a device register is performed by moving the bytes
+//! between here and a buffer, and separately between that buffer and the
+//! device. There used to be a pair of routines that borrowed `XMM0` to carry
+//! sixteen bytes to a device in one instruction, and they are gone: one
+//! assembly block is not exception-atomic, so an interrupt or a fault taken
+//! between borrowing the guest's register and restoring it would abandon guest
+//! state that has no other copy. A device that needs sixteen bytes in a single
+//! bus transaction cannot be served without that borrow, and so is refused by
+//! name — see [`Capability`](crate::mmio::Capability).
 
-use core::arch::asm;
+use core::arch::naked_asm;
 
 use iced_x86::Register;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
-use crate::{EmulateError, value::Width};
+use crate::{EmulateError, value::WIDEST};
 
 /// Turns on what a vector move needs, and refuses if the processor cannot.
 ///
@@ -49,10 +75,10 @@ pub(crate) fn available() -> Result<(), EmulateError> {
     }
     if !Cr4::read().contains(Cr4Flags::OSFXSR) {
         // SAFETY: this bit only says that the operating system is prepared to
-        // handle vector state, which for this one means the two instructions in
-        // this module and nothing else. It changes no translation and no
-        // protection, and control register four is host state that `VMRUN`
-        // swaps out, so no guest observes it.
+        // handle vector state, which for this one means the routines in this
+        // module and nothing else. It changes no translation and no protection,
+        // and control register four is host state that `VMRUN` swaps out, so no
+        // guest observes it.
         unsafe { Cr4::update(|flags| flags.insert(Cr4Flags::OSFXSR)) };
     }
     Ok(())
@@ -62,15 +88,15 @@ pub(crate) fn available() -> Result<(), EmulateError> {
 ///
 /// A register number is not something an instruction can take as an operand, so
 /// selecting one at runtime is a match however it is written. Writing the match
-/// out by hand would be three of them, sixteen arms each, with the register
-/// name repeated in an assembly string every time. This generates all three
-/// from one list, which is also what makes [`Vector`] an enum rather than a
-/// checked integer — and an enum is what lets each match be exhaustive with no
-/// arm for a number that cannot happen.
+/// out by hand would be two of them, sixteen arms each, with the register name
+/// repeated in an assembly string every time. This generates both from one
+/// list, which is also what makes [`Vector`] an enum rather than a checked
+/// integer — and an enum is what lets each match be exhaustive with no arm for
+/// a number that cannot happen.
 macro_rules! vectors {
     ($($variant:ident => $register:ident => $number:literal,)*) => {
         /// One of the processor's sixteen vector registers.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
         pub(crate) enum Vector {
             $(
                 #[doc = concat!("Vector register ", $number, ".")]
@@ -79,6 +105,18 @@ macro_rules! vectors {
         }
 
         impl Vector {
+            /// Every one of them, in the architecture's own order.
+            ///
+            /// Exhaustive by construction: a register added to the list above
+            /// appears here too, which is what lets a test walk all sixteen and
+            /// still be complete.
+            ///
+            /// Nothing in the hypervisor iterates the registers — a move names
+            /// exactly one — so this exists for the tests and is built only for
+            /// them.
+            #[cfg(test)]
+            pub(crate) const ALL: [Self; 16] = [$(Self::$variant,)*];
+
             /// The register an instruction named, or `None` if it named
             /// something else.
             ///
@@ -94,44 +132,62 @@ macro_rules! vectors {
                 })
             }
 
-            /// What the guest has in it.
-            pub(crate) fn read(self) -> [u8; Width::Vector.bytes()] {
-                let mut value = [0; Width::Vector.bytes()];
+            /// Which register this is, as the architecture numbers them.
+            ///
+            /// The hypervisor never needs this: a register number is not
+            /// something an instruction can take as an operand, which is why the
+            /// accesses below are a match rather than an index. It is how the
+            /// test register file — which really is an array — finds its row.
+            #[cfg(test)]
+            pub(crate) const fn number(self) -> u8 {
                 match self {
-                    $(Self::$variant => {
-                        // SAFETY: `available` established that the processor
-                        // will execute this rather than trap it, and the
-                        // destination is sixteen writable bytes of this frame.
-                        // Naming a vector register is sound because no other
-                        // instruction in this image names one, so the guest's
-                        // value is what is in it.
-                        unsafe {
-                            asm!(
-                                concat!("movdqu [{at}], xmm", $number),
-                                at = in(reg) value.as_mut_ptr(),
-                                options(nostack, preserves_flags),
-                            );
-                        }
-                    })*
+                    $(Self::$variant => $number,)*
                 }
-                value
             }
+        }
 
-            /// Puts a value in it, which is the guest's register changing.
-            pub(crate) fn write(self, value: [u8; Width::Vector.bytes()]) {
-                match self {
-                    $(Self::$variant => {
-                        // SAFETY: as in `read`, with the sixteen bytes read
-                        // rather than written — hence `readonly`.
-                        unsafe {
-                            asm!(
-                                concat!("movdqu xmm", $number, ", [{at}]"),
-                                at = in(reg) value.as_ptr(),
-                                options(nostack, readonly, preserves_flags),
-                            );
-                        }
-                    })*
-                }
+        /// What the guest has in one of its vector registers.
+        ///
+        /// The value is the guest's because nothing else in this image can have
+        /// put anything there: the target emits no vector instruction, and the
+        /// only ones that exist are here.
+        pub(crate) fn read(register: Vector) -> [u8; WIDEST] {
+            let mut value = [0; WIDEST];
+            match register {
+                $(Vector::$variant => {
+                    /// Copies this register to sixteen bytes at the first
+                    /// argument, which the convention puts in `RDI`.
+                    #[unsafe(naked)]
+                    unsafe extern "sysv64" fn store(_into: *mut u8) {
+                        naked_asm!(concat!("movdqu [rdi], xmm", $number), "ret")
+                    }
+                    // SAFETY: `available` established that the processor will
+                    // execute a vector move rather than trap it, and the
+                    // destination is sixteen writable bytes of this frame that
+                    // nothing else borrows. The call itself declares — through
+                    // a convention in which every vector register is
+                    // caller-saved — that vector state may change across it.
+                    unsafe { store(value.as_mut_ptr()) };
+                })*
+            }
+            value
+        }
+
+        /// Puts a value in one of them, which is the guest's register changing.
+        pub(crate) fn write(register: Vector, value: [u8; WIDEST]) {
+            match register {
+                $(Vector::$variant => {
+                    /// Loads this register from sixteen bytes at the first
+                    /// argument.
+                    #[unsafe(naked)]
+                    unsafe extern "sysv64" fn load(_from: *const u8) {
+                        naked_asm!(concat!("movdqu xmm", $number, ", [rdi]"), "ret")
+                    }
+                    // SAFETY: as in `read`, with the sixteen bytes read rather
+                    // than written — and read out of a local this call cannot
+                    // outlive.
+                    unsafe { load(value.as_ptr()) };
+                })*
             }
         }
     };
@@ -156,63 +212,80 @@ vectors! {
     Xmm15 => XMM15 => 15,
 }
 
-/// Moves sixteen bytes out of a device in one bus transaction.
-///
-/// A quadword pair would not do. Two eight-byte reads are two transactions, and
-/// a device that answers a sixteen-byte read need not answer two halves of one
-/// the same way — so the access the guest asked for is the access that has to
-/// be made. Nothing narrower than a vector register can make it, and this image
-/// has no other way to name one.
-///
-/// The register it borrows is saved and put back inside the same block, so the
-/// guest's own value is unchanged by the time this returns.
-///
-/// # Safety
-///
-/// `from` must be sixteen readable bytes of a live mapping, and reading them
-/// must be something the device behind it tolerates.
-pub(crate) unsafe fn read_device(from: *const u8) -> [u8; Width::Vector.bytes()] {
-    let mut borrowed = [0; Width::Vector.bytes()];
-    let mut value = [0; Width::Vector.bytes()];
-    // SAFETY: the caller vouches for the device address. The register is saved
-    // before it is used and restored after, and nothing between the two can
-    // observe it: an interrupt taken here would run this image's own handler,
-    // which names no vector register either.
-    unsafe {
-        asm!(
-            "movdqu [{borrowed}], xmm0",
-            "movdqu xmm0, [{from}]",
-            "movdqu [{value}], xmm0",
-            "movdqu xmm0, [{borrowed}]",
-            borrowed = in(reg) borrowed.as_mut_ptr(),
-            from = in(reg) from,
-            value = in(reg) value.as_mut_ptr(),
-            options(nostack, preserves_flags),
-        );
-    }
-    value
-}
+#[cfg(test)]
+mod tests {
+    use iced_x86::Register;
 
-/// Moves sixteen bytes into a device in one bus transaction, borrowing a vector
-/// register the same way [`read_device`] does.
-///
-/// # Safety
-///
-/// `to` must be sixteen writable bytes of a live mapping, and writing them must
-/// be something the device behind it tolerates.
-pub(crate) unsafe fn write_device(to: *mut u8, value: [u8; Width::Vector.bytes()]) {
-    let mut borrowed = [0; Width::Vector.bytes()];
-    // SAFETY: as in `read_device`, with the transfer the other way round.
-    unsafe {
-        asm!(
-            "movdqu [{borrowed}], xmm0",
-            "movdqu xmm0, [{value}]",
-            "movdqu [{to}], xmm0",
-            "movdqu xmm0, [{borrowed}]",
-            borrowed = in(reg) borrowed.as_mut_ptr(),
-            value = in(reg) value.as_ptr(),
-            to = in(reg) to,
-            options(nostack, preserves_flags),
-        );
+    use super::Vector;
+
+    #[test]
+    fn every_register_is_listed_once_and_numbered_as_the_architecture_does() {
+        assert_eq!(Vector::ALL.len(), 16);
+        for (number, register) in Vector::ALL.into_iter().enumerate() {
+            assert_eq!(
+                u32::from(register.number()),
+                u32::try_from(number).expect("sixteen fits"),
+                "{register:?} must carry its own architectural number"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sixteen_legacy_registers_are_the_ones_recognized() {
+        let named = [
+            Register::XMM0,
+            Register::XMM1,
+            Register::XMM2,
+            Register::XMM3,
+            Register::XMM4,
+            Register::XMM5,
+            Register::XMM6,
+            Register::XMM7,
+            Register::XMM8,
+            Register::XMM9,
+            Register::XMM10,
+            Register::XMM11,
+            Register::XMM12,
+            Register::XMM13,
+            Register::XMM14,
+            Register::XMM15,
+        ];
+        for (register, expected) in named.into_iter().zip(Vector::ALL) {
+            assert_eq!(Vector::new(register), Some(expected));
+        }
+    }
+
+    #[test]
+    fn nothing_else_is_a_register_this_crate_reaches() {
+        // The wider vector registers are refused rather than truncated to their
+        // low sixteen bytes: a move of thirty-two would leave half the
+        // destination holding whatever it held before.
+        for register in [
+            Register::XMM16,
+            Register::XMM31,
+            Register::YMM0,
+            Register::YMM15,
+            Register::ZMM0,
+            Register::ZMM31,
+            Register::MM0,
+            Register::MM7,
+            Register::RAX,
+            Register::EAX,
+            Register::AH,
+            Register::CS,
+            Register::CR0,
+            Register::DR7,
+            Register::K1,
+            Register::BND0,
+            Register::TMM0,
+            Register::RIP,
+            Register::None,
+        ] {
+            assert_eq!(
+                Vector::new(register),
+                None,
+                "{register:?} is not one of the sixteen this crate reaches"
+            );
+        }
     }
 }

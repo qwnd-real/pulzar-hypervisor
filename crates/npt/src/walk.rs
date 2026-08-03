@@ -206,6 +206,40 @@ pub(crate) fn lookup(
 }
 
 /// The table whose entries describe `level`-sized regions on the path to `gpa`,
+/// or `None` if no such table exists.
+///
+/// The counterpart of [`descend`] for undoing rather than building: it
+/// allocates nothing, splits nothing, and answers `None` where `descend` would
+/// have made a table. That is what makes it usable on a path that is giving
+/// something back — there is nothing to give back where nothing was ever built,
+/// and a call that allocated in order to clear an entry could fail for want of
+/// memory while releasing memory.
+///
+/// A large page on the way down is reported as `None` for the same reason: this
+/// crate only ever traps at 4 KiB, so an address covered by a large page was
+/// never trapped page by page, and splitting one here would be building rather
+/// than undoing.
+pub(crate) fn table_of(
+    window: DirectMap,
+    root: PhysAddr,
+    gpa: PhysAddr,
+    level: Level,
+) -> Result<Option<NonNull<PageTable>>, NptError> {
+    let mut table = root;
+    for above in Level::ALL {
+        if above <= level {
+            break;
+        }
+        let (flags, frame) = read(window, table, above.index(gpa))?;
+        if !flags.contains(PageTableFlags::PRESENT) || flags.contains(PageTableFlags::HUGE_PAGE) {
+            return Ok(None);
+        }
+        table = frame;
+    }
+    reach(window, table).map(Some)
+}
+
+/// The table whose entries describe `level`-sized regions on the path to `gpa`,
 /// building every table above it that does not exist yet.
 ///
 /// Every table this creates is zeroed by the allocator that handed out its

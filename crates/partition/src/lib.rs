@@ -42,7 +42,11 @@
 
 #![no_std]
 
+extern crate alloc;
+
 mod asid;
+
+use alloc::vec::Vec;
 
 use emulate::{Mmio, MmioError, Region, Registrar};
 use log::info;
@@ -102,11 +106,15 @@ impl Partition {
     /// the nested tables permit while a guest is running would mean
     /// discarding every processor's cached translations first.
     ///
+    /// Room for every region is reserved before any of them is taken over, so
+    /// that running out of memory is a failure that has changed nothing rather
+    /// than one discovered after the tables have been edited.
+    ///
     /// # Errors
     ///
     /// [`PartitionError::AlreadyInterposed`] for a second call, or
-    /// [`PartitionError::Mmio`] if a region cannot be taken over — the first
-    /// failure stops the walk, and the regions taken over before it stay taken
+    /// [`PartitionError::Mmio`] if a region cannot be taken over. A region that
+    /// fails is undone in full; the regions taken over before it stay taken
     /// over, because a half-trapped guest is not one to hand back.
     pub fn interpose(
         &self,
@@ -115,15 +123,20 @@ impl Partition {
     ) -> Result<(), PartitionError> {
         let mut outcome = Ok(());
         let mut sealed = false;
+        let regions = regions.into_iter().collect::<Vec<_>>();
         self.devices.call_once(|| {
             sealed = true;
-            let mut registrar = Registrar::new();
-            for region in regions {
-                // The address space first and the tables second, as everywhere
-                // else here.
-                if let Err(error) = registrar.register(space, &mut self.npt.lock(), region) {
-                    outcome = Err(error.into());
-                    break;
+            let mut npt = self.npt.lock();
+            let mut registrar = Registrar::new(space, &mut npt);
+            outcome = registrar
+                .reserve(regions.len())
+                .map_err(PartitionError::from);
+            if outcome.is_ok() {
+                for region in regions {
+                    if let Err(error) = registrar.register(region) {
+                        outcome = Err(error.into());
+                        break;
+                    }
                 }
             }
             registrar.seal()

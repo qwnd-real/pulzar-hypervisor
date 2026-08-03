@@ -295,7 +295,7 @@ impl Npt {
                 bytes,
             });
         }
-        let Some(slot) = self.trapped.iter_mut().find(|slot| slot.is_none()) else {
+        let Some(slot) = self.trapped.iter().position(Option::is_none) else {
             return Err(NptError::TooManyTrapped {
                 limit: TRAPPED_REGIONS,
             });
@@ -305,12 +305,79 @@ impl Npt {
         // order would leave pages described as untouchable that nothing knows to
         // trap, which is a guest faulting for ever on an address the tables have
         // no answer for.
-        *slot = Some(Interposed {
+        self.trapped[slot] = Some(Interposed {
             span: Span::new(gpa, bytes),
             trap,
         });
 
-        (0..bytes / page).try_for_each(|index| self.interpose(frames, gpa + index * page, trap))
+        let described = (0..bytes / page)
+            .try_for_each(|index| self.interpose(frames, gpa + index * page, trap));
+        if described.is_err() {
+            // The region is not described and so must not go on being remembered:
+            // a slot naming pages that were never trapped would refuse to let
+            // `fault` describe them, and the guest would fault on them for ever
+            // with nothing to answer. The pages that *were* described are left as
+            // they are — they trap, which is safe — and the caller undoing this
+            // registration removes them.
+            self.trapped[slot] = None;
+        }
+        described
+    }
+
+    /// Stops trapping a region, leaving its pages to be described on demand
+    /// again.
+    ///
+    /// The counterpart [`Npt::protect`] needs, for two situations that both
+    /// otherwise leave the tables describing something nothing answers for: a
+    /// registration that failed after the region was trapped, and a guest being
+    /// taken apart.
+    ///
+    /// The entries are cleared rather than filled in. A trapped page is
+    /// described as read-only or as nothing at all, and what it *should* be
+    /// depends on whether it is the hypervisor's own memory or the guest's
+    /// — which is exactly the question [`Npt::fault`] already answers. So
+    /// the pages are left with no translation, which is where every page of
+    /// a guest starts, and the first access to one describes it correctly.
+    ///
+    /// # The caller discards what the guest cached
+    ///
+    /// This grants permission rather than reducing it, so no processor can hold
+    /// a translation that these tables no longer justify — a page with no
+    /// entry had nothing to cache. A processor may hold the *trapping*
+    /// description, which is more restrictive than what replaces it, so the
+    /// guest merely faults once more than it needs to and is then
+    /// described. Removing a region while a guest runs is still the
+    /// caller's to make safe, which is why nothing here may be called at
+    /// that point.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::TrapGeometry`] unless the range is a whole number of pages
+    /// on a page boundary, [`NptError::NotTrapped`] if no region was
+    /// recorded at exactly that range, or [`NptError::Unreachable`] if the
+    /// window does not reach one of these tables.
+    pub fn release(&mut self, gpa: PhysAddr, bytes: u64) -> Result<(), NptError> {
+        let page = Level::Page.span();
+        if bytes == 0 || !gpa.as_u64().is_multiple_of(page) || !bytes.is_multiple_of(page) {
+            return Err(NptError::TrapGeometry {
+                gpa: gpa.as_u64(),
+                bytes,
+            });
+        }
+        let span = Span::new(gpa, bytes);
+        let slot = self
+            .trapped
+            .iter()
+            .position(|region| region.is_some_and(|region| region.span == span))
+            .ok_or(NptError::NotTrapped {
+                gpa: gpa.as_u64(),
+                bytes,
+            })?;
+        // Forgotten first, so that a failure part-way through leaves pages that
+        // `fault` is willing to describe rather than pages it refuses to touch and
+        // nothing answers for.
+        self.trapped[slot] = None;
+        (0..bytes / page).try_for_each(|index| self.abandon(gpa + index * page))
     }
 
     /// Maps immutable pages of the owned chunk for guest access before first
@@ -518,6 +585,29 @@ impl Npt {
         Ok(())
     }
 
+    /// Leaves one page of a released region with no translation at all.
+    ///
+    /// The opposite of [`Npt::interpose`], and deliberately not its mirror
+    /// image: it does not put back whatever the page was described as
+    /// before, because that is not knowable here and is not worth
+    /// remembering. A page with no entry is where every page of a guest
+    /// starts, and the first access to one goes through [`Npt::fault`],
+    /// which decides correctly whether it is the guest's memory or the
+    /// hypervisor's.
+    ///
+    /// A page that has no table under it needs nothing done: there is no entry
+    /// to clear, which is already the state this is trying to reach.
+    fn abandon(&mut self, gpa: PhysAddr) -> Result<(), NptError> {
+        let Some(mut table) = walk::table_of(self.window, self.root, gpa, Level::Page)? else {
+            return Ok(());
+        };
+        // SAFETY: `table_of` returns a table of these nested tables, reached
+        // through the window, and `&mut self` is the only handle to them.
+        let table = unsafe { table.as_mut() };
+        table[Level::Page.index(gpa)].set_unused();
+        Ok(())
+    }
+
     /// Points every 4 KiB of the 2 MiB region containing `gpa` at the shared
     /// page of zeroes.
     ///
@@ -674,6 +764,19 @@ pub enum NptError {
         /// How long it is.
         bytes: u64,
     },
+    /// A region was released that was never trapped, or was trapped as part of
+    /// a differently shaped one.
+    ///
+    /// Released by exactly the range it was trapped by, deliberately: releasing
+    /// half of a region would leave the other half trapped by a record that no
+    /// longer describes it.
+    #[error("no trapped region covers exactly {gpa:#x} for {bytes:#x} bytes")]
+    NotTrapped {
+        /// Where the region was said to begin.
+        gpa: u64,
+        /// How long it was said to be.
+        bytes: u64,
+    },
     /// A guest-visible chunk mapping was requested outside the chunk.
     #[error("guest exposure at {gpa:#x} of {bytes:#x} bytes leaves the hypervisor chunk")]
     OutsideOwned {
@@ -711,7 +814,7 @@ struct Interposed {
 /// Two quite different things are described by one of these — the memory that
 /// is the hypervisor's own, and a region something interposes on — but the
 /// questions asked of them are the same two, so they are written once.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Span {
     base: u64,
     end: u64,

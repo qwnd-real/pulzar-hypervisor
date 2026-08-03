@@ -106,7 +106,18 @@ impl<'a> Linear<'a> {
     }
 
     /// Whether every byte of a range is the guest's to write.
-    fn writable(&self, linear: u64, bytes: usize) -> Result<bool, MemoryError> {
+    ///
+    /// What [`Linear::write`] asks itself before writing anything, and what
+    /// anything acting on a guest's behalf asks before doing something it
+    /// cannot undo. An emulated instruction that reads a device register
+    /// and then finds its destination unwritable has consumed a read it
+    /// cannot give back, so the question is worth asking while the answer
+    /// is still free.
+    ///
+    /// # Errors
+    ///
+    /// As [`Linear::translate`].
+    pub fn writable(&self, linear: u64, bytes: usize) -> Result<bool, MemoryError> {
         let mut left = as_u64(bytes);
         let mut at = linear;
         while left != 0 {

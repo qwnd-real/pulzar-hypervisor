@@ -39,7 +39,7 @@
 
 use alloc::boxed::Box;
 
-use emulate::{Commit, Data, Device, Read, Width, Write};
+use emulate::{Capability, Commit, Data, Device, Read, Width, Write};
 
 use crate::{
     access,
@@ -83,7 +83,20 @@ impl Page {
 }
 
 impl Device for Page {
-    fn read(&self, access: Read) -> Data {
+    /// Aligned 32-bit accesses and nothing else.
+    ///
+    /// Every register of the controller is 32 bits on a 128-bit boundary, and
+    /// the architecture requires software to reach one with an aligned
+    /// 32-bit access. Anything else is undefined on real hardware, so there
+    /// is no behaviour to reproduce — and declaring it here means such an
+    /// access is refused before this device is asked about it, rather than
+    /// being decoded into an illegal-register error that claims the guest
+    /// named a bad offset when what it really did was use the wrong width.
+    fn capability(&self) -> Capability {
+        Capability::only(Width::Long)
+    }
+
+    fn read(&self, access: Read<'_>) -> Data {
         let width = access.width();
         let Some((vlapic, register)) = self.decode(access.offset(), width) else {
             return Data::from_u64(0, width);
@@ -99,7 +112,7 @@ impl Device for Page {
         Data::from_u64(u64::from(value), width)
     }
 
-    fn write(&self, access: Write) -> Commit {
+    fn write(&self, access: Write<'_>) -> Commit {
         let Some((vlapic, register)) = self.decode(access.offset(), access.width()) else {
             return Commit::Discard;
         };

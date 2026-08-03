@@ -17,5 +17,13 @@ thiserror = { workspace = true }
 vcpu = { workspace = true }
 x86_64 = { workspace = true }
 
+# Interrupt vectors, used only to name an exception exit in the tests that check
+# which exit classes supply a next-instruction address. The crate itself never
+# constructs one: it reports a fault as a vector number, so that nothing on the
+# emulation path depends on the descriptor tables.
+[dev-dependencies]
+descriptors = { workspace = true }
+spin = { workspace = true }
+
 [lints]
 workspace = true
