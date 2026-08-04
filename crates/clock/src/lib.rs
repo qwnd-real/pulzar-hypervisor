@@ -289,6 +289,18 @@ pub fn wall_clock() -> Option<Wall> {
     CLOCK.get().and_then(Clock::wall_clock)
 }
 
+/// What the installed clock keeps time with, or `None` before one is installed.
+///
+/// Which piece of hardware it is matters to anything converting between the
+/// timebase and a rate of its own: a span measured in this counter's ticks can
+/// only be turned into nanoseconds by the rate this reports, and only a caller
+/// that knows which counter it is can say whether a reading taken elsewhere is
+/// denominated in the same ticks.
+#[must_use]
+pub fn source() -> Option<Counter> {
+    CLOCK.get().map(Clock::source)
+}
+
 /// Waits for `micros` microseconds on the installed clock.
 ///
 /// # Errors

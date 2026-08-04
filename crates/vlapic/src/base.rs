@@ -109,6 +109,43 @@ impl ApicBase {
         Self(Self::DEFAULT_PAGE | GLOBAL_ENABLE | flag)
     }
 
+    /// The register a controller firmware left holding `value` should start in.
+    ///
+    /// Two fields are firmware's and two are not. The enable bits are the whole
+    /// point: firmware that had taken its controller into x2APIC has to resume
+    /// into one that is still there, because everything it programmed elsewhere
+    /// on the machine — every logical destination in an I/O controller or a
+    /// device's message — is addressed the way that face addresses things.
+    /// Everything the architecture reserves is dropped, so that a guest reading
+    /// the register back sees what it promises.
+    ///
+    /// The address is *not* firmware's. The register page is trapped once,
+    /// before any guest has run, and nothing here can re-trap a range while
+    /// processors are executing — the same reason [`BaseFault::Relocated`]
+    /// refuses a guest's own attempt to move it. Firmware that had moved its
+    /// page is told about rather than followed, which is what
+    /// [`ApicBase::relocated`] is for.
+    ///
+    /// The bootstrap flag is not firmware's either, and for a different reason:
+    /// it is the roster's, established when the controller was built, and no
+    /// value read from anywhere can change which processor the machine came up
+    /// on.
+    pub(crate) fn seeded(value: u64, bootstrap: bool) -> Self {
+        let flag = if bootstrap { BOOTSTRAP } else { 0 };
+        Self((value & (GLOBAL_ENABLE | X2APIC_ENABLE)) | Self::DEFAULT_PAGE | flag)
+    }
+
+    /// Whether a value read out of real hardware puts the register page
+    /// somewhere other than where this hypervisor traps one.
+    pub(crate) const fn relocated(value: u64) -> bool {
+        Self::page_of(value) != Self::DEFAULT_PAGE
+    }
+
+    /// Where a value read out of real hardware puts the register page.
+    pub(crate) const fn page_of(value: u64) -> u64 {
+        Self(value).address()
+    }
+
     /// The register holding exactly these bits.
     pub(crate) const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -150,7 +187,6 @@ impl ApicBase {
     const fn address(self) -> u64 {
         self.0 & !(RESERVED_LOW | BOOTSTRAP | X2APIC_ENABLE | GLOBAL_ENABLE)
     }
-
     /// Whether this is the processor the guest was started on.
     pub(crate) const fn bootstrap(self) -> bool {
         self.0 & BOOTSTRAP != 0

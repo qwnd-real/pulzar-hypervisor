@@ -143,6 +143,24 @@ impl ErrorStatus {
         self.pending.store(0, Ordering::Release);
         self.latched.store(0, Ordering::Release);
     }
+
+    /// Latches what a real controller was already holding, from a capture of
+    /// it.
+    ///
+    /// The latched word and not the pending one, because that is what the
+    /// capture read: the register answers with whatever the last write latched,
+    /// and the capture deliberately does not write. So the value is exactly
+    /// what a guest's next read should answer with, and the pending set is
+    /// left empty — which leaves the error interrupt armed, as it is after
+    /// any write.
+    ///
+    /// Bits the architecture reserves are dropped rather than stored: hardware
+    /// should not report them, and a guest must not read one back from a
+    /// register this crate answers for.
+    pub(crate) fn seed(&self, latched: u32) {
+        self.latched
+            .store(latched & Errors::all().bits(), Ordering::Release);
+    }
 }
 
 #[cfg(test)]

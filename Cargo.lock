@@ -1151,6 +1151,7 @@ dependencies = [
  "apic",
  "bitfield-struct",
  "bitflags",
+ "clock",
  "cpu",
  "descriptors",
  "emulate",

@@ -9,6 +9,7 @@ publish.workspace = true
 apic = { workspace = true }
 bitfield-struct = { workspace = true }
 bitflags = { workspace = true }
+clock = { workspace = true }
 cpu = { workspace = true }
 descriptors = { workspace = true }
 emulate = { workspace = true }

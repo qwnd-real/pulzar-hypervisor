@@ -40,12 +40,11 @@
 //! # Nothing is forgotten because paying failed
 //!
 //! Every operation that could not pay leaves the debt where it was. A debt
-//! dropped because the controller refused a write, or because its turn had not
-//! come, is a real in-service entry with nothing left that would ever retire
-//! it.
+//! dropped because the controller could not be reached, or because its turn had
+//! not come, is a real in-service entry with nothing left that would ever
+//! retire it.
 
 use descriptors::Vector;
-use log::warn;
 
 use crate::vectors::Bitmap;
 
@@ -112,19 +111,13 @@ impl Ledger {
             if self.released.is_empty() {
                 return;
             }
-            let Ok(Some(top)) = local.in_service_top() else {
+            let Some(top) = local.in_service_top() else {
                 return;
             };
             if !self.released.get(top) {
                 return;
             }
-            if let Err(error) = local.end_of_interrupt() {
-                // Deliberately kept. The real controller is still holding the
-                // vector, so the debt is still real, and forgetting it here
-                // would leave nothing that could ever retire it.
-                warn!("vlapic: could not acknowledge {top} on real hardware: {error}");
-                return;
-            }
+            local.end_of_interrupt();
             self.released.clear(top);
         }
     }

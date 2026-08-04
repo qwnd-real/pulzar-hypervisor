@@ -124,7 +124,7 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
         return Err(ApicError::TrampolineUnreachable { phys: base });
     }
     let local = crate::local()?;
-    let here = local.id()?;
+    let here = local.id();
     let startable = startable()?;
 
     let root = paging::with(|space| space.root().start_address())?;

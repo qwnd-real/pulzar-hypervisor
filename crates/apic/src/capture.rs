@@ -38,9 +38,9 @@ use paging::DirectMap;
 use x86_64::registers::model_specific::Msr;
 
 use crate::{
-    base, pic, register,
+    Mode, base, pic, register,
     register::{Access, MappedRegister, Page, Register},
-    timer::{self, Mode},
+    timer::{self, Mode as TimerMode},
 };
 
 /// How many registers it takes to describe two hundred and fifty-six vectors
@@ -64,6 +64,29 @@ pub struct FirmwareState {
     pub local: LocalState,
     /// The interrupt masks of the two legacy controllers, the primary's first.
     pub legacy_masks: [u8; 2],
+}
+
+impl FirmwareState {
+    /// Which interface firmware left this processor's controller presenting, or
+    /// `None` where it had switched the controller off or the processor has
+    /// none.
+    ///
+    /// What a hypervisor that means to hand the machine back has to bring its
+    /// own controllers up in. The emulated controller it hands firmware starts
+    /// in the mode firmware was using, and the real one behind it has to
+    /// present the same interface — a logical destination is matched
+    /// against the real register, and the two interfaces do not spell one
+    /// the same way.
+    #[must_use]
+    pub const fn mode(&self) -> Option<Mode> {
+        if self.base & base::GLOBAL_ENABLE == 0 {
+            None
+        } else if self.base & base::X2APIC_ENABLE == 0 {
+            Some(Mode::XApic)
+        } else {
+            Some(Mode::X2Apic)
+        }
+    }
 }
 
 /// Whether the local controller could be read, and why not where it could not.
@@ -151,6 +174,32 @@ pub struct LocalState {
     /// only on a processor that implements the mode.
     pub tsc_deadline: u64,
 }
+
+impl LocalState {
+    /// Every local vector table entry, in the order the architecture counts
+    /// them.
+    ///
+    /// That order is the architecture's own and is not the order the registers
+    /// sit at in the page. It matters because a controller has exactly the
+    /// first however-many of these, so anything pairing these values with
+    /// entries has to walk them in this order or it pairs a thermal entry
+    /// with a timer.
+    #[must_use]
+    pub const fn lvt(&self) -> [u32; LVT_ENTRIES] {
+        [
+            self.lvt_timer,
+            self.lvt_lint0,
+            self.lvt_lint1,
+            self.lvt_error,
+            self.lvt_performance,
+            self.lvt_thermal,
+            self.lvt_corrected_machine_check,
+        ]
+    }
+}
+
+/// How many local vector table entries the architecture defines.
+pub const LVT_ENTRIES: usize = 7;
 
 /// Reads the interrupt controllers as firmware left them, writing to none of
 /// them.
@@ -241,8 +290,8 @@ fn read(access: Access) -> LocalState {
         timer_current_count: access.read(Register::TIMER_CURRENT_COUNT),
         // A timer already in the mode is proof the processor implements it,
         // which is the only thing that makes the register safe to read.
-        tsc_deadline: match Mode::of(lvt_timer) {
-            Some(Mode::Deadline) => {
+        tsc_deadline: match TimerMode::of(lvt_timer) {
+            Some(TimerMode::Deadline) => {
                 // SAFETY: the entry says the timer is counting against a
                 // deadline, so the register holding that deadline exists, and
                 // reading a model-specific register has no side effect.

@@ -167,7 +167,8 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // Logged on this side of the transition rather than the other, because that
     // is what proves the capture survived it: nothing firmware left is
     // addressable any more, and these numbers come out of the chunk.
-    inherited(handoff)?.describe("core");
+    let firmware = inherited(handoff)?;
+    firmware.describe("core");
 
     let acpi = survey_machine(handoff, &space)?;
     start_clock(&mut space, &acpi, handoff)?;
@@ -182,14 +183,20 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // address space may make for itself: it can ask how many processors are
     // running instead.
     paging::shootdown::watch(cpu::online_count)?;
-    let apic = Apic::install(&mut space, acpi.madt())?;
+    // Brought up in the face firmware was using rather than the best one this
+    // processor offers. The guest is that same firmware, and it goes on
+    // addressing passed-through interrupts the way it already had — so the real
+    // controller has to keep spelling a logical destination the way the emulated
+    // one does. A guest that moves to x2APIC later takes its own processor's real
+    // controller with it.
+    let apic = Apic::install(&mut space, acpi.madt(), host_apic_mode(firmware))?;
     apic.describe("core");
-    cpu::attach(apic::local()?.id()?)?;
+    cpu::attach(apic::local()?.id())?;
     ipi::install()?;
     // After the interprocessor interrupts it takes a vector from, and before
     // any other processor is started: a controller has to exist before anything
     // can deliver to it, and before the processor it belongs to does.
-    vlapic::install()?;
+    vlapic::install(firmware)?;
     // Running, because this is the processor the guest is entered on. Every
     // other one joins the guest held, however long it has been executing.
     vlapic::claim_processor(Joining::Running)?;
@@ -361,7 +368,13 @@ fn attach() -> Result<(cpu::ApicId, Descriptors), CoreError> {
     // unlocked: a processor that fell over between the two would otherwise leave
     // that lock held for every processor after it.
     let descriptors = paging::with(Tables::build)??.activate()?;
-    let id = apic::LocalApic::enable()?.id()?;
+    // The older face, and not because it is the safe choice: it is the only one
+    // that matches. This processor came out of a startup command, which leaves a
+    // controller in that face, and the emulated controller it is about to be
+    // given is at reset, which is also that face. Its guest has never started it,
+    // so nothing has asked for anything else — and if the guest does, `vlapic`
+    // takes this controller across behind it.
+    let id = apic::LocalApic::enable(apic::Mode::XApic)?.id();
     cpu::attach(id)?;
     // The moment this processor can answer for itself, and not a step later: a
     // startup message the guest sends before this is forwarded to real hardware,
@@ -721,6 +734,25 @@ fn phys(value: u64) -> Result<PhysAddr, CoreError> {
 /// [`CoreError::BadAddress`] if the value is not canonical.
 fn virt(value: u64) -> Result<VirtAddr, CoreError> {
     VirtAddr::try_new(value).map_err(|_| CoreError::BadAddress { value })
+}
+
+/// Which face the host's own controllers are brought up in.
+///
+/// Firmware's, because the guest *is* firmware and it goes on addressing the
+/// machine the way it already was. Everything it programmed outside its own
+/// controller — every logical destination in an I/O controller's redirection
+/// table, every device message — is passed through untouched and matched by
+/// hardware against the real controller's logical destination register, which
+/// the two faces do not spell the same way. Coming up in the other face would
+/// mean every one of those interrupts arriving at the wrong processor or at
+/// none.
+///
+/// A controller firmware had switched off, or a processor that has none, leaves
+/// nothing to match: the emulated controller is seeded switched off too, and
+/// the only face its guest can switch it on into is the older one. So that is
+/// where the real controller waits for it.
+fn host_apic_mode(firmware: &FirmwareContext) -> apic::Mode {
+    firmware.interrupts.mode().unwrap_or(apic::Mode::XApic)
 }
 
 /// The state firmware was running with, out of the chunk.

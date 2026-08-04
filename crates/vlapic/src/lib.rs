@@ -58,17 +58,19 @@ mod vectors;
 use alloc::boxed::Box;
 use core::num::NonZeroU64;
 
+use apic::Controller;
 use cpu::{CpuError, CpuIndex};
 use descriptors::{DescriptorError, Vector};
 use emulate::{Capability, Commit, Data, Device, Read, Region, Trap, Write};
 use log::{info, trace, warn};
+use snapshot::FirmwareContext;
 use spin::Once;
 use thiserror::Error;
 use x86_64::PhysAddr;
 
 use crate::{
     access::Written,
-    base::ApicBase,
+    base::{ApicBase, Mode},
     error::Errors,
     icr::Trigger,
     mmio::Page,
@@ -80,19 +82,34 @@ pub use crate::{
     msr::{TSC_DEADLINE_MSR, claims},
 };
 
-/// Builds one controller per processor the machine has.
+/// Builds one controller per processor the machine has, and puts this
+/// processor's into the state firmware left the real one in.
 ///
 /// Called once, on the boot processor, after the roster is taken and before any
 /// processor is started — a controller has to exist before anything can deliver
 /// to it, and an application processor's controller has to exist before that
 /// processor does.
 ///
+/// `firmware` is the capture taken before anything had overwritten it. Only
+/// this processor's controller is seeded from it, because it is the only
+/// processor the capture describes and the only one whose guest has ever run:
+/// every other processor joins the guest held, so the guest believes it was
+/// never started, and a processor that was never started has a controller at
+/// reset.
+///
+/// The whole context is taken rather than its interrupt half alone because the
+/// two fields read here belong together: the timer's counts are stale from the
+/// instant they were read, and the timestamp counter beside them is what says
+/// by how much.
+///
 /// # Errors
 ///
 /// [`VlapicError::AlreadyInstalled`] for a second call, [`VlapicError::Cpu`] if
-/// the roster has not been taken, or [`VlapicError::Descriptors`] if no vector
-/// is free for the sources this crate programs onto real hardware.
-pub fn install() -> Result<(), VlapicError> {
+/// the roster has not been taken, [`VlapicError::Descriptors`] if no vector is
+/// free for the sources this crate programs onto real hardware, or
+/// [`VlapicError::Apic`] if this processor's own controller cannot be reached
+/// to be asked which one it is.
+pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     // Asked before anything is acquired so that a second call is cheap and
     // leaves nothing behind. It is not what makes this safe against two callers
     // at once — nothing is, and nothing needs to be: this runs on the boot
@@ -100,6 +117,7 @@ pub fn install() -> Result<(), VlapicError> {
     if LAPICS.is_completed() {
         return Err(VlapicError::AlreadyInstalled);
     }
+    let here = apic::local()?.id();
     let roster = cpu::roster()?;
     // Firmware lists the boot processor first, and the bootstrap flag in the
     // base register records which processor the machine came up on. Nothing
@@ -145,7 +163,68 @@ pub fn install() -> Result<(), VlapicError> {
         page.all().len(),
         page.all().first().map_or(0, Vlapic::version)
     );
+
+    // Last, because it programs real hardware from what it seeds and so needs
+    // everything that reaches hardware to be in place — and because a controller
+    // that could not be seeded is still a working controller, so a machine whose
+    // firmware left nothing to inherit is one this leaves at reset rather than
+    // one it refuses.
+    if let Some(vlapic) = page.all().iter().find(|vlapic| vlapic.apic_id() == here) {
+        inherit(vlapic, firmware);
+    } else {
+        warn!("vlapic: {here} is not in the roster, so nothing inherited firmware's controller");
+    }
     Ok(())
+}
+
+/// Puts one controller into the state firmware left the real one in, and brings
+/// real hardware into agreement with it.
+///
+/// Both halves are necessary and the second is the one easily forgotten. The
+/// host's own bring-up masked every source, stopped the timer, zeroed the task
+/// priority and re-vectored the spurious and error entries — so a controller
+/// seeded with firmware's registers and left there would describe a machine
+/// that no longer exists. Programming hardware from the seeded values is what
+/// makes firmware's timer tick again and its pins deliver again.
+fn inherit(vlapic: &Vlapic, firmware: &FirmwareContext) {
+    let interrupts = &firmware.interrupts;
+    if interrupts.controller != Controller::Read {
+        // Not a failure, and worth saying rather than passing over: a controller
+        // firmware had switched off, or that this processor does not have, left
+        // nothing to inherit, and the reset state the guest gets instead is the
+        // honest answer for it.
+        info!(
+            "vlapic: {} has nothing to inherit, firmware's controller was {:?}",
+            vlapic.index(),
+            interrupts.controller
+        );
+        return;
+    }
+    if ApicBase::relocated(interrupts.base) {
+        // The page is trapped once, before any guest runs, and nothing here can
+        // re-trap a range while processors are executing. Firmware that had
+        // moved its register page therefore resumes to find it back at the
+        // default address, which is a way in which this machine is narrower than
+        // the one it describes and is not something to discover from a symptom.
+        warn!(
+            "vlapic: {} inherits firmware's register page from {:#x} moved to {:#x}, which is the \
+             only address this hypervisor traps",
+            vlapic.index(),
+            ApicBase::page_of(interrupts.base),
+            ApicBase::DEFAULT_PAGE
+        );
+    }
+    vlapic.seed(&interrupts.local, interrupts.base);
+    mirror_logical_destination(vlapic);
+    sources::reprogram(vlapic);
+    timer::inherit(vlapic, &interrupts.local, firmware.tsc);
+    info!(
+        "vlapic: {} inherited firmware's controller in {}, spurious {:#x}, task priority {}",
+        vlapic.index(),
+        vlapic.mode(),
+        vlapic.spurious(),
+        vlapic.task_priority(),
+    );
 }
 
 /// The region of the guest's memory this crate answers for.
@@ -226,9 +305,9 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     // the number an interrupt arrived on is already the number the guest is
     // owed — and a source the guest has masked was programmed masked and did
     // not deliver at all.
-    if !local.arrived_level(vector)? {
+    if !local.arrived_level(vector) {
         vlapic.accept(vector, Trigger::Edge);
-        local.end_of_interrupt()?;
+        local.end_of_interrupt();
         trace!(
             "vlapic: {} received edge {vector}, acknowledged and requested it",
             vlapic.index()
@@ -613,11 +692,12 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
 ///
 /// The virtual half of the transition has already happened: sources were
 /// quieted, debts settled, and whatever the architecture does not preserve was
-/// reset. What is left is to program the machine from whatever the controller
-/// now holds — which for a controller that was reset means putting every source
-/// back to masked, and for one that merely changed how it is addressed means
-/// re-establishing the logical routing that passed-through interrupts are
-/// matched against.
+/// reset. What is left is to bring the machine across after it — which means
+/// taking the real controller into the same face the guest just entered, and
+/// then programming it from whatever the emulated controller now holds. The
+/// order is not a preference: every register written below is written through
+/// whichever face the real controller presents, and the logical destination in
+/// particular is only reachable in one of them.
 fn entered(vlapic: &Vlapic, transition: Transition) {
     let Transition::Changed { quiet, settled } = transition else {
         return;
@@ -634,32 +714,105 @@ fn entered(vlapic: &Vlapic, transition: Transition) {
             if settled { "settled" } else { "still owed" },
         );
     }
+    promote(vlapic);
     mirror_logical_destination(vlapic);
     sources::reprogram(vlapic);
     timer::reprogram(vlapic);
     info!("vlapic: {} entered {}", vlapic.index(), vlapic.mode());
 }
 
-/// Tells the real controller which logical destinations this processor answers
-/// to.
+/// Brings the real controller's logical destination into agreement with the
+/// guest's.
 ///
 /// Necessary because the I/O controllers are passed through: the guest programs
 /// them directly with logical destinations, and hardware matches those against
 /// the *real* register. A disagreement is an interrupt delivered to the wrong
 /// processor or to none, which is how a guest ends up unable to find its own
 /// disk.
+///
+/// How agreement is reached is not the same in the two faces, and neither is a
+/// failure. In the older face the registers are writable and the guest's values
+/// are written. In x2APIC they are not writable at all — hardware derives the
+/// identifier from this processor's own, and there is only the one destination
+/// model — so nothing is written and nothing needs to be: the emulated
+/// controller derives its answer by the architecture's rule from the *real*
+/// identifier, which is the same rule applied to the same number. That is the
+/// whole reason [`promote`] exists, and it is checked here rather than trusted,
+/// because a silent disagreement in this register is exactly the fault this
+/// function is for.
 fn mirror_logical_destination(vlapic: &Vlapic) {
+    let Ok(local) = apic::local() else {
+        warn!(
+            "vlapic: {} could not reach its controller to mirror its logical destination",
+            vlapic.index()
+        );
+        return;
+    };
+    let wanted = vlapic.logical_destination();
+    if local.set_logical_routing(vlapic.destination_format(), wanted) {
+        return;
+    }
+    // The register is hardware's in this face. Reading it back is the only way
+    // to know the two really do agree, and a mismatch means passed-through
+    // interrupts are being matched against something the guest never asked for.
+    let real = local.logical_destination();
+    if real == wanted {
+        trace!(
+            "vlapic: {} answers logical destination {real:#x}, which its guest derives too",
+            vlapic.index()
+        );
+        return;
+    }
+    warn!(
+        "vlapic: {} answers logical destination {real:#x} and its guest believes {wanted:#x}; \
+         interrupts addressed logically will not reach it",
+        vlapic.index()
+    );
+}
+
+/// Takes the real controller into x2APIC behind a guest that has just gone
+/// there.
+///
+/// The one thing that makes logical destinations pass through at all. A guest
+/// in x2APIC addresses interrupts by an identifier the architecture *derives*
+/// from the processor's own, and programs that identifier straight into
+/// passed-through I/O controllers and device messages — none of which this
+/// hypervisor intercepts. Hardware then matches those against the real
+/// controller's own register, which in the older face holds something written
+/// by the host and spelled differently. There is no value the host could write
+/// that would agree: the two faces encode a logical identifier differently, and
+/// the x2APIC one is read-only. So the real controller is moved into the same
+/// face, where hardware derives the identifier from the same number the guest
+/// derived it from, and the two agree because they are the same computation.
+///
+/// Only ever into x2APIC, and only when the guest is already there. A guest
+/// that switches its controller off is not followed: the host needs its own
+/// controller for the doorbells and shootdowns that keep the machine running,
+/// and an emulated controller that is off already refuses everything offered to
+/// it.
+fn promote(vlapic: &Vlapic) {
+    if vlapic.mode() != Mode::X2Apic {
+        return;
+    }
     let Ok(local) = apic::local() else {
         return;
     };
-    let outcome = local
-        .set_destination_format(vlapic.destination_format())
-        .and_then(|()| local.set_logical_destination(vlapic.logical_destination()));
-    if let Err(error) = outcome {
-        warn!(
-            "vlapic: {} could not mirror its logical destination: {error}",
+    if local.mode() == apic::Mode::X2Apic {
+        return;
+    }
+    match local.enter_x2apic() {
+        Ok(_) => info!(
+            "vlapic: {} took its real controller into x2apic behind its guest",
             vlapic.index()
-        );
+        ),
+        // Worth a line of its own rather than being folded into the mirror
+        // warning below it: this is the reason the two will disagree, and it says
+        // the machine cannot do what the guest asked rather than that something
+        // went wrong doing it.
+        Err(error) => warn!(
+            "vlapic: {} could not take its real controller into x2apic: {error}",
+            vlapic.index()
+        ),
     }
 }
 

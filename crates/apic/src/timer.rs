@@ -127,18 +127,16 @@ impl Divisor {
 
 /// The timer of whichever processor is holding this.
 ///
-/// Carries nothing for the same reason [`LocalApic`] carries nothing: every
-/// register it drives is reached the same way on every processor and answers
-/// about the processor doing the reaching, so a handle that named one would be
-/// a handle that could be wrong. Like that one, it is made only from a
-/// controller that is up, and only inside this crate.
+/// Carries that processor's controller, for the reason [`LocalApic`] carries
+/// what it does: every register the timer drives answers about the processor
+/// doing the reaching, and how to reach it is that processor's own.
 #[derive(Clone, Copy, Debug)]
-pub struct Timer(());
+pub struct Timer(LocalApic);
 
 impl Timer {
     /// This processor's timer.
-    pub(crate) const fn new(_: LocalApic) -> Self {
-        Self(())
+    pub(crate) const fn new(local: LocalApic) -> Self {
+        Self(local)
     }
 
     /// Stops the timer and stops it delivering.
@@ -152,12 +150,8 @@ impl Timer {
     /// timer, so a masked entry is already enough to stop the interrupt — but
     /// the deadline itself sits in a register of its own and would still be
     /// there, describing a moment in the past, for whoever reads it next.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if this processor's controller is not up.
-    pub fn disarm(self) -> Result<(), ApicError> {
-        let access = crate::register::access()?;
+    pub fn disarm(self) {
+        let access = self.0.access();
         let was = Mode::of(access.read(Register::LVT_TIMER));
         // SAFETY: zero is the architectural way to stop a counting timer, and a
         // masked entry with a valid vector delivers nothing. Neither can produce
@@ -173,7 +167,6 @@ impl Timer {
             // as no deadline at all.
             unsafe { Msr::new(IA32_TSC_DEADLINE).write(0) };
         }
-        Ok(())
     }
 
     /// Says what the timer delivers, in which mode, at which rate — and starts
@@ -199,10 +192,9 @@ impl Timer {
     ///
     /// # Errors
     ///
-    /// [`ApicError::IllegalVector`] for a vector no controller may deliver,
+    /// [`ApicError::IllegalVector`] for a vector no controller may deliver, or
     /// [`ApicError::NoTscDeadline`] if [`Mode::Deadline`] was asked for on a
-    /// processor that does not implement it, or [`ApicError::NotInstalled`] if
-    /// this processor's controller is not up.
+    /// processor that does not implement it.
     pub fn configure(
         self,
         delivery: Option<Vector>,
@@ -222,7 +214,7 @@ impl Timer {
             Some(vector) => Entry::new(Delivery::Fixed(vector)),
             None => Entry::masked(),
         };
-        let access = crate::register::access()?;
+        let access = self.0.access();
         // SAFETY: the divisor's encoding comes from the architecture's own
         // table, and the entry either names a vector that has a gate like every
         // other or is masked and delivers nothing. Neither write starts
@@ -240,17 +232,11 @@ impl Timer {
     /// This is the write the architecture defines as starting the timer, which
     /// is why it is the only thing here that does. A count of zero stops it,
     /// which is the architecture's own spelling and not an error.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if this processor's controller is not up.
-    pub fn reload(self, count: u32) -> Result<(), ApicError> {
-        let access = crate::register::access()?;
+    pub fn reload(self, count: u32) {
         // SAFETY: the count is a plain 32-bit value the timer counts down, and
         // zero is the architectural way to say stopped. What it delivers when it
         // gets there was settled by the entry, which this does not touch.
-        unsafe { access.write(Register::TIMER_INITIAL_COUNT, count) };
-        Ok(())
+        unsafe { self.0.access().write(Register::TIMER_INITIAL_COUNT, count) };
     }
 
     /// Arms the deadline the timer fires at, against whatever
@@ -308,24 +294,18 @@ impl Timer {
     /// deadline still means anything: changing the mode disarms the timer, so a
     /// caller reconfiguring it has to know whether it is leaving deadline mode
     /// in order to put the deadline register down as well.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if this processor's controller is not up.
-    pub fn mode(self) -> Result<Option<Mode>, ApicError> {
-        crate::register::access().map(|access| Mode::of(access.read(Register::LVT_TIMER)))
+    #[must_use]
+    pub fn mode(self) -> Option<Mode> {
+        Mode::of(self.0.access().read(Register::LVT_TIMER))
     }
 
     /// What the timer has left to count.
     ///
     /// Zero in deadline mode, where nothing is counting, and zero after a
     /// one-shot has fired.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if this processor's controller is not up.
-    pub fn remaining(self) -> Result<u32, ApicError> {
-        crate::register::access().map(|access| access.read(Register::TIMER_CURRENT_COUNT))
+    #[must_use]
+    pub fn remaining(self) -> u32 {
+        self.0.access().read(Register::TIMER_CURRENT_COUNT)
     }
 
     /// Measures how fast the timer counts at `divisor`.
@@ -348,12 +328,11 @@ impl Timer {
     ///
     /// # Errors
     ///
-    /// [`ApicError::Clock`] if no timebase is installed to measure against,
+    /// [`ApicError::Clock`] if no timebase is installed to measure against, or
     /// [`ApicError::Calibration`] if the timer did not move or moved so far it
-    /// wrapped, or [`ApicError::NotInstalled`] if this processor's controller
-    /// is not up.
+    /// wrapped.
     pub fn calibrate(self, divisor: Divisor) -> Result<Frequency, ApicError> {
-        let access = crate::register::access()?;
+        let access = self.0.access();
         // SAFETY: a masked entry delivers nothing whatever the count does, and
         // the count is a plain value. Nothing is armed by this.
         unsafe {
@@ -365,7 +344,7 @@ impl Timer {
         clock::sleep_micros(CALIBRATION_MICROS).map_err(|_| ApicError::Clock)?;
         let remaining = access.read(Register::TIMER_CURRENT_COUNT);
         let elapsed = (clock::now().ok_or(ApicError::Clock)? - started).as_nanos();
-        self.disarm()?;
+        self.disarm();
 
         // Reaching zero means the count wrapped, so what is left says nothing
         // about how far the timer got; not moving at all means the timer is not

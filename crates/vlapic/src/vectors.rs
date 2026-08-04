@@ -143,6 +143,18 @@ impl Bitmap {
             slot.store(0, Ordering::Release);
         }
     }
+
+    /// Puts every register at what a real controller was holding.
+    ///
+    /// Only ever used to seed a controller from a capture of the hardware it
+    /// stands for, before any guest has run and before anything can be
+    /// delivering into it — which is what makes storing the registers one at a
+    /// time rather than as one step correct here and nowhere else.
+    pub(crate) fn seed(&self, words: &[u32; SLOTS]) {
+        for (slot, word) in self.slots.iter().zip(words) {
+            slot.store(*word, Ordering::Release);
+        }
+    }
 }
 
 /// Which register a vector's bit is in, and which bit of it.

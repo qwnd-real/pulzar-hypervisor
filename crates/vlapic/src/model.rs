@@ -79,7 +79,7 @@ impl Model {
     pub(crate) fn of_machine() -> Self {
         let features = processor::features();
         let entries = apic::local()
-            .and_then(LocalApic::entries)
+            .map(LocalApic::entries)
             .map_or(Entry::FEWEST, |entries| {
                 usize::try_from(entries).unwrap_or(Entry::FEWEST)
             });

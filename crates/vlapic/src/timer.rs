@@ -53,8 +53,9 @@
 //! immediately from a moment already in the past. Reading the register is both
 //! simpler and the only thing that is correct.
 
-use apic::{Divisor, LocalApic, TimerMode as HardwareMode};
-use log::warn;
+use apic::{Divisor, LocalApic, LocalState, TimerMode as HardwareMode};
+use clock::Kind;
+use log::{trace, warn};
 
 use crate::{
     lvt::{Entry, TimerMode},
@@ -69,9 +70,7 @@ pub(crate) fn remaining(vlapic: &Vlapic) -> u32 {
     if mode_of(vlapic) == Some(TimerMode::Deadline) {
         return 0;
     }
-    apic::local()
-        .and_then(|local| local.timer().remaining())
-        .unwrap_or(0)
+    apic::local().map_or(0, |local| local.timer().remaining())
 }
 
 /// The deadline the guest's timer is counting towards.
@@ -109,7 +108,7 @@ pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
     };
     let entry = vlapic.lvt(Entry::Timer);
     let asked = mode_of(vlapic);
-    let was = timer.mode().unwrap_or(None);
+    let was = timer.mode();
     let mode = match asked {
         Some(TimerMode::OneShot) => HardwareMode::OneShot,
         Some(TimerMode::Periodic) => HardwareMode::Periodic,
@@ -155,12 +154,7 @@ pub(crate) fn reload(vlapic: &Vlapic) {
     let Ok(timer) = apic::local().map(LocalApic::timer) else {
         return;
     };
-    if let Err(error) = timer.reload(vlapic.timer_initial()) {
-        warn!(
-            "vlapic: {} could not start its timer: {error}",
-            vlapic.index()
-        );
-    }
+    timer.reload(vlapic.timer_initial());
 }
 
 /// Arms the guest's timer at the deadline it just wrote.
@@ -176,6 +170,121 @@ pub(crate) fn arm_deadline(vlapic: &Vlapic, deadline: u64) {
     }
 }
 
+/// Starts the guest's timer where firmware's was, having seeded the entry it
+/// runs against.
+///
+/// The register file has already been seeded, so what the timer delivers and in
+/// which mode is settled; what is left is the half no configuration write
+/// performs, which is starting it. Firmware may have had a timer counting for
+/// its own purposes, and the host stopped it during bring-up — so leaving it
+/// stopped would be an appointment firmware made and can no longer re-derive.
+///
+/// The three modes are not restored alike, because only one of them holds
+/// something that is still true:
+///
+/// - A **deadline** is absolute. It is written back exactly, and one that has
+///   passed in the meantime fires at once, which is what firmware was owed.
+/// - A **periodic** timer is reloaded from its initial count. The period is
+///   exact and the phase moves by up to one period, which nothing could
+///   reconstruct: the count firmware was at says where it is in *this* period,
+///   not where the period began.
+/// - A **one-shot** is aged. Its remaining count is a duration into the future,
+///   so however long the capture has been sitting in the chunk has to come off
+///   it, or firmware's appointment lands late by the whole of bring-up.
+pub(crate) fn inherit(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
+    reprogram(vlapic);
+    match mode_of(vlapic) {
+        Some(TimerMode::Deadline) if firmware.tsc_deadline != 0 => {
+            arm_deadline(vlapic, firmware.tsc_deadline);
+        }
+        Some(TimerMode::Periodic) => reload(vlapic),
+        Some(TimerMode::OneShot) if firmware.timer_current_count != 0 => {
+            oneshot(vlapic, firmware, since);
+        }
+        // Three ways to have nothing to start, and `reprogram` has left the
+        // timer stopped for all of them: a deadline mode firmware had not armed,
+        // a one-shot that had already run out, and the encoding the architecture
+        // reserves, which a controller given it does nothing defined with.
+        _ => {}
+    }
+}
+
+/// Restarts a one-shot firmware left counting, less however long it has been
+/// since.
+///
+/// The count is in timer ticks and the elapsed span is in timestamp counter
+/// ticks, and neither rate is reported by anything — so the timer's is measured
+/// against the timebase, at the guest's own divide, and the timestamp counter's
+/// comes from the timebase itself. A remainder that has already run out is
+/// armed at one tick rather than zero, because zero is how the architecture
+/// spells a stopped timer and would drop the appointment entirely.
+///
+/// Where either rate is unavailable — no timebase, a timebase that is not the
+/// timestamp counter, a measurement that did not converge — the raw count is
+/// reloaded and the reason is logged. That fires late by the length of
+/// bring-up, which is a worse answer than the aged one and a far better answer
+/// than never.
+fn oneshot(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
+    let Some(elapsed) = elapsed_ticks(vlapic, since) else {
+        reload(vlapic);
+        return;
+    };
+    let remaining = firmware
+        .timer_current_count
+        .saturating_sub(elapsed)
+        .max(SOONEST);
+    let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        return;
+    };
+    timer.reload(remaining);
+    trace!(
+        "vlapic: {} restarted firmware's one-shot timer at {remaining} of {}",
+        vlapic.index(),
+        firmware.timer_current_count,
+    );
+}
+
+/// How many of this timer's ticks have passed since the capture was taken, or
+/// `None` where that cannot be worked out.
+fn elapsed_ticks(vlapic: &Vlapic, since: u64) -> Option<u32> {
+    let source = clock::source()?;
+    if source.kind() != Kind::Tsc {
+        warn!(
+            "vlapic: {} cannot age firmware's one-shot timer, the timebase is the {} rather than \
+             the timestamp counter",
+            vlapic.index(),
+            source.kind()
+        );
+        return None;
+    }
+    // SAFETY: `RDTSC` is always permitted at privilege level zero, whatever
+    // `CR4.TSD` says, and reading the counter does not disturb it.
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let rate = apic::local()
+        .map(LocalApic::timer)
+        .and_then(|timer| timer.calibrate(divisor(vlapic)))
+        .inspect_err(|error| {
+            warn!(
+                "vlapic: {} cannot age firmware's one-shot timer, its rate could not be measured: \
+                 {error}",
+                vlapic.index()
+            );
+        })
+        .ok()?;
+    // Through nanoseconds rather than by a ratio of the two rates, because that
+    // is the one conversion both clocks already offer and it needs no arithmetic
+    // of its own to be right about.
+    let nanos = source.frequency().nanos(now.saturating_sub(since));
+    u32::try_from(rate.ticks(nanos)).ok().or(Some(u32::MAX))
+}
+
+/// The fewest ticks a restarted timer is armed at.
+///
+/// One rather than zero, because the architecture reads a count of zero as a
+/// stopped timer rather than as one due immediately — so a deadline that has
+/// already passed has to be spelled as the soonest reachable one instead.
+const SOONEST: u32 = 1;
+
 /// Stops the guest's timer and stops it delivering.
 ///
 /// What a controller transition needs: an old timer left running would deliver
@@ -183,18 +292,14 @@ pub(crate) fn arm_deadline(vlapic: &Vlapic, deadline: u64) {
 /// switched off.
 pub(crate) fn disarm(vlapic: &Vlapic) -> bool {
     let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        warn!(
+            "vlapic: {} could not reach its controller to disarm its timer",
+            vlapic.index()
+        );
         return false;
     };
-    match timer.disarm() {
-        Ok(()) => true,
-        Err(error) => {
-            warn!(
-                "vlapic: {} could not disarm its timer: {error}",
-                vlapic.index()
-            );
-            false
-        }
-    }
+    timer.disarm();
+    true
 }
 
 /// Which mode the guest's entry selects, or `None` for the encoding the

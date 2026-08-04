@@ -53,6 +53,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
+use apic::LocalState;
 use cpu::{ApicId, CpuIndex};
 use descriptors::Vector;
 
@@ -126,6 +127,74 @@ impl Vlapic {
         };
         this.reset_registers();
         this
+    }
+
+    /// Puts this controller into the state firmware left the real one in.
+    ///
+    /// Called once, before the guest has run, on the controller belonging to
+    /// the processor the capture was taken on. What it is for is that
+    /// pulzar does not boot a fresh guest: it re-enters the firmware it
+    /// found, and firmware expects its controller to hold what it left
+    /// there. Every register below was read before anything overwrote it
+    /// and would otherwise be gone — the real controller has since been
+    /// masked, re-vectored and acknowledged out from under firmware by the
+    /// host's own bring-up.
+    ///
+    /// # What is not seeded, and why
+    ///
+    /// The in-service bank. The host has already retired every bit of it on
+    /// real hardware, and more decisively the guest does not resume inside
+    /// firmware's interrupt handler — it resumes at a stub that calls back
+    /// into firmware from the top. So nothing would ever acknowledge a
+    /// seeded in-service bit, and the controller would refuse everything of
+    /// that priority or lower for the rest of the machine's life.
+    ///
+    /// The request and trigger-mode banks *are* seeded, and cannot double up:
+    /// the host retired what was in service and left what was merely
+    /// requested where it was, so those vectors are still latched in the
+    /// real controller too. When hardware delivers one, [`Vlapic::accept`]
+    /// folds it into the bit already set exactly as hardware folds a
+    /// repeated interrupt.
+    ///
+    /// The identifier and the version are not seeded either, and are not
+    /// firmware's to give: the first is the real one this controller was built
+    /// with, because every passed-through interrupt is routed by it, and the
+    /// second describes the hardware behind this controller rather than what
+    /// firmware saw.
+    pub(crate) fn seed(&self, firmware: &LocalState, base: u64) {
+        self.base.store(
+            ApicBase::seeded(base, self.base().bootstrap()).bits(),
+            Ordering::Release,
+        );
+        self.task_priority.store(
+            firmware.task_priority & TASK_PRIORITY_MASK,
+            Ordering::Release,
+        );
+        // Stored raw rather than through the setters, which mask to what a guest
+        // may write: these came out of hardware, so what they hold is by
+        // definition what the register holds, and a guest reading one back has to
+        // find firmware's value rather than a narrowed one.
+        self.logical_destination.store(
+            firmware.logical_destination & LOGICAL_DESTINATION_MASK,
+            Ordering::Release,
+        );
+        self.destination_format.store(
+            (firmware.destination_format & DESTINATION_FORMAT_MASK) | !DESTINATION_FORMAT_MASK,
+            Ordering::Release,
+        );
+        self.spurious
+            .store(firmware.spurious & SPURIOUS_WRITABLE, Ordering::Release);
+        for (entry, value) in Entry::ALL.into_iter().zip(firmware.lvt()) {
+            self.lvt[entry.index()].store(value & entry.writable(self.model), Ordering::Release);
+        }
+        self.timer_divide
+            .store(firmware.timer_divide & TIMER_DIVIDE_MASK, Ordering::Release);
+        self.timer_initial
+            .store(firmware.timer_initial_count, Ordering::Release);
+        self.command.store(firmware.command, Ordering::Release);
+        self.errors.seed(firmware.error_status);
+        self.request.seed(&firmware.interrupt_request);
+        self.trigger_mode.seed(&firmware.trigger_mode);
     }
 
     /// Where this controller sits in the roster.

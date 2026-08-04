@@ -17,12 +17,17 @@
 //! and the two registers only one of them has are a type only that one can
 //! reach.
 //!
-//! The choice is the machine's rather than a processor's. Every processor is
-//! put into the same mode, because a mode is also a destination width, and a
-//! machine where some processors could be addressed and others could not is not
-//! one anything above here should have to reason about. The trip into that mode
-//! is one-way and is made by each processor for itself, so a handle to a
-//! controller is only handed out to a processor that has made it.
+//! The choice is not a preference. Pulzar hands the machine on to firmware and
+//! goes on emulating a controller for it, and the emulated one's logical
+//! destination register has to agree with the real one — because the I/O
+//! controllers are passed through, and hardware matches a passed-through
+//! interrupt against the *real* register. In x2APIC that register is read-only
+//! and derived from the identifier, so the only way to make the two agree is
+//! for the real controller to present the same interface the emulated one does.
+//! So the mode is whichever one firmware was in, and each processor follows its
+//! own guest from there. The trip into x2APIC is one-way and is made by each
+//! processor for itself, so a handle to a controller carries how that processor
+//! reaches it.
 //!
 //! # What the controller has
 //!
@@ -78,7 +83,10 @@ mod timer;
 mod trampoline;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    fmt::{self, Display, Formatter},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use acpi::{Madt, NmiTarget};
 use cpu::{ApicId, CpuError};
@@ -92,7 +100,7 @@ use x86_64::PhysAddr;
 
 use crate::register::{Access, MappedRegister, Page, Register};
 pub use crate::{
-    capture::{Controller, FirmwareState, LocalState, VECTOR_WORDS, capture},
+    capture::{Controller, FirmwareState, LVT_ENTRIES, LocalState, VECTOR_WORDS, capture},
     icr::{Command, Delivery, Target},
     lvt::{Delivery as LvtDelivery, Entry, Polarity, Trigger},
     smp::{Started, start},
@@ -138,7 +146,7 @@ pub(crate) const fn deliverable(vector: Vector) -> bool {
 /// mapped memory in some other size.
 pub(crate) const PAGE: u64 = 4096;
 
-/// Which of the two interfaces the machine's controllers present.
+/// Which of the two interfaces a controller presents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// The page of memory-mapped registers, with eight-bit identifiers.
@@ -147,20 +155,43 @@ pub enum Mode {
     X2Apic,
 }
 
+impl Mode {
+    /// What to call this mode in a log line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::XApic => "xapic",
+            Self::X2Apic => "x2apic",
+        }
+    }
+}
+
+impl Display for Mode {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
 /// The machine's local interrupt controllers.
 ///
 /// Produced once, by the boot processor. What it holds is what is true of all
-/// of them; a particular processor's controller is a [`LocalApic`], which is
-/// nothing but a handle for whichever processor asks.
+/// of them; a particular processor's controller is a [`LocalApic`], which is a
+/// handle for whichever processor asks.
 #[derive(Clone, Copy, Debug)]
 pub struct Apic {
-    mode: Mode,
+    entered: Mode,
     masked_8259: bool,
 }
 
 impl Apic {
-    /// Chooses how the machine's controllers are reached, silences what would
-    /// interfere, and brings the boot processor's own controller up.
+    /// Maps the register page, silences what would interfere, and brings the
+    /// boot processor's own controller up in `mode`.
+    ///
+    /// The mode is the caller's rather than this crate's, and what it should be
+    /// is whichever one firmware was already in — because the controller is
+    /// handed back to firmware as an emulated one, and the emulated
+    /// controller's logical destination register can only agree with the
+    /// real one when both present the same interface.
     ///
     /// Everything that can be refused is refused before anything is recorded,
     /// so a machine this declines to run on is one nothing has been done to.
@@ -174,26 +205,31 @@ impl Apic {
     /// [`ApicError::AlreadyInstalled`] for a second call, which would leave the
     /// machine with two answers to a question that has one;
     /// [`ApicError::NoApic`] on a processor with no local controller;
-    /// [`ApicError::NoX2Apic`] if the machine has a processor whose identifier
-    /// needs x2APIC and this processor does not implement it;
     /// [`ApicError::NoRegisterPage`] if the processor reports its register page
     /// at address zero; [`ApicError::Descriptors`] if either of this crate's
     /// vectors is already claimed; [`ApicError::Paging`] if the register page
     /// cannot be mapped; or whatever bringing this processor's controller up
     /// reported.
-    pub fn install(space: &mut AddressSpace, madt: &Madt) -> Result<Self, ApicError> {
+    pub fn install(space: &mut AddressSpace, madt: &Madt, mode: Mode) -> Result<Self, ApicError> {
         if CONFIGURATION.is_completed() {
             return Err(ApicError::AlreadyInstalled);
         }
         if !processor::features().contains(Features::APIC) {
             return Err(ApicError::NoApic);
         }
-        let wide = cpu::roster()?.needs_x2apic();
-        let mode = match (wide, processor::features().contains(Features::X2APIC)) {
-            (true, false) => return Err(ApicError::NoX2Apic),
-            (_, true) => Mode::X2Apic,
-            (false, false) => Mode::XApic,
-        };
+        // Said rather than refused. A machine with a processor whose identifier
+        // needs x2APIC, whose firmware left the controllers in xAPIC, is one
+        // whose own firmware could not address those processors either — and the
+        // ones that can be addressed are worth running. Each unaddressable
+        // processor is refused individually, where it is named: `Command::bits`
+        // answers `IdTooWide` and `smp::start_each` logs and skips it.
+        if mode == Mode::XApic && cpu::roster()?.needs_x2apic() {
+            warn!(
+                "apic: firmware left the controllers in xapic and the machine has a processor \
+                 whose identifier does not fit its destination field; those processors cannot be \
+                 started"
+            );
+        }
 
         // Claimed before any controller is switched on, so that neither vector
         // can arrive to find nothing claiming it — and before anything at all is
@@ -209,43 +245,45 @@ impl Apic {
             pic::mask();
         }
 
-        let access = match mode {
-            Mode::X2Apic => Access::Msr,
-            Mode::XApic => {
-                let phys = register_page(madt)?;
-                // SAFETY: the address is the processor's own answer for where
-                // its register page is, and a controller's registers are not
-                // memory — nothing else in this image maps them, and no
-                // reference into the mapping outlives this crate.
-                let mapping = unsafe {
-                    space.map_physical(phys, PAGE, Protection::ReadWrite, CacheType::Uncached)
-                }?;
-                // SAFETY: a whole register page, uncached as the architecture
-                // requires, at an address nothing releases.
-                Access::Mapped(unsafe { Page::new(mapping.addr()) })
-            }
-        };
-        register::establish(access)?;
+        // Mapped whichever mode was asked for, because which interface a
+        // processor presents is that processor's own and changes while the
+        // machine runs: a guest that enters x2APIC takes its processor with it,
+        // and every processor that has not followed reaches its controller
+        // through this page. There is no later moment at which it could be
+        // mapped, either — the address space stops being a value once bring-up
+        // is past it.
+        let phys = register_page(madt)?;
+        // SAFETY: the address is the processor's own answer for where its
+        // register page is, and a controller's registers are not memory —
+        // nothing else in this image maps them, and no reference into the
+        // mapping outlives this crate.
+        let mapping =
+            unsafe { space.map_physical(phys, PAGE, Protection::ReadWrite, CacheType::Uncached) }?;
+        // SAFETY: a whole register page, uncached as the architecture requires,
+        // at an address nothing releases.
+        register::establish_page(unsafe { Page::new(mapping.addr()) })?;
         CONFIGURATION.call_once(|| Configuration {
-            mode,
             local_nmis: madt.local_nmis().to_vec(),
         });
-        LocalApic::enable()?;
-        Ok(Self { mode, masked_8259 })
+        let entered = LocalApic::enable(mode)?.mode();
+        Ok(Self {
+            entered,
+            masked_8259,
+        })
     }
 
-    /// Which interface the machine's controllers present.
+    /// Which interface the boot processor's controller was brought up in.
+    ///
+    /// The machine's answer only for as long as no guest has moved a processor
+    /// of its own; [`LocalApic::mode`] is what answers for a processor.
     #[must_use]
     pub const fn mode(self) -> Mode {
-        self.mode
+        self.entered
     }
 
-    /// Logs what was chosen, what was silenced, and what has gone wrong since.
+    /// Logs what was entered, what was silenced, and what has gone wrong since.
     pub fn describe(self, who: &str) {
-        let mode = match self.mode {
-            Mode::XApic => "xapic",
-            Mode::X2Apic => "x2apic",
-        };
+        let mode = self.entered.name();
         match Self::identity() {
             Ok((id, version)) => info!(
                 "{who}: apic {mode}, boot processor is {id}, version {:#04x}, {} lvt entries",
@@ -267,7 +305,7 @@ impl Apic {
     /// What this processor's controller calls itself, and what it says it is.
     fn identity() -> Result<(ApicId, u32), ApicError> {
         let local = local()?;
-        Ok((local.id()?, local.version()?))
+        Ok((local.id(), local.version()))
     }
 }
 
@@ -301,21 +339,25 @@ fn register_page(madt: &Madt) -> Result<PhysAddr, ApicError> {
 
 /// A handle to the controller of whichever processor is holding it.
 ///
-/// Carries nothing, because there is nothing to carry: every register is
-/// reached the same way on every processor and answers about the processor
-/// doing the reaching, so a handle that named one would be a handle that could
-/// be wrong. What it is, is proof — it cannot be made outside this crate, and
-/// inside it is only made for a processor whose controller is up and in the
-/// mode the machine chose.
+/// Carries how that processor reaches its controller, and nothing else: every
+/// register answers about the processor doing the reaching, so a handle that
+/// named one would be a handle that could be wrong. What the access *is* cannot
+/// be a property of the machine, because a guest may take its own processor
+/// into x2APIC and leave the others where they were — so it is derived, per
+/// handle, from the one register that says which interface this controller
+/// presents.
+///
+/// It is also proof: it cannot be made outside this crate, and inside it is
+/// only made for a processor whose controller is switched on.
 #[derive(Clone, Copy, Debug)]
-pub struct LocalApic(());
+pub struct LocalApic(Access);
 
 impl LocalApic {
-    /// Brings this processor's controller up.
+    /// Brings this processor's controller up in `mode`.
     ///
     /// Called by the boot processor from [`Apic::install`], and by every other
-    /// processor for itself once it is running: the mode is a one-way
-    /// transition each processor has to make, and the local vector table is
+    /// processor for itself once it is running: entering a mode is something
+    /// each processor does to its own controller, and the local vector table is
     /// per processor.
     ///
     /// The order inside is the architecture's rather than a preference. Every
@@ -330,15 +372,14 @@ impl LocalApic {
     ///
     /// [`ApicError::NotInstalled`] before [`Apic::install`],
     /// [`ApicError::NoX2Apic`], [`ApicError::ModeRegression`] or
-    /// [`ApicError::ModeNotEntered`] if this processor cannot reach the mode
-    /// the machine chose, or [`ApicError::Cpu`] if the roster does not describe
-    /// this processor.
-    pub fn enable() -> Result<Self, ApicError> {
+    /// [`ApicError::ModeNotEntered`] if this processor cannot reach `mode`, or
+    /// [`ApicError::Cpu`] if the roster does not describe this processor.
+    pub fn enable(mode: Mode) -> Result<Self, ApicError> {
         let configuration = CONFIGURATION.get().ok_or(ApicError::NotInstalled)?;
-        base::enter(configuration.mode)?;
-        let access = register::access()?;
-        let this = Self(());
-        let entries = register::lvt_entries(this.version()?);
+        base::enter(mode)?;
+        let this = local()?;
+        let access = this.0;
+        let entries = this.entries();
 
         // SAFETY: a masked entry with a valid vector delivers nothing, which is
         // what every one of these is; a zero count stops a timer that firmware
@@ -367,7 +408,7 @@ impl LocalApic {
             );
         }
 
-        let id = this.id()?;
+        let id = this.id();
         let uid = cpu::roster()?
             .find(id)
             .ok_or(CpuError::Unknown { apic_id: id })?
@@ -388,35 +429,72 @@ impl LocalApic {
         Self::retire_inherited(access);
         // Last: the register latches whatever the controller noticed while it
         // was being set up, and none of that describes a running machine.
-        Self::clear_errors();
+        this.clear_errors();
         Ok(this)
+    }
+
+    /// Which interface this processor's controller presents.
+    #[must_use]
+    pub const fn mode(self) -> Mode {
+        match self.0 {
+            Access::Mapped(_) => Mode::XApic,
+            Access::Msr => Mode::X2Apic,
+        }
+    }
+
+    /// How this processor reaches its controller's registers.
+    ///
+    /// For the modules of this crate that drive a register file of their own —
+    /// the timer — rather than for anything outside it.
+    pub(crate) const fn access(self) -> Access {
+        self.0
+    }
+
+    /// Takes this processor's controller into x2APIC, and answers with a handle
+    /// that reaches it there.
+    ///
+    /// The whole of what a hypervisor needs this for is agreement. Its guest's
+    /// emulated controller may enter x2APIC, and from that moment the guest
+    /// addresses passed-through interrupts by an identifier the architecture
+    /// derives rather than one software writes — so the real controller has to
+    /// derive the same one, which it does only in the same mode.
+    ///
+    /// Nothing is reprogrammed, because nothing needs to be: the architecture
+    /// carries the register file across this transition, so the spurious
+    /// vector, the local vector table and the priorities are all still what
+    /// they were.
+    ///
+    /// Returning a new handle rather than mutating this one is what stops a
+    /// handle taken before the transition being used after it, which would
+    /// reach registers that are no longer there.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NoX2Apic`] if this processor does not implement it, or
+    /// [`ApicError::ModeNotEntered`] if it took the write and did not change.
+    pub fn enter_x2apic(self) -> Result<Self, ApicError> {
+        base::enter(Mode::X2Apic)?;
+        local()
     }
 
     /// This processor's identifier.
     ///
     /// The older interface keeps it in the top eight bits of the register; the
     /// newer one uses the whole of it.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up.
-    pub fn id(self) -> Result<ApicId, ApicError> {
-        let access = register::access()?;
-        let raw = access.read(Register::ID);
-        Ok(ApicId::new(match access {
+    #[must_use]
+    pub fn id(self) -> ApicId {
+        let raw = self.0.read(Register::ID);
+        ApicId::new(match self.0 {
             Access::Msr => raw,
             Access::Mapped(_) => raw >> XAPIC_ID_SHIFT,
-        }))
+        })
     }
 
     /// The controller's version register: its version in the low byte, and one
     /// less than its number of local vector table entries in the third.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up.
-    pub fn version(self) -> Result<u32, ApicError> {
-        register::access().map(|access| access.read(Register::VERSION))
+    #[must_use]
+    pub fn version(self) -> u32 {
+        self.0.read(Register::VERSION)
     }
 
     /// This processor's timer.
@@ -439,14 +517,10 @@ impl LocalApic {
     /// finished with once it has been taken; a level-triggered one is asserted
     /// until whoever raised it is dealt with, so acknowledging it before that
     /// happens delivers it again immediately.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up.
-    pub fn arrived_level(self, vector: Vector) -> Result<bool, ApicError> {
-        let access = register::access()?;
+    #[must_use]
+    pub fn arrived_level(self, vector: Vector) -> bool {
         let (slot, bit) = trigger_place(vector);
-        Ok(access.read(Register::TRIGGER_MODE.offset_by(slot)) & bit != 0)
+        self.0.read(Register::TRIGGER_MODE.offset_by(slot)) & bit != 0
     }
 
     /// Whether this processor has accepted `vector` and not yet acknowledged
@@ -461,14 +535,10 @@ impl LocalApic {
     /// controller also uses for something of its own can tell a genuinely
     /// accepted interrupt from a withdrawn one, since a withdrawn one is
     /// never accepted and sets no bit here.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up.
-    pub fn in_service(self, vector: Vector) -> Result<bool, ApicError> {
-        let access = register::access()?;
+    #[must_use]
+    pub fn in_service(self, vector: Vector) -> bool {
         let (slot, bit) = trigger_place(vector);
-        Ok(access.read(Register::IN_SERVICE.offset_by(slot)) & bit != 0)
+        self.0.read(Register::IN_SERVICE.offset_by(slot)) & bit != 0
     }
 
     /// The highest-priority vector this processor is holding in service, if
@@ -481,24 +551,20 @@ impl LocalApic {
     /// somebody else.
     ///
     /// Highest-numbered is highest-priority, so one descending scan answers it.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up.
-    pub fn in_service_top(self) -> Result<Option<Vector>, ApicError> {
-        let access = register::access()?;
+    #[must_use]
+    pub fn in_service_top(self) -> Option<Vector> {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "eight slots of thirty-two bits is the whole of a vector's range, so neither the slot nor the bit can leave a byte"
         )]
-        Ok((0..register::VECTOR_SLOTS).rev().find_map(|slot| {
+        (0..register::VECTOR_SLOTS).rev().find_map(|slot| {
             let slot = slot as u32;
-            let word = access.read(Register::IN_SERVICE.offset_by(slot));
+            let word = self.0.read(Register::IN_SERVICE.offset_by(slot));
             (word != 0).then(|| {
                 let bit = u32::BITS - 1 - word.leading_zeros();
                 Vector::new((slot * u32::BITS + bit) as u8)
             })
-        }))
+        })
     }
 
     /// One of the controller's own sources, as the controller currently holds
@@ -506,15 +572,13 @@ impl LocalApic {
     ///
     /// # Errors
     ///
-    /// [`ApicError::NotInstalled`] if the controller is not up, or
     /// [`ApicError::NoSuchLvt`] if this controller does not have the entry.
     pub fn source(self, source: Source) -> Result<Entry, ApicError> {
-        let access = register::access()?;
         let register = source.register();
-        if !register::has_lvt(register, register::lvt_entries(self.version()?)) {
+        if !register::has_lvt(register, self.entries()) {
             return Err(ApicError::NoSuchLvt { which: source });
         }
-        Ok(Entry::from_bits(access.read(register)))
+        Ok(Entry::from_bits(self.0.read(register)))
     }
 
     /// How many local vector table entries this controller has.
@@ -525,12 +589,9 @@ impl LocalApic {
     /// registers. Anything describing this controller to somebody else — a
     /// hypervisor handing a guest a local controller, above all — has to report
     /// this number rather than the largest the architecture allows.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up.
-    pub fn entries(self) -> Result<u32, ApicError> {
-        self.version().map(register::lvt_entries)
+    #[must_use]
+    pub fn entries(self) -> u32 {
+        register::lvt_entries(self.version())
     }
 
     /// Programs one of the controller's own sources.
@@ -547,74 +608,78 @@ impl LocalApic {
     ///
     /// # Errors
     ///
-    /// [`ApicError::NotInstalled`] if the controller is not up, or
     /// [`ApicError::NoSuchLvt`] if this controller does not have the entry —
     /// three of them are optional and a controller reports how many it has.
     pub fn program(self, source: Source, entry: Entry) -> Result<(), ApicError> {
-        let access = register::access()?;
         let register = source.register();
-        if !register::has_lvt(register, register::lvt_entries(self.version()?)) {
+        if !register::has_lvt(register, self.entries()) {
             return Err(ApicError::NoSuchLvt { which: source });
         }
         // SAFETY: the value came from an `Entry`, which can only describe
         // combinations the architecture defines, and the register was just
         // established to be one this controller has.
-        unsafe { access.write(register, entry.bits()) };
+        unsafe { self.0.write(register, entry.bits()) };
         Ok(())
     }
 
-    /// Sets which logical destinations this processor answers to.
+    /// Tells this controller how to match a logical destination, and which ones
+    /// it answers to.
+    ///
+    /// The two registers are one operation, because a destination only means
+    /// anything against the model that matches it: written apart there is a
+    /// window in which the controller answers to a set of processors that is
+    /// neither the old one nor the new one. The format is written first, which
+    /// is the order that keeps that window from being a live one — a
+    /// destination matched by the wrong model is a real interrupt going to
+    /// the wrong processor, while a model with no destination yet matches
+    /// nothing.
     ///
     /// The value belongs to whatever is deciding how interrupts are addressed
-    /// on this machine. A hypervisor passing its I/O controllers through has to
-    /// keep this equal to what its guest believes, because the guest programs
-    /// those controllers directly and hardware matches the destination against
-    /// *this* register — so a disagreement is an interrupt delivered to the
-    /// wrong processor or to none.
+    /// on this machine. A hypervisor passing its I/O controllers through
+    /// has to keep this equal to what its guest believes, because the guest
+    /// programs those controllers directly and hardware matches the
+    /// destination against *this* register — so a disagreement is an
+    /// interrupt delivered to the wrong processor or to none.
     ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up, or
-    /// [`ApicError::NotMapped`] in x2APIC, where the register is derived from
-    /// the identifier by hardware and is not writable at all.
-    pub fn set_logical_destination(self, value: u32) -> Result<(), ApicError> {
-        match register::access()? {
-            // SAFETY: every value of the top byte is a legal set of logical
-            // destinations, and the rest of the register is reserved and
-            // written as zero by the mask.
-            Access::Mapped(page) => unsafe {
-                page.write(
-                    Register::LOGICAL_DESTINATION,
-                    value & LOGICAL_DESTINATION_MASK,
-                );
-                Ok(())
-            },
-            Access::Msr => Err(ApicError::NotMapped),
+    /// Answers whether the registers were written. In x2APIC they are not:
+    /// hardware derives the identifier from this processor's own and there is
+    /// only the one model, so neither register is writable and there is nothing
+    /// to write. Nothing has gone wrong — a caller that needs the two to agree
+    /// there agrees by deriving the same value, and
+    /// [`LocalApic::logical_destination`] is what it checks against.
+    #[must_use]
+    pub fn set_logical_routing(self, format: u32, destination: u32) -> bool {
+        let Access::Mapped(page) = self.0 else {
+            return false;
+        };
+        // SAFETY: of the format register only the top nibble selects anything and
+        // every encoding of it is one the architecture defines, with the reserved
+        // remainder written as ones — its reset value and what the architecture
+        // requires. Every value of the destination register's top byte is a legal
+        // set of logical destinations, and its remainder is reserved and written
+        // as zero.
+        unsafe {
+            page.write(
+                MappedRegister::DESTINATION_FORMAT,
+                format | !DESTINATION_FORMAT_MASK,
+            );
+            page.write(
+                Register::LOGICAL_DESTINATION,
+                destination & LOGICAL_DESTINATION_MASK,
+            );
         }
+        true
     }
 
-    /// Sets how a logical destination is matched: the flat model or the
-    /// cluster model.
+    /// Which logical destinations this processor actually answers to.
     ///
-    /// # Errors
-    ///
-    /// As [`LocalApic::set_logical_destination`]. x2APIC has only the cluster
-    /// model, so the register it would select between them does not exist.
-    pub fn set_destination_format(self, value: u32) -> Result<(), ApicError> {
-        match register::access()? {
-            // SAFETY: only the top nibble selects anything and every encoding
-            // of it is one the architecture defines; the reserved remainder is
-            // written as ones, which is its reset value and what the
-            // architecture requires.
-            Access::Mapped(page) => unsafe {
-                page.write(
-                    MappedRegister::DESTINATION_FORMAT,
-                    value | !DESTINATION_FORMAT_MASK,
-                );
-                Ok(())
-            },
-            Access::Msr => Err(ApicError::NotMapped),
-        }
+    /// Read back rather than remembered, because in x2APIC nothing wrote it:
+    /// hardware derives the value from the identifier and makes the register
+    /// read-only. That makes this the one way to ask what passed-through
+    /// interrupts are really matched against, in either mode.
+    #[must_use]
+    pub fn logical_destination(self) -> u32 {
+        self.0.read(Register::LOGICAL_DESTINATION)
     }
 
     /// Acknowledges the interrupt this processor is currently servicing.
@@ -622,16 +687,10 @@ impl LocalApic {
     /// Owed for everything the controller delivered, and for nothing else: a
     /// spurious interrupt was never accepted, so acknowledging one would retire
     /// whatever really is in service instead.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller is not up.
-    pub fn end_of_interrupt(self) -> Result<(), ApicError> {
-        let access = register::access()?;
+    pub fn end_of_interrupt(self) {
         // SAFETY: the register takes zero and nothing else, and writing it is
         // what the architecture defines as acknowledging.
-        unsafe { access.write(Register::END_OF_INTERRUPT, 0) };
-        Ok(())
+        unsafe { self.0.write(Register::END_OF_INTERRUPT, 0) };
     }
 
     /// Sends `command`.
@@ -639,18 +698,16 @@ impl LocalApic {
     /// # Errors
     ///
     /// [`ApicError::IdTooWide`] if the target cannot be named in the interface
-    /// in use, [`ApicError::IllegalVector`] if the command names a vector no
-    /// controller may deliver, [`ApicError::CommandStuck`] if a previous
-    /// command has still not left, or [`ApicError::NotInstalled`] if the
-    /// controller is not up.
+    /// this processor presents, [`ApicError::IllegalVector`] if the command
+    /// names a vector no controller may deliver, or
+    /// [`ApicError::CommandStuck`] if a previous command has still not left.
     pub fn send(self, command: Command) -> Result<(), ApicError> {
-        let configuration = CONFIGURATION.get().ok_or(ApicError::NotInstalled)?;
-        let bits = command.bits(configuration.mode)?;
+        let bits = command.bits(self.mode())?;
         // SAFETY: `bits` came from a `Command`, which can only describe
         // combinations the architecture defines: its reserved fields are zero,
         // its vector is one a controller may deliver, and its destination was
         // checked against the width of the interface.
-        unsafe { register::access()?.send(bits) }
+        unsafe { self.0.send(bits) }
     }
 
     /// Acknowledges whatever the controller was already holding in service, and
@@ -692,24 +749,21 @@ impl LocalApic {
     ///
     /// The register latches, and the architecture requires a write before a
     /// read to make it report what has happened since it was last asked.
-    fn take_errors() -> u32 {
-        let Ok(access) = register::access() else {
-            return 0;
-        };
+    fn take_errors(self) -> u32 {
         // SAFETY: the register takes zero and nothing else; the write is what
         // makes the read report anything, and the second is what clears what was
         // just read.
         unsafe {
-            access.write(Register::ERROR_STATUS, 0);
-            let errors = access.read(Register::ERROR_STATUS);
-            access.write(Register::ERROR_STATUS, 0);
+            self.0.write(Register::ERROR_STATUS, 0);
+            let errors = self.0.read(Register::ERROR_STATUS);
+            self.0.write(Register::ERROR_STATUS, 0);
             errors
         }
     }
 
     /// Throws away whatever the controller latched during bring-up.
-    fn clear_errors() {
-        let _ = Self::take_errors();
+    fn clear_errors(self) {
+        let _ = self.take_errors();
     }
 }
 
@@ -798,42 +852,46 @@ const SOFTWARE_ENABLE: u32 = 1 << 8;
 ///
 /// Answering means two things are true, and the second does not follow from the
 /// first. The machine's controllers have been installed — and *this* processor
-/// has made the one-way trip into the mode they were installed in, which is
-/// something every processor does for itself in [`LocalApic::enable`]. On a
-/// machine using x2APIC, the registers a handle reaches are not merely
-/// different before that trip: they are absent, and naming one faults.
+/// has switched its own on, which is something every processor does for itself
+/// in [`LocalApic::enable`].
+///
+/// Which interface the handle reaches the controller through is decided here,
+/// from the same register read that establishes the second of those. That is
+/// what makes it this processor's answer rather than the machine's: a guest may
+/// take its own processor into x2APIC and leave every other one where it was,
+/// and this crate has to follow it there without disturbing the rest.
 ///
 /// # Errors
 ///
-/// [`ApicError::NotInstalled`] before [`Apic::install`], or
-/// [`ApicError::NotEnabled`] on a processor that has not yet brought its own
-/// controller up.
+/// [`ApicError::NoApic`] on a processor with no local controller,
+/// [`ApicError::NotEnabled`] on one that has not yet switched its own on, or
+/// [`ApicError::NotInstalled`] before [`Apic::install`] has mapped the register
+/// page.
 pub fn local() -> Result<LocalApic, ApicError> {
-    let configuration = CONFIGURATION.get().ok_or(ApicError::NotInstalled)?;
-    base::presents(configuration.mode)
-        .then_some(LocalApic(()))
-        .ok_or(ApicError::NotEnabled)
+    let base = base::read().ok_or(ApicError::NoApic)?;
+    if base & base::GLOBAL_ENABLE == 0 {
+        return Err(ApicError::NotEnabled);
+    }
+    Access::of(base).map(LocalApic)
 }
 
 /// Acknowledges the interrupt this processor is servicing.
 ///
 /// A free function as well as a method, because every subsystem that consumes
-/// an interrupt owes one and none of them should have to hold a handle to
-/// something with no state in it. It asks nothing about the controller that
-/// [`local`] would ask: an interrupt being serviced is one a controller
-/// delivered, and a controller that delivers is one that is up.
+/// an interrupt owes one and none of them should have to hold a handle to say
+/// so.
 ///
 /// # Errors
 ///
-/// [`ApicError::NotInstalled`] if the controller is not up.
+/// As [`local`], which an interrupt being serviced already implies: it was
+/// delivered by a controller, and a controller that delivers is one that is up.
 pub fn end_of_interrupt() -> Result<(), ApicError> {
-    LocalApic(()).end_of_interrupt()
+    local().map(LocalApic::end_of_interrupt)
 }
 
 /// What is true of every processor's controller, decided once.
 #[derive(Debug)]
 struct Configuration {
-    mode: Mode,
     local_nmis: Vec<acpi::LocalNmi>,
 }
 
@@ -911,10 +969,13 @@ static CONTROLLER_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// arrival and cannot be told apart from the inside; nothing in the delivery
 /// carries its origin.
 fn spurious(interrupt: &Interrupt) -> Disposition {
-    if LocalApic(())
-        .in_service(interrupt.vector())
-        .unwrap_or(false)
-    {
+    // A controller that cannot be reached cannot be asked, and the safe answer
+    // is to pass the arrival on: consuming it would throw away an interrupt that
+    // may have been genuinely accepted.
+    let Ok(local) = local() else {
+        return Disposition::Passed;
+    };
+    if local.in_service(interrupt.vector()) {
         return Disposition::Passed;
     }
     if SPURIOUS_ARRIVALS.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -943,14 +1004,19 @@ fn spurious(interrupt: &Interrupt) -> Disposition {
 /// direction: a real error arriving alongside an interrupt something else sent
 /// on this vector reads as ours, and that arrival is consumed.
 fn errors(_: &Interrupt) -> Disposition {
-    let errors = LocalApic::take_errors();
+    // As in `spurious`: a controller that cannot be asked what it latched has
+    // said nothing that would make this arrival ours.
+    let Ok(local) = local() else {
+        return Disposition::Passed;
+    };
+    let errors = local.take_errors();
     if errors == 0 {
         return Disposition::Passed;
     }
     if CONTROLLER_ERRORS.fetch_add(1, Ordering::Relaxed) == 0 {
         warn!("apic: controller reported errors {errors:#010b}, counting any others");
     }
-    let _ = LocalApic(()).end_of_interrupt();
+    local.end_of_interrupt();
     Disposition::Consumed
 }
 

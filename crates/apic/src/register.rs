@@ -44,6 +44,11 @@
 //! and each one sees its own controller through it. So it is mapped once and
 //! the address is shared, which is why this module holds a global rather than
 //! handing out a mapping per processor.
+//!
+//! What is *not* global is which of the two interfaces a processor presents.
+//! That is per processor and it changes while the machine runs, so the page is
+//! kept here and the choice between it and the model-specific registers is made
+//! by whoever asks — from the one register that answers the question.
 
 use core::ptr;
 
@@ -308,6 +313,25 @@ pub(crate) enum Access {
 }
 
 impl Access {
+    /// How a controller whose base register holds `base` is reached.
+    ///
+    /// The register that says which interface a controller presents is the same
+    /// one that says whether it is switched on, so deriving the access from a
+    /// value already read out of it is what keeps the two from disagreeing —
+    /// and what makes the answer this processor's rather than the machine's.
+    ///
+    /// # Errors
+    ///
+    /// [`ApicError::NotInstalled`] if the controller presents the
+    /// memory-mapped interface and nothing has mapped the page yet.
+    pub(crate) fn of(base: u64) -> Result<Self, ApicError> {
+        if base & crate::base::X2APIC_ENABLE == 0 {
+            page().map(Self::Mapped)
+        } else {
+            Ok(Self::Msr)
+        }
+    }
+
     /// Reads a register.
     pub(crate) fn read(self, register: Register) -> u32 {
         match self {
@@ -436,35 +460,35 @@ const fn truncate(value: u64) -> u32 {
     value as u32
 }
 
-/// How this machine's local APICs are reached, decided once by the boot
-/// processor and the same for all of them.
-static ACCESS: Once<Access> = Once::new();
+/// The register page, mapped once by the boot processor.
+static PAGE: Once<Page> = Once::new();
 
-/// Records how the registers are reached.
+/// Records where the register page was mapped.
 ///
-/// The choice belongs to the machine, not to a processor: every processor is
-/// put into the same mode, so that one destination format and one register
-/// width serve all of them.
+/// Mapped whichever interface the machine starts in, because which one a
+/// processor presents is per processor and changes while the machine runs: a
+/// guest entering x2APIC takes its processor with it, and every processor that
+/// has not followed still reaches its controller through here.
 ///
 /// # Errors
 ///
-/// [`ApicError::AlreadyInstalled`] if something has already decided. The cell
+/// [`ApicError::AlreadyInstalled`] if something has already mapped it. The cell
 /// runs the closure for the caller that fills it and for no other, so whether
-/// it ran is exactly whether this call is the one that decided.
-pub(crate) fn establish(access: Access) -> Result<(), ApicError> {
-    let mut decided = false;
-    ACCESS.call_once(|| {
-        decided = true;
-        access
+/// it ran is exactly whether this call is the one that mapped it.
+pub(crate) fn establish_page(page: Page) -> Result<(), ApicError> {
+    let mut mapped = false;
+    PAGE.call_once(|| {
+        mapped = true;
+        page
     });
-    decided.then_some(()).ok_or(ApicError::AlreadyInstalled)
+    mapped.then_some(()).ok_or(ApicError::AlreadyInstalled)
 }
 
-/// How the registers are reached, once something has decided.
+/// The register page, once the boot processor has mapped it.
 ///
 /// # Errors
 ///
-/// [`ApicError::NotInstalled`] before the boot processor has chosen.
-pub(crate) fn access() -> Result<Access, ApicError> {
-    ACCESS.get().copied().ok_or(ApicError::NotInstalled)
+/// [`ApicError::NotInstalled`] before the boot processor has mapped it.
+pub(crate) fn page() -> Result<Page, ApicError> {
+    PAGE.get().copied().ok_or(ApicError::NotInstalled)
 }
