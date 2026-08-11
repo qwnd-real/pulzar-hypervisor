@@ -27,6 +27,23 @@
 //! told the moment the window opens, at which point the interrupt is withdrawn
 //! and re-decided from the controller's current state and injected properly.
 //!
+//! # The priority armed with the doorbell is what makes it ring
+//!
+//! The processor raises that exit when the guest's flag admits an interrupt
+//! *and* the armed priority outranks the guest's own task priority. Both halves
+//! matter, and the second is the only way the host hears about the register
+//! that holds it: with interrupt masking virtualized, the guest's writes to its
+//! task priority through the control register go straight into the control
+//! block and take no exit at all. A hypervisor that decided for itself that the
+//! priority was too high, and armed nothing, would be waiting for an exit that
+//! only the guest lowering that priority could cause — and it has just arranged
+//! for that not to cause one.
+//!
+//! So the vector the doorbell carries is the highest one the controller has
+//! that is not already outranked by something in service, whether or not the
+//! guest's task priority currently admits it, and the priority armed with it is
+//! that vector's own. The comparison is then made where the register lives.
+//!
 //! # An interrupted delivery is owed back
 //!
 //! An intercept can happen part-way through the processor delivering an event —
@@ -74,7 +91,11 @@ pub struct Pending {
     nmi: bool,
     nmi_blocked: bool,
     blocking: Blocking,
-    window: bool,
+    /// The vector an interrupt window is currently armed for, or `None` when
+    /// none is. The vector and not merely the fact, because the priority armed
+    /// beside it is that vector's own — so a window armed for a different
+    /// vector has to be rewritten rather than left alone.
+    window: Option<Vector>,
 }
 
 impl Pending {
@@ -87,7 +108,7 @@ impl Pending {
             nmi: false,
             nmi_blocked: false,
             blocking: Blocking::of(processor::svm().map(|svm| svm.features)),
-            window: false,
+            window: None,
         }
     }
 
@@ -152,7 +173,7 @@ impl Pending {
         self.interrupted = None;
         self.nmi = false;
         self.nmi_blocked = false;
-        self.window = false;
+        self.window = None;
         let control = vcpu.control_mut();
         control.event_injection = Event::none();
         control.interrupt_control = control
@@ -176,20 +197,38 @@ impl Pending {
 
     /// Decides what the guest takes on its next entry, and puts it there.
     ///
-    /// `candidate` is the highest-priority vector the controller says the guest
-    /// should take, already checked against its task priority — or `None` if it
-    /// should take nothing. The answer says what was actually injected, because
-    /// a candidate is only consumed if it went in: the controller must not move
-    /// a vector from requested to in-service for an injection that did not
-    /// happen.
-    pub fn commit(&mut self, vcpu: &mut Vcpu, candidate: Option<Vector>) -> Injected {
-        let injected = self.choose(vcpu, candidate);
-        // Armed whenever something is owed that could not go in now, so that
-        // the moment the guest becomes willing there is an exit to decide again
-        // at. Withdrawn as soon as nothing is waiting, because left armed it
-        // would exit on every window the guest opens for the rest of its life.
-        let waiting = matches!(injected, Injected::Nothing) && candidate.is_some();
-        self.arm_window(vcpu, waiting, candidate);
+    /// `deliverable` is the highest-priority vector the controller says the
+    /// guest should take now, already checked against its task priority — or
+    /// `None` if it should take nothing. The answer says what was actually
+    /// injected, because a candidate is only consumed if it went in: the
+    /// controller must not move a vector from requested to in-service for an
+    /// injection that did not happen.
+    ///
+    /// `blocked` is the highest-priority vector the controller has that only
+    /// the guest's task priority may be holding back, and is what an
+    /// interrupt window is armed for. It is a wider question than
+    /// `deliverable` on purpose: the guest changes that priority without
+    /// exiting, so a window armed only for what the priority already admits
+    /// would leave the guest lowering it and nothing noticing.
+    pub fn commit(
+        &mut self,
+        vcpu: &mut Vcpu,
+        deliverable: Option<Vector>,
+        blocked: Option<Vector>,
+    ) -> Injected {
+        let injected = self.choose(vcpu, deliverable);
+        // Armed whenever the controller is holding something the guest has not
+        // been given, whichever of the two things is holding it back — its
+        // interrupt flag, or its task priority. Withdrawn as soon as nothing is
+        // waiting, because left armed it would exit on every window the guest
+        // opens for the rest of its life.
+        //
+        // An injection of something else — a requeued event, a non-maskable
+        // interrupt — leaves the window armed rather than withdrawing it. What
+        // is waiting is still waiting, and the guest is about to run a handler
+        // for something quite unrelated to it.
+        let waiting = blocked.filter(|_| !matches!(injected, Injected::Interrupt(_)));
+        self.arm_window(vcpu, waiting);
         injected
     }
 
@@ -277,10 +316,16 @@ impl Pending {
     /// Arms or withdraws the conditional delivery that exists only to say when
     /// the guest becomes willing.
     ///
-    /// The vector and priority written here are never the ones the guest takes.
-    /// They are what makes the processor raise the exit at the right moment,
-    /// and the interrupt is re-decided from the controller when it does.
-    fn arm_window(&mut self, vcpu: &mut Vcpu, waiting: bool, candidate: Option<Vector>) {
+    /// The vector written here is never the one the guest takes; the interrupt
+    /// is re-decided from the controller when the exit arrives. The
+    /// *priority* beside it is not decoration, though — it is what the
+    /// processor compares against the guest's own task priority to decide
+    /// whether the guest is willing, so it has to be the priority of the
+    /// vector really waiting. Anything lower arms a window the guest's
+    /// priority suppresses; anything higher reports one the guest cannot
+    /// take the waiting vector through, and that is an exit which arms
+    /// itself again.
+    fn arm_window(&mut self, vcpu: &mut Vcpu, waiting: Option<Vector>) {
         let iret = self.blocking == Blocking::Iret && self.nmi_blocked;
         if waiting == self.window && !iret {
             return;
@@ -291,14 +336,16 @@ impl Pending {
         let changed = waiting != self.window;
         self.window = waiting;
         if changed {
-            if let Some(vector) = candidate.filter(|_| waiting) {
-                trace!("inject: arming the interrupt window with {vector} pending");
-            } else {
-                trace!("inject: withdrawing the interrupt window");
+            match waiting {
+                Some(vector) => trace!(
+                    "inject: arming the interrupt window for {vector} at priority {:#x}",
+                    priority_class(vector)
+                ),
+                None => trace!("inject: withdrawing the interrupt window"),
             }
         }
         let control = vcpu.control_mut();
-        control.interrupt_control = match candidate.filter(|_| waiting) {
+        control.interrupt_control = match waiting {
             Some(vector) => control
                 .interrupt_control
                 .with_virtual_irq_pending(true)
@@ -310,7 +357,9 @@ impl Pending {
                 .with_virtual_vector(0)
                 .with_virtual_priority(0),
         };
-        control.intercept_1.set(Intercepts1::VINTR, waiting);
+        control
+            .intercept_1
+            .set(Intercepts1::VINTR, waiting.is_some());
         // The return from a handler stays intercepted only while a window that
         // nothing else tracks is open.
         if !iret {

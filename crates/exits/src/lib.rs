@@ -240,25 +240,6 @@ impl<'a> Exits<'a> {
             self.left = Left::Stopped;
             return flow;
         }
-        // The guest's task priority is one register reached through two doors:
-        // the control block's virtual task priority, which the processor
-        // answers a guest's `CR8` access from, and the emulated register the
-        // guest writes through the page or a model-specific register. The exit
-        // above already read the first into the second; a guest that instead
-        // wrote the second has just changed it here, and the first has to be
-        // brought back into agreement before the guest runs again — otherwise
-        // the two halves of one register disagree, and a guest that lowered
-        // its priority through the page would find its own `CR8` read still
-        // answering the old value. Only the class is held in the control
-        // block, which is the upper nibble of the emulated byte.
-        if let Ok(priority) = vlapic::task_priority() {
-            let class = priority >> TPR_CLASS_SHIFT;
-            if vcpu.control().interrupt_control.virtual_tpr() != class {
-                let control = vcpu.control_mut();
-                control.interrupt_control = control.interrupt_control.with_virtual_tpr(class);
-                vcpu.soil(CleanBits::INTERRUPT);
-            }
-        }
         self.enter(vcpu)
     }
 
@@ -277,16 +258,19 @@ impl<'a> Exits<'a> {
     /// Decides what the guest takes on its way back in, or that there is no
     /// longer a guest to enter.
     ///
-    /// Three things are asked of the controller here and every one of them is a
-    /// *last* look — nothing else will consult it before the guest is running
-    /// again. So the store saying this processor has stopped watching comes
-    /// before all three, and that pairing is what stops any of them being lost
-    /// to a processor that was entering the guest as the answer changed: a
-    /// sender that misses the flag is one whose message one of these three
-    /// looks finds, and a look that misses the message is one the sender's
-    /// doorbell interrupts.
+    /// Everything asked of the controller here is a *last* look — nothing else
+    /// will consult it before the guest is running again. So the store saying
+    /// this processor has stopped watching comes before all of them, and
+    /// that pairing is what stops any being lost to a processor that was
+    /// entering the guest as the answer changed: a sender that misses the
+    /// flag is one whose message one of these looks finds, and a
+    /// look that misses the message is one the sender's doorbell interrupts.
     fn enter(&mut self, vcpu: &mut Vcpu) -> Flow {
         let _ = vlapic::set_away(true);
+        // Before anything below reads the controller, because the interrupt
+        // window one of them arms is judged by the processor against exactly
+        // this field.
+        Self::mirror_task_priority(vcpu);
         // A non-maskable interrupt another processor sent this one is held by
         // the controller, because the processor that sent it could not reach
         // what this exit loop owns.
@@ -309,13 +293,56 @@ impl<'a> Exits<'a> {
         // through delivery goes first, a non-maskable interrupt outranks it, the
         // guest's interrupt window may be shut — and a controller that had
         // already consumed the request would have thrown the interrupt away.
+        //
+        // The second answer is the wider one, and is what an interrupt window
+        // is armed for. A guest changes its task priority without exiting, so
+        // the vector that priority is holding back has to be armed as well as
+        // the one it admits — otherwise the guest lowering it is a change
+        // nothing on this machine hears about.
         let candidate = vlapic::select().unwrap_or(None);
-        let injected = self.interrupts.commit(vcpu, candidate);
-        trace!("exits: entering with candidate {candidate:?}, injected {injected:?}");
+        let blocked = vlapic::pending().unwrap_or(None);
+        let injected = self.interrupts.commit(vcpu, candidate, blocked);
+        trace!(
+            "exits: entering with candidate {candidate:?}, blocked {blocked:?}, injected \
+             {injected:?}"
+        );
         if let Injected::Interrupt(vector) = injected {
             let _ = vlapic::committed(vector);
         }
         Flow::Resume
+    }
+
+    /// Brings the control block's virtual task priority into agreement with the
+    /// emulated register.
+    ///
+    /// The guest's task priority is one register reached through two doors: the
+    /// control block's copy, which the processor answers a guest's `CR8` access
+    /// from and compares an armed interrupt window against, and the emulated
+    /// register the guest writes through the page or a model-specific register.
+    /// [`Exits::exit`] reads the first into the second on the way out; this
+    /// writes the second back into the first on the way in, so that a guest
+    /// which lowered its priority through the register file finds its own `CR8`
+    /// answering the same number and its pending interrupts judged against it.
+    ///
+    /// Done on every entry rather than only after an exit, which is what covers
+    /// the two entries that follow no exit at all: the first one, where the
+    /// copy still reads zero and the emulated register holds what firmware
+    /// left, and the one after a startup message, where the emulated
+    /// register has just been reset and the copy has not.
+    ///
+    /// Only the class is held in the control block, which is the upper nibble
+    /// of the emulated byte.
+    fn mirror_task_priority(vcpu: &mut Vcpu) {
+        let Ok(priority) = vlapic::task_priority() else {
+            return;
+        };
+        let class = priority >> TPR_CLASS_SHIFT;
+        if vcpu.control().interrupt_control.virtual_tpr() == class {
+            return;
+        }
+        let control = vcpu.control_mut();
+        control.interrupt_control = control.interrupt_control.with_virtual_tpr(class);
+        vcpu.soil(CleanBits::INTERRUPT);
     }
 }
 

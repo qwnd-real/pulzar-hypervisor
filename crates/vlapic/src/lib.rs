@@ -496,6 +496,29 @@ pub fn select() -> Result<Option<Vector>, VlapicError> {
     current().map(Vlapic::select)
 }
 
+/// The highest-priority interrupt this processor's guest is owed, whatever its
+/// task priority currently says.
+///
+/// What an interrupt window has to be armed for, and it is deliberately not
+/// [`select`]. A guest changes its task priority through its control register
+/// without exiting — with interrupt masking virtualized the processor keeps the
+/// value in the control block — so a vector [`select`] refused on a priority
+/// read at the last exit would stay refused however far the guest lowered that
+/// priority afterwards, and nothing would ever ask again. Arming the window for
+/// this instead hands the comparison to the hardware that owns the register,
+/// and the guest lowering its priority is what produces the exit.
+///
+/// Everything else a controller filters on is applied: a controller that is
+/// switched off or software-disabled offers nothing, and neither does one whose
+/// only requests are outranked by what it already has in service.
+///
+/// # Errors
+///
+/// As [`read_msr`].
+pub fn pending() -> Result<Option<Vector>, VlapicError> {
+    current().map(Vlapic::pending)
+}
+
 /// Records that the guest really has been given `vector`, moving it from
 /// requested to in service.
 ///
@@ -553,19 +576,26 @@ pub fn raise_nmi() -> Result<(), VlapicError> {
     current().map(Vlapic::raise_nmi)
 }
 
-/// Records the task priority the guest set while it was running.
+/// Records the priority class the guest set while it was running.
 ///
 /// With interrupt masking virtualized, a guest's writes to its task priority
 /// through the control register do not exit — the processor keeps them in the
 /// control block instead. So the value is read back out of it at every exit,
 /// and this is where it lands.
 ///
+/// `class` is the four bits the control block carries, which is the whole of
+/// what that control register holds. A class equal to the one already recorded
+/// changes nothing, so a subclass the guest wrote through the register file
+/// survives being observed; a class that differs is a write to the control
+/// register, which clears the subclass, and is recorded with nothing beneath
+/// it.
+///
 /// A failure is deliberately not reported: this is called on the exit path
 /// before anything has been decided, and a processor with no controller has
 /// nothing that could want the value.
-pub fn observe_task_priority(priority: u8) {
+pub fn observe_task_priority(class: u8) {
     if let Ok(vlapic) = current() {
-        vlapic.observe_task_priority(priority);
+        vlapic.observe_task_priority(class);
     }
 }
 

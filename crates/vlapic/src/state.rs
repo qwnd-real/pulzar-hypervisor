@@ -428,21 +428,43 @@ impl Vlapic {
             .store(value & TASK_PRIORITY_MASK, Ordering::Release);
     }
 
-    /// Records the task priority the guest set without exiting.
+    /// Records the priority class the guest set through its control register
+    /// without exiting.
     ///
-    /// The control block holds only the four bits of the priority class, which
-    /// is what the control register a guest sets it through holds too — so the
-    /// subclass is zero, and that is the value rather than a truncation of one.
-    pub(crate) fn observe_task_priority(&self, priority: u8) {
-        self.task_priority.store(
-            u32::from(priority) << PRIORITY_CLASS_SHIFT,
-            Ordering::Release,
-        );
+    /// The control block carries only the four bits of the class, because that
+    /// is all the control register carries — and a write to that register
+    /// clears the subclass, which is why a class differing from the stored
+    /// one is stored as a whole byte with nothing beneath it.
+    ///
+    /// A class that agrees with the stored one is left alone, and that is the
+    /// substance of this rather than an optimisation. This is called at every
+    /// exit with a value that is only ever as wide as a class, so storing
+    /// unconditionally would erase the subclass of any priority the guest wrote
+    /// through the register file instead: a guest that asked for `0x21` would
+    /// read `0x20` back at its next exit, having been told its write did not
+    /// happen.
+    pub(crate) fn observe_task_priority(&self, class: u8) {
+        if self.task_priority().class() == class {
+            return;
+        }
+        self.task_priority
+            .store(u32::from(class) << PRIORITY_CLASS_SHIFT, Ordering::Release);
     }
 
     /// The priority this controller is actually servicing at.
     pub(crate) fn processor_priority(&self) -> Priority {
         priority::processor_priority(self.task_priority(), self.in_service.highest())
+    }
+
+    /// The priority the interrupts this controller has already accepted impose,
+    /// with the guest's task priority left out of it.
+    ///
+    /// Half of [`Vlapic::processor_priority`], and the half this hypervisor can
+    /// see change. The other half moves without any exit at all — the guest's
+    /// control register writes land in the control block — which is why the two
+    /// are separable at all and why [`Vlapic::pending`] needs this one alone.
+    fn servicing(&self) -> Priority {
+        priority::processor_priority(Priority::NONE, self.in_service.highest())
     }
 
     /// The arbitration priority, which exists only in the older face.
@@ -707,6 +729,38 @@ impl Vlapic {
         let selected = self.select_inner();
         self.report_selection(selected);
         selected
+    }
+
+    /// The highest-priority interrupt nothing but the guest's task priority may
+    /// be holding back.
+    ///
+    /// A superset of [`Vlapic::select`], and the difference between them is the
+    /// one comparison this hypervisor must not be the one to make. A guest
+    /// changes its task priority through its control register without exiting —
+    /// the processor keeps the value in the control block — so a vector this
+    /// crate ruled out on a task priority it read at the last exit would stay
+    /// ruled out however far the guest lowered that priority afterwards, and
+    /// nothing would ever ask again.
+    ///
+    /// So the two halves of the processor priority are split. What is already
+    /// in service is applied here, because it moves only when the guest
+    /// acknowledges an interrupt and that always exits. The task priority is
+    /// left to the hardware that owns it: this is what an interrupt window is
+    /// armed for, and the processor raises one exactly when the guest's own
+    /// priority admits the vector.
+    ///
+    /// Applying the in-service half here rather than leaving both to hardware
+    /// is what keeps that arrangement from spinning. The control block
+    /// carries only the task priority, so a vector armed while an interrupt
+    /// of its own class or higher is still in service would have the
+    /// processor report a window the guest cannot actually take anything
+    /// through, and every exit would arm it again.
+    pub(crate) fn pending(&self) -> Option<Vector> {
+        if !self.accepting() {
+            return None;
+        }
+        let vector = self.request.highest()?;
+        priority::deliverable(vector, self.servicing()).then_some(vector)
     }
 
     /// [`Vlapic::select`] proper, with nothing said about what it decided.
