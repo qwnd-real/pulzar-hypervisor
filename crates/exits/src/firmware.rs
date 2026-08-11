@@ -140,6 +140,7 @@ impl Firmware {
     /// machine.
     fn handed(&mut self, vcpu: &mut Vcpu) -> Flow {
         if self.stage == Stage::Portal {
+            info!("exits: About to boot APICs");
             match apic::start(self.boot.trampoline, self.boot.attach) {
                 Ok(started) => {
                     self.stage = Stage::Handed;

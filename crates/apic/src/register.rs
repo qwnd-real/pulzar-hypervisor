@@ -21,9 +21,12 @@
 //! The interrupt command register is two 32-bit registers in the older
 //! interface and one 64-bit model-specific register in x2APIC, so it is offered
 //! as [`Access::command`] and [`Access::send`] rather than as an offset, and no
-//! caller assembles it twice. A write to the older one is posted, so its
-//! delivery status has to be polled before the next command; an x2APIC write is
-//! not, so there is nothing to poll and the bit does not exist.
+//! caller assembles it twice. The two also need opposite things of their
+//! caller: the older one is a posted write whose delivery status has to be
+//! polled before the next command and whose two halves must not be interleaved
+//! with anybody else's, while an x2APIC write is a single model-specific
+//! register that the architecture deliberately exempts from `WRMSR`'s ordering
+//! against earlier stores.
 //!
 //! The upper half of that command register and the destination format register
 //! exist only in the older interface, and the difference is not that x2APIC
@@ -38,22 +41,21 @@
 //! another processor, and one addressed to this processor goes through the same
 //! command register as the rest.
 //!
-//! # One mapping, every processor
+//! # What a [`Register`] is allowed to be
 //!
-//! The memory-mapped page is at the same physical address on every processor,
-//! and each one sees its own controller through it. So it is mapped once and
-//! the address is shared, which is why this module holds a global rather than
-//! handing out a mapping per processor.
-//!
-//! What is *not* global is which of the two interfaces a processor presents.
-//! That is per processor and it changes while the machine runs, so the page is
-//! kept here and the choice between it and the model-specific registers is made
-//! by whoever asks — from the one register that answers the question.
+//! Every one of them is a register software both reads and writes. The two that
+//! are not are kept out of the list rather than trusted to a comment: the
+//! acknowledgement register, which x2APIC faults a read of, is reachable only
+//! as [`Access::acknowledge`], and the eight-register banks are reachable only
+//! through [`bank`] and [`word`], so the offset arithmetic that could leave the
+//! page cannot be written anywhere else.
 
-use core::ptr;
+use core::{
+    ptr,
+    sync::atomic::{Ordering, fence},
+};
 
-use spin::Once;
-use x86_64::{VirtAddr, registers::model_specific::Msr};
+use x86_64::{VirtAddr, instructions::interrupts, registers::model_specific::Msr};
 
 use crate::ApicError;
 
@@ -86,8 +88,6 @@ impl Register {
     /// The priority this processor is actually servicing at, which is its task
     /// priority or the highest interrupt in service, whichever is higher.
     pub(crate) const PROCESSOR_PRIORITY: Self = Self(0xA0);
-    /// Written to acknowledge the interrupt currently being serviced.
-    pub(crate) const END_OF_INTERRUPT: Self = Self(0xB0);
     /// Which logical destinations this processor answers to.
     pub(crate) const LOGICAL_DESTINATION: Self = Self(0xD0);
     /// Spurious interrupt vector, and the bit that software-enables the
@@ -128,13 +128,20 @@ impl Register {
     /// How far the bus clock is divided before the timer counts it.
     pub(crate) const TIMER_DIVIDE: Self = Self(0x3E0);
 
+    /// Written to acknowledge the interrupt currently being serviced.
+    ///
+    /// Private, and the reason is that it is the one register software may not
+    /// read: x2APIC faults the attempt. [`Access::acknowledge`] is the whole of
+    /// what anything needs of it.
+    const END_OF_INTERRUPT: Self = Self(0xB0);
+
     /// The register `slots` slots past this one.
     ///
-    /// Three of the controller's registers are really the first of eight
-    /// consecutive ones, describing the two hundred and fifty-six vectors
-    /// thirty-two at a time. Deriving the rest from the first is what keeps
-    /// twenty-four offsets from being written out by hand.
-    pub(crate) const fn offset_by(self, slots: u32) -> Self {
+    /// Private, because unchecked offset arithmetic is how a register leaves
+    /// the page it was promised to be in. [`bank`] and [`word`] are the
+    /// only two things that need it, and both are bounded by
+    /// [`VECTOR_SLOTS`].
+    const fn offset_by(self, slots: u32) -> Self {
         Self(self.0 + slots * STRIDE)
     }
 
@@ -191,14 +198,30 @@ const LVT_ENTRIES: [Register; 7] = [
 
 /// How many of the controller's registers it takes to describe every vector one
 /// bit at a time: two hundred and fifty-six vectors, thirty-two to a register.
-pub(crate) const VECTOR_SLOTS: usize = 8;
+pub(crate) const VECTOR_SLOTS: u32 = 8;
+
+/// How many local vector table entries the architecture defines, and so how far
+/// a controller's count is believed.
+pub(crate) const DEFINED_LVT_ENTRIES: usize = LVT_ENTRIES.len();
 
 /// The eight consecutive registers a bank of one bit per vector is spread
 /// across, lowest vectors first.
-pub(crate) fn bank(first: Register) -> impl Iterator<Item = Register> {
-    (0..)
-        .take(VECTOR_SLOTS)
-        .map(move |slot| first.offset_by(slot))
+///
+/// Reversible, because the one question asked of a bank in reverse is which of
+/// the vectors in it has the highest priority.
+pub(crate) fn bank(
+    first: Register,
+) -> impl DoubleEndedIterator<Item = Register> + ExactSizeIterator {
+    (0..VECTOR_SLOTS).map(move |slot| first.offset_by(slot))
+}
+
+/// Which register of a bank holds a vector's bit, and which bit of it.
+pub(crate) fn word(first: Register, vector: u8) -> (Register, u32) {
+    let number = u32::from(vector);
+    (
+        first.offset_by(number / u32::BITS),
+        1 << (number % u32::BITS),
+    )
 }
 
 /// Every local vector table entry a controller counting `entries` of them has,
@@ -220,7 +243,9 @@ pub(crate) fn has_lvt(register: Register, entries: u32) -> bool {
 /// How many local vector table entries the version register reports.
 ///
 /// The field holds one less than the count, so every controller has at least
-/// one and the arithmetic cannot wrap.
+/// one and the arithmetic cannot wrap. A controller reporting more than the
+/// architecture defines is not trusted beyond that: [`lvt_present`] stops at
+/// the entries this crate knows the offsets of.
 pub(crate) const fn lvt_entries(version: u32) -> u32 {
     ((version >> LVT_COUNT_SHIFT) & VERSION_FIELD) + 1
 }
@@ -280,8 +305,10 @@ impl Page {
     pub(crate) fn read(self, register: impl Offset) -> u32 {
         // SAFETY: a whole 4 KiB page is mapped uncached at this address, which
         // is what `new` requires, and every register is an offset inside it that
-        // the architecture defines as a readable 32-bit slot. Volatile because
-        // these are registers and the read is the point.
+        // the architecture defines as a readable 32-bit slot — the offsets are
+        // this module's own and the only derived ones are bounded by
+        // `VECTOR_SLOTS`. Volatile because these are registers and the read is
+        // the point.
         unsafe { ptr::read_volatile(self.pointer(register)) }
     }
 
@@ -303,7 +330,13 @@ impl Page {
     }
 }
 
-/// How the local APIC's registers are reached on this machine.
+/// How the local APIC's registers are reached on this processor, right now.
+///
+/// Derived at each use rather than remembered. Which interface a controller
+/// presents is per processor and changes while the machine runs — a guest
+/// entering x2APIC takes its own processor with it — and a remembered answer
+/// taken before that would go on reaching a page the architecture has since
+/// made unavailable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Access {
     /// Through the memory-mapped page.
@@ -313,33 +346,15 @@ pub(crate) enum Access {
 }
 
 impl Access {
-    /// How a controller whose base register holds `base` is reached.
-    ///
-    /// The register that says which interface a controller presents is the same
-    /// one that says whether it is switched on, so deriving the access from a
-    /// value already read out of it is what keeps the two from disagreeing —
-    /// and what makes the answer this processor's rather than the machine's.
-    ///
-    /// # Errors
-    ///
-    /// [`ApicError::NotInstalled`] if the controller presents the
-    /// memory-mapped interface and nothing has mapped the page yet.
-    pub(crate) fn of(base: u64) -> Result<Self, ApicError> {
-        if base & crate::base::X2APIC_ENABLE == 0 {
-            page().map(Self::Mapped)
-        } else {
-            Ok(Self::Msr)
-        }
-    }
-
     /// Reads a register.
     pub(crate) fn read(self, register: Register) -> u32 {
         match self {
             Self::Mapped(page) => page.read(register),
             // SAFETY: the register exists because this variant is only chosen
-            // once x2APIC has been enabled on this processor, and reading any of
-            // the controller's registers has no side effect the architecture
-            // does not document as one of its uses.
+            // once x2APIC is enabled on this processor, every `Register` is one
+            // both interfaces have and software may read, and reading any of
+            // them has no side effect the architecture does not document as one
+            // of its uses.
             Self::Msr => truncate(unsafe { Msr::new(register.msr()).read() }),
         }
     }
@@ -361,8 +376,32 @@ impl Access {
         }
     }
 
+    /// Acknowledges the interrupt this processor is currently servicing.
+    ///
+    /// Its own operation rather than a register, because it is the one register
+    /// that is write-only: the architecture defines no value it returns and
+    /// x2APIC faults a read of it.
+    ///
+    /// Owed for everything a controller delivered and for nothing else. The
+    /// register takes no vector — it retires whichever interrupt in service has
+    /// the highest priority — so anything withholding an acknowledgement has to
+    /// establish that the one it owes is still that one.
+    pub(crate) fn acknowledge(self) {
+        // SAFETY: the register takes zero and nothing else, and writing it is
+        // what the architecture defines as acknowledging.
+        unsafe { self.write(Register::END_OF_INTERRUPT, 0) };
+    }
+
     /// The interrupt command as one value, whichever interface holds it and in
     /// however many pieces.
+    ///
+    /// Only ever a description of what the register holds. The older interface
+    /// splits it across two registers with nothing to read them together, so an
+    /// answer is only coherent where nothing can be sending a command — which
+    /// is true of firmware capture, before any of this crate's own senders
+    /// exist, and is not something this can establish for itself. x2APIC
+    /// reads it in one piece, and the architecture describes that read as a
+    /// debugging aid rather than as the last value written.
     pub(crate) fn command(self) -> u64 {
         match self {
             Self::Mapped(page) => {
@@ -376,25 +415,36 @@ impl Access {
         }
     }
 
-    /// Sends an interrupt command, waiting first for any previous one to have
-    /// left.
+    /// Sends an interrupt command, and makes everything already written to
+    /// memory visible to whoever receives it.
     ///
-    /// The two halves of the older interface are written destination first,
-    /// because writing the low half is what sends the command.
+    /// The two interfaces need opposite things here.
     ///
-    /// The wait is before the write and not after it. What it protects is the
-    /// register's contents, which the previous command owns until it has left;
-    /// once this one is written the register is this command's and there is
-    /// nothing a caller could do with the news that it has gone. A command that
-    /// never leaves is reported to whoever sends the next one, and not asking
-    /// twice saves an uncached read on a path that sends one interrupt per
-    /// processor.
+    /// The older one is three operations that have to be one: the delivery
+    /// status of the previous command is polled, the destination is written,
+    /// and then the low half is written, which is what sends it.
+    /// Interleaving somebody else's destination with this command's is an
+    /// interrupt — or an `INIT` — delivered to the wrong processor, so the
+    /// whole of it runs with this processor's maskable interrupts held off.
+    /// A non-maskable interrupt can still interpose, and a handler that
+    /// sent a command from there would break this; nothing in this image
+    /// does.
+    ///
+    /// x2APIC needs no exclusion at all, because the command is one
+    /// model-specific register and one write. What it needs instead is a fence:
+    /// the architecture deliberately relaxes `WRMSR`'s ordering for the APIC's
+    /// own registers, so the command may reach the controller before stores
+    /// this processor has already made are visible to the processor
+    /// receiving it. The startup sequence depends on exactly that ordering,
+    /// and on this architecture the store-store ordering a release fence
+    /// would rely on is not enough — only a real barrier is.
     ///
     /// # Errors
     ///
-    /// [`ApicError::CommandStuck`] if a previous command is still pending after
-    /// the wait — which means the controller has not accepted something the
-    /// processor gave it, and sending another would overwrite it.
+    /// [`ApicError::CommandStuck`] if a previous command through the older
+    /// interface is still pending after the wait, which means the controller
+    /// has not accepted something the processor gave it and sending another
+    /// would overwrite it.
     ///
     /// # Safety
     ///
@@ -403,17 +453,20 @@ impl Access {
     /// reset or deliver to a vector nothing is prepared for.
     pub(crate) unsafe fn send(self, command: u64) -> Result<(), ApicError> {
         match self {
-            Self::Mapped(page) => {
+            Self::Mapped(page) => interrupts::without_interrupts(|| {
                 self.settle()?;
                 // SAFETY: the destination half accepts any value in its top
                 // eight bits, and writing it sends nothing on its own.
                 unsafe { page.write(MappedRegister::COMMAND_HIGH, truncate(command >> u32::BITS)) };
-                // SAFETY: the caller vouches for the command, and the previous
-                // one has left.
+                // SAFETY: the caller vouches for the command, the previous one
+                // has left, and no other sender on this processor can have
+                // reached the register since — interrupts are held off across
+                // all three operations.
                 unsafe { page.write(Register::COMMAND_LOW, truncate(command)) };
                 Ok(())
-            }
+            }),
             Self::Msr => {
+                fence(Ordering::SeqCst);
                 // SAFETY: the caller vouches for the command. The write does
                 // not return until the controller has accepted it, so there is
                 // nothing to wait for on either side of it.
@@ -429,9 +482,6 @@ impl Access {
     /// bus cycles, and a controller that has not finished after this many
     /// reads is not going to.
     fn settle(self) -> Result<(), ApicError> {
-        let Self::Mapped(_) = self else {
-            return Ok(());
-        };
         for _ in 0..COMMAND_POLLS {
             if self.read(Register::COMMAND_LOW) & DELIVERY_PENDING == 0 {
                 return Ok(());
@@ -460,35 +510,117 @@ const fn truncate(value: u64) -> u32 {
     value as u32
 }
 
-/// The register page, mapped once by the boot processor.
-static PAGE: Once<Page> = Once::new();
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFINED_LVT_ENTRIES, LVT_ENTRIES, MappedRegister, Register, VECTOR_SLOTS, bank, has_lvt,
+        lvt_entries, lvt_present, version_number, word,
+    };
 
-/// Records where the register page was mapped.
-///
-/// Mapped whichever interface the machine starts in, because which one a
-/// processor presents is per processor and changes while the machine runs: a
-/// guest entering x2APIC takes its processor with it, and every processor that
-/// has not followed still reaches its controller through here.
-///
-/// # Errors
-///
-/// [`ApicError::AlreadyInstalled`] if something has already mapped it. The cell
-/// runs the closure for the caller that fills it and for no other, so whether
-/// it ran is exactly whether this call is the one that mapped it.
-pub(crate) fn establish_page(page: Page) -> Result<(), ApicError> {
-    let mut mapped = false;
-    PAGE.call_once(|| {
-        mapped = true;
-        page
-    });
-    mapped.then_some(()).ok_or(ApicError::AlreadyInstalled)
-}
+    /// Every register both interfaces have, with the model-specific index the
+    /// architecture puts it in.
+    const DERIVED: [(Register, u32); 22] = [
+        (Register::ID, 0x802),
+        (Register::VERSION, 0x803),
+        (Register::TASK_PRIORITY, 0x808),
+        (Register::PROCESSOR_PRIORITY, 0x80A),
+        (Register::END_OF_INTERRUPT, 0x80B),
+        (Register::LOGICAL_DESTINATION, 0x80D),
+        (Register::SPURIOUS, 0x80F),
+        (Register::IN_SERVICE, 0x810),
+        (Register::TRIGGER_MODE, 0x818),
+        (Register::INTERRUPT_REQUEST, 0x820),
+        (Register::ERROR_STATUS, 0x828),
+        (Register::LVT_CORRECTED_MACHINE_CHECK, 0x82F),
+        (Register::COMMAND_LOW, 0x830),
+        (Register::LVT_TIMER, 0x832),
+        (Register::LVT_THERMAL, 0x833),
+        (Register::LVT_PERFORMANCE, 0x834),
+        (Register::LVT_LINT0, 0x835),
+        (Register::LVT_LINT1, 0x836),
+        (Register::LVT_ERROR, 0x837),
+        (Register::TIMER_INITIAL_COUNT, 0x838),
+        (Register::TIMER_CURRENT_COUNT, 0x839),
+        (Register::TIMER_DIVIDE, 0x83E),
+    ];
 
-/// The register page, once the boot processor has mapped it.
-///
-/// # Errors
-///
-/// [`ApicError::NotInstalled`] before the boot processor has mapped it.
-pub(crate) fn page() -> Result<Page, ApicError> {
-    PAGE.get().copied().ok_or(ApicError::NotInstalled)
+    #[test]
+    fn every_offset_derives_the_architecture_s_own_model_specific_index() {
+        for (register, msr) in DERIVED {
+            assert_eq!(register.msr(), msr, "{register:?}");
+        }
+    }
+
+    #[test]
+    fn every_register_sits_in_the_page_on_a_sixteen_byte_boundary() {
+        for (register, _) in DERIVED {
+            assert!(register.0 < 4096, "{register:?}");
+            assert_eq!(register.0 % 16, 0, "{register:?}");
+        }
+        for register in [
+            MappedRegister::COMMAND_HIGH,
+            MappedRegister::DESTINATION_FORMAT,
+        ] {
+            assert!(register.0 < 4096);
+            assert_eq!(register.0 % 16, 0);
+        }
+    }
+
+    #[test]
+    fn the_two_registers_only_one_interface_has_would_derive_reserved_indices() {
+        // Named as the reason they are a separate type: 0x80E and 0x831 are
+        // reserved, and reaching either faults.
+        assert_eq!(Register(MappedRegister::DESTINATION_FORMAT.0).msr(), 0x80E);
+        assert_eq!(Register(MappedRegister::COMMAND_HIGH.0).msr(), 0x831);
+    }
+
+    #[test]
+    fn a_bank_is_eight_consecutive_registers_and_stays_in_the_page() {
+        let mut counted = 0;
+        for (register, slot) in bank(Register::IN_SERVICE).zip(0..) {
+            assert_eq!(register, Register(0x100 + 0x10 * slot));
+            assert!(register.0 < 4096);
+            counted += 1;
+        }
+        assert_eq!(counted, VECTOR_SLOTS);
+    }
+
+    #[test]
+    fn a_vector_s_bit_is_in_the_slot_thirty_two_of_them_share() {
+        assert_eq!(word(Register::IN_SERVICE, 0), (Register(0x100), 1));
+        assert_eq!(word(Register::IN_SERVICE, 31), (Register(0x100), 1 << 31));
+        assert_eq!(word(Register::IN_SERVICE, 32), (Register(0x110), 1));
+        assert_eq!(
+            word(Register::TRIGGER_MODE, 255),
+            (Register(0x1F0), 1 << 31)
+        );
+    }
+
+    #[test]
+    fn the_version_register_counts_one_less_than_the_entries_it_has() {
+        assert_eq!(lvt_entries(0x0000_0010), 1);
+        assert_eq!(lvt_entries(0x0003_0010), 4);
+        assert_eq!(lvt_entries(0x0006_0015), 7);
+        assert_eq!(version_number(0x0006_0015), 0x15);
+        assert_eq!(version_number(u32::MAX), 0xFF);
+    }
+
+    #[test]
+    fn a_controller_has_exactly_the_first_however_many_entries_it_counts() {
+        assert_eq!(lvt_present(0).count(), 0);
+        assert!(lvt_present(4).eq(LVT_ENTRIES[..4].iter().copied()));
+        assert!(has_lvt(Register::LVT_ERROR, 4));
+        assert!(!has_lvt(Register::LVT_PERFORMANCE, 4));
+        assert!(has_lvt(Register::LVT_CORRECTED_MACHINE_CHECK, 7));
+    }
+
+    #[test]
+    fn a_controller_claiming_more_entries_than_exist_is_read_no_further() {
+        assert_eq!(lvt_entries(0x00FF_0010), 256);
+        assert_eq!(
+            lvt_present(256).count(),
+            DEFINED_LVT_ENTRIES,
+            "no offset exists past the entries the architecture defines"
+        );
+    }
 }

@@ -19,7 +19,28 @@
 //!
 //! It also means one stack and one set of parameters are in flight at a time,
 //! which is what lets the trampoline's parameter block be rewritten between
-//! processors instead of one existing per processor.
+//! processors instead of one existing per processor. That is a real constraint
+//! and not merely a convenience: the block may only be rewritten once the
+//! processor before it has said it has finished reading it, so a processor that
+//! begins and then stops somewhere in the middle stops the whole sequence.
+//! There is nothing else to do with it — the alternative is to overwrite the
+//! stack pointer and the entry point of a processor that may still be about to
+//! read them, and two processors running on one stack is a worse machine than
+//! one with fewer processors.
+//!
+//! A processor that never began at all is a different case and is only logged:
+//! the architecture's own startup sequence defines the two commands and the
+//! delays after them, and a processor that has not executed its first
+//! instruction by the end of that is one the sequence has finished with.
+//!
+//! # Stacks are never handed on
+//!
+//! Every processor that is sent a startup command keeps the stack allocated for
+//! it, whether or not it ever ran. Reclaiming one means proving that no
+//! processor can still be executing on it, and a command the controller
+//! accepted is not something that can be un-accepted. Sixty-four kilobytes per
+//! processor that failed to start is the price of never having two of them on
+//! one stack.
 //!
 //! # Never twice
 //!
@@ -90,6 +111,13 @@ const ATTACH_MICROS: u64 = 1_000_000;
 const ONE_MIB: u64 = 1 << 20;
 
 /// What starting the other processors came to.
+///
+/// Two counts over two populations, which is worth saying because they can
+/// disagree in both directions: `startable` is how many distinct processors
+/// firmware described as ones that may be started, and `online` is how many are
+/// attached — which includes any that were attached before this ran and
+/// excludes any firmware described as unstartable. Equal numbers mean
+/// everything described came up; unequal ones mean the log has the detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Started {
     /// How many processors are now attached, this one included.
@@ -108,16 +136,25 @@ pub struct Started {
 /// tables is the first thing it should do, because until it does the processor
 /// has no way to report anything that goes wrong.
 ///
-/// A processor that does not arrive is logged and skipped. One processor
-/// failing to start is not a reason to refuse to run a machine, and the count
-/// returned is what actually happened rather than what was attempted.
+/// A processor that never answered a startup command is logged and skipped: one
+/// processor failing to start is not a reason to refuse to run a machine, and
+/// the count returned is what actually happened rather than what was attempted.
+/// A processor that answered and then stopped part-way is not skipped, because
+/// starting anything else would mean overwriting parameters it may still read.
 ///
 /// # Errors
 ///
 /// [`ApicError::TrampolineUnreachable`] if the page is not a frame-aligned one
-/// below one megabyte, [`ApicError::Paging`] if it cannot be mapped or
-/// unmapped, [`ApicError::NotEnabled`] if this processor's own controller is
-/// not up, or whatever placing the trampoline reported.
+/// below one megabyte or is outside the direct map;
+/// [`ApicError::NotInstalled`], [`ApicError::NotEnabled`] or
+/// [`ApicError::NoApic`] if this processor's own controller cannot be reached;
+/// [`ApicError::Cpu`] if the processor roster cannot be read;
+/// [`ApicError::Paging`] if the page cannot be mapped or unmapped, which
+/// includes some processor failing to acknowledge dropping the mapping;
+/// [`ApicError::StartupUnresolved`] if a processor began starting and stopped
+/// before it had read its parameters, which leaves the trampoline page mapped
+/// because that processor may still be executing from it; or whatever placing
+/// the trampoline reported.
 pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError> {
     let base = trampoline.as_u64();
     if base >= ONE_MIB || !base.is_multiple_of(PAGE) {
@@ -160,26 +197,52 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
     // physical address — checked above to be frame-aligned and below one
     // megabyte.
     let placed = unsafe { Trampoline::place(at.as_ptr(), trampoline, root, entry_address(main)) };
-    let result = placed.map(|trampoline| start_each(local, &trampoline, &startable, here));
+    let started = placed.and_then(|trampoline| start_each(local, &trampoline, &startable, here));
 
     // Unmapped whatever happened above: leaving one executable page of the low
     // half behind would outlast the reason it existed. This is also what makes
     // every processor that just ran from it forget the translation.
-    let unmapped = paging::with(|space| {
-        // SAFETY: every processor is either past the point of using this page —
-        // each is waited for before the next is started — or never reached it.
-        unsafe { space.unmap_region(VirtAddr::new(base), PAGE) }
-    })?;
+    //
+    // Unless a processor is unaccounted for. One that began and never finished
+    // reading its parameters may yet execute the instruction that turns paging
+    // on, and that instruction is fetched from this page — so removing the
+    // mapping is the one thing that could still make its situation worse.
+    let unmapped = match &started {
+        Err(ApicError::StartupUnresolved { apic_id }) => {
+            warn!(
+                "apic: leaving the trampoline mapped at {base:#x}; {apic_id} began starting and \
+                 may still be executing from it"
+            );
+            Ok(())
+        }
+        _ => paging::with(|space| {
+            // SAFETY: every processor is either past the point of using this page
+            // — each is waited for before the next is started, and one that began
+            // and did not finish stops the sequence above — or never reached it.
+            unsafe { space.unmap_region(VirtAddr::new(base), PAGE) }
+        })?,
+    };
 
-    result?;
-    unmapped?;
-    Ok(Started {
-        online: cpu::online_count(),
-        startable: startable.len(),
-    })
+    // Both outcomes matter and only one can be returned. A failed cleanup is the
+    // one that outlives the call — an executable page of the low half, or a
+    // processor still translating one — so it is the one reported, and the other
+    // is logged where it happened.
+    match (started, unmapped) {
+        (Ok(()), Ok(())) => Ok(Started {
+            online: cpu::online_count(),
+            startable: startable.len(),
+        }),
+        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            warn!("apic: starting the other processors also failed: {error}");
+            Err(cleanup.into())
+        }
+    }
 }
 
-/// Every processor firmware described as startable, named once each.
+/// Every processor firmware described as startable, named once each and in
+/// order.
 ///
 /// Deduplicated because a machine may describe one processor twice: the tables
 /// have two ways of naming a processor, one of them older and narrower, and
@@ -187,12 +250,14 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
 /// become two startup sequences, and the second would reset a processor that
 /// the first had just brought up.
 fn startable() -> Result<Vec<ApicId>, ApicError> {
-    let mut startable = Vec::new();
-    for entry in cpu::roster()?.entries() {
-        if entry.startable() && !startable.contains(&entry.apic_id()) {
-            startable.push(entry.apic_id());
-        }
-    }
+    let mut startable: Vec<ApicId> = cpu::roster()?
+        .entries()
+        .iter()
+        .filter(|entry| entry.startable())
+        .map(cpu::Entry::apic_id)
+        .collect();
+    startable.sort_unstable();
+    startable.dedup();
     Ok(startable)
 }
 
@@ -201,36 +266,54 @@ fn startable() -> Result<Vec<ApicId>, ApicError> {
 /// Whoever is running this is skipped, and so is anyone already attached: a
 /// processor that is one of the machine's is one an `INIT` would reset rather
 /// than start.
-fn start_each(local: LocalApic, trampoline: &Trampoline, startable: &[ApicId], here: ApicId) {
-    let mut spare = None;
+///
+/// # Errors
+///
+/// [`ApicError::StartupUnresolved`] if a processor began and stopped before it
+/// had taken its parameters out of the trampoline, which is the one failure
+/// that stops the rest: the next processor's parameters go in the same place.
+fn start_each(
+    local: LocalApic,
+    trampoline: &Trampoline,
+    startable: &[ApicId],
+    here: ApicId,
+) -> Result<(), ApicError> {
     for target in startable.iter().copied() {
         if target == here || attached(target) {
             continue;
         }
-        let stack = match spare.take().map_or_else(allocate_stack, Ok) {
+        let stack = match allocate_stack() {
             Ok(stack) => stack,
             // Every processor after this one would ask for the same thing and
             // be refused the same way, so there is nothing to be gained by
             // asking again.
             Err(error) => {
                 warn!("apic: no stack for {target} or anything after it: {error}");
-                return;
+                return Ok(());
             }
         };
+        // Whatever comes of this, the stack stays this processor's. Handing it
+        // to the next one would need proof that a command the controller
+        // accepted can no longer produce a running processor, and there is no
+        // such proof.
         match bring_up(local, trampoline, target, &stack) {
             Ok(()) => info!("apic: {target} started"),
-            Err(error) => {
-                warn!("apic: {target} did not start: {error}");
-                // A processor that never executed an instruction never touched
-                // the stack it was given, so the next one can have it. One that
-                // began and did not arrive may be anywhere, and its stack has to
-                // be assumed to be under it.
-                if trampoline.started().load(Ordering::Acquire) == 0 {
-                    spare = Some(stack);
-                }
+            // It began and did not arrive, so where it is now is unknown and it
+            // may still have the parameter block to read. Nothing else can be
+            // started, because the next processor's parameters go in the same
+            // place. A success is not this case: it ends in the target
+            // publishing itself, which is a long way past its last read.
+            Err(error) if trampoline.began() => {
+                warn!(
+                    "apic: {target} stopped after stage {} of starting: {error}",
+                    trampoline.reached()
+                );
+                return Err(ApicError::StartupUnresolved { apic_id: target });
             }
+            Err(error) => warn!("apic: {target} did not start: {error}"),
         }
     }
+    Ok(())
 }
 
 /// A stack for one processor to run on, out of the machine's address space.
@@ -242,10 +325,10 @@ fn allocate_stack() -> Result<Stack, ApicError> {
 ///
 /// # Errors
 ///
-/// Whatever sending it a command reported, [`ApicError::NoStartupResponse`] if
-/// it never executed the first instruction of the trampoline, or
-/// [`ApicError::AttachTimeout`] if it began and never became one of the
-/// machine's.
+/// Whatever sending it a command reported, [`ApicError::Clock`] if there is no
+/// timebase to wait on, [`ApicError::NoStartupResponse`] if it never executed
+/// the first instruction of the trampoline, or [`ApicError::AttachTimeout`] if
+/// it began and never became one of the machine's.
 fn bring_up(
     local: LocalApic,
     trampoline: &Trampoline,
@@ -255,7 +338,8 @@ fn bring_up(
     trampoline.prepare(stack.top().as_u64());
 
     // Everything the processor will read has to be in memory before the command
-    // that lets it read anything.
+    // that lets it read anything. The command itself adds the barrier the
+    // architecture requires of the interface it goes out through.
     core::sync::atomic::fence(Ordering::Release);
 
     local.send(Command::new(Delivery::Init, Target::One(target)))?;
@@ -267,20 +351,14 @@ fn bring_up(
             Target::One(target),
         ))?;
         sleep(STARTUP_MICROS)?;
-        if began(trampoline) {
+        if trampoline.began() {
             break;
         }
     }
-    if !began(trampoline) {
+    if !trampoline.began() {
         return Err(ApicError::NoStartupResponse { apic_id: target });
     }
     wait_for(target)
-}
-
-/// Whether the processor being started has executed the first instruction of
-/// the trampoline, which it says before it does anything that could fail.
-fn began(trampoline: &Trampoline) -> bool {
-    trampoline.started().load(Ordering::Acquire) != 0
 }
 
 /// Where a function the trampoline jumps to lives.
@@ -301,6 +379,10 @@ const STARTUP_COMMANDS: u32 = 2;
 
 /// Waits for `target` to become one of the machine's.
 ///
+/// Looked at once more after the last wait than before it, so that a processor
+/// which publishes itself during that wait is seen to have arrived inside its
+/// budget rather than reported as having missed it.
+///
 /// # Errors
 ///
 /// [`ApicError::AttachTimeout`] if it never did, or [`ApicError::Clock`] if
@@ -311,6 +393,9 @@ fn wait_for(target: ApicId) -> Result<(), ApicError> {
             return Ok(());
         }
         sleep(POLL_MICROS)?;
+    }
+    if attached(target) {
+        return Ok(());
     }
     Err(ApicError::AttachTimeout { apic_id: target })
 }

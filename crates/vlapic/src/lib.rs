@@ -58,7 +58,7 @@ mod vectors;
 use alloc::boxed::Box;
 use core::num::NonZeroU64;
 
-use apic::Controller;
+use apic::{Controller, IA32_TSC_DEADLINE};
 use cpu::{CpuError, CpuIndex};
 use descriptors::{DescriptorError, Vector};
 use emulate::{Capability, Commit, Data, Device, Read, Region, Trap, Write};
@@ -77,10 +77,7 @@ use crate::{
     model::Model,
     state::{Accepted, Transition, Vlapic},
 };
-pub use crate::{
-    delivery::Resumption,
-    msr::{TSC_DEADLINE_MSR, claims},
-};
+pub use crate::{delivery::Resumption, msr::claims};
 
 /// Builds one controller per processor the machine has, and puts this
 /// processor's into the state firmware left the real one in.
@@ -539,7 +536,8 @@ pub fn take_nmi() -> Result<bool, VlapicError> {
 /// that hold a register: reaching an unassigned one is a fault the guest is
 /// entitled to, and it cannot be given one by code that never sees the access.
 pub fn intercepted() -> impl Iterator<Item = u32> {
-    (register::X2APIC_BASE_MSR..=register::X2APIC_LAST_MSR).chain([ApicBase::MSR, TSC_DEADLINE_MSR])
+    (register::X2APIC_BASE_MSR..=register::X2APIC_LAST_MSR)
+        .chain([ApicBase::MSR, IA32_TSC_DEADLINE])
 }
 
 /// Records that this processor's guest is owed a non-maskable interrupt.
@@ -690,29 +688,34 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
 
 /// Brings real hardware across a change of face, and says so.
 ///
-/// The virtual half of the transition has already happened: sources were
-/// quieted, debts settled, and whatever the architecture does not preserve was
-/// reset. What is left is to bring the machine across after it — which means
-/// taking the real controller into the same face the guest just entered, and
-/// then programming it from whatever the emulated controller now holds. The
-/// order is not a preference: every register written below is written through
-/// whichever face the real controller presents, and the logical destination in
-/// particular is only reachable in one of them.
+/// The virtual half of the transition has already happened: whatever the
+/// architecture does not preserve was reset, and where it does not preserve
+/// anything the sources were quieted and the debts settled first. What is left
+/// is to bring the machine across after it — which means taking the real
+/// controller into the same face the guest just entered, and then programming
+/// it from whatever the emulated controller now holds. The order is not a
+/// preference: every register written below is written through whichever face
+/// the real controller presents, and the logical destination in particular is
+/// only reachable in one of them.
+///
+/// None of it disturbs a running timer. Reprogramming says what the timer
+/// delivers and how fast it counts, and the count and the deadline are left
+/// where they were — which is what carries a guest's armed timer across the one
+/// transition the architecture preserves it across.
 fn entered(vlapic: &Vlapic, transition: Transition) {
-    let Transition::Changed { quiet, settled } = transition else {
-        return;
-    };
-    if !quiet || !settled {
+    match transition {
+        Transition::Unchanged => return,
         // Worth a line rather than a trace: real hardware was left holding
         // something across a boundary the guest believes cleared it, and that is
         // a state nothing later in the guest's life will explain.
-        warn!(
+        Transition::Changed { quiet, settled } if !quiet || !settled => warn!(
             "vlapic: {} changed face without fully settling hardware: sources {}, \
              acknowledgements {}",
             vlapic.index(),
             if quiet { "quiet" } else { "still armed" },
             if settled { "settled" } else { "still owed" },
-        );
+        ),
+        Transition::Preserved | Transition::Changed { .. } => {}
     }
     promote(vlapic);
     mirror_logical_destination(vlapic);
@@ -801,7 +804,7 @@ fn promote(vlapic: &Vlapic) {
         return;
     }
     match local.enter_x2apic() {
-        Ok(_) => info!(
+        Ok(()) => info!(
             "vlapic: {} took its real controller into x2apic behind its guest",
             vlapic.index()
         ),

@@ -256,9 +256,13 @@ impl Entry {
     /// would let it claim a delivery that never happened or retire one that is
     /// still outstanding.
     ///
-    /// The error entry is the one whose shape depends on the model rather than
-    /// only on the entry, which is why this takes one: its message type is
-    /// writable on AMD and reserved on Intel.
+    /// Two entries have a shape the model decides rather than the entry. The
+    /// error entry's message type is writable on AMD and reserved on Intel. And
+    /// the timer's mode field is only two bits wide on a processor that
+    /// implements the timestamp-counter deadline: without it there are two
+    /// modes rather than three, the bit that would select the third is
+    /// reserved, and a guest allowed to set it would select a mode its own
+    /// `CPUID` denies and real hardware would refuse to be programmed for.
     pub(crate) const fn writable(self, model: Model) -> u32 {
         let delivery = if model.has_delivery(self) {
             WRITABLE_DELIVERY
@@ -268,7 +272,8 @@ impl Entry {
         WRITABLE_COMMON
             | delivery
             | match self {
-                Self::Timer => WRITABLE_TIMER_MODE,
+                Self::Timer if model.deadline() => WRITABLE_TIMER_MODE,
+                Self::Timer => WRITABLE_COUNTING_MODE,
                 Self::Lint0 | Self::Lint1 => WRITABLE_PIN,
                 _ => 0,
             }
@@ -312,12 +317,21 @@ const WRITABLE_PIN: u32 = Lvt::new()
 /// The timer-mode field, in the timer entry alone.
 const WRITABLE_TIMER_MODE: u32 = Lvt::new().with_timer_mode(TIMER_MODE_FIELD).into_bits();
 
+/// As much of it as a processor without the timestamp-counter deadline has: the
+/// bit that chooses between the two counting modes, and not the one that would
+/// select the third.
+const WRITABLE_COUNTING_MODE: u32 = Lvt::new().with_timer_mode(COUNTING_MODE_FIELD).into_bits();
+
 /// A three-bit delivery-mode field with every bit set, which is what marks
 /// where the field sits rather than a mode any entry accepts.
 const DELIVERY_FIELD: u8 = 0b111;
 
 /// The same for the two-bit timer-mode field.
 const TIMER_MODE_FIELD: u8 = 0b11;
+
+/// The part of that field that selects between one-shot and periodic, which are
+/// the two modes every controller's timer has.
+const COUNTING_MODE_FIELD: u8 = 0b01;
 
 /// Every entry the architecture defines has to be in the order it counts them,
 /// because a model with fewer than all of them keeps exactly the first however
@@ -333,7 +347,8 @@ mod tests {
     use descriptors::Vector;
 
     use super::{
-        Delivery, Entry, Lvt, TimerMode, WRITABLE_DELIVERY, WRITABLE_PIN, WRITABLE_TIMER_MODE,
+        Delivery, Entry, Lvt, TimerMode, WRITABLE_COUNTING_MODE, WRITABLE_DELIVERY, WRITABLE_PIN,
+        WRITABLE_TIMER_MODE,
     };
     use crate::{model, register::Register};
 
@@ -390,6 +405,25 @@ mod tests {
             let held = entry.writable(model::tests::AMD) & WRITABLE_TIMER_MODE;
             assert_eq!(held == WRITABLE_TIMER_MODE, matches!(entry, Entry::Timer));
         }
+    }
+
+    #[test]
+    fn the_deadline_mode_cannot_be_selected_without_the_processor_feature() {
+        let sparse = model::tests::SPARSE;
+        assert!(!sparse.deadline());
+        // The counting modes stay reachable and the third does not: what is left
+        // of the field is the one bit that tells one-shot from periodic.
+        let held = Entry::Timer.writable(sparse) & WRITABLE_TIMER_MODE;
+        assert_eq!(held, WRITABLE_COUNTING_MODE);
+        assert_eq!(
+            Lvt::from_bits(held).timer_mode(),
+            TimerMode::Periodic as u8,
+            "the bit that survives is the one periodic mode needs"
+        );
+        assert_eq!(
+            Entry::Timer.writable(model::tests::AMD) & WRITABLE_TIMER_MODE,
+            WRITABLE_TIMER_MODE
+        );
     }
 
     #[test]

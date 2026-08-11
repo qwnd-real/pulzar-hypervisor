@@ -239,7 +239,10 @@ fn describe(vlapic: &Vlapic, entry: Entry) -> HardwareEntry {
 /// hardware: the error belongs to the moment a source would have delivered on
 /// an impossible vector, and a guest that programs one into a masked entry and
 /// never unmasks it has not caused an interrupt to go missing.
-fn armable(vlapic: &Vlapic, vector: Vector) -> Option<Vector> {
+///
+/// Shared with the timer, which is programmed elsewhere and would otherwise
+/// mask itself over an impossible vector without telling the guest why.
+pub(crate) fn armable(vlapic: &Vlapic, vector: Vector) -> Option<Vector> {
     if arms(vector) {
         return Some(vector);
     }
@@ -248,7 +251,7 @@ fn armable(vlapic: &Vlapic, vector: Vector) -> Option<Vector> {
 }
 
 /// Whether real hardware may be told to deliver a source on this vector.
-pub(crate) fn arms(vector: Vector) -> bool {
+fn arms(vector: Vector) -> bool {
     !vector.is_exception() && vector != apic::ERROR && vector != apic::SPURIOUS
 }
 

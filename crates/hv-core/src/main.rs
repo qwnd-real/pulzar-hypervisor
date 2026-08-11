@@ -368,13 +368,15 @@ fn attach() -> Result<(cpu::ApicId, Descriptors), CoreError> {
     // unlocked: a processor that fell over between the two would otherwise leave
     // that lock held for every processor after it.
     let descriptors = paging::with(Tables::build)??.activate()?;
-    // The older face, and not because it is the safe choice: it is the only one
-    // that matches. This processor came out of a startup command, which leaves a
-    // controller in that face, and the emulated controller it is about to be
-    // given is at reset, which is also that face. Its guest has never started it,
-    // so nothing has asked for anything else — and if the guest does, `vlapic`
-    // takes this controller across behind it.
-    let id = apic::LocalApic::enable(apic::Mode::XApic)?.id();
+    // In the face the machine's controllers were installed in, which is not this
+    // processor's to choose: every processor has to spell a logical destination
+    // the same way, because the I/O controllers are passed through and hardware
+    // matches a passed-through interrupt against whichever real register the
+    // destination names. A startup command leaves a controller in whatever face
+    // it was already in — `INIT` preserves that — so on a machine firmware left
+    // in x2APIC this processor arrives there and stays, and the emulated
+    // controller its guest has not started yet catches up when the guest asks.
+    let id = apic::LocalApic::enable()?.id();
     cpu::attach(id)?;
     // The moment this processor can answer for itself, and not a step later: a
     // startup message the guest sends before this is forwarded to real hardware,

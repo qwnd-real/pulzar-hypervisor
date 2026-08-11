@@ -261,7 +261,7 @@ pub(crate) mod tests {
 
     /// A controller with only the entries every one of them has, on a processor
     /// with neither optional interface.
-    const SPARSE: Model = Model {
+    pub(crate) const SPARSE: Model = Model {
         vendor: Vendor::Amd,
         entries: 4,
         x2apic: false,

@@ -232,21 +232,27 @@ impl Vlapic {
     /// Takes a write to the base register, and says what it became.
     ///
     /// A change of face is a lifecycle boundary rather than a different way of
-    /// naming the same registers, and the physical hardware standing behind
-    /// this controller has to be brought across it before any virtual state
-    /// is touched. Sources are quieted and the timer stopped first, because
-    /// an entry left armed goes on delivering into a controller the guest
-    /// believes is switched off or freshly programmed; and every
-    /// acknowledgement real hardware is owed is settled first, because the
-    /// tokens that would have discharged them are about to be deleted.
+    /// naming the same registers, and which of the two boundaries it is decides
+    /// everything below.
     ///
-    /// Which virtual state survives depends on which transition it is, and the
-    /// two are not alike. Entering x2APIC from the older face preserves
-    /// everything the architecture says it preserves — the priorities, what is
-    /// requested and in service, the table, the errors — because a guest doing
-    /// it is changing how it addresses its controller and not asking for a new
-    /// one. Switching the controller off is the other thing entirely, and
-    /// leaves the register file as reset leaves it.
+    /// Entering x2APIC from the older face preserves everything the
+    /// architecture says it preserves — the priorities, what is requested and
+    /// in service, the table, the errors — because a guest doing it is
+    /// changing how it addresses its controller and not asking for a new
+    /// one. So the machine behind those registers is preserved too, and
+    /// deliberately: a timer that is counting goes on counting, an armed
+    /// deadline stays armed, and every acknowledgement real hardware is
+    /// owed stays owed, because the entries and the in-service bits that
+    /// make sense of all three survive the write. Quieting them here would
+    /// take away a timer the guest is entitled to keep and an appointment
+    /// it cannot re-derive.
+    ///
+    /// Switching the controller off is the other thing entirely, and leaves the
+    /// register file as reset leaves it. There the physical hardware has to be
+    /// brought across first: an entry left armed goes on delivering into a
+    /// controller the guest believes is switched off, and every acknowledgement
+    /// owed has to be settled before the tokens that would have discharged it
+    /// are deleted.
     ///
     /// # Errors
     ///
@@ -262,17 +268,11 @@ impl Vlapic {
             self.base.store(next.bits(), Ordering::Release);
             return Ok(Transition::Unchanged);
         }
-        // Before anything virtual moves, and in this order: a source that is
-        // still armed can deliver into whatever comes next, and a debt that is
-        // still outstanding needs the register file that records it.
-        let quiet = sources::quiesce(self) & crate::timer::disarm(self);
-        let settled = self.ledger.settle();
-
-        self.base.store(next.bits(), Ordering::Release);
         if matches!(
             (current.mode(), next.mode()),
             (Mode::XApic, Mode::X2Apic) | (Mode::X2Apic, Mode::XApic)
         ) {
+            self.base.store(next.bits(), Ordering::Release);
             // The two exceptions the architecture names. The logical destination
             // stops being stored at all — x2APIC derives it from the identifier
             // — and the destination half of the command register has no
@@ -280,9 +280,16 @@ impl Vlapic {
             self.logical_destination.store(0, Ordering::Release);
             self.command
                 .store(self.command().low().into(), Ordering::Release);
-        } else {
-            self.reset_registers();
+            return Ok(Transition::Preserved);
         }
+        // Before anything virtual moves, and in this order: a source that is
+        // still armed can deliver into whatever comes next, and a debt that is
+        // still outstanding needs the register file that records it.
+        let quiet = sources::quiesce(self) & crate::timer::disarm(self);
+        let settled = self.ledger.settle();
+
+        self.base.store(next.bits(), Ordering::Release);
+        self.reset_registers();
         Ok(Transition::Changed { quiet, settled })
     }
 
@@ -491,15 +498,23 @@ impl Vlapic {
     /// Takes a write to a local-vector-table entry, and answers with what the
     /// entry became.
     ///
-    /// Two rules the architecture states about writes here, both enforced:
-    /// bits the entry reserves are dropped rather than stored, and while the
-    /// controller is software-disabled the mask bit cannot be cleared.
+    /// Three rules the architecture states about writes here, all enforced:
+    /// bits the entry reserves are dropped rather than stored; while the
+    /// controller is software-disabled the mask bit cannot be cleared; and a
+    /// timer entry that crosses into or out of deadline mode leaves the initial
+    /// count behind, because the count registers stop meaning anything there
+    /// and hardware clears them as the mode changes. A guest coming back to
+    /// a counting mode must not find an old count waiting to start a timer
+    /// it never asked for.
     pub(crate) fn write_lvt(&self, entry: Entry, value: u32) -> Lvt {
         let mut kept = value & entry.writable(self.model);
         if !self.software_enabled() {
             kept |= MASKED;
         }
-        self.lvt[entry.index()].store(kept, Ordering::Release);
+        let was = self.lvt[entry.index()].swap(kept, Ordering::AcqRel);
+        if entry == Entry::Timer && waits_for_a_deadline(was) != waits_for_a_deadline(kept) {
+            self.timer_initial.store(0, Ordering::Release);
+        }
         Lvt::from_bits(kept)
     }
 
@@ -992,14 +1007,24 @@ impl Vlapic {
 /// running before giving up on it.
 const EPOCH_SPINS: u32 = 100_000;
 
+/// Whether a timer entry selects the mode that counts nothing, and so the mode
+/// the count registers mean nothing in.
+fn waits_for_a_deadline(entry: u32) -> bool {
+    TimerMode::from_bits(Lvt::from_bits(entry).timer_mode()) == Some(TimerMode::Deadline)
+}
+
 /// What a write to the base register did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Transition {
     /// The write named the state the register was already in, so nothing
     /// happened and nothing has to be reconciled.
     Unchanged,
-    /// The controller changed face, and the physical hardware behind it was
-    /// brought across.
+    /// The controller changed face and kept its register file, which is what
+    /// the architecture preserves across that one move — so nothing behind
+    /// it was quieted and there was nothing to settle.
+    Preserved,
+    /// The controller changed face and its register file was reset, so the
+    /// physical hardware behind it was brought across first.
     Changed {
         /// Whether every source really was quieted first.
         quiet: bool,

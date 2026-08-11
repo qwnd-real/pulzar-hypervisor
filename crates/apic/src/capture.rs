@@ -16,17 +16,33 @@
 //! whatever was latched rather than what has happened since. That is the honest
 //! answer to ask for — the alternative reports more by destroying it.
 //!
+//! # It is a sweep and not an instant
+//!
+//! Reading is not the same as reading *at once*. There are around forty
+//! registers here and no way to sample them together; a controller is live
+//! hardware and firmware may still be taking interrupts through it, so a vector
+//! can move from requested to in service to acknowledged while the three banks
+//! that describe it are being read one after another, and the timer's count is
+//! stale from the instant it is read. What comes back is therefore what the
+//! controller held over the course of the sweep, which is the strongest thing a
+//! read-only capture can be, and the fields most likely to disagree with one
+//! another are the ones the architecture also gives no atomic view of. Whoever
+//! restores from this has to treat it as a description rather than as a
+//! transcript.
+//!
 //! # Which registers exist depends on the controller
 //!
-//! Four gates, each the difference between a value and a fault. The processor
+//! Five gates, each the difference between a value and a fault. The processor
 //! may have no local controller at all, in which case even the register saying
 //! where the others are does not exist. The controller may be switched off, in
-//! which case it has no registers to answer with. It may already be in x2APIC,
-//! where the destination format register and the upper half of the interrupt
-//! command are not merely unused but absent, and reading the model-specific
-//! registers they would have had is a general protection fault. And the entries
-//! of the local vector table exist only as far as the version register counts,
-//! so the performance, thermal and machine-check entries are all questions a
+//! which case it has no registers to answer with. Its base register may hold
+//! the one combination of its two mode bits the architecture does not define,
+//! which says nothing reliable about either. It may be in x2APIC, where the
+//! destination format register and the upper half of the interrupt command are
+//! not merely unused but absent, and reading the model-specific registers they
+//! would have had is a general protection fault. And the entries of the local
+//! vector table exist only as far as the version register counts, so the
+//! performance, thermal and machine-check entries are all questions a
 //! controller may have no answer to.
 //!
 //! Every one of those is reported rather than papered over: a zeroed
@@ -35,17 +51,24 @@
 //! same answer and nothing downstream could tell them apart.
 
 use paging::DirectMap;
+use processor::Features;
 use x86_64::registers::model_specific::Msr;
 
 use crate::{
-    Mode, base, pic, register,
+    Mode, PAGE, base, pic, register,
     register::{Access, MappedRegister, Page, Register},
     timer::{self, Mode as TimerMode},
 };
 
 /// How many registers it takes to describe two hundred and fifty-six vectors
 /// one bit at a time.
-pub const VECTOR_WORDS: usize = register::VECTOR_SLOTS;
+///
+/// The same count [`crate::register`] spreads a bank across; the two are
+/// checked against each other by this module's own tests.
+pub const VECTOR_WORDS: usize = 8;
+
+/// How many local vector table entries the architecture defines.
+pub const LVT_ENTRIES: usize = register::DEFINED_LVT_ENTRIES;
 
 /// The interrupt controllers as firmware left them.
 #[derive(Clone, Copy, Debug)]
@@ -62,14 +85,22 @@ pub struct FirmwareState {
     /// This processor's local controller, or every field zero where
     /// [`FirmwareState::controller`] says it could not be read.
     pub local: LocalState,
-    /// The interrupt masks of the two legacy controllers, the primary's first.
+    /// What the data ports of the two legacy interrupt controllers answered,
+    /// the primary's first.
+    ///
+    /// Interrupt masks on a machine that has those controllers, and nothing at
+    /// all on one that does not: a port no device decodes returns whatever the
+    /// bus was carrying, which is indistinguishable from two fully masked
+    /// controllers. Whether the machine has them is firmware's to say, in a
+    /// table parsed long after this, so these bytes only become masks once that
+    /// table has been read.
     pub legacy_masks: [u8; 2],
 }
 
 impl FirmwareState {
     /// Which interface firmware left this processor's controller presenting, or
-    /// `None` where it had switched the controller off or the processor has
-    /// none.
+    /// `None` where it had switched the controller off, the processor has none,
+    /// or the base register held a combination that names neither.
     ///
     /// What a hypervisor that means to hand the machine back has to bring its
     /// own controllers up in. The emulated controller it hands firmware starts
@@ -79,12 +110,9 @@ impl FirmwareState {
     /// the same way.
     #[must_use]
     pub const fn mode(&self) -> Option<Mode> {
-        if self.base & base::GLOBAL_ENABLE == 0 {
-            None
-        } else if self.base & base::X2APIC_ENABLE == 0 {
-            Some(Mode::XApic)
-        } else {
-            Some(Mode::X2Apic)
+        match (self.controller, base::State::of(self.base)) {
+            (Controller::Read, Some(state)) => state.mode(),
+            _ => None,
         }
     }
 }
@@ -93,7 +121,9 @@ impl FirmwareState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Controller {
-    /// Read. Every field of [`LocalState`] is what the controller held.
+    /// Read: every register the controller has was sampled over the course of
+    /// the sweep, and every field of [`LocalState`] the controller does not
+    /// have is zero rather than absent.
     Read = 0,
     /// The processor has no local controller, so there was nothing to read and
     /// no register saying where to read it from.
@@ -105,6 +135,10 @@ pub enum Controller {
     /// page is not inside the window this was given, so reading it would have
     /// meant reading something else instead.
     Unreachable = 3,
+    /// The base register selected the model-specific interface with the
+    /// controller switched off, which is not a state the architecture defines.
+    /// Nothing about such a controller can be read on purpose.
+    Malformed = 4,
 }
 
 /// One local controller's registers.
@@ -112,7 +146,10 @@ pub enum Controller {
 /// Every field is zero where the controller does not have that register: the
 /// local vector table stops where the version register says it stops, and the
 /// destination format register and the deadline exist only in one interface and
-/// one timer mode respectively.
+/// one timer mode respectively. Which is why a consumer works out what a field
+/// means from the field that governs it — the version register, the interface,
+/// the timer's mode — rather than from [`Controller::Read`], which says the
+/// sweep happened and nothing about what the controller had to offer.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct LocalState {
@@ -121,7 +158,9 @@ pub struct LocalState {
     /// whole of it under x2APIC.
     pub id: u32,
     /// The controller's version, and one less than its number of local vector
-    /// table entries in the third byte.
+    /// table entries in the third byte. A controller reporting more entries
+    /// than the architecture defines is left saying so: the raw value is here,
+    /// and only the entries below are read.
     pub version: u32,
     /// Which interrupt priorities firmware was willing to accept.
     pub task_priority: u32,
@@ -170,8 +209,8 @@ pub struct LocalState {
     /// by how much has to pair it with a reading of something that also counts.
     pub timer_current_count: u32,
     /// The deadline the timer was waiting for, where it was in the mode that
-    /// has one. Zero otherwise, and the register is not read at all: it exists
-    /// only on a processor that implements the mode.
+    /// has one and the processor implements that mode. Zero otherwise, and the
+    /// register is not read at all.
     pub tsc_deadline: u64,
 }
 
@@ -197,9 +236,6 @@ impl LocalState {
         ]
     }
 }
-
-/// How many local vector table entries the architecture defines.
-pub const LVT_ENTRIES: usize = 7;
 
 /// Reads the interrupt controllers as firmware left them, writing to none of
 /// them.
@@ -241,18 +277,22 @@ pub unsafe fn capture(window: DirectMap) -> FirmwareState {
 /// As [`capture`].
 unsafe fn reached(base: Option<u64>, window: DirectMap) -> Result<Access, Controller> {
     let base = base.ok_or(Controller::Absent)?;
-    if base & base::GLOBAL_ENABLE == 0 {
-        return Err(Controller::Disabled);
+    match base::State::of(base).ok_or(Controller::Malformed)? {
+        base::State::Disabled => Err(Controller::Disabled),
+        base::State::X2Apic => Ok(Access::Msr),
+        base::State::XApic => {
+            // The whole page and not merely the address it starts at: a page
+            // whose base is inside the window can end outside it, and the last
+            // register of the file is at the far end of it.
+            let virt = window
+                .reach(base::page_of(base), PAGE)
+                .map_err(|_| Controller::Unreachable)?;
+            // SAFETY: every byte of the page is inside the window, and the
+            // caller guarantees the window is mapped and mapped uncached — which
+            // is the whole of what a page needs.
+            Ok(Access::Mapped(unsafe { Page::new(virt) }))
+        }
     }
-    if base & base::X2APIC_ENABLE != 0 {
-        return Ok(Access::Msr);
-    }
-    let virt = window
-        .virt(base::page_of(base))
-        .ok_or(Controller::Unreachable)?;
-    // SAFETY: the window maps whole frames and the caller guarantees this one is
-    // mapped, and mapped uncached — which is the whole of what a page needs.
-    Ok(Access::Mapped(unsafe { Page::new(virt) }))
 }
 
 /// Every register the controller reached through `access` has.
@@ -288,18 +328,29 @@ fn read(access: Access) -> LocalState {
         timer_divide: access.read(Register::TIMER_DIVIDE),
         timer_initial_count: access.read(Register::TIMER_INITIAL_COUNT),
         timer_current_count: access.read(Register::TIMER_CURRENT_COUNT),
-        // A timer already in the mode is proof the processor implements it,
-        // which is the only thing that makes the register safe to read.
-        tsc_deadline: match TimerMode::of(lvt_timer) {
-            Some(TimerMode::Deadline) => {
-                // SAFETY: the entry says the timer is counting against a
-                // deadline, so the register holding that deadline exists, and
-                // reading a model-specific register has no side effect.
-                unsafe { Msr::new(timer::IA32_TSC_DEADLINE).read() }
-            }
-            _ => 0,
-        },
+        tsc_deadline: deadline(lvt_timer),
     }
+}
+
+/// The deadline the timer was counting towards, or zero where there is no such
+/// register to ask.
+///
+/// Both conditions are required, and the timer's own entry is not one of them
+/// on its own: the register exists because the processor says it implements the
+/// mode, and firmware that had put the timer in some other mode wrote no
+/// deadline into it. A controller reporting the mode on a processor whose
+/// `CPUID` does not — a virtual one with a defect, or one whose state did not
+/// survive a migration — would otherwise turn a capture into a fault, and this
+/// runs before there is anywhere to report a fault to.
+fn deadline(lvt_timer: u32) -> u64 {
+    if !matches!(TimerMode::of(lvt_timer), Some(TimerMode::Deadline))
+        || !processor::features().contains(Features::TSC_DEADLINE)
+    {
+        return 0;
+    }
+    // SAFETY: the processor's own feature report says the register exists, and
+    // reading a model-specific register has no side effect.
+    unsafe { Msr::new(timer::IA32_TSC_DEADLINE).read() }
 }
 
 /// One local vector table entry, or zero on a controller that does not count
@@ -319,4 +370,66 @@ fn bank(access: Access, first: Register) -> [u32; VECTOR_WORDS] {
         *word = access.read(register);
     }
     words
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::{align_of, size_of};
+
+    use super::{Controller, FirmwareState, LVT_ENTRIES, LocalState, VECTOR_WORDS};
+    use crate::register;
+
+    #[test]
+    fn a_bank_here_is_as_wide_as_the_registers_it_is_read_from() {
+        assert_eq!(usize::try_from(register::VECTOR_SLOTS), Ok(VECTOR_WORDS));
+    }
+
+    #[test]
+    fn the_entries_named_here_are_the_entries_the_architecture_defines() {
+        assert_eq!(LVT_ENTRIES, 7);
+        assert_eq!(LocalState::default().lvt().len(), LVT_ENTRIES);
+    }
+
+    #[test]
+    fn the_layout_the_loader_writes_is_the_one_the_hypervisor_reads() {
+        // These structures cross from one image to another as bytes, so their
+        // shape is an interface and not an implementation detail. A change here
+        // has to be a deliberate one, with the handoff version to match.
+        assert_eq!(size_of::<FirmwareState>(), 0xD0);
+        assert_eq!(align_of::<FirmwareState>(), 8);
+        assert_eq!(size_of::<LocalState>(), 0xB8);
+        assert_eq!(align_of::<LocalState>(), 8);
+        assert_eq!(size_of::<Controller>(), 4);
+    }
+
+    #[test]
+    fn every_reason_a_controller_could_not_be_read_has_its_own_number() {
+        for (controller, discriminant) in [
+            (Controller::Read, 0),
+            (Controller::Absent, 1),
+            (Controller::Disabled, 2),
+            (Controller::Unreachable, 3),
+            (Controller::Malformed, 4),
+        ] {
+            assert_eq!(controller as u32, discriminant, "{controller:?}");
+        }
+    }
+
+    #[test]
+    fn a_controller_that_was_not_read_reports_no_interface() {
+        for controller in [
+            Controller::Absent,
+            Controller::Disabled,
+            Controller::Unreachable,
+            Controller::Malformed,
+        ] {
+            let state = FirmwareState {
+                base: 0,
+                controller,
+                local: LocalState::default(),
+                legacy_masks: [0xFF; 2],
+            };
+            assert_eq!(state.mode(), None, "{controller:?}");
+        }
+    }
 }

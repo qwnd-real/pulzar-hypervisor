@@ -17,6 +17,7 @@
 //! `RDMSR` and `WRMSR`, which are intercepted through the permission map, and
 //! the exit handler calls [`read`] and [`write`] directly.
 
+use apic::IA32_TSC_DEADLINE;
 use descriptors::Vector;
 
 use crate::{
@@ -29,10 +30,6 @@ use crate::{
     timer,
 };
 
-/// The timestamp counter deadline the timer fires at, which the architecture
-/// puts outside the controller's own range.
-pub const TSC_DEADLINE_MSR: u32 = 0x6E0;
-
 /// Whether an index is one this crate answers for.
 ///
 /// The whole of the controller's reserved range counts, not merely the indices
@@ -42,7 +39,7 @@ pub const TSC_DEADLINE_MSR: u32 = 0x6E0;
 pub const fn claims(index: u32) -> bool {
     matches!(index, X2APIC_BASE_MSR..=X2APIC_LAST_MSR)
         || index == ApicBase::MSR
-        || index == TSC_DEADLINE_MSR
+        || index == IA32_TSC_DEADLINE
 }
 
 /// What the guest reads.
@@ -56,7 +53,7 @@ pub(crate) fn read(vlapic: &Vlapic, index: u32) -> Result<u64, Fault> {
     if index == ApicBase::MSR {
         return Ok(vlapic.base().bits());
     }
-    if index == TSC_DEADLINE_MSR {
+    if index == IA32_TSC_DEADLINE {
         // Absent unless the processor reports it, and `CPUID` is passed through
         // — so a guest told the feature does not exist finds the register does
         // not exist either.
@@ -94,7 +91,7 @@ pub(crate) fn write(vlapic: &Vlapic, index: u32, value: u64) -> Result<Written, 
             .map(Written::ModeChanged)
             .map_err(Fault::Base);
     }
-    if index == TSC_DEADLINE_MSR {
+    if index == IA32_TSC_DEADLINE {
         if !vlapic.model().deadline() {
             return Err(Fault::NoSuchRegister);
         }
