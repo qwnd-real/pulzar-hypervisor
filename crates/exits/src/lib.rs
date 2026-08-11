@@ -47,6 +47,7 @@
 
 #![no_std]
 
+mod census;
 mod cpuid;
 mod firmware;
 mod msr;
@@ -65,7 +66,7 @@ use vlapic::{Resumption, VlapicError};
 use x86_64::instructions::interrupts;
 
 pub use crate::firmware::Boot;
-use crate::firmware::Firmware;
+use crate::{census::Census, firmware::Firmware};
 
 /// The guest's exits, and everything the host needs to answer one.
 ///
@@ -80,6 +81,7 @@ pub struct Exits<'a> {
     firmware: Option<Firmware>,
     interrupts: Pending,
     left: Left,
+    census: Census,
 }
 
 impl<'a> Exits<'a> {
@@ -91,6 +93,7 @@ impl<'a> Exits<'a> {
             firmware: Some(Firmware::new(portal, boot)),
             interrupts: Pending::new(),
             left: Left::Stopped,
+            census: Census::new(),
         }
     }
 
@@ -107,6 +110,7 @@ impl<'a> Exits<'a> {
             firmware: None,
             interrupts: Pending::new(),
             left: Left::Stopped,
+            census: Census::new(),
         }
     }
 
@@ -192,6 +196,7 @@ impl<'a> Exits<'a> {
     /// processor an interrupt.
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
         let reason = vcpu.reason();
+        self.census.record(vcpu);
         // This processor is out of the guest and consults its controller below
         // before going back in, so nothing needs to interrupt it to make it
         // look.

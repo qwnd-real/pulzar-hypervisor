@@ -56,6 +56,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use apic::LocalState;
 use cpu::{ApicId, CpuIndex};
 use descriptors::Vector;
+use log::info;
 
 use crate::{
     base::{ApicBase, BaseFault, Mode},
@@ -95,6 +96,10 @@ pub struct Vlapic {
     away: AtomicBool,
     nmi: AtomicBool,
     owned: AtomicBool,
+    /// The last selection state [`Vlapic::report_selection`] logged, packed by
+    /// [`SelectionState::bits`], so a controller whose answer has not changed
+    /// stays quiet. Diagnostic only: nothing reads it back but the report.
+    reported: AtomicU64,
 }
 
 impl Vlapic {
@@ -124,6 +129,7 @@ impl Vlapic {
             away: AtomicBool::new(false),
             nmi: AtomicBool::new(false),
             owned: AtomicBool::new(false),
+            reported: AtomicU64::new(NOTHING_REPORTED),
         };
         this.reset_registers();
         this
@@ -683,11 +689,78 @@ impl Vlapic {
     /// request stays pending, which is what makes a task priority a filter
     /// rather than a discard.
     pub(crate) fn select(&self) -> Option<Vector> {
+        let selected = self.select_inner();
+        self.report_selection(selected);
+        selected
+    }
+
+    /// [`Vlapic::select`] proper, with nothing said about what it decided.
+    fn select_inner(&self) -> Option<Vector> {
         if !self.accepting() {
             return None;
         }
         let vector = self.request.highest()?;
         priority::deliverable(vector, self.processor_priority()).then_some(vector)
+    }
+
+    /// Says why this controller is nominating what it is, the first time it
+    /// reaches any given answer.
+    ///
+    /// A controller that has stopped delivering says so once and then goes
+    /// quiet, so this costs nothing on the path it sits on: what makes an
+    /// interrupt undeliverable is state that has to change before it becomes
+    /// deliverable again, and the change is what gets reported. The three ways
+    /// a nomination comes to nothing are indistinguishable to the caller, and
+    /// they are three different faults — a controller its guest switched off,
+    /// a controller with nothing to give, and a controller holding something
+    /// back behind a priority that never falls.
+    fn report_selection(&self, selected: Option<Vector>) {
+        let accepting = self.accepting();
+        let requested = self.request.highest();
+        let in_service = self.in_service.highest();
+        let task = self.task_priority();
+        let processor = self.processor_priority();
+        // Everything the report below names, packed into one word so that
+        // "has this changed" is a single comparison rather than a lock.
+        let bits = u64::from(accepting)
+            | u64::from(number(requested)) << 8
+            | u64::from(number(in_service)) << 24
+            | u64::from(task.get()) << 40
+            | u64::from(processor.get()) << 48
+            | u64::from(number(selected)) << 56;
+        if self.reported.swap(bits, Ordering::Relaxed) == bits {
+            return;
+        }
+        match (accepting, requested, selected) {
+            (false, _, _) => info!(
+                "vlapic: {} is not accepting interrupts: mode {:?}, software {}",
+                self.index(),
+                self.mode(),
+                if self.software_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+            (true, None, _) => info!(
+                "vlapic: {} has nothing requested; in service {in_service:?}, task priority {:#x}",
+                self.index(),
+                task.get()
+            ),
+            (true, Some(vector), None) => info!(
+                "vlapic: {} is holding {vector} back: processor priority {:#x} from task {:#x} \
+                 and in service {in_service:?}",
+                self.index(),
+                processor.get(),
+                task.get()
+            ),
+            (true, Some(_), Some(vector)) => info!(
+                "vlapic: {} nominates {vector}, processor priority {:#x}, in service \
+                 {in_service:?}",
+                self.index(),
+                processor.get()
+            ),
+        }
     }
 
     /// Records that the guest really has been given `vector`, moving it from
@@ -977,6 +1050,24 @@ impl Startup {
 ///
 /// Outside the eight bits a vector occupies, so it cannot collide with one.
 const NO_SIPI: u32 = u32::MAX;
+
+/// What [`Vlapic::reported`] holds before any selection has been reported.
+///
+/// Not a state any real packing produces, so the first selection always reports
+/// however trivial it is.
+const NOTHING_REPORTED: u64 = u64::MAX;
+
+/// A vector's number, or a value outside the eight bits one occupies when there
+/// is no vector.
+///
+/// Used to pack an optional vector into the reported selection state, where
+/// "nothing" has to be as distinguishable as any vector is.
+const fn number(vector: Option<Vector>) -> u16 {
+    match vector {
+        Some(vector) => vector.number() as u16,
+        None => u16::MAX,
+    }
+}
 
 /// Bits the older interface's identifier is shifted by.
 const XAPIC_ID_SHIFT: u32 = 24;

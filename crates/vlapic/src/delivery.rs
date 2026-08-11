@@ -47,7 +47,7 @@
 
 use apic::{Command as HardwareCommand, Delivery as HardwareDelivery, Target};
 use descriptors::Vector;
-use log::{trace, warn};
+use log::{info, trace, warn};
 
 use crate::{
     error::Errors,
@@ -246,6 +246,11 @@ fn initialize(from: &Vlapic, target: &Vlapic) {
         forward(from, target, HardwareDelivery::Init);
         return;
     }
+    info!(
+        "vlapic: {} sent an init to {}",
+        from.index(),
+        target.index()
+    );
     target.request_init();
     nudge(from, target);
 }
@@ -263,7 +268,18 @@ fn start(from: &Vlapic, target: &Vlapic, vector: u8) {
     // Refused unless the target is waiting for one, which is what makes the
     // second of the pair a guest sends harmless: the first starts the
     // processor, and the second finds it already running.
-    if target.request_sipi(vector) {
+    let taken = target.request_sipi(vector);
+    info!(
+        "vlapic: {} sent a startup at page {vector:#x} to {}, {}",
+        from.index(),
+        target.index(),
+        if taken {
+            "which was waiting for one"
+        } else {
+            "which was not waiting for one"
+        }
+    );
+    if taken {
         nudge(from, target);
     }
 }
@@ -278,7 +294,7 @@ fn forward(from: &Vlapic, target: &Vlapic, delivery: HardwareDelivery) {
         ))
     });
     match outcome {
-        Ok(()) => trace!(
+        Ok(()) => info!(
             "vlapic: {} forwarded {delivery:?} to {} on real hardware",
             from.index(),
             target.apic_id()
@@ -453,7 +469,7 @@ pub(crate) fn settle(vlapic: &Vlapic) -> Resumption {
         // survive, everything else is as it was at reset.
         vlapic.reset_registers();
         vlapic.set_startup(Startup::WaitingForSipi);
-        trace!("vlapic: {} reset by an init and waiting", vlapic.index());
+        info!("vlapic: {} reset by an init and waiting", vlapic.index());
     }
     if vlapic.startup() != Startup::WaitingForSipi {
         return Resumption::Carry;
@@ -461,7 +477,7 @@ pub(crate) fn settle(vlapic: &Vlapic) -> Resumption {
     match vlapic.take_sipi() {
         Some(page) => {
             vlapic.set_startup(Startup::Running);
-            trace!("vlapic: {} started at page {page:#x}", vlapic.index());
+            info!("vlapic: {} started at page {page:#x}", vlapic.index());
             Resumption::StartAt(page)
         }
         None => Resumption::Wait,

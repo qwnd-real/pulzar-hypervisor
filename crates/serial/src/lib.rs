@@ -36,13 +36,14 @@ use x86_64::instructions::interrupts;
 
 use crate::uart::Uart;
 
-/// Most verbose level that gets logged: everything in debug builds, `Info`
-/// and up in release builds.
-pub const MAX_LEVEL: LevelFilter = if cfg!(debug_assertions) {
-    LevelFilter::Trace
-} else {
-    LevelFilter::Info
-};
+/// Most verbose level that gets logged.
+///
+/// `Info` and up regardless of profile. Every byte leaves through a polled
+/// UART register, and on a virtualized machine each of those port accesses
+/// costs a world switch — so per-exit logging does not merely slow the guest
+/// down, it starves it: the host spends longer reporting an exit than the
+/// guest gets to run between two of them.
+pub const MAX_LEVEL: LevelFilter = LevelFilter::Info;
 
 /// The UART all log output funnels through, behind the lock that keeps each
 /// core's lines whole. `None` until [`init`] selects a port.
