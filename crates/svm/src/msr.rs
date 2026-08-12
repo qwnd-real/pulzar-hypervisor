@@ -31,15 +31,20 @@
 //! from "this machine was configured not to" — very different things to report
 //! to whoever is trying to boot it.
 //!
-//! # What is deliberately absent
+//! # The one register here that is not this extension's
 //!
-//! The bit that actually switches the extension on is not in this block at all.
-//! It lives in the extended feature register, which is architectural rather
-//! than particular to this extension, and the `x86_64` crate already spells it
-//! [`EferFlags`](x86_64::registers::model_specific::EferFlags)`::SECURE_VIRTUAL_MACHINE_ENABLE`.
-//! Restating it here would leave the codebase with two names for one bit;
+//! The bit that actually switches the extension on is not in this block. It
+//! lives in the extended feature register, which is architectural rather than
+//! particular to this extension — but a hypervisor hiding the extension has to
+//! intercept that register too, and saying which permission bit to set takes an
+//! address. So [`EFER`] and [`EFER_RESERVED`] are here, beside the block whose
+//! meaning they are needed for, while the bit itself stays
+//! [`EferFlags`](x86_64::registers::model_specific::EferFlags)`::SECURE_VIRTUAL_MACHINE_ENABLE`
+//! as the `x86_64` crate spells it: one name for one bit.
 //! [`VmCr::svm_disabled`] is the reason writing that bit can quietly fail to
 //! take.
+//!
+//! # What is deliberately absent
 //!
 //! The doorbell register a hypervisor pokes to signal a processor already
 //! running a guest is numbered in this same block, but it means nothing apart
@@ -53,7 +58,7 @@
 use core::fmt::{self, Debug, Formatter};
 
 use bitfield_struct::bitfield;
-use x86_64::PhysAddr;
+use x86_64::{PhysAddr, registers::model_specific::EferFlags};
 
 /// `VM_CR`, the register deciding whether this extension may be used on this
 /// machine, with three unrelated switches sharing the space.
@@ -114,6 +119,96 @@ pub struct VmCr {
     #[bits(59)]
     __: u64,
 }
+
+impl VmCr {
+    /// Every bit the architecture assigns a meaning to, which is the low five.
+    ///
+    /// Built from the fields rather than written as a number so that it cannot
+    /// disagree with them.
+    pub const DEFINED: u64 = Self::new()
+        .with_debug_port_disabled(true)
+        .with_init_redirect(true)
+        .with_a20_masking_disabled(true)
+        .with_lock(true)
+        .with_svm_disabled(true)
+        .into_bits();
+
+    /// Every bit the architecture reserves, which a write must leave clear.
+    ///
+    /// These are must-be-zero rather than ignored: a `WRMSR` setting one raises
+    /// `#GP`, so this is the mask a write is judged against rather than masked
+    /// with.
+    pub const RESERVED: u64 = !Self::DEFINED;
+
+    /// The two bits [`lock`](Self::lock) protects, itself included.
+    ///
+    /// While it is set, a write of either is discarded without a fault and
+    /// without any other trace, so this is the mask of what a locked register
+    /// keeps regardless of what software writes.
+    pub const LOCKED: u64 = Self::new()
+        .with_lock(true)
+        .with_svm_disabled(true)
+        .into_bits();
+}
+
+const _: () = assert!(
+    VmCr::DEFINED == 0b1_1111 && VmCr::LOCKED == 0b1_1000,
+    "the five defined bits are the low five, and the locked pair the top two of them",
+);
+
+/// `EFER`, the architectural extended feature register, where the bit that
+/// actually enables this extension lives.
+///
+/// Numbered outside this block and defined by the architecture rather than by
+/// this extension, which is why the bits are `x86_64`'s
+/// [`EferFlags`] and not a type of this crate's. The address is here because a
+/// hypervisor hiding the extension has to intercept the register, and naming a
+/// register to intercept takes its address.
+pub const EFER: u32 = 0xC000_0080;
+
+/// The bits of [`EFER`] that are reserved on every processor.
+///
+/// Reserved here means must-be-zero: a `WRMSR` that sets one raises `#GP`
+/// rather than dropping it quietly, so this is the mask a write is judged
+/// against rather than masked with.
+///
+/// The four flags a recent processor has above the ones [`EferFlags`] names are
+/// deliberately treated as writable even though they are reserved on a
+/// processor that lacks them. Which processor that is takes a feature query per
+/// flag, and faulting a write that the machine underneath would have accepted
+/// is the worse mistake of the two.
+pub const EFER_RESERVED: u64 = !(EferFlags::all().bits()
+    | EFER_MCOMMIT
+    | EFER_INTERRUPTIBLE_WBINVD
+    | EFER_UPPER_ADDRESS_IGNORE
+    | EFER_AUTOMATIC_IBRS);
+
+/// `MCOMMIT`: enables the instruction that waits for stores to become
+/// non-cancellable.
+const EFER_MCOMMIT: u64 = 1 << 17;
+
+/// `INTWB`: makes cache writeback interruptible, so a long one does not hold a
+/// processor past every interrupt it should have taken.
+const EFER_INTERRUPTIBLE_WBINVD: u64 = 1 << 18;
+
+/// `UAIE`: ignores the upper address bits rather than requiring them to be a
+/// sign extension of the address.
+const EFER_UPPER_ADDRESS_IGNORE: u64 = 1 << 20;
+
+/// `AIBRSE`: keeps indirect branch prediction restricted whenever the processor
+/// is in supervisor mode, without software having to ask each time.
+const EFER_AUTOMATIC_IBRS: u64 = 1 << 21;
+
+const _: () = assert!(
+    EFER_RESERVED & EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE.bits() == 0
+        && EFER_RESERVED & EferFlags::LONG_MODE_ENABLE.bits() == 0
+        && EFER_RESERVED & EferFlags::LONG_MODE_ACTIVE.bits() == 0,
+    "the bits a hypervisor forces, tests and preserves must not be reserved",
+);
+const _: () = assert!(
+    EFER_RESERVED == 0xFFFF_FFFF_FFC9_02FE,
+    "the reserved bits of the extended feature register are 63:22, 19, 16, 9 and 7:1",
+);
 
 /// `IGNNE`, which drives the processor-internal signal of the same name.
 pub const IGNNE: u32 = 0xC001_0115;

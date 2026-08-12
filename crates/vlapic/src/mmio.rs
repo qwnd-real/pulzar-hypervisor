@@ -40,6 +40,7 @@
 use alloc::boxed::Box;
 
 use emulate::{Capability, Commit, Data, Device, Read, Width, Write};
+use log::info;
 
 use crate::{
     access,
@@ -109,6 +110,12 @@ impl Device for Page {
             Access::WriteOnly | Access::Absent => 0,
             Access::ReadOnly | Access::ReadWrite => access::read(vlapic, register),
         };
+        info!(
+            "vlapic: cpu {} read its {:#05x} register through the page and got {:#010x}",
+            vlapic.index(),
+            register.offset(),
+            value
+        );
         Data::from_u64(u64::from(value), width)
     }
 
@@ -129,6 +136,12 @@ impl Device for Page {
             reason = "the access was established to be exactly four bytes wide by `decode`"
         )]
         let value = access.value().as_u64() as u32;
+        info!(
+            "vlapic: cpu {} wrote {:#010x} to its {:#05x} register through the page",
+            vlapic.index(),
+            value,
+            register.offset()
+        );
         crate::acted(vlapic, access::write(vlapic, register, value));
         // Nothing the guest writes here reaches the hardware behind the page.
         // The page a guest sees is this hypervisor's answer, and the real

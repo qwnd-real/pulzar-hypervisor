@@ -34,6 +34,7 @@
 use svm::{
     ControlArea, EventKind, SaveArea,
     intercept::Intercepts2Flags,
+    msr::EFER_RESERVED,
     permissions::{IOPM_BYTES, MSRPM_BYTES},
 };
 use thiserror::Error;
@@ -306,20 +307,11 @@ fn above(address: u64, bits: u8) -> bool {
 /// Bits of a value that lie above the low thirty-two.
 const UPPER_HALF: u64 = !0 << 32;
 
-/// The bits of the extended feature register that are reserved on every
-/// processor.
-///
-/// Bits 63:22, 19, 16 and 9. The two most recent flags — automatic indirect
-/// branch restriction and upper address ignore — are deliberately outside this
-/// mask even though they are reserved on a processor that lacks them, because
-/// which processor that is takes a feature query and a wrong answer here
-/// refuses a legal guest.
-const EFER_RESERVED: u64 = (!0 << 22) | (1 << 19) | (1 << 16) | (1 << 9);
-
 /// How many memory-type fields a page-attribute table has.
 const PAT_FIELDS: u8 = 8;
 
 const _: () = assert!(
-    EFER_RESERVED & (1 << 12) == 0 && EFER_RESERVED & (1 << 8) == 0,
+    EFER_RESERVED & EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE.bits() == 0
+        && EFER_RESERVED & EferFlags::LONG_MODE_ENABLE.bits() == 0,
     "the virtualization-enable and long-mode-enable bits are not reserved",
 );

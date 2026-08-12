@@ -55,8 +55,8 @@ use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
     control::NestedPagingControl,
     intercept::{Intercepts1, Intercepts2, Intercepts2Flags, TlbControl},
-    msr::VM_CR,
-    permissions::{MSRPM_BYTES, MsrPermission, msrpm_position},
+    msr::{EFER, SVM_KEY, VM_CR},
+    permissions::{MSRPM_BYTES, msrpm_position},
 };
 use x86_64::{
     PhysAddr, instructions::interrupts, registers::control::EferFlags,
@@ -69,11 +69,14 @@ use crate::{
     switch,
 };
 
-/// The permission bits for the one MSR this layer always intercepts.
-const VM_CR_PERMISSION: MsrPermission = match msrpm_position(VM_CR) {
-    Some(permission) => permission,
-    None => panic!("VM_CR must be inside the architectural MSRPM"),
-};
+/// The permission bits for the registers this layer always intercepts.
+///
+/// All three are how a guest could reach the machine's own virtualization
+/// extension. [`VM_CR`] holds the switch that disables it and the lock over
+/// that switch, [`SVM_KEY`] is what lifts the lock, and the extended feature
+/// register holds the enable bit itself — a guest writing any of them writes
+/// the host's, which is the extension the guest is running under.
+const HIDDEN_MSRS: [u32; 3] = [VM_CR, SVM_KEY, EFER];
 
 /// What a guest's control block has to be told about the guest before it can
 /// run at all.
@@ -165,8 +168,7 @@ impl Vcpu {
         // SAFETY: the two-page run was just allocated to this VCPU, is zeroed,
         // and `msrpm` reaches all of it through the direct map.
         let msrpm = unsafe { msrpm.as_mut() };
-        msrpm[VM_CR_PERMISSION.read.byte] |= VM_CR_PERMISSION.read.mask();
-        msrpm[VM_CR_PERMISSION.write.byte] |= VM_CR_PERMISSION.write.mask();
+        intercept(msrpm, HIDDEN_MSRS);
         let mut vcpu = Self {
             registers: Registers::zeroed(),
             vmcb,
@@ -406,10 +408,11 @@ impl Vcpu {
     ///
     /// Which registers a guest may not have is policy, and policy does not
     /// belong here — this takes whichever ones the caller names and says
-    /// nothing about what they are for. The one register this layer intercepts
-    /// on its own account is the one saying whether the virtualization
-    /// extension exists, because a guest that saw the truth there could try to
-    /// use it.
+    /// nothing about what they are for. The registers this layer intercepts on
+    /// its own account are the three a guest could reach the machine's own
+    /// virtualization extension through, because a guest that saw the truth
+    /// there could try to use it, and one that wrote any of them would be
+    /// writing the extension it is itself running under.
     ///
     /// An index outside the three ranges the architecture gives the permission
     /// map is skipped rather than refused: the map cannot express one, so the
@@ -435,13 +438,7 @@ impl Vcpu {
         // not `Send`, so the only processor that could have entered it is this
         // one, and this one is here.
         let map = unsafe { map.as_mut() };
-        for msr in msrs {
-            let Some(permission) = msrpm_position(msr) else {
-                continue;
-            };
-            map[permission.read.byte] |= permission.read.mask();
-            map[permission.write.byte] |= permission.write.mask();
-        }
+        intercept(map, msrs);
         self.soil(CleanBits::PERMISSION_MAPS);
         Ok(())
     }
@@ -517,6 +514,20 @@ impl Vcpu {
     }
 }
 
+/// Sets both permission bits of every named register in a permission map.
+///
+/// An index the map does not cover is skipped: there is no bit for one, and an
+/// access to it is intercepted unconditionally anyway.
+fn intercept(map: &mut [u8; MSRPM_BYTES], msrs: impl IntoIterator<Item = u32>) {
+    for msr in msrs {
+        let Some(permission) = msrpm_position(msr) else {
+            continue;
+        };
+        map[permission.read.byte] |= permission.read.mask();
+        map[permission.write.byte] |= permission.write.mask();
+    }
+}
+
 /// The narrowest way this processor can discard one guest's translations.
 ///
 /// Flushing by identifier throws away this guest's and nothing else's. A
@@ -549,3 +560,13 @@ const _: () = assert!(
     RAX & NUMBER == RAX && RSP & NUMBER == RSP,
     "both must survive the mask, or the arms testing for them are unreachable",
 );
+const _: () = {
+    let mut index = 0;
+    while index < HIDDEN_MSRS.len() {
+        assert!(
+            msrpm_position(HIDDEN_MSRS[index]).is_some(),
+            "every register this layer hides must have a bit in the permission map",
+        );
+        index += 1;
+    }
+};

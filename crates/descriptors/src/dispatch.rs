@@ -19,6 +19,12 @@
 //! an interrupt to a guest, and it is the only thing that has to change to make
 //! that happen.
 //!
+//! [`Disposition::Redirected`] is the third answer and belongs to the faults:
+//! the interrupt was the hypervisor's own, and the code it interrupted carries
+//! on somewhere other than at the instruction that raised it. It is how a
+//! subsystem that deliberately attempts something the machine may refuse gets
+//! the refusal back as a value.
+//!
 //! Every vector has an entry point, including the ones the architecture
 //! reserves and the ones no handler has claimed. An interrupt arriving on one
 //! of those is not a case to be silently absorbed — it is the hypervisor
@@ -45,7 +51,11 @@ use core::{
     sync::atomic::{AtomicPtr, Ordering},
 };
 
-use x86_64::{registers::control::Cr2, structures::idt::InterruptStackFrameValue};
+use x86_64::{
+    VirtAddr,
+    registers::control::Cr2,
+    structures::idt::{InterruptStackFrame, InterruptStackFrameValue},
+};
 
 use crate::{DescriptorError, Resumption, Vector, fatal, nesting::Guard};
 
@@ -59,6 +69,26 @@ pub enum Disposition {
     /// The interrupt was not the hypervisor's, and has not been acknowledged.
     /// What becomes of it is the hypervisor's decision, not the handler's.
     Passed,
+    /// The hypervisor caused this interrupt, has dealt with it, and the
+    /// interrupted code carries on at this address rather than at what raised
+    /// it.
+    ///
+    /// For a fault, which is what this exists for. The processor reports the
+    /// instruction that faulted rather than the one after it, so a handler
+    /// answering [`Disposition::Consumed`] to a fault has arranged for the same
+    /// fault to be raised forever. A handler that knows what the faulting
+    /// instruction was doing — because it is the one that put it there — can
+    /// say where that code carries on instead, which is how an operation
+    /// the hypervisor is willing to have fail is allowed to fail.
+    ///
+    /// The address is written into the frame the processor returns through, so
+    /// a handler answering this must name one the interrupted code can
+    /// really carry on at: in this image, and reachable with the stack
+    /// exactly as the faulting instruction left it. The stack is what makes
+    /// that a real obligation rather than a formality — nothing here moves
+    /// `RSP`, so the address has to belong to the routine the fault
+    /// happened in.
+    Redirected(VirtAddr),
 }
 
 /// A function pinned to one vector, which decides whether that interrupt was
@@ -320,14 +350,24 @@ pub(crate) fn adopted() -> bool {
 ///
 /// `vector` and the presence of `error_code` both come from the entry point the
 /// vector's own gate names, so neither can disagree with what the processor
-/// actually delivered.
-pub(crate) fn deliver(vector: Vector, frame: &InterruptStackFrameValue, error_code: Option<u64>) {
+/// actually delivered. The frame is borrowed mutably for the sake of one
+/// handler answer out of three: a fault the hypervisor asked for is recovered
+/// from by changing where the interrupted code resumes.
+pub(crate) fn deliver(vector: Vector, frame: &mut InterruptStackFrame, error_code: Option<u64>) {
     // First, before anything else on this stack: it is what a second arrival on
     // the same stack lands below instead of on top of.
     let _level = Guard::enter(vector);
     let interrupt = Interrupt::new(vector, frame, error_code);
-    if claimed(vector).is_some_and(|handler| handler(&interrupt) == Disposition::Consumed) {
-        return;
+    match claimed(vector).map(|handler| handler(&interrupt)) {
+        Some(Disposition::Consumed) => return,
+        Some(Disposition::Redirected(rip)) => {
+            // SAFETY: the address comes from the handler that claimed this
+            // vector, which `Disposition::Redirected` obliges to name one the
+            // interrupted code can carry on at with the stack as it stands.
+            unsafe { resume_at(frame, rip) };
+            return;
+        }
+        Some(Disposition::Passed) | None => {}
     }
     match unclaimed() {
         Some(unclaimed) => unclaimed(&interrupt),
@@ -352,6 +392,27 @@ pub(crate) fn terminal(
     error_code: Option<u64>,
 ) -> ! {
     fatal::interrupt(&Interrupt::new(vector, frame, error_code))
+}
+
+/// Puts the address the interrupted code is to carry on at into the frame the
+/// processor returns through.
+///
+/// The instruction pointer and nothing else: the rest of the frame is what the
+/// processor pushed, and the flags, the stack pointer and both selectors are
+/// still the ones the interrupted code was running with.
+///
+/// # Safety
+///
+/// `rip` must be an address the interrupted code can carry on at, which is the
+/// obligation [`Disposition::Redirected`] states in full. A handler naming one
+/// that does not meet it returns the processor into whatever is at that
+/// address.
+unsafe fn resume_at(frame: &mut InterruptStackFrame, rip: VirtAddr) {
+    // SAFETY: the caller vouches for `rip`, and the field written is the one the
+    // architecture reads the return address out of. The write goes through the
+    // volatile wrapper because the compiler is otherwise entitled to discard a
+    // store to a frame nothing in this image reads again.
+    unsafe { frame.as_mut() }.update(|frame| frame.instruction_pointer = rip);
 }
 
 /// The handler that claimed `vector`, if one did.

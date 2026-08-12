@@ -14,6 +14,10 @@ log = { workspace = true }
 npt = { workspace = true }
 partition = { workspace = true }
 portal = { workspace = true }
+# How a register the machine may not have is reached: an access outside the
+# permission map's three ranges is intercepted whatever the map says, and the
+# only way to find out whether such a register exists is to attempt it.
+probe = { workspace = true }
 processor = { workspace = true }
 svm = { workspace = true }
 thiserror = { workspace = true }

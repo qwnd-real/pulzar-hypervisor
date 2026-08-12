@@ -288,13 +288,13 @@ fn entry_point<const NUMBER: u8>() -> VirtAddr {
 }
 
 /// The entry point for a vector the processor pushes no error code for.
-extern "x86-interrupt" fn plain<const NUMBER: u8>(frame: InterruptStackFrame) {
-    dispatch::deliver(Vector::new(NUMBER), &frame, None);
+extern "x86-interrupt" fn plain<const NUMBER: u8>(mut frame: InterruptStackFrame) {
+    dispatch::deliver(Vector::new(NUMBER), &mut frame, None);
 }
 
 /// The entry point for a vector the processor pushes an error code for.
-extern "x86-interrupt" fn coded<const NUMBER: u8>(frame: InterruptStackFrame, error_code: u64) {
-    dispatch::deliver(Vector::new(NUMBER), &frame, Some(error_code));
+extern "x86-interrupt" fn coded<const NUMBER: u8>(mut frame: InterruptStackFrame, error_code: u64) {
+    dispatch::deliver(Vector::new(NUMBER), &mut frame, Some(error_code));
 }
 
 /// The entry point for `#DF`, which the architecture gives no way back from.

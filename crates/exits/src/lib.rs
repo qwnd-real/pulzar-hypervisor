@@ -8,8 +8,13 @@
 //!
 //! - `CPUID`, answered with the machine's own answer less the virtualization
 //!   extension, so the guest does not discover the hypervisor underneath it.
-//! - The one model-specific register that says whether the extension is
-//!   available, answered consistently with that.
+//! - The model-specific registers that decide whether that extension may be
+//!   used, answered consistently with that — and the extended feature register
+//!   whose enable bit would otherwise contradict it.
+//! - Every other model-specific register the permission map cannot cover, which
+//!   the processor intercepts whatever that map says. Those reach the machine's
+//!   own register, and one the machine does not have is a fault the guest
+//!   takes.
 //! - Nested page faults, which are how a guest's memory comes to be described
 //!   at all, and how a write to hypervisor memory is stepped over.
 //! - The two notifications the [`portal`] makes, which are the only two things
@@ -66,13 +71,14 @@ use vlapic::{Resumption, VlapicError};
 use x86_64::instructions::interrupts;
 
 pub use crate::firmware::Boot;
-use crate::{census::Census, firmware::Firmware};
+use crate::{census::Census, firmware::Firmware, msr::Virtualization};
 
 /// The guest's exits, and everything the host needs to answer one.
 ///
-/// One of these per processor, holding the two things that are one processor's:
-/// what its guest is owed, and how far it has got out of firmware — which for
-/// every processor but one is "there was no firmware". The guest's memory is
+/// One of these per processor, holding the things that are one processor's:
+/// what its guest is owed, how far it has got out of firmware — which for every
+/// processor but one is "there was no firmware" — and what it has been told
+/// about this machine's virtualization extension. The guest's memory is
 /// borrowed rather than held, because that part really is shared by all of
 /// them.
 #[derive(Debug)]
@@ -80,6 +86,7 @@ pub struct Exits<'a> {
     partition: &'a Partition,
     firmware: Option<Firmware>,
     interrupts: Pending,
+    virtualization: Virtualization,
     left: Left,
     census: Census,
 }
@@ -92,6 +99,7 @@ impl<'a> Exits<'a> {
             partition,
             firmware: Some(Firmware::new(portal, boot)),
             interrupts: Pending::new(),
+            virtualization: Virtualization::new(),
             left: Left::Stopped,
             census: Census::new(),
         }
@@ -109,6 +117,7 @@ impl<'a> Exits<'a> {
             partition,
             firmware: None,
             interrupts: Pending::new(),
+            virtualization: Virtualization::new(),
             left: Left::Stopped,
             census: Census::new(),
         }
@@ -180,6 +189,7 @@ impl<'a> Exits<'a> {
                 info!("exits: the guest started this processor at page {page:#x}");
                 vcpu.start_at(page);
                 self.interrupts.reset(vcpu);
+                self.virtualization.reset();
                 Ok(true)
             }
         }
@@ -211,7 +221,7 @@ impl<'a> Exits<'a> {
         }
         let flow = match reason {
             Some(Reason::Cpuid) => cpuid::exit(vcpu),
-            Some(Reason::MsrAccess) => msr::exit(vcpu),
+            Some(Reason::MsrAccess) => self.virtualization.exit(vcpu),
             Some(Reason::NestedPageFault) => nested::exit(vcpu, self.partition),
             Some(Reason::Vmmcall) => self.notified(vcpu),
             // Two exits that are answered by the fact of having happened.

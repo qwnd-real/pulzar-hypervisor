@@ -1,0 +1,17 @@
+[package]
+name = "probe"
+description = "Model-specific register access that reports a fault instead of taking one"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The interrupt entry path, which is where a fault is recognised as one of this
+# crate's own and turned back into a return value.
+descriptors = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+x86_64 = { workspace = true }
+
+[lints]
+workspace = true

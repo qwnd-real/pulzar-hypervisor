@@ -61,6 +61,12 @@ impl Vector {
     /// `#MC`, the one vector this hypervisor stops on by policy.
     pub const MACHINE_CHECK: Self = Self(18);
 
+    /// `#GP`, which is what the processor raises for an instruction that is
+    /// legal but was asked to do something the machine does not allow — and so
+    /// the exception a hypervisor both recovers from on its own behalf and
+    /// hands to a guest on the guest's.
+    pub const GENERAL_PROTECTION: Self = Self(13);
+
     /// The non-maskable interrupt, which no masking holds off and which
     /// therefore arrives in the middle of whatever this processor was doing —
     /// including inside a lock it will now never release, and including inside

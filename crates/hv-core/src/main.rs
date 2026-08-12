@@ -155,6 +155,10 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     descriptors::adopt(unclaimed)?;
     Tables::build(&mut space)?.activate()?.describe("core");
     emulate::install()?;
+    // With the tables live and before any guest exists, which is the window this
+    // belongs in: it claims a vector, and what it claims it for is a fault the
+    // host takes deliberately while answering for a guest.
+    probe::install()?;
 
     // SAFETY: this space is the active one, physical memory is reached through
     // its direct map rather than firmware's identity map, and nothing firmware

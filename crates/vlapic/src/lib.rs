@@ -252,10 +252,15 @@ pub fn region() -> Result<Region, VlapicError> {
 /// should take a general protection fault for the access.
 pub fn read_msr(index: u32) -> Result<u64, VlapicError> {
     let vlapic = current()?;
-    msr::read(vlapic, index).map_err(|fault| {
+    let value = msr::read(vlapic, index).map_err(|fault| {
         warn!("vlapic: refusing a read of {index:#x}: {fault:?}");
         VlapicError::Fault
-    })
+    })?;
+    info!(
+        "vlapic: {} read -> {index:#05x}: {value:#018x}",
+        vlapic.index()
+    );
+    Ok(value)
 }
 
 /// What a write to one of the controller's model-specific registers does.
@@ -269,6 +274,10 @@ pub fn write_msr(index: u32, value: u64) -> Result<(), VlapicError> {
         warn!("vlapic: refusing a write of {value:#x} to {index:#x}: {fault:?}");
         VlapicError::Fault
     })?;
+    info!(
+        "vlapic: {} wrote {value:#018x} to its {index:#05x} model-specific register",
+        vlapic.index()
+    );
     acted(vlapic, written);
     Ok(())
 }
