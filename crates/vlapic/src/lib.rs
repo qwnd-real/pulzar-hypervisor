@@ -56,9 +56,12 @@ mod timer;
 mod vectors;
 
 use alloc::boxed::Box;
-use core::num::NonZeroU64;
+use core::{
+    num::NonZeroU64,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
-use apic::{Controller, IA32_TSC_DEADLINE};
+use apic::{Controller, IA32_TSC_DEADLINE, LocalApic};
 use cpu::{CpuError, CpuIndex};
 use descriptors::{DescriptorError, Vector};
 use emulate::{Capability, Commit, Data, Device, Read, Region, Trap, Write};
@@ -256,8 +259,8 @@ pub fn read_msr(index: u32) -> Result<u64, VlapicError> {
         warn!("vlapic: refusing a read of {index:#x}: {fault:?}");
         VlapicError::Fault
     })?;
-    info!(
-        "vlapic: {} read -> {index:#05x}: {value:#018x}",
+    trace!(
+        "vlapic: {} read {index:#05x} to its {value:#018x} model-specific register",
         vlapic.index()
     );
     Ok(value)
@@ -274,7 +277,7 @@ pub fn write_msr(index: u32, value: u64) -> Result<(), VlapicError> {
         warn!("vlapic: refusing a write of {value:#x} to {index:#x}: {fault:?}");
         VlapicError::Fault
     })?;
-    info!(
+    trace!(
         "vlapic: {} wrote {value:#018x} to its {index:#05x} model-specific register",
         vlapic.index()
     );
@@ -311,12 +314,34 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     // the number an interrupt arrived on is already the number the guest is
     // owed — and a source the guest has masked was programmed masked and did
     // not deliver at all.
-    if !local.arrived_level(vector) {
+    let level = local.arrived_level(vector);
+    // The real controller's own in-service bank is what says whether a source
+    // can go on delivering: it refuses everything of a held vector's priority or
+    // lower, so a vector left in service there is a source that has stopped for
+    // good, and the acknowledgement below is the only thing that ever clears it.
+    let seen = ARRIVALS.fetch_add(1, Ordering::Relaxed) + 1;
+    trace!(
+        "vlapic: {} arrival {seen} of {vector}, {} triggered: real in service {:?}, guest requested \
+         {:?}, {} in service, task priority {}, hardware {}",
+        vlapic.index(),
+        if level { "level" } else { "edge" },
+        local.in_service_top(),
+        vlapic.requested(),
+        vlapic.in_service_count(),
+        vlapic.task_priority(),
+        if vlapic.ledger().is_empty() {
+            "owed nothing"
+        } else {
+            "still owed an acknowledgement"
+        }
+    );
+    if !level {
         vlapic.accept(vector, Trigger::Edge);
         local.end_of_interrupt();
         trace!(
-            "vlapic: {} received edge {vector}, acknowledged and requested it",
-            vlapic.index()
+            "vlapic: {} acknowledged real {vector} at once, leaving real in service {:?}",
+            vlapic.index(),
+            local.in_service_top()
         );
         return Ok(());
     }
@@ -325,8 +350,10 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     vlapic.ledger().owe(vector);
     match vlapic.accept(vector, Trigger::Level) {
         Accepted::Requested | Accepted::Coalesced => trace!(
-            "vlapic: {} received level {vector}, owing real hardware an acknowledgement",
-            vlapic.index()
+            "vlapic: {} withheld real {vector}'s acknowledgement until its guest gives one, real \
+             in service {:?}",
+            vlapic.index(),
+            local.in_service_top()
         ),
         refused => {
             // The guest was not given it and will therefore never acknowledge
@@ -335,9 +362,11 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
             // occupying a real in-service slot for the life of the machine,
             // blocking everything of its priority or lower on this processor.
             vlapic.ledger().release(vector);
-            trace!(
-                "vlapic: {} received level {vector} but is not accepting it: {refused:?}",
-                vlapic.index()
+            warn!(
+                "vlapic: {} received level {vector} but is not accepting it: {refused:?}, real in \
+                 service {:?}",
+                vlapic.index(),
+                local.in_service_top()
             );
         }
     }
@@ -684,7 +713,21 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // discharging whatever real hardware was owed for it is part of the
         // acknowledgement rather than something done after it.
         Written::EndOfInterrupt => {
-            vlapic.end_of_interrupt();
+            let retired = vlapic.end_of_interrupt();
+            trace!(
+                "vlapic: {} acknowledged {retired:?}, leaving {} in service and {} requested at \
+                 task priority {}, real in service {:?}, hardware {}",
+                vlapic.index(),
+                vlapic.in_service_count(),
+                vlapic.requested_count(),
+                vlapic.task_priority(),
+                apic::local().ok().and_then(LocalApic::in_service_top),
+                if vlapic.ledger().is_empty() {
+                    "owed nothing"
+                } else {
+                    "still owed an acknowledgement"
+                }
+            );
         }
         Written::Timer => {
             timer::reprogram(vlapic);
@@ -915,6 +958,14 @@ fn merge(first: NonZeroU64, _: NonZeroU64) -> NonZeroU64 {
 
 /// How long the memory-mapped register page is.
 const PAGE: u64 = 4096;
+
+/// How many interrupts have reached [`arrived`] on this machine.
+///
+/// One counter for every processor rather than one each, because what it is for
+/// is telling "the source fired once" from "the source is firing and nothing is
+/// taking it", and a single number answers that whichever processor the
+/// arrivals landed on.
+static ARRIVALS: AtomicU32 = AtomicU32::new(0);
 
 /// Why the emulated controllers could not be set up or driven.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]

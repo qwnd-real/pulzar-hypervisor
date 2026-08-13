@@ -35,8 +35,9 @@ pub struct Spec {
     pub installer: Option<PathBuf>,
     /// Attach an emulated TPM 2.0 backed by `swtpm`.
     pub tpm: bool,
-    /// Serial ports to capture: entry N becomes COM(N+1), written to the
-    /// named file. Empty means the default single COM1-on-stdio port.
+    /// Log outputs to capture: the first entry takes the debug console, which
+    /// is where the guest writes, and any further ones become COM1 upwards.
+    /// Empty means the debug console on stdio.
     pub serial_logs: Vec<PathBuf>,
 }
 
@@ -65,9 +66,9 @@ pub fn run(os: Guest, release: bool, serial_logs: Vec<PathBuf>) -> Result<()> {
 pub fn launch(spec: &Spec) -> Result<()> {
     let (code, vars) = firmware(spec.label)?;
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu.args(["-machine", "q35,accel=kvm", "-cpu", "host"]);
+    qemu.args(["-machine", "q35,accel=kvm", "-cpu", "host,invtsc=on"]);
     qemu.args(["-smp", "4", "-m", "4G"]);
-    serial_args(&mut qemu, &spec.serial_logs)?;
+    output_args(&mut qemu, &spec.serial_logs)?;
     qemu.arg("-drive").arg(format!(
         "if=pflash,format=raw,readonly=on,file={}",
         drive_path(&code)
@@ -103,28 +104,44 @@ pub fn launch(spec: &Spec) -> Result<()> {
     proc::run(&mut qemu, QEMU_INSTALL_HINT)
 }
 
-/// Wires the guest serial ports into `qemu`: with no capture files
-/// requested, COM1 goes to stdio as always; otherwise each file becomes a
-/// chardev feeding one COM port, in request order. Files are created empty
-/// up front — appending to a previous run's log, or silently keeping one
-/// around when QEMU fails to start, would be a debugging hazard.
-fn serial_args(qemu: &mut Command, logs: &[PathBuf]) -> Result<()> {
-    if logs.is_empty() {
-        qemu.args(["-serial", "stdio"]);
+/// Wires the guest's log outputs into `qemu`.
+///
+/// The debug console is the guest's own preferred backend and gets the first
+/// destination, because that is where its output will actually appear: it is a
+/// single I/O port with no line rate, so a hypervisor describing its own
+/// interrupt path is affordable through it and is not through a UART.
+///
+/// With no capture files requested that destination is stdio, as COM1 always
+/// was. Otherwise the first file becomes the debug console's and any further
+/// ones become COM ports in request order, so a run that wants both still gets
+/// both. Files are created empty up front — appending to a previous run's log,
+/// or silently keeping one around when QEMU fails to start, would be a
+/// debugging hazard.
+fn output_args(qemu: &mut Command, logs: &[PathBuf]) -> Result<()> {
+    let Some((console, ports)) = logs.split_first() else {
+        qemu.args(["-debugcon", "stdio", "-serial", "none"]);
         return Ok(());
-    }
+    };
     ensure!(
-        logs.len() <= 4,
-        "QEMU's PC machines expose at most four serial ports (COM1–COM4)"
+        ports.len() <= 4,
+        "QEMU's PC machines expose at most four serial ports (COM1–COM4) beyond the debug console"
     );
-    for (index, path) in logs.iter().enumerate() {
-        fs::File::create(path)
-            .with_context(|| format!("failed to create serial log {}", path.display()))?;
+    qemu.arg("-chardev")
+        .arg(format!("file,id=debugcon,path={}", chardev_path(console)?));
+    qemu.args(["-debugcon", "chardev:debugcon"]);
+    for (index, path) in ports.iter().enumerate() {
         qemu.arg("-chardev")
-            .arg(format!("file,id=char{index},path={}", drive_path(path)));
+            .arg(format!("file,id=char{index},path={}", chardev_path(path)?));
         qemu.arg("-serial").arg(format!("chardev:char{index}"));
     }
     Ok(())
+}
+
+/// Creates one capture file empty and formats its path for a chardev option.
+fn chardev_path(path: &Path) -> Result<String> {
+    fs::File::create(path)
+        .with_context(|| format!("failed to create log file {}", path.display()))?;
+    Ok(drive_path(path))
 }
 
 /// Removes a guest's firmware-variable store and TPM state, so a recreated

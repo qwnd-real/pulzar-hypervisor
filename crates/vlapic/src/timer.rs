@@ -60,9 +60,9 @@
 //! to convert here, and a deadline passed through unconverted would fire at the
 //! wrong moment in whichever direction the two had drifted.
 
-use apic::{Divisor, LocalApic, LocalState, TimerMode as HardwareMode};
+use apic::{Divisor, LocalApic, LocalState, Source, TimerMode as HardwareMode};
 use clock::Kind;
-use log::{trace, warn};
+use log::{info, trace, warn};
 
 use crate::{
     lvt::{Entry, TimerMode},
@@ -124,7 +124,10 @@ pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
         .then(|| entry.vector())
         .and_then(|vector| sources::armable(vlapic, vector));
     match timer.configure(delivery, mode, divisor(vlapic)) {
-        Ok(()) => true,
+        Ok(()) => {
+            report(vlapic, "configured");
+            true
+        }
         Err(error) => {
             warn!(
                 "vlapic: {} could not program its timer, so it is stopped: {error}",
@@ -138,6 +141,39 @@ pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
             false
         }
     }
+}
+
+/// Says what the guest asked its timer for and what the real timer holds
+/// afterwards.
+///
+/// The two are the same registers seen from either side, and the whole of what
+/// makes a guest's timer work is that they agree: a mode the guest selected and
+/// the hardware did not take, a vector masked on one side and not the other, or
+/// a count the hardware refused to start are each invisible from the guest's
+/// own reads and each stop its ticks.
+fn report(vlapic: &Vlapic, what: &str) {
+    let Ok(local) = apic::local() else {
+        return;
+    };
+    let guest = vlapic.lvt(Entry::Timer);
+    let real = local.source(Source::Timer);
+    info!(
+        "vlapic: {} {what} its timer: guest {:?} vector {} {}, divide {:#x}, count {:#x}; real \
+         mode {:?}, {}, remaining {:#x}",
+        vlapic.index(),
+        vlapic.timer_mode(),
+        guest.vector(),
+        if guest.masked() { "masked" } else { "armed" },
+        vlapic.timer_divide(),
+        vlapic.timer_initial(),
+        local.timer().mode(),
+        match real {
+            Ok(entry) if entry.is_masked() => "masked",
+            Ok(_) => "armed",
+            Err(_) => "unreachable",
+        },
+        local.timer().remaining(),
+    );
 }
 
 /// Starts the guest's timer counting from what it last wrote.
@@ -155,7 +191,9 @@ pub(crate) fn reload(vlapic: &Vlapic) {
             "vlapic: {} could not start its timer counting: {error}",
             vlapic.index()
         );
+        return;
     }
+    report(vlapic, "started");
 }
 
 /// Arms the guest's timer at the deadline it just wrote.
@@ -306,6 +344,7 @@ pub(crate) fn disarm(vlapic: &Vlapic) -> bool {
         return false;
     };
     timer.disarm();
+    info!("vlapic: {} disarmed its timer", vlapic.index());
     true
 }
 

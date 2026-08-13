@@ -40,7 +40,7 @@
 use alloc::boxed::Box;
 
 use emulate::{Capability, Commit, Data, Device, Read, Width, Write};
-use log::info;
+use log::trace;
 
 use crate::{
     access,
@@ -110,7 +110,7 @@ impl Device for Page {
             Access::WriteOnly | Access::Absent => 0,
             Access::ReadOnly | Access::ReadWrite => access::read(vlapic, register),
         };
-        info!(
+        trace!(
             "vlapic: cpu {} read its {:#05x} register through the page and got {:#010x}",
             vlapic.index(),
             register.offset(),
@@ -136,7 +136,7 @@ impl Device for Page {
             reason = "the access was established to be exactly four bytes wide by `decode`"
         )]
         let value = access.value().as_u64() as u32;
-        info!(
+        trace!(
             "vlapic: cpu {} wrote {:#010x} to its {:#05x} register through the page",
             vlapic.index(),
             value,

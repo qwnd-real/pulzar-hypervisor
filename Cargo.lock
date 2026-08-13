@@ -377,6 +377,7 @@ dependencies = [
  "npt",
  "partition",
  "portal",
+ "probe",
  "processor",
  "svm",
  "thiserror",
@@ -471,6 +472,7 @@ dependencies = [
  "partition",
  "pci",
  "portal",
+ "probe",
  "serial",
  "snapshot",
  "spin 0.12.2",
@@ -731,6 +733,16 @@ dependencies = [
  "paging",
  "thiserror",
  "uefi-raw",
+ "x86_64",
+]
+
+[[package]]
+name = "probe"
+version = "0.1.0"
+dependencies = [
+ "descriptors",
+ "log",
+ "thiserror",
  "x86_64",
 ]
 

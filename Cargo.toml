@@ -19,6 +19,7 @@ members = [
     "crates/partition",
     "crates/pci",
     "crates/portal",
+    "crates/probe",
     "crates/processor",
     "crates/serial",
     "crates/snapshot",
@@ -63,9 +64,11 @@ uefi-raw = "0.15.1"
 # `partition` is the guest those processors are running; `emulate` decodes an
 # intercepted instruction when hardware cannot provide its following address;
 # `portal` is the only hypervisor memory a guest is ever shown, being the pages
-# firmware is entered at and leaves through, `vlapic` is the interrupt
-# controller a guest sees in place of the machine's own, and `exits` is what
-# every one of a guest's exits means and what the host does about it.
+# firmware is entered at and leaves through, `probe` reaches a model-specific
+# register the machine may not have and reports a refusal rather than taking
+# it, `vlapic` is the interrupt controller a guest sees in place of the
+# machine's own, and `exits` is what every one of a guest's exits means and
+# what the host does about it.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -82,6 +85,7 @@ paging = { path = "crates/paging" }
 partition = { path = "crates/partition" }
 pci = { path = "crates/pci" }
 portal = { path = "crates/portal" }
+probe = { path = "crates/probe" }
 processor = { path = "crates/processor" }
 snapshot = { path = "crates/snapshot" }
 svm = { path = "crates/svm" }

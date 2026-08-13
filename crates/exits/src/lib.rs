@@ -312,10 +312,23 @@ impl<'a> Exits<'a> {
         let candidate = vlapic::select().unwrap_or(None);
         let blocked = vlapic::pending().unwrap_or(None);
         let injected = self.interrupts.commit(vcpu, candidate, blocked);
-        trace!(
-            "exits: entering with candidate {candidate:?}, blocked {blocked:?}, injected \
-             {injected:?}"
-        );
+        // Only when there was something to decide about. Every exit reaches
+        // here, and a guest with nothing owed would otherwise describe that
+        // several thousand times a second — but an entry that had a candidate,
+        // or armed a window, or put something in is one of the few that says
+        // where an interrupt went.
+        if candidate.is_some() || blocked.is_some() || injected != Injected::Nothing {
+            trace!(
+                "exits: entering with candidate {candidate:?}, blocked {blocked:?}, injected \
+                 {injected:?}, virtual tpr {:#x}",
+                vcpu.control().interrupt_control.virtual_tpr()
+            );
+        } else {
+            trace!(
+                "exits: entering with candidate {candidate:?}, blocked {blocked:?}, injected \
+                {injected:?}"
+            );
+        }
         if let Injected::Interrupt(vector) = injected {
             let _ = vlapic::committed(vector);
         }

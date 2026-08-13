@@ -39,9 +39,10 @@ enum Cli {
         /// Build with the release profile.
         #[arg(long)]
         release: bool,
-        /// Capture a guest serial port to a file, created fresh each run.
-        /// Repeatable: the first use maps to COM1, the next to COM2, and so
-        /// on. Without it, COM1 goes to stdio as before.
+        /// Capture a guest log output to a file, created fresh each run.
+        /// Repeatable: the first use maps to the debug console, which is where
+        /// the guest logs, and further uses to COM1 upwards. Without it, the
+        /// debug console goes to stdio.
         #[arg(long, value_name = "FILE")]
         serial_log: Vec<PathBuf>,
     },
