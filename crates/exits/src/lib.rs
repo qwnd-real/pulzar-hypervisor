@@ -211,6 +211,7 @@ impl<'a> Exits<'a> {
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
         let reason = vcpu.reason();
         self.census.record(vcpu);
+        vlapic::observe_task_priority(vcpu.control().interrupt_control.virtual_tpr());
         // This processor is out of the guest and consults its controller below
         // before going back in, so nothing needs to interrupt it to make it
         // look.
@@ -255,10 +256,6 @@ impl<'a> Exits<'a> {
                 | Reason::Skinit
                 | Reason::Invlpga,
             ) => hidden_svm::refuse(vcpu, &mut self.interrupts),
-            Some(Reason::WriteControlRegisterTrap(8)) => {
-                vlapic::observe_task_priority(vcpu.control().interrupt_control.virtual_tpr());
-                Flow::Resume
-            }
             // Two exits that are answered by the fact of having happened.
             //
             // The first says the guest became willing to take an interrupt: the

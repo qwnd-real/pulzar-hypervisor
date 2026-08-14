@@ -81,6 +81,7 @@ pub fn windows(iso: &Path, force: bool) -> Result<()> {
         disk: Some(image),
         installer: Some(iso.to_path_buf()),
         tpm: true,
+        gdb: false,
         serial_logs: Vec::new(),
     })?;
     println!(

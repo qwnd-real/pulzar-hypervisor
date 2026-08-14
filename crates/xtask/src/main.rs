@@ -39,6 +39,9 @@ enum Cli {
         /// Build with the release profile.
         #[arg(long)]
         release: bool,
+        /// Expose QEMU's guest GDB stub on 127.0.0.1:1234.
+        #[arg(long)]
+        gdb: bool,
         /// Capture a guest log output to a file, created fresh each run.
         /// Repeatable: the first use maps to the debug console, which is where
         /// the guest logs, and further uses to COM1 upwards. Without it, the
@@ -99,7 +102,8 @@ fn main() -> Result<()> {
         Cli::Run {
             os,
             release,
+            gdb,
             serial_log,
-        } => vm::run(os, release, serial_log),
+        } => vm::run(os, release, gdb, serial_log),
     }
 }

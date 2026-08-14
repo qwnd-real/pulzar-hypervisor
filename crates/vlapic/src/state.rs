@@ -440,8 +440,8 @@ impl Vlapic {
     ///
     /// The control block carries only the four bits of the class, because that
     /// is all the control register carries. Every write clears the subclass,
-    /// including a write of the class already present, so this stores
-    /// unconditionally and is called only for the completed-write trap.
+    /// including a write of the class already present, so the exit path stores
+    /// the hardware-maintained value unconditionally.
     pub(crate) fn observe_task_priority(&self, class: u8) {
         self.task_priority
             .store(u32::from(class) << PRIORITY_CLASS_SHIFT, Ordering::Release);

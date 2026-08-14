@@ -646,16 +646,16 @@ pub fn raise_nmi() -> Result<(), VlapicError> {
 /// Records the priority class the guest set through `CR8`.
 ///
 /// With interrupt masking virtualized, the processor keeps `CR8` in the control
-/// block. A write trap reports each completed write, including one that writes
-/// the same class already present, which matters because every `CR8` write
-/// clears the APIC task-priority subclass.
+/// block and writes it back on every exit. Observing it on every exit also
+/// covers a write of the same class already present, which matters because a
+/// `CR8` write clears the APIC task-priority subclass.
 ///
 /// `class` is the four bits the control block carries, which is the whole of
 /// what that control register holds.
 ///
-/// A failure is deliberately not reported: this is called on the exit path
-/// before anything has been decided, and a processor with no controller has
-/// nothing that could want the value.
+/// A failure is deliberately not reported: this is called on every exit before
+/// anything has been decided, and a processor with no controller has nothing
+/// that could want the value.
 pub fn observe_task_priority(class: u8) {
     if let Ok(vlapic) = current() {
         vlapic.observe_task_priority(class);

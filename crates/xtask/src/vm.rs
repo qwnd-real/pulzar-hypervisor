@@ -35,6 +35,8 @@ pub struct Spec {
     pub installer: Option<PathBuf>,
     /// Attach an emulated TPM 2.0 backed by `swtpm`.
     pub tpm: bool,
+    /// Expose QEMU's guest GDB stub on the local machine.
+    pub gdb: bool,
     /// Log outputs to capture: the first entry takes the debug console, which
     /// is where the guest writes, and any further ones become COM1 upwards.
     /// Empty means the debug console on stdio.
@@ -42,7 +44,7 @@ pub struct Spec {
 }
 
 /// Builds the boot media and runs it in QEMU, optionally with a guest disk.
-pub fn run(os: Guest, release: bool, serial_logs: Vec<PathBuf>) -> Result<()> {
+pub fn run(os: Guest, release: bool, gdb: bool, serial_logs: Vec<PathBuf>) -> Result<()> {
     let staged = esp::stage(release)?;
     let disk = match os {
         Guest::None => None,
@@ -58,6 +60,7 @@ pub fn run(os: Guest, release: bool, serial_logs: Vec<PathBuf>) -> Result<()> {
         disk,
         installer: None,
         tpm: matches!(os, Guest::Windows),
+        gdb,
         serial_logs,
     })
 }
@@ -69,6 +72,9 @@ pub fn launch(spec: &Spec) -> Result<()> {
     qemu.args(["-machine", "q35,accel=kvm", "-cpu", "host,invtsc=on"]);
     qemu.args(["-smp", "4", "-m", "4G"]);
     qemu.args(["-no-shutdown", "-no-reboot"]);
+    if spec.gdb {
+        qemu.args(["-gdb", "tcp:127.0.0.1:1234"]);
+    }
     output_args(&mut qemu, &spec.serial_logs)?;
     qemu.arg("-drive").arg(format!(
         "if=pflash,format=raw,readonly=on,file={}",
