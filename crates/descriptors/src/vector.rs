@@ -58,6 +58,10 @@ impl Vector {
     /// `#DF`, the one vector the architecture gives no way back from.
     pub const DOUBLE_FAULT: Self = Self(8);
 
+    /// `#UD`, raised when an instruction is not available in the current
+    /// processor configuration.
+    pub const INVALID_OPCODE: Self = Self(6);
+
     /// `#MC`, the one vector this hypervisor stops on by policy.
     pub const MACHINE_CHECK: Self = Self(18);
 

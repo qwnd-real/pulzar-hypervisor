@@ -87,9 +87,11 @@ use vcpu::Vcpu;
 /// somewhere else: that *is* reached from other processors.
 #[derive(Clone, Copy, Debug)]
 pub struct Pending {
-    interrupted: Option<Event>,
-    nmi: bool,
+    interrupted: Option<Interrupted>,
+    nmi: u8,
     nmi_blocked: bool,
+    awaiting_iret: Option<u64>,
+    shutdown: bool,
     blocking: Blocking,
     /// The vector an interrupt window is currently armed for, or `None` when
     /// none is. The vector and not merely the fact, because the priority armed
@@ -105,8 +107,10 @@ impl Pending {
     pub fn new() -> Self {
         Self {
             interrupted: None,
-            nmi: false,
+            nmi: 0,
             nmi_blocked: false,
+            awaiting_iret: None,
+            shutdown: false,
             blocking: Blocking::of(processor::svm().map(|svm| svm.features)),
             window: None,
         }
@@ -119,7 +123,7 @@ impl Pending {
     /// goes back in ahead of anything the controller has since decided,
     /// because it is not a new interrupt competing on priority — it is one the
     /// guest had already been given and was part-way through taking.
-    pub fn harvest(&mut self, vcpu: &mut Vcpu) {
+    pub fn harvest(&mut self, vcpu: &mut Vcpu, next_rip: Option<u64>) {
         let event = vcpu.control().exit_interrupt_info;
         if !event.valid() {
             return;
@@ -128,12 +132,56 @@ impl Pending {
         // rather than as an event, so that it goes through the blocking rules
         // the rest of this type keeps.
         if event.kind() == EventKind::Nmi {
-            self.nmi = true;
+            self.raise_nmi();
             trace!("inject: an nmi delivery was interrupted; it stays owed");
             return;
         }
-        self.interrupted = Some(event);
+        if self.interrupted.is_some() {
+            warn!("inject: replacing an interrupted event with a newer interrupted event");
+        }
+        self.interrupted = Some(Interrupted { event, next_rip });
         trace!("inject: took back an interrupted {event:?}");
+    }
+
+    /// Whether replaying this interrupted event needs its following address.
+    #[must_use]
+    pub fn needs_next_rip(vcpu: &Vcpu) -> bool {
+        let event = vcpu.control().exit_interrupt_info;
+        event.valid()
+            && (event.kind() == EventKind::Software
+                || (event.kind() == EventKind::Exception
+                    && matches!(event.vector().number(), 3 | 4)))
+    }
+
+    /// Queues an exception raised while answering a guest exit.
+    ///
+    /// An interrupted event always stays ahead of a newly raised exception: it
+    /// was already being delivered when the processor left the guest. A valid
+    /// injection field is moved into that slot first, so no event is
+    /// overwritten while the exit handler turns an access failure into an
+    /// exception.
+    pub fn raise_exception(&mut self, vcpu: &mut Vcpu, event: Event) {
+        debug_assert!(event.valid() && event.kind() == EventKind::Exception);
+        let previous = self
+            .interrupted
+            .take()
+            .map(|interrupted| interrupted.event)
+            .or_else(|| {
+                let injected = vcpu.control().event_injection;
+                injected.valid().then_some(injected)
+            });
+        if let Some(previous) = previous {
+            match combine_exceptions(previous, event) {
+                Combined::Event(combined) => Self::inject(vcpu, combined),
+                Combined::Shutdown => {
+                    self.shutdown = true;
+                    vcpu.control_mut().event_injection = Event::none();
+                    vcpu.soil(CleanBits::INTERRUPT);
+                }
+            }
+            return;
+        }
+        Self::inject(vcpu, event);
     }
 
     /// Records that this processor took a non-maskable interrupt the guest is
@@ -142,16 +190,29 @@ impl Pending {
     /// Called from the host's own handler, which runs in interrupt context on
     /// this processor between a world switch and the next entry.
     pub const fn raise_nmi(&mut self) {
-        self.nmi = true;
+        if self.nmi < 2 {
+            self.nmi += 1;
+        }
     }
 
-    /// Records that the guest returned from an interrupt handler, which ends
-    /// the window during which it takes no further non-maskable interrupt.
+    /// Records that an intercepted return is about to execute.
     ///
-    /// Only reached where the processor does not virtualize that blocking; the
-    /// `IRET` intercept it needs is armed and disarmed by [`Pending::commit`].
-    pub const fn retired_iret(&mut self) {
-        self.nmi_blocked = false;
+    /// The intercept is removed for one attempt and the blocking state remains
+    /// set until a later exit proves that the instruction pointer advanced.
+    /// An event that wins before the return executes therefore cannot open the
+    /// NMI window early.
+    pub fn intercepted_iret(&mut self, vcpu: &mut Vcpu) {
+        self.awaiting_iret = Some(vcpu.save().rip);
+        vcpu.control_mut().intercept_1.remove(Intercepts1::IRET);
+        vcpu.soil(CleanBits::INTERCEPTS);
+    }
+
+    /// Finishes a return whose execution a later exit has proved.
+    pub fn complete_iret(&mut self, vcpu: &Vcpu) {
+        if self.awaiting_iret.is_some_and(|rip| vcpu.save().rip != rip) {
+            self.awaiting_iret = None;
+            self.nmi_blocked = false;
+        }
     }
 
     /// Forgets everything the guest was owed, which is what resetting the
@@ -171,8 +232,10 @@ impl Pending {
     /// blocking flag into its next life and take no further one, ever.
     pub fn reset(&mut self, vcpu: &mut Vcpu) {
         self.interrupted = None;
-        self.nmi = false;
+        self.nmi = 0;
         self.nmi_blocked = false;
+        self.awaiting_iret = None;
+        self.shutdown = false;
         self.window = None;
         let control = vcpu.control_mut();
         control.event_injection = Event::none();
@@ -192,7 +255,13 @@ impl Pending {
     /// that halted should be woken.
     #[must_use]
     pub const fn owed(&self) -> bool {
-        self.interrupted.is_some() || self.nmi
+        self.interrupted.is_some() || self.nmi != 0 || self.shutdown
+    }
+
+    /// Whether exception delivery reached the architectural shutdown state.
+    #[must_use]
+    pub const fn shutdown(&self) -> bool {
+        self.shutdown
     }
 
     /// Decides what the guest takes on its next entry, and puts it there.
@@ -244,13 +313,13 @@ impl Pending {
         }
         // Ahead of everything, because this is not a new event: the guest was
         // already taking it.
-        if let Some(event) = self.interrupted.take() {
-            Self::inject(vcpu, event);
-            trace!("inject: requeued interrupted {event:?}");
+        if let Some(interrupted) = self.interrupted.take() {
+            interrupted.inject(vcpu);
+            trace!("inject: requeued interrupted {:?}", interrupted.event);
             return Injected::Requeued;
         }
-        if self.nmi && self.nmi_deliverable(vcpu) {
-            self.nmi = false;
+        if self.nmi != 0 && self.nmi_deliverable(vcpu) {
+            self.nmi -= 1;
             self.block_nmi(vcpu);
             Self::inject(vcpu, Event::nmi());
             trace!("inject: injecting the owed non-maskable interrupt");
@@ -273,6 +342,7 @@ impl Pending {
     /// Puts an event where the processor will take it on the next entry.
     fn inject(vcpu: &mut Vcpu, event: Event) {
         vcpu.control_mut().event_injection = event;
+        vcpu.soil(CleanBits::INTERRUPT);
     }
 
     /// Whether a non-maskable interrupt may go in now.
@@ -295,17 +365,14 @@ impl Pending {
     /// interrupt.
     fn block_nmi(&mut self, vcpu: &mut Vcpu) {
         match self.blocking {
-            // The processor keeps the flag and clears it on the guest's own
-            // `IRET`, so there is nothing to intercept and nothing to track.
-            Blocking::Virtual => {
-                let control = vcpu.control_mut();
-                control.interrupt_control = control.interrupt_control.with_virtual_nmi_masked(true);
-                vcpu.soil(CleanBits::INTERRUPT);
-            }
+            // The processor sets the blocking flag as it delivers the injected
+            // NMI and clears it on the guest's own `IRET`.
+            Blocking::Virtual => {}
             // Nothing tracks it, so the return has to be intercepted to learn
             // when the window closes.
             Blocking::Iret => {
                 self.nmi_blocked = true;
+                self.awaiting_iret = None;
                 let control = vcpu.control_mut();
                 control.intercept_1 |= Intercepts1::IRET;
                 vcpu.soil(CleanBits::INTERCEPTS);
@@ -326,7 +393,8 @@ impl Pending {
     /// take the waiting vector through, and that is an exit which arms
     /// itself again.
     fn arm_window(&mut self, vcpu: &mut Vcpu, waiting: Option<Vector>) {
-        let iret = self.blocking == Blocking::Iret && self.nmi_blocked;
+        let iret =
+            self.blocking == Blocking::Iret && self.nmi_blocked && self.awaiting_iret.is_none();
         if waiting == self.window && !iret {
             return;
         }
@@ -366,6 +434,76 @@ impl Pending {
             control.intercept_1.remove(Intercepts1::IRET);
         }
         vcpu.soil(CleanBits::INTERRUPT | CleanBits::INTERCEPTS);
+    }
+}
+
+/// An event taken back from interrupted delivery, with any state its encoding
+/// does not carry itself.
+#[derive(Clone, Copy, Debug)]
+struct Interrupted {
+    event: Event,
+    next_rip: Option<u64>,
+}
+
+impl Interrupted {
+    /// Restores the event and the following address software delivery needs.
+    fn inject(self, vcpu: &mut Vcpu) {
+        if let Some(next_rip) = self.next_rip {
+            vcpu.control_mut().next_rip = next_rip;
+        }
+        Pending::inject(vcpu, self.event);
+    }
+}
+
+/// Combines two exceptions which arose while the first was being delivered.
+///
+/// A double fault replaces two contributory faults, or a page fault followed
+/// by any non-benign fault. `#DF` followed by another exception is shutdown on
+/// real hardware; VMRUN exposes that as a shutdown exit, which this layer does
+/// not synthesize because it has no ownership of guest lifecycle policy.
+fn combine_exceptions(first: Event, second: Event) -> Combined {
+    if first.kind() != EventKind::Exception || second.kind() != EventKind::Exception {
+        return Combined::Event(first);
+    }
+    if first.vector() == Vector::DOUBLE_FAULT {
+        return Combined::Shutdown;
+    }
+    let first_class = exception_class(first.vector());
+    let second_class = exception_class(second.vector());
+    if (first_class == ExceptionClass::Contributory && second_class == ExceptionClass::Contributory)
+        || (first_class == ExceptionClass::PageFault && second_class != ExceptionClass::Benign)
+    {
+        return Combined::Event(Event::exception_with_code(Vector::DOUBLE_FAULT, 0));
+    }
+    Combined::Event(second)
+}
+
+/// The architectural result of an exception colliding with exception delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Combined {
+    /// The event the guest must take next.
+    Event(Event),
+    /// A fault while delivering `#DF`, which shuts the virtual processor down.
+    Shutdown,
+}
+
+/// How an exception participates in architectural double-fault combination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExceptionClass {
+    /// Never combines into a double fault.
+    Benign,
+    /// A segment, stack, or protection fault that combines with another one.
+    Contributory,
+    /// A page fault, which combines with any non-benign following fault.
+    PageFault,
+}
+
+/// The architectural double-fault class of `vector`.
+const fn exception_class(vector: Vector) -> ExceptionClass {
+    match vector.number() {
+        14 => ExceptionClass::PageFault,
+        0 | 10 | 11 | 12 | 13 => ExceptionClass::Contributory,
+        _ => ExceptionClass::Benign,
     }
 }
 
@@ -418,15 +556,25 @@ pub fn window_open(vcpu: &Vcpu) -> bool {
 /// flag stops governing whether the *host* can be interrupted — without which a
 /// guest that clears its flag would stop the machine answering its devices.
 ///
-/// Non-maskable interrupts are deliberately not intercepted. One that arrives
-/// while the guest is running belongs to the guest, and passing it straight
-/// through is both cheaper and closer to the machine the guest thinks it is on.
+/// Physical non-maskable interrupts are intercepted at the SVM boundary. This
+/// is required even with hardware vNMI: the intercept is what lets the host
+/// distinguish an NMI taken during guest execution from one arriving while the
+/// host is between entries. Hardware vNMI then tracks the guest's NMI-blocking
+/// state without the software IRET fallback.
 pub fn arm(vcpu: &mut Vcpu) {
+    let features = processor::svm().map(|svm| svm.features);
     let control = vcpu.control_mut();
-    control.intercept_1 |= Intercepts1::INTR;
+    control.intercept_1 |= Intercepts1::INTR | Intercepts1::NMI;
     control.interrupt_control = control
         .interrupt_control
         .with_intercept_interrupt_masking(true);
+    if Blocking::supports_virtual(features) {
+        control.interrupt_control = control
+            .interrupt_control
+            .with_virtual_gif(true)
+            .with_virtual_gif_enable(true)
+            .with_virtual_nmi_enable(true);
+    }
     vcpu.soil(CleanBits::INTERCEPTS | CleanBits::INTERRUPT);
 }
 
@@ -443,16 +591,20 @@ pub enum Blocking {
 }
 
 impl Blocking {
+    /// Whether the processor can track virtual NMI blocking in hardware.
+    const fn supports_virtual(features: Option<SvmFeatures>) -> bool {
+        matches!(features, Some(features) if features.contains(SvmFeatures::VNMI) && features.contains(SvmFeatures::VGIF))
+    }
+
     /// Which mechanism a processor with these features offers.
     fn of(features: Option<SvmFeatures>) -> Self {
-        match features {
-            Some(features) if features.contains(SvmFeatures::VNMI) => Self::Virtual,
-            _ => {
-                warn!(
-                    "inject: this processor does not virtualize non-maskable interrupt masking; intercepting the return from a handler instead"
-                );
-                Self::Iret
-            }
+        if Self::supports_virtual(features) {
+            Self::Virtual
+        } else {
+            warn!(
+                "inject: this processor does not virtualize non-maskable interrupt masking; intercepting the return from a handler instead"
+            );
+            Self::Iret
         }
     }
 }
@@ -468,3 +620,54 @@ const PRIORITY_SHIFT: u8 = 4;
 /// The bit of the guest's flags that says it is willing to take a maskable
 /// interrupt.
 const INTERRUPT_FLAG: u64 = 1 << 9;
+
+#[cfg(test)]
+mod tests {
+    use descriptors::Vector;
+    use processor::SvmFeatures;
+    use svm::Event;
+
+    use super::{Blocking, Combined, ExceptionClass, combine_exceptions, exception_class};
+
+    #[test]
+    fn virtual_nmi_requires_vgif_too() {
+        assert!(!Blocking::supports_virtual(Some(SvmFeatures::VNMI)));
+        assert!(!Blocking::supports_virtual(Some(SvmFeatures::VGIF)));
+        assert!(Blocking::supports_virtual(Some(
+            SvmFeatures::VNMI | SvmFeatures::VGIF
+        )));
+    }
+
+    #[test]
+    fn exception_classes_match_double_fault_rules() {
+        assert_eq!(
+            exception_class(Vector::new(13)),
+            ExceptionClass::Contributory
+        );
+        assert_eq!(exception_class(Vector::new(14)), ExceptionClass::PageFault);
+        assert_eq!(exception_class(Vector::new(6)), ExceptionClass::Benign);
+    }
+
+    #[test]
+    fn contributory_faults_combine_into_double_fault() {
+        let combined = combine_exceptions(
+            Event::exception(Vector::new(13)),
+            Event::exception(Vector::new(11)),
+        );
+        assert!(matches!(
+            combined,
+            Combined::Event(event) if event.vector() == Vector::DOUBLE_FAULT
+        ));
+    }
+
+    #[test]
+    fn fault_during_double_fault_shuts_down() {
+        assert_eq!(
+            combine_exceptions(
+                Event::exception(Vector::DOUBLE_FAULT),
+                Event::exception(Vector::new(14)),
+            ),
+            Combined::Shutdown
+        );
+    }
+}

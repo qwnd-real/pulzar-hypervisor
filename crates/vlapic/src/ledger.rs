@@ -45,6 +45,7 @@
 //! retire it.
 
 use descriptors::Vector;
+use x86_64::instructions::interrupts;
 
 use crate::vectors::Bitmap;
 
@@ -107,19 +108,21 @@ impl Ledger {
         let Ok(local) = apic::local() else {
             return;
         };
-        for _ in 0..Bitmap::CAPACITY {
-            if self.released.is_empty() {
-                return;
+        interrupts::without_interrupts(|| {
+            for _ in 0..Bitmap::CAPACITY {
+                if self.released.is_empty() {
+                    return;
+                }
+                let Some(top) = local.in_service_top() else {
+                    return;
+                };
+                if !self.released.get(top) {
+                    return;
+                }
+                local.end_of_interrupt();
+                self.released.clear(top);
             }
-            let Some(top) = local.in_service_top() else {
-                return;
-            };
-            if !self.released.get(top) {
-                return;
-            }
-            local.end_of_interrupt();
-            self.released.clear(top);
-        }
+        });
     }
 
     /// Pays everything outstanding, because the guest that owed it is about to

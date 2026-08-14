@@ -55,6 +55,7 @@
 mod census;
 mod cpuid;
 mod firmware;
+mod hidden_svm;
 mod msr;
 mod nested;
 
@@ -62,11 +63,11 @@ use core::convert::Infallible;
 
 use inject::{Injected, Pending};
 use log::{error, info, trace};
-use partition::Partition;
+use partition::{Addressing, Partition};
 use portal::Portal;
 use svm::{CleanBits, Reason};
 use thiserror::Error;
-use vcpu::{Flow, Vcpu, VcpuError};
+use vcpu::{Flow, RunPhase, Vcpu, VcpuError};
 use vlapic::{Resumption, VlapicError};
 use x86_64::instructions::interrupts;
 
@@ -162,11 +163,14 @@ impl<'a> Exits<'a> {
             // Deciding what the guest takes can also discover that there is no
             // longer a guest to give it to, because a startup message can arrive
             // at any point up to the entry itself.
-            if self.enter(vcpu) == Flow::Resume {
-                // SAFETY: forwarded to the caller, whose obligations are
-                // `Vcpu::run`'s in full.
-                unsafe { vcpu.run(|vcpu| self.exit(vcpu)) }?;
-            }
+            // SAFETY: forwarded to the caller, whose obligations are
+            // `Vcpu::run`'s in full.
+            unsafe {
+                vcpu.run(|vcpu, phase| match phase {
+                    RunPhase::Enter => self.enter(vcpu),
+                    RunPhase::Exit => self.exit(vcpu),
+                })
+            }?;
             if self.left == Left::Stopped {
                 return Err(ExitError::Stopped);
             }
@@ -211,8 +215,24 @@ impl<'a> Exits<'a> {
         // before going back in, so nothing needs to interrupt it to make it
         // look.
         let _ = vlapic::set_away(false);
-        self.interrupts.harvest(vcpu);
-        vlapic::observe_task_priority(vcpu.control().interrupt_control.virtual_tpr());
+        self.interrupts.complete_iret(vcpu);
+        let next_rip = if Pending::needs_next_rip(vcpu) {
+            let addressing = Addressing::from_save(vcpu.save());
+            match self
+                .partition
+                .with_memory(addressing, |guest| emulate::next_rip(vcpu, guest))
+            {
+                Ok(next_rip) => Some(next_rip),
+                Err(error) => {
+                    error!("exits: could not recover an interrupted software event: {error}");
+                    self.left = Left::Stopped;
+                    return Flow::Leave;
+                }
+            }
+        } else {
+            None
+        };
+        self.interrupts.harvest(vcpu, next_rip);
         // Before the exit is answered rather than after, because answering one
         // can resume the guest and the portal must be gone by the time it runs
         // again.
@@ -221,9 +241,24 @@ impl<'a> Exits<'a> {
         }
         let flow = match reason {
             Some(Reason::Cpuid) => cpuid::exit(vcpu),
-            Some(Reason::MsrAccess) => self.virtualization.exit(vcpu),
-            Some(Reason::NestedPageFault) => nested::exit(vcpu, self.partition),
+            Some(Reason::MsrAccess) => self.virtualization.exit(vcpu, &mut self.interrupts),
+            Some(Reason::NestedPageFault) => {
+                nested::exit(vcpu, self.partition, &mut self.interrupts)
+            }
             Some(Reason::Vmmcall) => self.notified(vcpu),
+            Some(
+                Reason::Vmrun
+                | Reason::Vmload
+                | Reason::Vmsave
+                | Reason::Stgi
+                | Reason::Clgi
+                | Reason::Skinit
+                | Reason::Invlpga,
+            ) => hidden_svm::refuse(vcpu, &mut self.interrupts),
+            Some(Reason::WriteControlRegisterTrap(8)) => {
+                vlapic::observe_task_priority(vcpu.control().interrupt_control.virtual_tpr());
+                Flow::Resume
+            }
             // Two exits that are answered by the fact of having happened.
             //
             // The first says the guest became willing to take an interrupt: the
@@ -233,11 +268,11 @@ impl<'a> Exits<'a> {
             // the host at the world switch and has already been given to
             // whichever controller it was for, and the exit itself carries
             // nothing further.
-            Some(Reason::VirtualInterrupt | Reason::Interrupt) => Flow::Resume,
+            Some(Reason::VirtualInterrupt | Reason::Interrupt | Reason::Nmi) => Flow::Resume,
             // The guest left an interrupt handler, which ends the window during
             // which it takes no further non-maskable interrupt.
             Some(Reason::Iret) => {
-                self.interrupts.retired_iret();
+                self.interrupts.intercepted_iret(vcpu);
                 Flow::Resume
             }
             _ => {
@@ -250,7 +285,7 @@ impl<'a> Exits<'a> {
             self.left = Left::Stopped;
             return flow;
         }
-        self.enter(vcpu)
+        Flow::Resume
     }
 
     /// Acts on one of the portal's two notifications, if this processor is the
@@ -276,6 +311,10 @@ impl<'a> Exits<'a> {
     /// flag is one whose message one of these looks finds, and a
     /// look that misses the message is one the sender's doorbell interrupts.
     fn enter(&mut self, vcpu: &mut Vcpu) -> Flow {
+        if self.interrupts.shutdown() {
+            self.left = Left::Stopped;
+            return Flow::Leave;
+        }
         let _ = vlapic::set_away(true);
         // Before anything below reads the controller, because the interrupt
         // window one of them arms is judged by the processor against exactly
@@ -284,7 +323,7 @@ impl<'a> Exits<'a> {
         // A non-maskable interrupt another processor sent this one is held by
         // the controller, because the processor that sent it could not reach
         // what this exit loop owns.
-        if vlapic::take_nmi().unwrap_or(false) {
+        while vlapic::take_nmi().unwrap_or(false) {
             self.interrupts.raise_nmi();
             trace!("exits: this processor was owed a non-maskable interrupt");
         }

@@ -2,6 +2,7 @@
 
 use descriptors::Vector;
 use emulate::{Fault, Outcome};
+use inject::Pending;
 use log::error;
 use npt::Resolution;
 use partition::{Addressing, Partition};
@@ -15,13 +16,13 @@ use x86_64::PhysAddr;
 /// A fault here is ordinary: a guest's memory is described as it is touched, so
 /// most of these are the guest reaching a region for the first time and the
 /// answer is to describe it and resume.
-pub(crate) fn exit(vcpu: &mut Vcpu, partition: &Partition) -> Flow {
+pub(crate) fn exit(vcpu: &mut Vcpu, partition: &Partition, interrupts: &mut Pending) -> Flow {
     let cause = NestedPageFault::from_bits(vcpu.control().exit_info_1);
     let gpa = PhysAddr::new_truncate(vcpu.control().exit_info_2);
     match partition.resolve(gpa, cause) {
         Ok(Resolution::Mapped) => Flow::Resume,
         Ok(Resolution::Shadowed) => discard(vcpu, partition, gpa),
-        Ok(Resolution::Trapped) => interposed(vcpu, partition, gpa, cause),
+        Ok(Resolution::Trapped) => interposed(vcpu, partition, gpa, cause, interrupts),
         Err(error) => {
             error!("exits: nested fault at {gpa:#x} could not be resolved: {error}");
             Flow::Leave
@@ -41,6 +42,7 @@ fn interposed(
     partition: &Partition,
     gpa: PhysAddr,
     cause: NestedPageFault,
+    interrupts: &mut Pending,
 ) -> Flow {
     let Some(devices) = partition.devices() else {
         // The region is trapped, so something meant to answer for it, but the
@@ -57,7 +59,7 @@ fn interposed(
         // the guest's own registers. Either way the guest resumes and needs
         // nothing from us.
         Ok(Outcome::Stepped | Outcome::Repeating) => Flow::Resume,
-        Ok(Outcome::Faulted(fault)) => raise(vcpu, fault),
+        Ok(Outcome::Faulted(fault)) => raise(vcpu, fault, interrupts),
         Err(error) => {
             error!("exits: the access to {gpa:#x} could not be performed: {error}");
             Flow::Leave
@@ -77,15 +79,15 @@ fn interposed(
 /// The instruction pointer is deliberately unchanged, so the handler returns to
 /// the instruction rather than past it, and whatever progress a repeated move
 /// made is already in the index and count registers.
-fn raise(vcpu: &mut Vcpu, fault: Fault) -> Flow {
+fn raise(vcpu: &mut Vcpu, fault: Fault, interrupts: &mut Pending) -> Flow {
     let vector = Vector::new(fault.vector());
     if let Some(address) = fault.address() {
         // What the handler reads to find out which address it has to describe. The
         // architecture publishes it in `CR2`, and nothing else carries it.
         vcpu.save_mut().cr2 = address;
+        vcpu.soil(CleanBits::FAULT_ADDRESS);
     }
-    vcpu.control_mut().event_injection = Event::exception_with_code(vector, fault.code());
-    vcpu.soil(CleanBits::INTERRUPT);
+    interrupts.raise_exception(vcpu, Event::exception_with_code(vector, fault.code()));
     Flow::Resume
 }
 

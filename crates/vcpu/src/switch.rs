@@ -92,6 +92,31 @@ pub(crate) unsafe fn enter(registers: &mut Registers, guest: PhysAddr, host: Phy
     }
 }
 
+/// Prevents every physical interrupt class from being delivered to the host.
+///
+/// # Safety
+///
+/// SVM must be enabled on this processor and the caller must restore GIF with
+/// [`enable_global_interrupts`] if it does not proceed through `VMRUN`, which
+/// sets GIF as it enters the guest.
+pub(crate) unsafe fn disable_global_interrupts() {
+    // SAFETY: the caller guarantees SVM is enabled and owns the obligation to
+    // restore GIF if VMRUN will not do so.
+    unsafe { core::arch::asm!("clgi", options(nomem, nostack, preserves_flags)) };
+}
+
+/// Restores delivery of physical interrupts after an aborted guest entry.
+///
+/// # Safety
+///
+/// SVM must be enabled on this processor, and the caller must have cleared GIF
+/// on the same processor without an intervening `VMRUN` restoring it.
+pub(crate) unsafe fn enable_global_interrupts() {
+    // SAFETY: the caller guarantees SVM is enabled and GIF was cleared on this
+    // processor for an entry which is no longer going to execute.
+    unsafe { core::arch::asm!("stgi", options(nomem, nostack, preserves_flags)) };
+}
+
 /// The switch.
 ///
 /// This target's C ABI is the Windows one, so the three arguments arrive in
@@ -150,6 +175,10 @@ unsafe extern "C" fn switch(registers: *mut Registers, guest: u64, host: u64) {
         // taken with half the guest's state loaded would be taken in a world
         // that does not exist. VMRUN sets the flag again as it enters the
         // guest, and #VMEXIT clears it again on the way back.
+        // GIF was cleared by `Vcpu::run` before the final entry decision, so
+        // no NMI can consume that decision before VMRUN enables GIF for the
+        // guest. Repeating CLGI is harmless and keeps this routine safe for
+        // callers that do not need a final decision under GIF exclusion.
         "clgi",
         "vmload rax",
         "vmrun rax",

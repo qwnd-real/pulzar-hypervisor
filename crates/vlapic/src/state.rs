@@ -94,7 +94,7 @@ pub struct Vlapic {
     startup: AtomicU8,
     sipi_vector: AtomicU32,
     away: AtomicBool,
-    nmi: AtomicBool,
+    nmi: AtomicU8,
     owned: AtomicBool,
     /// The last selection state [`Vlapic::report_selection`] logged, packed by
     /// [`SelectionState::bits`], so a controller whose answer has not changed
@@ -127,7 +127,7 @@ impl Vlapic {
             startup: AtomicU8::new(Startup::Running as u8),
             sipi_vector: AtomicU32::new(NO_SIPI),
             away: AtomicBool::new(false),
-            nmi: AtomicBool::new(false),
+            nmi: AtomicU8::new(0),
             owned: AtomicBool::new(false),
             reported: AtomicU64::new(NOTHING_REPORTED),
         };
@@ -428,25 +428,13 @@ impl Vlapic {
             .store(value & TASK_PRIORITY_MASK, Ordering::Release);
     }
 
-    /// Records the priority class the guest set through its control register
-    /// without exiting.
+    /// Records the priority class the guest set through its control register.
     ///
     /// The control block carries only the four bits of the class, because that
-    /// is all the control register carries — and a write to that register
-    /// clears the subclass, which is why a class differing from the stored
-    /// one is stored as a whole byte with nothing beneath it.
-    ///
-    /// A class that agrees with the stored one is left alone, and that is the
-    /// substance of this rather than an optimisation. This is called at every
-    /// exit with a value that is only ever as wide as a class, so storing
-    /// unconditionally would erase the subclass of any priority the guest wrote
-    /// through the register file instead: a guest that asked for `0x21` would
-    /// read `0x20` back at its next exit, having been told its write did not
-    /// happen.
+    /// is all the control register carries. Every write clears the subclass,
+    /// including a write of the class already present, so this stores
+    /// unconditionally and is called only for the completed-write trap.
     pub(crate) fn observe_task_priority(&self, class: u8) {
-        if self.task_priority().class() == class {
-            return;
-        }
         self.task_priority
             .store(u32::from(class) << PRIORITY_CLASS_SHIFT, Ordering::Release);
     }
@@ -839,10 +827,11 @@ impl Vlapic {
     /// and only by the processor this controller belongs to — which is the only
     /// one that ever clears a request bit.
     ///
-    /// The request bit is cleared before the in-service bit is set, so that a
-    /// reader never sees the vector in neither register. Answers whether the
-    /// vector really was still requested: a reset between the selection and the
-    /// commitment leaves nothing to move, and nothing is then put in service.
+    /// The request bit is cleared before the in-service bit is set, matching
+    /// the controller's transition order. A concurrent reader can briefly see
+    /// neither bit. Answers whether the vector really was still requested: a
+    /// reset between the selection and the commitment leaves nothing to move,
+    /// and nothing is then put in service.
     pub(crate) fn committed(&self, vector: Vector) -> bool {
         if !self.request.clear(vector) {
             return false;
@@ -922,12 +911,20 @@ impl Vlapic {
     /// store of that flag and its read of this one, and a weaker ordering lets
     /// both sides miss.
     pub(crate) fn raise_nmi(&self) {
-        self.nmi.store(true, Ordering::SeqCst);
+        let _ = self
+            .nmi
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < 2).then(|| count + 1)
+            });
     }
 
     /// Takes the outstanding non-maskable interrupt, if there is one.
     pub(crate) fn take_nmi(&self) -> bool {
-        self.nmi.swap(false, Ordering::AcqRel)
+        self.nmi
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count != 0).then(|| count - 1)
+            })
+            .is_ok()
     }
 
     /// Whether this hypervisor runs the processor this controller belongs to.
@@ -1024,6 +1021,7 @@ impl Vlapic {
         self.request.reset();
         self.in_service.reset();
         self.trigger_mode.reset();
+        self.nmi.store(0, Ordering::Release);
         self.task_priority.store(0, Ordering::Release);
         self.logical_destination.store(0, Ordering::Release);
         self.destination_format

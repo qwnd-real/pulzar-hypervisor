@@ -246,40 +246,56 @@ impl Vcpu {
     /// entitled to run: entering one is handing it the processor.
     pub unsafe fn run(
         &mut self,
-        mut exits: impl FnMut(&mut Self) -> Flow,
+        mut callback: impl FnMut(&mut Self, RunPhase) -> Flow,
     ) -> Result<(), VcpuError> {
         if let Some(invalid) = self.validate() {
             return Err(VcpuError::Invalid(invalid));
         }
 
         loop {
-            let clean = CleanBits::ALL_CACHED.soil(self.dirty);
-            let flush = if self.stale {
-                flush_command()
-            } else {
-                TlbControl::DoNothing
-            };
-            let control = self.control_mut();
-            control.clean = clean;
-            control.tlb_control = flush;
-            self.dirty = CleanBits::nothing_cached();
-            self.stale = false;
+            let entered = interrupts::without_interrupts(|| {
+                // SAFETY: `Host::install` enabled SVM on this processor. VMRUN
+                // restores GIF on the successful path; the early return below
+                // restores it explicitly.
+                unsafe { switch::disable_global_interrupts() };
+                if callback(self, RunPhase::Enter) == Flow::Leave {
+                    // SAFETY: GIF was cleared immediately above and no VMRUN
+                    // has occurred to restore it.
+                    unsafe { switch::enable_global_interrupts() };
+                    return false;
+                }
+                let clean = CleanBits::ALL_CACHED.soil(self.dirty);
+                let flush = if self.stale {
+                    flush_command()
+                } else {
+                    TlbControl::DoNothing
+                };
+                let control = self.control_mut();
+                control.clean = clean;
+                control.tlb_control = flush;
+                self.dirty = CleanBits::nothing_cached();
+                self.stale = false;
 
-            // SAFETY: the block was checked above and after every exit that
-            // edited it, `Host::install` enabled the extension and programmed
-            // the host state-save address on this processor, and the snapshot
-            // comes from that same call on this same processor. The caller
-            // guarantees the block has not moved and has not been entered
-            // elsewhere.
-            //
-            // Interrupts are masked for the crossing and restored the moment
-            // the host is back, so an interrupt that arrived while the guest
-            // was running is taken right here, on the host's own descriptor
-            // table, by the handler this hypervisor registered for it — before
-            // the exit is even looked at.
-            interrupts::without_interrupts(|| unsafe {
-                switch::enter(&mut self.registers, self.vmcb_phys, self.host.snapshot());
+                // SAFETY: the block was checked above and after every exit that
+                // edited it, `Host::install` enabled the extension and programmed
+                // the host state-save address on this processor, and the snapshot
+                // comes from that same call on this same processor. The caller
+                // guarantees the block has not moved and has not been entered
+                // elsewhere.
+                //
+                // Interrupts are masked from the final entry preparation through
+                // the crossing and restored the moment the host is back. A
+                // doorbell published before the preparation is observed there;
+                // one published afterwards stays pending until VMRUN enables GIF
+                // and immediately causes the intercepted interrupt to exit.
+                unsafe {
+                    switch::enter(&mut self.registers, self.vmcb_phys, self.host.snapshot());
+                }
+                true
             });
+            if !entered {
+                return Ok(());
+            }
 
             if self.control().exit_code == ExitCode::INVALID {
                 // No guest instruction ran, so resuming would produce this exit
@@ -289,7 +305,7 @@ impl Vcpu {
                     self.validate().unwrap_or(Invalid::Unexplained),
                 ));
             }
-            if exits(self) == Flow::Leave {
+            if callback(self, RunPhase::Exit) == Flow::Leave {
                 return Ok(());
             }
         }
@@ -512,6 +528,15 @@ impl Vcpu {
             None => info!("{who}: vcpu would enter"),
         }
     }
+}
+
+/// Which side of a guest transition [`Vcpu::run`] is invoking its callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunPhase {
+    /// The control block is prepared and the guest is about to be entered.
+    Enter,
+    /// The guest has exited and the callback may inspect and answer the exit.
+    Exit,
 }
 
 /// Sets both permission bits of every named register in a permission map.

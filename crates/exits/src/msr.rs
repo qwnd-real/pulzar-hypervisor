@@ -36,6 +36,7 @@
 //! way in, which leaves the guest a consistent view and the processor the bit
 //! it insists on.
 
+use inject::Pending;
 use log::{error, trace};
 use svm::{
     CleanBits, Event,
@@ -79,14 +80,14 @@ impl Virtualization {
     }
 
     /// Answers one intercepted register access.
-    pub(crate) fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
+    pub(crate) fn exit(&mut self, vcpu: &mut Vcpu, interrupts: &mut Pending) -> Flow {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "a model-specific register index is the low half of RCX; the architecture ignores the rest"
         )]
         let msr = vcpu.registers().rcx as u32;
         if vlapic::claims(msr) {
-            return controller(vcpu, msr);
+            return controller(vcpu, msr, interrupts);
         }
         let Some(register) = Hidden::of(msr) else {
             if msrpm_position(msr).is_some() {
@@ -97,7 +98,7 @@ impl Virtualization {
                 error!("exits: unexpected intercepted MSR {msr:#x}");
                 return Flow::Leave;
             }
-            return passthrough(vcpu, msr);
+            return passthrough(vcpu, msr, interrupts);
         };
         let answered = match MsrAccess::from_exit_info(vcpu.control().exit_info_1) {
             MsrAccess::Read => {
@@ -112,7 +113,7 @@ impl Virtualization {
                 advance(vcpu, BYTES);
                 Flow::Resume
             }
-            Err(Fault) => refuse(vcpu),
+            Err(Fault) => refuse(vcpu, interrupts),
         }
     }
 
@@ -291,7 +292,7 @@ fn write_efer(vcpu: &mut Vcpu, value: u64) -> Result<(), Fault> {
 /// raised had no hypervisor been there. Which of the two an index is cannot be
 /// decided here — only the processor knows — so the access is attempted and its
 /// refusal is caught rather than predicted.
-fn passthrough(vcpu: &mut Vcpu, msr: u32) -> Flow {
+fn passthrough(vcpu: &mut Vcpu, msr: u32, interrupts: &mut Pending) -> Flow {
     let outcome = match MsrAccess::from_exit_info(vcpu.control().exit_info_1) {
         MsrAccess::Read => probe::read(msr).map(|value| answer(vcpu, value)),
         MsrAccess::Write => probe::write(msr, written(vcpu)),
@@ -303,7 +304,7 @@ fn passthrough(vcpu: &mut Vcpu, msr: u32) -> Flow {
         }
         Err(fault) => {
             trace!("exits: {fault}, so the guest takes the exception for it");
-            refuse(vcpu)
+            refuse(vcpu, interrupts)
         }
     }
 }
@@ -314,7 +315,7 @@ fn passthrough(vcpu: &mut Vcpu, msr: u32) -> Flow {
 /// refuses — a reserved index, a read of a write-only register, a reserved bit
 /// written non-zero — because that is what the access would have raised on real
 /// hardware, and a guest probing its controller relies on being told no.
-fn controller(vcpu: &mut Vcpu, msr: u32) -> Flow {
+fn controller(vcpu: &mut Vcpu, msr: u32, interrupts: &mut Pending) -> Flow {
     let outcome = match MsrAccess::from_exit_info(vcpu.control().exit_info_1) {
         MsrAccess::Read => vlapic::read_msr(msr).map(|value| answer(vcpu, value)),
         MsrAccess::Write => vlapic::write_msr(msr, written(vcpu)),
@@ -324,7 +325,7 @@ fn controller(vcpu: &mut Vcpu, msr: u32) -> Flow {
             advance(vcpu, BYTES);
             Flow::Resume
         }
-        Err(vlapic::VlapicError::Fault) => refuse(vcpu),
+        Err(vlapic::VlapicError::Fault) => refuse(vcpu, interrupts),
         Err(error) => {
             error!("exits: the guest's controller could not answer for {msr:#x}: {error}");
             Flow::Leave
@@ -337,9 +338,9 @@ fn controller(vcpu: &mut Vcpu, msr: u32) -> Flow {
 /// The instruction pointer is deliberately not advanced: the guest takes the
 /// exception at the instruction that caused it, which is where its handler
 /// expects to find it.
-fn refuse(vcpu: &mut Vcpu) -> Flow {
+fn refuse(vcpu: &mut Vcpu, interrupts: &mut Pending) -> Flow {
     let general_protection = descriptors::Vector::GENERAL_PROTECTION;
-    vcpu.control_mut().event_injection = Event::exception_with_code(general_protection, 0);
+    interrupts.raise_exception(vcpu, Event::exception_with_code(general_protection, 0));
     Flow::Resume
 }
 

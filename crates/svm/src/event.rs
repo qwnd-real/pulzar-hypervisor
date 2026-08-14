@@ -26,11 +26,11 @@
 //! and are checked against the intercepts as usual, so a fault while pushing
 //! the injected frame comes straight back out as a `#VMEXIT`.
 //!
-//! An injected non-maskable interrupt is not quite the real article either: it
-//! does not block delivery of further NMIs, where one the processor raised
-//! itself blocks them until `IRET`. No hardware state tracks that for an
-//! injected one, so a hypervisor that cares about NMI blocking tracks it
-//! itself.
+//! With virtual NMI masking disabled, an injected non-maskable interrupt does
+//! not block delivery of further NMIs, where one the processor raised itself
+//! blocks them until `IRET`. Enabling virtual NMI masking makes the processor
+//! track that state for injected NMIs too; otherwise the hypervisor tracks the
+//! window through an `IRET` intercept.
 //!
 //! # A malformed event does not deliver badly — it fails the VMRUN
 //!
@@ -187,8 +187,9 @@ impl Event {
     /// written into it regardless, so that a dump of the raw field reads as
     /// the event it is rather than as vector zero.
     ///
-    /// Unlike one the processor raises, an injected NMI blocks nothing: further
-    /// NMIs remain deliverable immediately.
+    /// With virtual NMI masking enabled, the processor blocks further NMIs
+    /// until the guest returns; otherwise the hypervisor must track that
+    /// window.
     #[must_use]
     pub const fn nmi() -> Self {
         Self::none()

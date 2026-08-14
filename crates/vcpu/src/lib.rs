@@ -70,7 +70,7 @@ pub use crate::{
     host::Host,
     invalid::Invalid,
     registers::{RAX, RSP, Registers},
-    vcpu::{Flow, Guest, Vcpu},
+    vcpu::{Flow, Guest, RunPhase, Vcpu},
 };
 
 /// Why a processor could not be prepared to run a guest, or why a guest could

@@ -456,11 +456,19 @@ fn virtualize(space: &mut AddressSpace) -> Result<Vcpu, CoreError> {
     host.describe("core");
 
     let mut vcpu = partition.attach(host, space)?;
-    vcpu.control_mut().intercept_1 |= Intercepts1::CPUID;
+    vcpu.control_mut().intercept_1 |= Intercepts1::CPUID | Intercepts1::INVLPGA;
     vcpu.control_mut().intercept_2 = vcpu
         .control()
         .intercept_2
-        .with_flags(Intercepts2Flags::VMMCALL);
+        .with_flags(
+            Intercepts2Flags::VMMCALL
+                | Intercepts2Flags::VMLOAD
+                | Intercepts2Flags::VMSAVE
+                | Intercepts2Flags::STGI
+                | Intercepts2Flags::CLGI
+                | Intercepts2Flags::SKINIT,
+        )
+        .with_write_trap(8);
     // The guest's own controller answers for every one of these, so none of
     // them may reach the real one underneath.
     vcpu.intercept_msrs(window, vlapic::intercepted())?;
