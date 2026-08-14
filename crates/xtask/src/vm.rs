@@ -68,6 +68,7 @@ pub fn launch(spec: &Spec) -> Result<()> {
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.args(["-machine", "q35,accel=kvm", "-cpu", "host,invtsc=on"]);
     qemu.args(["-smp", "4", "-m", "4G"]);
+    qemu.args(["-no-shutdown", "-no-reboot"]);
     output_args(&mut qemu, &spec.serial_logs)?;
     qemu.arg("-drive").arg(format!(
         "if=pflash,format=raw,readonly=on,file={}",

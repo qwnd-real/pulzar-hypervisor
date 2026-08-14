@@ -37,7 +37,7 @@ pub mod svm;
 use bitflags::bitflags;
 use log::info;
 use raw_cpuid::{
-    ApmInfo, CpuId, ExtendedProcessorFeatureIdentifiers, FeatureInfo,
+    ApmInfo, CpuId, ExtendedFeatures, ExtendedProcessorFeatureIdentifiers, FeatureInfo,
     ProcessorCapacityAndFeatureInfo, native_cpuid::cpuid_count,
 };
 use spin::Once;
@@ -83,6 +83,9 @@ bitflags! {
         /// register to read or program, and the memory type a mapping asks for
         /// cannot be established.
         const PAGE_ATTRIBUTE_TABLE = 1 << 7;
+        /// The timestamp-counter adjustment register exists, so software can
+        /// observe and update the cumulative changes made to the counter.
+        const TSC_ADJUST = 1 << 8;
     }
 }
 
@@ -145,6 +148,13 @@ impl Features {
         features.set(
             Self::PAGE_ATTRIBUTE_TABLE,
             basic.as_ref().is_some_and(FeatureInfo::has_pat),
+        );
+        features.set(
+            Self::TSC_ADJUST,
+            cpuid
+                .get_extended_feature_info()
+                .as_ref()
+                .is_some_and(ExtendedFeatures::has_tsc_adjust_msr),
         );
         features
     }

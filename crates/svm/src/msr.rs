@@ -60,6 +60,22 @@ use core::fmt::{self, Debug, Formatter};
 use bitfield_struct::bitfield;
 use x86_64::{PhysAddr, registers::model_specific::EferFlags};
 
+/// `IA32_TSC`, the architectural timestamp counter.
+///
+/// Named here because a virtual processor using the control block's timestamp
+/// offset must intercept writes to the register that changes the value being
+/// offset. Reads are intercepted as well so both access directions share one
+/// permission-map entry and one virtual time domain.
+pub const IA32_TSC: u32 = 0x10;
+
+/// `IA32_TSC_ADJUST`, the cumulative adjustment made to the timestamp counter.
+///
+/// Present only when the processor reports it through `CPUID`. A hypervisor
+/// virtualizing timestamp writes must virtualize this register with them: a
+/// write changes the timestamp by the difference from the old adjustment, and
+/// a write to [`IA32_TSC`] changes this value by the same amount.
+pub const IA32_TSC_ADJUST: u32 = 0x3B;
+
 /// `VM_CR`, the register deciding whether this extension may be used on this
 /// machine, with three unrelated switches sharing the space.
 pub const VM_CR: u32 = 0xC001_0114;

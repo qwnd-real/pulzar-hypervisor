@@ -124,7 +124,7 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     // else in the roster distinguishes it.
     let bootstrap = roster.entries().first().map(cpu::Entry::apic_id);
     let model = Model::of_machine();
-    let lapics = roster
+    let lapics: Box<[_]> = roster
         .entries()
         .iter()
         .map(|entry| {
@@ -136,6 +136,9 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
             )
         })
         .collect();
+    if let Some(vlapic) = lapics.iter().find(|vlapic| vlapic.apic_id() == here) {
+        timer::calibrate(vlapic)?;
+    }
 
     // Everything that can fail happens before either cell is published. A page
     // installed without a doorbell is a machine that can deliver an interrupt
@@ -248,14 +251,17 @@ pub fn region() -> Result<Region, VlapicError> {
 
 /// What the guest reads from one of the controller's model-specific registers.
 ///
+/// `tsc_offset` is the offset applied to this processor's guest timestamp and
+/// is used to translate timestamp-counter deadline readback into that domain.
+///
 /// # Errors
 ///
 /// [`VlapicError::NotInstalled`] before [`install`], [`VlapicError::NoLapic`]
 /// on a processor with no controller, or [`VlapicError::Fault`] if the guest
 /// should take a general protection fault for the access.
-pub fn read_msr(index: u32) -> Result<u64, VlapicError> {
+pub fn read_msr(index: u32, tsc_offset: u64) -> Result<u64, VlapicError> {
     let vlapic = current()?;
-    let value = msr::read(vlapic, index).map_err(|fault| {
+    let value = msr::read(vlapic, index, tsc_offset).map_err(|fault| {
         warn!("vlapic: refusing a read of {index:#x}: {fault:?}");
         VlapicError::Fault
     })?;
@@ -268,12 +274,15 @@ pub fn read_msr(index: u32) -> Result<u64, VlapicError> {
 
 /// What a write to one of the controller's model-specific registers does.
 ///
+/// `tsc_offset` is the offset applied to this processor's guest timestamp and
+/// is used to translate a timestamp-counter deadline onto physical hardware.
+///
 /// # Errors
 ///
 /// As [`read_msr`].
-pub fn write_msr(index: u32, value: u64) -> Result<(), VlapicError> {
+pub fn write_msr(index: u32, value: u64, tsc_offset: u64) -> Result<(), VlapicError> {
     let vlapic = current()?;
-    let written = msr::write(vlapic, index, value).map_err(|fault| {
+    let written = msr::write(vlapic, index, value, tsc_offset).map_err(|fault| {
         warn!("vlapic: refusing a write of {value:#x} to {index:#x}: {fault:?}");
         VlapicError::Fault
     })?;
@@ -283,6 +292,25 @@ pub fn write_msr(index: u32, value: u64) -> Result<(), VlapicError> {
     );
     acted(vlapic, written);
     Ok(())
+}
+
+/// Keeps an armed timestamp-counter deadline fixed while the guest's timestamp
+/// offset changes.
+///
+/// `adjustment` is the wrapping difference between the new offset and the old
+/// one. A deadline in physical timestamp space moves by the opposite amount;
+/// counting timers and disarmed deadline timers are unchanged.
+///
+/// # Errors
+///
+/// [`VlapicError::NotInstalled`] before [`install`], [`VlapicError::NoLapic`]
+/// on a processor with no controller, or [`VlapicError::Apic`] if the physical
+/// deadline cannot be read or rewritten.
+pub fn adjust_deadline(adjustment: u64) -> Result<(), VlapicError> {
+    if adjustment == 0 {
+        return Ok(());
+    }
+    Ok(timer::adjust_deadline(current()?, adjustment)?)
 }
 
 /// Gives this processor's guest an interrupt that arrived on real hardware.
@@ -435,10 +463,11 @@ pub fn describe(who: &str) {
 ///
 /// As [`read_msr`].
 pub fn claim_processor(joining: Joining) -> Result<(), VlapicError> {
-    current().map(|vlapic| {
-        vlapic.set_startup(joining.startup());
-        vlapic.take_ownership();
-    })
+    let vlapic = current()?;
+    timer::calibrate(vlapic)?;
+    vlapic.set_startup(joining.startup());
+    vlapic.take_ownership();
+    Ok(())
 }
 
 /// Where a processor's guest stands at the moment the hypervisor takes the

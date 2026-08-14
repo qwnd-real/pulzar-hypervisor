@@ -49,7 +49,7 @@ pub const fn claims(index: u32) -> bool {
 /// [`Fault`] if the index names nothing, names a register that does not exist
 /// in the mode the guest is in, or names one that may not be read — each of
 /// which the guest takes as a general protection fault.
-pub(crate) fn read(vlapic: &Vlapic, index: u32) -> Result<u64, Fault> {
+pub(crate) fn read(vlapic: &Vlapic, index: u32, tsc_offset: u64) -> Result<u64, Fault> {
     if index == ApicBase::MSR {
         return Ok(vlapic.base().bits());
     }
@@ -60,7 +60,7 @@ pub(crate) fn read(vlapic: &Vlapic, index: u32) -> Result<u64, Fault> {
         if !vlapic.model().deadline() {
             return Err(Fault::NoSuchRegister);
         }
-        return Ok(timer::deadline(vlapic));
+        return Ok(guest_deadline(timer::deadline(vlapic), tsc_offset));
     }
     let register = addressable(vlapic, index)?;
     if !matches!(
@@ -84,7 +84,12 @@ pub(crate) fn read(vlapic: &Vlapic, index: u32) -> Result<u64, Fault> {
 /// As [`read`], and additionally [`Fault::Reserved`] if a bit the register
 /// reserves was written non-zero — which through this face is a fault rather
 /// than something quietly dropped.
-pub(crate) fn write(vlapic: &Vlapic, index: u32, value: u64) -> Result<Written, Fault> {
+pub(crate) fn write(
+    vlapic: &Vlapic,
+    index: u32,
+    value: u64,
+    tsc_offset: u64,
+) -> Result<Written, Fault> {
     if index == ApicBase::MSR {
         return vlapic
             .write_base(value)
@@ -103,7 +108,7 @@ pub(crate) fn write(vlapic: &Vlapic, index: u32, value: u64) -> Result<Written, 
         if vlapic.timer_mode() != Some(TimerMode::Deadline) {
             return Ok(Written::Nothing);
         }
-        return Ok(Written::TimerDeadline(value));
+        return Ok(Written::TimerDeadline(physical_deadline(value, tsc_offset)));
     }
     let register = addressable(vlapic, index)?;
     if !matches!(
@@ -143,6 +148,29 @@ pub(crate) fn write(vlapic: &Vlapic, index: u32, value: u64) -> Result<Written, 
         return Ok(Written::SelfIpi(Vector::new(vector_of(narrow))));
     }
     Ok(access::write(vlapic, register, narrow))
+}
+
+/// Translates a physical deadline into the timestamp domain the guest reads.
+///
+/// Zero is not a timestamp: it is the architectural spelling of a disarmed
+/// timer and must remain zero under every offset.
+const fn guest_deadline(physical: u64, offset: u64) -> u64 {
+    if physical == 0 {
+        0
+    } else {
+        physical.wrapping_add(offset)
+    }
+}
+
+/// Translates a guest deadline into the timestamp domain physical hardware
+/// compares against.
+const fn physical_deadline(guest: u64, offset: u64) -> u64 {
+    if guest == 0 {
+        0
+    } else {
+        let physical = guest.wrapping_sub(offset);
+        if physical == 0 { 1 } else { physical }
+    }
 }
 
 /// Which bits of a register's low half a guest in x2APIC may set.
@@ -231,4 +259,34 @@ pub(crate) enum Fault {
     Reserved,
     /// The base register refused the write.
     Base(crate::base::BaseFault),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{guest_deadline, physical_deadline};
+
+    #[test]
+    fn deadline_translation_preserves_disarmed_timers() {
+        assert_eq!(physical_deadline(0, 0x1234), 0);
+        assert_eq!(guest_deadline(0, 0x1234), 0);
+    }
+
+    #[test]
+    fn deadline_translation_round_trips_with_wrapping_offsets() {
+        for (deadline, offset) in [
+            (1, 0),
+            (0x1234_5678_9ABC_DEF0, 0x1111_2222_3333_4444),
+            (u64::MAX, u64::MAX - 7),
+        ] {
+            assert_eq!(
+                guest_deadline(physical_deadline(deadline, offset), offset),
+                deadline
+            );
+        }
+    }
+
+    #[test]
+    fn an_armed_guest_deadline_never_becomes_the_physical_disarm_value() {
+        assert_eq!(physical_deadline(0x1234, 0x1234), 1);
+    }
 }

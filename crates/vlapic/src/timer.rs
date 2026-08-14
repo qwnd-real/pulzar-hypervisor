@@ -53,16 +53,17 @@
 //! immediately from a moment already in the past. Reading the register is both
 //! simpler and the only thing that is correct.
 //!
-//! Handing the guest's deadline straight to hardware is sound only because the
-//! guest's timestamp counter *is* the host's: nothing offsets or scales it, and
-//! neither the instructions that read it nor the register that sets it are
-//! intercepted. A hypervisor that gave the guest a clock of its own would have
-//! to convert here, and a deadline passed through unconverted would fire at the
-//! wrong moment in whichever direction the two had drifted.
+//! The guest's timestamp counter is offset from the host's by its control
+//! block. The model-specific-register face translates guest deadlines into the
+//! physical counter's domain before they reach this module and translates
+//! readback the other way. An offset change rebases an armed deadline here
+//! before the new offset is published, so an absolute appointment remains the
+//! same guest-visible number in the adjusted timestamp domain.
 
 use apic::{Divisor, LocalApic, LocalState, Source, TimerMode as HardwareMode};
-use clock::Kind;
-use log::{info, trace, warn};
+use clock::{Frequency, Kind};
+use log::{trace, warn};
+use x86_64::instructions::interrupts;
 
 use crate::{
     lvt::{Entry, TimerMode},
@@ -78,7 +79,8 @@ pub(crate) fn remaining(vlapic: &Vlapic) -> u32 {
     if vlapic.timer_mode() == Some(TimerMode::Deadline) {
         return 0;
     }
-    apic::local().map_or(0, |local| local.timer().remaining())
+    let remaining = apic::local().map_or(0, |local| local.timer().remaining());
+    scale_remaining(remaining, vlapic.timer_initial(), vlapic.timer_clamp())
 }
 
 /// The deadline the guest's timer is counting towards.
@@ -123,7 +125,8 @@ pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
     let delivery = (!entry.masked())
         .then(|| entry.vector())
         .and_then(|vector| sources::armable(vlapic, vector));
-    match timer.configure(delivery, mode, divisor(vlapic)) {
+    let divisor = divisor(vlapic);
+    match reconfigure(vlapic, timer, delivery, mode, divisor) {
         Ok(()) => {
             report(vlapic, "configured");
             true
@@ -157,7 +160,7 @@ fn report(vlapic: &Vlapic, what: &str) {
     };
     let guest = vlapic.lvt(Entry::Timer);
     let real = local.source(Source::Timer);
-    info!(
+    trace!(
         "vlapic: {} {what} its timer: guest {:?} vector {} {}, divide {:#x}, count {:#x}; real \
          mode {:?}, {}, remaining {:#x}",
         vlapic.index(),
@@ -186,12 +189,32 @@ pub(crate) fn reload(vlapic: &Vlapic) {
     let Ok(timer) = apic::local().map(LocalApic::timer) else {
         return;
     };
-    if let Err(error) = timer.reload(vlapic.timer_initial()) {
+    let guest_count = vlapic.timer_initial();
+    let physical_count = clamped_count(vlapic, guest_count).unwrap_or(guest_count);
+    if let Err(error) = timer.reload(physical_count) {
         warn!(
             "vlapic: {} could not start its timer counting: {error}",
             vlapic.index()
         );
+        vlapic.clear_timer_clamp();
+        vlapic.set_timer_periodic_running(false);
+        timer.disarm();
         return;
+    }
+    vlapic.set_timer_periodic_running(
+        physical_count != 0 && vlapic.timer_mode() == Some(TimerMode::Periodic),
+    );
+    let clamp = if physical_count == guest_count {
+        0
+    } else {
+        physical_count
+    };
+    vlapic.set_timer_clamp(clamp);
+    if physical_count != guest_count && vlapic.report_timer_clamp_once() {
+        warn!(
+            "vlapic: {} limited a periodic timer count from {guest_count:#x} to {physical_count:#x}",
+            vlapic.index()
+        );
     }
     report(vlapic, "started");
 }
@@ -207,6 +230,56 @@ pub(crate) fn arm_deadline(vlapic: &Vlapic, deadline: u64) {
             vlapic.index()
         );
     }
+}
+
+/// Rebases an armed physical deadline across a guest timestamp-offset change.
+///
+/// `adjustment` is the amount added to the old offset. The physical deadline
+/// moves by the opposite amount so that adding the new offset still produces
+/// the same guest-visible absolute deadline. A disarmed deadline and every
+/// counting mode have nothing to rebase.
+///
+/// # Errors
+///
+/// The error returned by the physical controller if its timer cannot be read or
+/// rewritten.
+pub(crate) fn adjust_deadline(vlapic: &Vlapic, adjustment: u64) -> Result<(), apic::ApicError> {
+    if adjustment == 0 || vlapic.timer_mode() != Some(TimerMode::Deadline) {
+        return Ok(());
+    }
+    interrupts::without_interrupts(|| {
+        let timer = apic::local()?.timer();
+        let deadline = timer.deadline()?;
+        if deadline == 0 {
+            return Ok(());
+        }
+        timer.set_deadline(rebased_deadline(deadline, adjustment))
+    })
+}
+
+/// Measures and records this processor's undivided local-timer frequency.
+///
+/// Called before the timer is handed to the guest. Calibration temporarily
+/// uses the physical timer and leaves it stopped, so doing this later would
+/// destroy an appointment the guest had already made.
+///
+/// # Errors
+///
+/// The error returned by the physical timer if its rate cannot be measured.
+pub(crate) fn calibrate(vlapic: &Vlapic) -> Result<(), apic::ApicError> {
+    if vlapic.timer_frequency() != 0 {
+        return Ok(());
+    }
+    let frequency = apic::local()?.timer().calibrate(Divisor::By1)?;
+    vlapic.set_timer_frequency(frequency.hz());
+    vlapic.clear_timer_clamp();
+    vlapic.set_timer_periodic_running(false);
+    trace!(
+        "vlapic: {} calibrated its undivided timer at {} Hz",
+        vlapic.index(),
+        frequency.hz()
+    );
+    Ok(())
 }
 
 /// Starts the guest's timer where firmware's was, having seeded the entry it
@@ -251,18 +324,18 @@ pub(crate) fn inherit(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
 /// Restarts a one-shot firmware left counting, less however long it has been
 /// since.
 ///
-/// The count is in timer ticks and the elapsed span is in timestamp counter
-/// ticks, and neither rate is reported by anything — so the timer's is measured
-/// against the timebase, at the guest's own divide, and the timestamp counter's
-/// comes from the timebase itself. A remainder that has already run out is
-/// armed at one tick rather than zero, because zero is how the architecture
-/// spells a stopped timer and would drop the appointment entirely.
+/// The count is in divided timer ticks and the elapsed span is in timestamp
+/// counter ticks. The timer's undivided rate was measured once before guest
+/// ownership and is divided by the guest's current configuration here; the
+/// timestamp counter's rate comes from the timebase itself. A remainder that
+/// has already run out is armed at one tick rather than zero, because zero is
+/// how the architecture spells a stopped timer and would drop the appointment
+/// entirely.
 ///
-/// Where either rate is unavailable — no timebase, a timebase that is not the
-/// timestamp counter, a measurement that did not converge — what firmware had
-/// left is armed as it stands and the reason is logged. That fires late by the
-/// length of bring-up, which is a worse answer than the aged one and a far
-/// better answer than never.
+/// Where the timebase is not the timestamp counter, what firmware had left is
+/// armed as it stands and the reason is logged. That fires late by the length
+/// of bring-up, which is a worse answer than the aged one and a far better
+/// answer than never.
 fn oneshot(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
     let left = firmware.timer_current_count;
     let count = match elapsed_ticks(vlapic, since) {
@@ -279,6 +352,7 @@ fn oneshot(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
         );
         return;
     }
+    vlapic.set_timer_periodic_running(false);
     trace!(
         "vlapic: {} restarted firmware's one-shot timer at {count} of the {left} it had left",
         vlapic.index(),
@@ -298,21 +372,7 @@ fn elapsed_ticks(vlapic: &Vlapic, since: u64) -> Option<u32> {
         );
         return None;
     }
-    let rate = apic::local()
-        .map(LocalApic::timer)
-        .and_then(|timer| timer.calibrate(divisor(vlapic)))
-        .inspect_err(|error| {
-            warn!(
-                "vlapic: {} cannot age firmware's one-shot timer, its rate could not be measured: \
-                 {error}",
-                vlapic.index()
-            );
-        })
-        .ok()?;
-    // After the measurement and not before it: measuring watches the timer for a
-    // span of its own, and a counter read at the top would leave the whole of
-    // that span out of the elapsed time it is describing.
-    //
+    let rate = Frequency::from_hz(vlapic.timer_frequency())?;
     // SAFETY: `RDTSC` is always permitted at privilege level zero, whatever
     // `CR4.TSD` says, and reading the counter does not disturb it.
     let now = unsafe { core::arch::x86_64::_rdtsc() };
@@ -320,7 +380,8 @@ fn elapsed_ticks(vlapic: &Vlapic, since: u64) -> Option<u32> {
     // is the one conversion both clocks already offer and it needs no arithmetic
     // of its own to be right about.
     let nanos = source.frequency().nanos(now.saturating_sub(since));
-    u32::try_from(rate.ticks(nanos)).ok().or(Some(u32::MAX))
+    let elapsed = rate.ticks(nanos) / u64::from(divisor(vlapic).ratio());
+    u32::try_from(elapsed).ok().or(Some(u32::MAX))
 }
 
 /// The fewest ticks a restarted timer is armed at.
@@ -329,6 +390,9 @@ fn elapsed_ticks(vlapic: &Vlapic, since: u64) -> Option<u32> {
 /// stopped timer rather than as one due immediately — so a deadline that has
 /// already passed has to be spelled as the soonest reachable one instead.
 const SOONEST: u32 = 1;
+
+/// The shortest unmasked periodic interval exposed to physical hardware.
+const MINIMUM_PERIOD_NANOS: u64 = 200_000;
 
 /// Stops the guest's timer and stops it delivering.
 ///
@@ -344,8 +408,96 @@ pub(crate) fn disarm(vlapic: &Vlapic) -> bool {
         return false;
     };
     timer.disarm();
-    info!("vlapic: {} disarmed its timer", vlapic.index());
+    vlapic.clear_timer_clamp();
+    vlapic.set_timer_periodic_running(false);
+    trace!("vlapic: {} disarmed its timer", vlapic.index());
     true
+}
+
+/// Reconfigures a timer, lengthening an already-running unsafe period without
+/// exposing the short count on an unmasked physical entry.
+fn reconfigure(
+    vlapic: &Vlapic,
+    timer: apic::Timer,
+    delivery: Option<descriptors::Vector>,
+    mode: HardwareMode,
+    divisor: Divisor,
+) -> Result<(), apic::ApicError> {
+    let active = vlapic.timer_clamp();
+    let periodic = delivery.is_some() && mode == HardwareMode::Periodic;
+    let desired = if periodic {
+        clamped_count(vlapic, vlapic.timer_initial()).unwrap_or(0)
+    } else {
+        active
+    };
+    let remaining = timer.remaining();
+    if periodic && desired != active && (remaining != 0 || vlapic.timer_periodic_running()) {
+        let physical_count = if desired == 0 {
+            vlapic.timer_initial()
+        } else {
+            desired
+        };
+        timer.configure(None, mode, divisor)?;
+        timer.reload(physical_count)?;
+        timer.configure(delivery, mode, divisor)?;
+        vlapic.set_timer_clamp(desired);
+        vlapic.set_timer_periodic_running(physical_count != 0);
+        if desired != 0 && vlapic.report_timer_clamp_once() {
+            warn!(
+                "vlapic: {} limited a running periodic timer count from {:#x} to {desired:#x}",
+                vlapic.index(),
+                vlapic.timer_initial()
+            );
+        }
+        return Ok(());
+    }
+    timer.configure(delivery, mode, divisor)?;
+    if mode != HardwareMode::Periodic {
+        vlapic.set_timer_periodic_running(false);
+    } else if remaining != 0 {
+        vlapic.set_timer_periodic_running(true);
+    }
+    Ok(())
+}
+
+/// The physical count required to enforce the minimum periodic interval.
+fn clamped_count(vlapic: &Vlapic, guest_count: u32) -> Option<u32> {
+    if guest_count == 0
+        || vlapic.timer_mode() != Some(TimerMode::Periodic)
+        || vlapic.lvt(Entry::Timer).masked()
+    {
+        return None;
+    }
+    let minimum = minimum_period_count(vlapic.timer_frequency(), divisor(vlapic))?;
+    (guest_count < minimum).then_some(minimum)
+}
+
+/// The least physical count that lasts the enforced periodic interval.
+fn minimum_period_count(frequency: u64, divisor: Divisor) -> Option<u32> {
+    let frequency = Frequency::from_hz(frequency)?;
+    let undivided = frequency.ticks_ceil(MINIMUM_PERIOD_NANOS);
+    let divided = undivided.div_ceil(u64::from(divisor.ratio())).max(1);
+    Some(u32::try_from(divided).unwrap_or(u32::MAX))
+}
+
+/// Maps a physically lengthened countdown back into the guest's count range.
+fn scale_remaining(remaining: u32, guest_initial: u32, physical_initial: u32) -> u32 {
+    if physical_initial == 0 || guest_initial == 0 {
+        return remaining;
+    }
+    let scaled =
+        (u128::from(remaining) * u128::from(guest_initial)).div_ceil(u128::from(physical_initial));
+    u32::try_from(scaled).unwrap_or(u32::MAX).min(guest_initial)
+}
+
+/// Moves a physical deadline opposite to a guest timestamp-offset change.
+///
+/// Physical zero disarms the deadline timer. The single wrapping combination
+/// that would produce it is therefore represented by the earliest armed value
+/// instead, one physical timestamp tick away.
+const fn rebased_deadline(deadline: u64, adjustment: u64) -> u64 {
+    let rebased = deadline.wrapping_sub(adjustment);
+    if rebased == 0 { 1 } else { rebased }
 }
 
 /// How far the guest asked for the clock to be divided.
@@ -364,5 +516,47 @@ fn divisor(vlapic: &Vlapic) -> Divisor {
         0b101 => Divisor::By64,
         0b110 => Divisor::By128,
         _ => Divisor::By1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use apic::Divisor;
+
+    use super::{minimum_period_count, rebased_deadline, scale_remaining};
+
+    #[test]
+    fn minimum_period_counts_round_up_after_division() {
+        assert_eq!(
+            minimum_period_count(100_000_000, Divisor::By1),
+            Some(20_000)
+        );
+        assert_eq!(
+            minimum_period_count(100_000_001, Divisor::By2),
+            Some(10_001)
+        );
+        assert_eq!(minimum_period_count(1, Divisor::By128), Some(1));
+        assert_eq!(minimum_period_count(0, Divisor::By1), None);
+    }
+
+    #[test]
+    fn clamped_current_counts_stay_in_the_guest_range() {
+        assert_eq!(scale_remaining(20_000, 1_000, 20_000), 1_000);
+        assert_eq!(scale_remaining(10_000, 1_000, 20_000), 500);
+        assert_eq!(scale_remaining(1, 1_000, 20_000), 1);
+        assert_eq!(scale_remaining(0, 1_000, 20_000), 0);
+    }
+
+    #[test]
+    fn unclamped_current_counts_are_unchanged() {
+        assert_eq!(scale_remaining(123, 456, 0), 123);
+        assert_eq!(scale_remaining(123, 0, 456), 123);
+    }
+
+    #[test]
+    fn deadline_rebasing_moves_opposite_to_the_offset() {
+        assert_eq!(rebased_deadline(0x2000, 0x300), 0x1D00);
+        assert_eq!(rebased_deadline(0x100, u64::MAX), 0x101);
+        assert_eq!(rebased_deadline(0x1234, 0x1234), 1);
     }
 }

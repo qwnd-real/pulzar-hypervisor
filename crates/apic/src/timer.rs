@@ -124,6 +124,21 @@ pub enum Divisor {
 }
 
 impl Divisor {
+    /// The numeric ratio between input ticks and timer ticks.
+    #[must_use]
+    pub const fn ratio(self) -> u32 {
+        match self {
+            Self::By1 => 1,
+            Self::By2 => 2,
+            Self::By4 => 4,
+            Self::By8 => 8,
+            Self::By16 => 16,
+            Self::By32 => 32,
+            Self::By64 => 64,
+            Self::By128 => 128,
+        }
+    }
+
     /// The divide configuration register's encoding.
     ///
     /// Bit 2 of the field is not used, so the three meaningful bits are 0, 1
@@ -533,6 +548,23 @@ mod tests {
                 "bit two is not part of the field"
             );
             assert_eq!(divisor.bits() & !0b1011, 0, "{divisor:?}");
+        }
+    }
+
+    #[test]
+    fn every_divisor_reports_its_numeric_ratio() {
+        let expected = [
+            (Divisor::By1, 1),
+            (Divisor::By2, 2),
+            (Divisor::By4, 4),
+            (Divisor::By8, 8),
+            (Divisor::By16, 16),
+            (Divisor::By32, 32),
+            (Divisor::By64, 64),
+            (Divisor::By128, 128),
+        ];
+        for (divisor, ratio) in expected {
+            assert_eq!(divisor.ratio(), ratio, "{divisor:?}");
         }
     }
 }

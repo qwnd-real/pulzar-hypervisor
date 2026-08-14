@@ -1,18 +1,20 @@
 //! The model-specific registers the guest is answered for rather than allowed
 //! to reach.
 //!
-//! Three kinds are answered here, and they fail differently. The two registers
-//! that decide whether the virtualization extension may be used are answered
-//! with a lie the guest is entitled to believe, because a guest allowed at the
-//! machine's own copies could turn the extension off underneath the hypervisor
-//! running it. The extended feature register is the guest's own, and is
-//! answered by hiding one bit of it and forcing that same bit back on whatever
-//! the guest writes. The interrupt controller's registers are answered by the
-//! guest's own emulated controller, and an access the architecture does not
-//! allow is a general protection fault the guest is given rather than an error
-//! the host reports.
+//! Four kinds are answered here, and they fail differently. The timestamp
+//! counter and its adjustment register are backed by the control block's
+//! offset, keeping native `RDTSC` and `RDTSCP` reads on the zero-exit path. The
+//! two registers that decide whether the virtualization extension may be used
+//! are answered with a lie the guest is entitled to believe, because a guest
+//! allowed at the machine's own copies could turn the extension off underneath
+//! the hypervisor running it. The extended feature register is the guest's own,
+//! and is answered by hiding one bit of it and forcing that same bit back on
+//! whatever the guest writes. The interrupt controller's registers are
+//! answered by the guest's own emulated controller, and an access the
+//! architecture does not allow is a general protection fault the guest is
+//! given rather than an error the host reports.
 //!
-//! A fourth kind is not answered at all so much as forwarded. The permission
+//! A fifth kind is not answered at all so much as forwarded. The permission
 //! map covers three ranges of the index space and an access outside all three
 //! is intercepted whatever the map holds, so those arrive here whether this
 //! crate wants them or not; they reach the machine's own register, and a
@@ -40,7 +42,7 @@ use inject::Pending;
 use log::{error, trace};
 use svm::{
     CleanBits, Event,
-    msr::{EFER, EFER_RESERVED, SVM_KEY, VM_CR, VmCr},
+    msr::{EFER, EFER_RESERVED, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR, VmCr},
     permissions::{MsrAccess, msrpm_position},
 };
 use vcpu::{Flow, Vcpu};
@@ -86,6 +88,9 @@ impl Virtualization {
             reason = "a model-specific register index is the low half of RCX; the architecture ignores the rest"
         )]
         let msr = vcpu.registers().rcx as u32;
+        if let Some(register) = Timestamp::of(msr) {
+            return timestamp(vcpu, register, interrupts);
+        }
         if vlapic::claims(msr) {
             return controller(vcpu, msr, interrupts);
         }
@@ -172,6 +177,108 @@ impl Virtualization {
         self.vm_cr = VmCr::from_bits((value & !VmCr::LOCKED) | VmCr::LOCKED);
         Ok(())
     }
+}
+
+/// One of the registers that defines the guest's timestamp-counter domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Timestamp {
+    /// The timestamp counter itself.
+    Counter,
+    /// The cumulative adjustment made to the counter.
+    Adjust,
+    /// SVM's guest frequency ratio, which the hidden extension must not expose.
+    Ratio,
+}
+
+impl Timestamp {
+    /// Which timestamp register an address names.
+    const fn of(msr: u32) -> Option<Self> {
+        match msr {
+            IA32_TSC => Some(Self::Counter),
+            IA32_TSC_ADJUST => Some(Self::Adjust),
+            TSC_RATIO => Some(Self::Ratio),
+            _ => None,
+        }
+    }
+}
+
+/// Answers an intercepted access to the guest's timestamp-counter state.
+fn timestamp(vcpu: &mut Vcpu, register: Timestamp, interrupts: &mut Pending) -> Flow {
+    let outcome = match MsrAccess::from_exit_info(vcpu.control().exit_info_1) {
+        MsrAccess::Read => read_timestamp(vcpu, register).map(|value| answer(vcpu, value)),
+        MsrAccess::Write => write_timestamp(vcpu, register, written(vcpu)),
+    };
+    match outcome {
+        Ok(()) => {
+            advance(vcpu, BYTES);
+            Flow::Resume
+        }
+        Err(TimestampError::Fault) => refuse(vcpu, interrupts),
+        Err(TimestampError::Controller(error)) => {
+            error!("exits: the guest's timestamp state could not be updated: {error}");
+            Flow::Leave
+        }
+    }
+}
+
+/// What the guest reads from one of its timestamp registers.
+fn read_timestamp(vcpu: &Vcpu, register: Timestamp) -> Result<u64, TimestampError> {
+    match register {
+        Timestamp::Counter => Ok(vcpu.guest_timestamp()),
+        Timestamp::Adjust if processor::features().contains(processor::Features::TSC_ADJUST) => {
+            Ok(vcpu.tsc_adjust())
+        }
+        Timestamp::Adjust | Timestamp::Ratio => Err(TimestampError::Fault),
+    }
+}
+
+/// What a guest write to one of its timestamp registers does.
+fn write_timestamp(vcpu: &mut Vcpu, register: Timestamp, value: u64) -> Result<(), TimestampError> {
+    match register {
+        Timestamp::Counter => {
+            let old_offset = vcpu.tsc_offset();
+            let new_offset = offset_for_timestamp(value, processor::timestamp());
+            let adjustment = offset_adjustment(old_offset, new_offset);
+            rebase_timestamp(vcpu, new_offset, vcpu.tsc_adjust().wrapping_add(adjustment))
+        }
+        Timestamp::Adjust if processor::features().contains(processor::Features::TSC_ADJUST) => {
+            let adjustment = offset_adjustment(vcpu.tsc_adjust(), value);
+            rebase_timestamp(vcpu, vcpu.tsc_offset().wrapping_add(adjustment), value)
+        }
+        Timestamp::Adjust | Timestamp::Ratio => Err(TimestampError::Fault),
+    }
+}
+
+/// Publishes one timestamp-offset change after preserving any armed deadline.
+fn rebase_timestamp(
+    vcpu: &mut Vcpu,
+    new_offset: u64,
+    new_adjust: u64,
+) -> Result<(), TimestampError> {
+    let adjustment = offset_adjustment(vcpu.tsc_offset(), new_offset);
+    vlapic::adjust_deadline(adjustment).map_err(TimestampError::Controller)?;
+    vcpu.set_tsc_offset(new_offset);
+    vcpu.set_tsc_adjust(new_adjust);
+    Ok(())
+}
+
+/// The offset that makes `physical` read as `timestamp` to the guest.
+const fn offset_for_timestamp(timestamp: u64, physical: u64) -> u64 {
+    timestamp.wrapping_sub(physical)
+}
+
+/// The wrapping amount by which an offset changed.
+const fn offset_adjustment(old: u64, new: u64) -> u64 {
+    new.wrapping_sub(old)
+}
+
+/// Why a timestamp register access could not be answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimestampError {
+    /// The architecture requires the guest to take a general protection fault.
+    Fault,
+    /// The physical deadline could not be kept coherent with the new offset.
+    Controller(vlapic::VlapicError),
 }
 
 /// One of the registers answered here rather than the machine's own.
@@ -317,8 +424,10 @@ fn passthrough(vcpu: &mut Vcpu, msr: u32, interrupts: &mut Pending) -> Flow {
 /// hardware, and a guest probing its controller relies on being told no.
 fn controller(vcpu: &mut Vcpu, msr: u32, interrupts: &mut Pending) -> Flow {
     let outcome = match MsrAccess::from_exit_info(vcpu.control().exit_info_1) {
-        MsrAccess::Read => vlapic::read_msr(msr).map(|value| answer(vcpu, value)),
-        MsrAccess::Write => vlapic::write_msr(msr, written(vcpu)),
+        MsrAccess::Read => {
+            vlapic::read_msr(msr, vcpu.tsc_offset()).map(|value| answer(vcpu, value))
+        }
+        MsrAccess::Write => vlapic::write_msr(msr, written(vcpu), vcpu.tsc_offset()),
     };
     match outcome {
         Ok(()) => {
@@ -364,3 +473,21 @@ const _: () = assert!(
     EFER_RESERVED & (SVME | LME | LMA) == 0,
     "none of the three bits handled by name may be one a write is refused for",
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{offset_adjustment, offset_for_timestamp};
+
+    #[test]
+    fn timestamp_offsets_use_architectural_wrapping_arithmetic() {
+        assert_eq!(offset_for_timestamp(0, 1), u64::MAX);
+        assert_eq!(offset_for_timestamp(7, u64::MAX), 8);
+    }
+
+    #[test]
+    fn offset_adjustments_round_trip_across_wraparound() {
+        for (old, new) in [(0, 1), (1, 0), (u64::MAX - 3, 5)] {
+            assert_eq!(old.wrapping_add(offset_adjustment(old, new)), new);
+        }
+    }
+}

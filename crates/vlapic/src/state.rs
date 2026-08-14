@@ -56,7 +56,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use apic::LocalState;
 use cpu::{ApicId, CpuIndex};
 use descriptors::Vector;
-use log::info;
+use log::trace;
 
 use crate::{
     base::{ApicBase, BaseFault, Mode},
@@ -87,6 +87,10 @@ pub struct Vlapic {
     lvt: [AtomicU32; Entry::COUNT],
     timer_divide: AtomicU32,
     timer_initial: AtomicU32,
+    timer_frequency: AtomicU64,
+    timer_clamp: AtomicU32,
+    timer_clamp_reported: AtomicBool,
+    timer_periodic_running: AtomicBool,
     command: AtomicU64,
     errors: ErrorStatus,
     ledger: Ledger,
@@ -120,6 +124,10 @@ impl Vlapic {
             lvt: [const { AtomicU32::new(Entry::RESET) }; Entry::COUNT],
             timer_divide: AtomicU32::new(0),
             timer_initial: AtomicU32::new(0),
+            timer_frequency: AtomicU64::new(0),
+            timer_clamp: AtomicU32::new(0),
+            timer_clamp_reported: AtomicBool::new(false),
+            timer_periodic_running: AtomicBool::new(false),
             command: AtomicU64::new(0),
             errors: ErrorStatus::new(),
             ledger: Ledger::new(),
@@ -522,8 +530,16 @@ impl Vlapic {
             kept |= MASKED;
         }
         let was = self.lvt[entry.index()].swap(kept, Ordering::AcqRel);
-        if entry == Entry::Timer && waits_for_a_deadline(was) != waits_for_a_deadline(kept) {
-            self.timer_initial.store(0, Ordering::Release);
+        if entry == Entry::Timer {
+            let old_mode = timer_mode(was);
+            let new_mode = timer_mode(kept);
+            if old_mode != new_mode {
+                self.set_timer_periodic_running(false);
+            }
+            if waits_for_a_deadline(was) != waits_for_a_deadline(kept) {
+                self.timer_initial.store(0, Ordering::Release);
+                self.clear_timer_clamp();
+            }
         }
         Lvt::from_bits(kept)
     }
@@ -570,6 +586,49 @@ impl Vlapic {
         }
         self.timer_initial.store(value, Ordering::Release);
         true
+    }
+
+    /// The calibrated rate of the timer before division, in ticks per second.
+    pub(crate) fn timer_frequency(&self) -> u64 {
+        self.timer_frequency.load(Ordering::Acquire)
+    }
+
+    /// Records the timer's undivided calibrated rate.
+    pub(crate) fn set_timer_frequency(&self, frequency: u64) {
+        self.timer_frequency.store(frequency, Ordering::Release);
+    }
+
+    /// The physical initial count used to lengthen a pathological period.
+    pub(crate) fn timer_clamp(&self) -> u32 {
+        self.timer_clamp.load(Ordering::Acquire)
+    }
+
+    /// Records the physical initial count backing the guest's periodic timer.
+    pub(crate) fn set_timer_clamp(&self, count: u32) {
+        self.timer_clamp.store(count, Ordering::Release);
+    }
+
+    /// Stops scaling current-count reads for a physically lengthened period.
+    pub(crate) fn clear_timer_clamp(&self) {
+        self.set_timer_clamp(0);
+    }
+
+    /// Whether this controller has already reported period clamping.
+    pub(crate) fn report_timer_clamp_once(&self) -> bool {
+        self.timer_clamp_reported
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Whether a nonzero periodic count was successfully loaded on hardware.
+    pub(crate) fn timer_periodic_running(&self) -> bool {
+        self.timer_periodic_running.load(Ordering::Acquire)
+    }
+
+    /// Records whether the physical timer is running periodically.
+    pub(crate) fn set_timer_periodic_running(&self, running: bool) {
+        self.timer_periodic_running
+            .store(running, Ordering::Release);
     }
 
     /// Which mode the timer's entry selects, or `None` for the encoding the
@@ -789,7 +848,7 @@ impl Vlapic {
             return;
         }
         match (accepting, requested, selected) {
-            (false, _, _) => info!(
+            (false, _, _) => trace!(
                 "vlapic: {} is not accepting interrupts: mode {:?}, software {}",
                 self.index(),
                 self.mode(),
@@ -799,19 +858,19 @@ impl Vlapic {
                     "disabled"
                 }
             ),
-            (true, None, _) => info!(
+            (true, None, _) => trace!(
                 "vlapic: {} has nothing requested; in service {in_service:?}, task priority {:#x}",
                 self.index(),
                 task.get()
             ),
-            (true, Some(vector), None) => info!(
+            (true, Some(vector), None) => trace!(
                 "vlapic: {} is holding {vector} back: processor priority {:#x} from task {:#x} \
                  and in service {in_service:?}",
                 self.index(),
                 processor.get(),
                 task.get()
             ),
-            (true, Some(_), Some(vector)) => info!(
+            (true, Some(_), Some(vector)) => trace!(
                 "vlapic: {} nominates {vector}, processor priority {:#x}, in service \
                  {in_service:?}",
                 self.index(),
@@ -1032,6 +1091,8 @@ impl Vlapic {
         }
         self.timer_divide.store(0, Ordering::Release);
         self.timer_initial.store(0, Ordering::Release);
+        self.clear_timer_clamp();
+        self.set_timer_periodic_running(false);
         self.command.store(0, Ordering::Release);
         self.errors.reset();
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -1062,7 +1123,12 @@ const EPOCH_SPINS: u32 = 100_000;
 /// Whether a timer entry selects the mode that counts nothing, and so the mode
 /// the count registers mean nothing in.
 fn waits_for_a_deadline(entry: u32) -> bool {
-    TimerMode::from_bits(Lvt::from_bits(entry).timer_mode()) == Some(TimerMode::Deadline)
+    timer_mode(entry) == Some(TimerMode::Deadline)
+}
+
+/// The timer mode encoded in a raw local-vector-table entry.
+fn timer_mode(entry: u32) -> Option<TimerMode> {
+    TimerMode::from_bits(Lvt::from_bits(entry).timer_mode())
 }
 
 /// What a write to the base register did.

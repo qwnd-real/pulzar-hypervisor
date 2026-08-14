@@ -45,7 +45,7 @@ use paging::{DirectMap, Frames};
 use processor::{Svm, SvmFeatures};
 use svm::{
     Vmcb,
-    msr::{HostSaveAddress, VM_CR, VM_HSAVE_PA, VmCr},
+    msr::{HostSaveAddress, TSC_RATIO, TscRatio, VM_CR, VM_HSAVE_PA, VmCr},
 };
 use x86_64::{
     PhysAddr,
@@ -122,6 +122,12 @@ impl Host {
         unsafe { Efer::update(|efer| efer.insert(EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE)) };
         if !Efer::read().contains(EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE) {
             return Err(VcpuError::SvmDisabled);
+        }
+        if svm.features.contains(SvmFeatures::TSC_RATE_MSR) {
+            // SAFETY: the feature bit establishes that `TSC_RATIO` exists on
+            // this processor, and one is a valid ratio that leaves the guest's
+            // counter frequency unchanged.
+            unsafe { Msr::new(TSC_RATIO).write(TscRatio::ONE.into_bits()) };
         }
 
         let hsave = page(frames, window)?;

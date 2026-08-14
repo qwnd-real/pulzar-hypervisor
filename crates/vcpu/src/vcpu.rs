@@ -50,16 +50,18 @@ use core::ptr::NonNull;
 
 use log::info;
 use paging::{DirectMap, Frames};
-use processor::SvmFeatures;
+use processor::{Features, SvmFeatures};
 use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
     control::NestedPagingControl,
     intercept::{Intercepts1, Intercepts2, Intercepts2Flags, TlbControl},
-    msr::{EFER, SVM_KEY, VM_CR},
+    msr::{EFER, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR},
     permissions::{MSRPM_BYTES, msrpm_position},
 };
 use x86_64::{
-    PhysAddr, instructions::interrupts, registers::control::EferFlags,
+    PhysAddr,
+    instructions::interrupts,
+    registers::{control::EferFlags, model_specific::Msr},
     structures::paging::PhysFrame,
 };
 
@@ -71,12 +73,11 @@ use crate::{
 
 /// The permission bits for the registers this layer always intercepts.
 ///
-/// All three are how a guest could reach the machine's own virtualization
-/// extension. [`VM_CR`] holds the switch that disables it and the lock over
-/// that switch, [`SVM_KEY`] is what lifts the lock, and the extended feature
-/// register holds the enable bit itself — a guest writing any of them writes
-/// the host's, which is the extension the guest is running under.
-const HIDDEN_MSRS: [u32; 3] = [VM_CR, SVM_KEY, EFER];
+/// Three protect the machine's virtualization extension, two define the
+/// guest's offset timestamp domain, and the ratio register is hidden because
+/// the extension itself is hidden. Keeping them here makes their permission
+/// bits part of every VCPU rather than policy a caller could forget to install.
+const INTERCEPTED_MSRS: [u32; 6] = [VM_CR, SVM_KEY, EFER, IA32_TSC, IA32_TSC_ADJUST, TSC_RATIO];
 
 /// What a guest's control block has to be told about the guest before it can
 /// run at all.
@@ -116,6 +117,7 @@ pub struct Vcpu {
     vmcb_phys: PhysAddr,
     msrpm_phys: PhysAddr,
     host: &'static Host,
+    tsc_adjust: u64,
     dirty: CleanBits,
     stale: bool,
 }
@@ -168,13 +170,21 @@ impl Vcpu {
         // SAFETY: the two-page run was just allocated to this VCPU, is zeroed,
         // and `msrpm` reaches all of it through the direct map.
         let msrpm = unsafe { msrpm.as_mut() };
-        intercept(msrpm, HIDDEN_MSRS);
+        intercept(msrpm, INTERCEPTED_MSRS);
+        let tsc_adjust = if processor::features().contains(Features::TSC_ADJUST) {
+            // SAFETY: the feature bit establishes that the register exists, and
+            // reading it has no side effects.
+            unsafe { Msr::new(IA32_TSC_ADJUST).read() }
+        } else {
+            0
+        };
         let mut vcpu = Self {
             registers: Registers::zeroed(),
             vmcb,
             vmcb_phys,
             msrpm_phys,
             host,
+            tsc_adjust,
             // Everything counts as edited until the first entry, so that entry
             // publishes a clean field of zero.
             dirty: CleanBits::ALL_CACHED,
@@ -253,48 +263,47 @@ impl Vcpu {
         }
 
         loop {
-            let entered = interrupts::without_interrupts(|| {
-                // SAFETY: `Host::install` enabled SVM on this processor. VMRUN
-                // restores GIF on the successful path; the early return below
-                // restores it explicitly.
-                unsafe { switch::disable_global_interrupts() };
-                if callback(self, RunPhase::Enter) == Flow::Leave {
-                    // SAFETY: GIF was cleared immediately above and no VMRUN
-                    // has occurred to restore it.
-                    unsafe { switch::enable_global_interrupts() };
-                    return false;
-                }
-                let clean = CleanBits::ALL_CACHED.soil(self.dirty);
-                let flush = if self.stale {
-                    flush_command()
-                } else {
-                    TlbControl::DoNothing
-                };
-                let control = self.control_mut();
-                control.clean = clean;
-                control.tlb_control = flush;
-                self.dirty = CleanBits::nothing_cached();
-                self.stale = false;
-
-                // SAFETY: the block was checked above and after every exit that
-                // edited it, `Host::install` enabled the extension and programmed
-                // the host state-save address on this processor, and the snapshot
-                // comes from that same call on this same processor. The caller
-                // guarantees the block has not moved and has not been entered
-                // elsewhere.
-                //
-                // Interrupts are masked from the final entry preparation through
-                // the crossing and restored the moment the host is back. A
-                // doorbell published before the preparation is observed there;
-                // one published afterwards stays pending until VMRUN enables GIF
-                // and immediately causes the intercepted interrupt to exit.
-                unsafe {
-                    switch::enter(&mut self.registers, self.vmcb_phys, self.host.snapshot());
-                }
-                true
-            });
-            if !entered {
+            interrupts::disable();
+            // SAFETY: `Host::install` enabled SVM on this processor. VMRUN
+            // restores GIF on the successful path; the early return below
+            // restores it explicitly.
+            unsafe { switch::disable_global_interrupts() };
+            if callback(self, RunPhase::Enter) == Flow::Leave {
+                // SAFETY: GIF was cleared immediately above and no VMRUN has
+                // occurred to restore it.
+                unsafe { switch::enable_global_interrupts() };
+                interrupts::enable();
                 return Ok(());
+            }
+            let clean = CleanBits::ALL_CACHED.soil(self.dirty);
+            let flush = if self.stale {
+                flush_command()
+            } else {
+                TlbControl::DoNothing
+            };
+            let control = self.control_mut();
+            control.clean = clean;
+            control.tlb_control = flush;
+            self.dirty = CleanBits::nothing_cached();
+            self.stale = false;
+
+            // With interrupt masking virtualized, SVM takes the host's IF at
+            // entry as the mask for physical interrupts while the guest runs.
+            // GIF remains clear until VMRUN, so enabling IF here cannot deliver
+            // anything into the half-restored state below. The helper includes
+            // a NOP, which consumes STI's one-instruction interrupt shadow
+            // before VMRUN samples the flag.
+            interrupts::enable();
+
+            // SAFETY: the block was checked above and after every exit that
+            // edited it, `Host::install` enabled the extension and programmed
+            // the host state-save address on this processor, and the snapshot
+            // comes from that same call on this same processor. The caller
+            // guarantees the block has not moved and has not been entered
+            // elsewhere. GIF is clear across the final preparation and switch,
+            // so physical interrupts cannot observe partially restored state.
+            unsafe {
+                switch::enter(&mut self.registers, self.vmcb_phys, self.host.snapshot());
             }
 
             if self.control().exit_code == ExitCode::INVALID {
@@ -348,6 +357,45 @@ impl Vcpu {
     /// than a flush on every entry for the rest of the guest's life.
     pub const fn flush(&mut self) {
         self.stale = true;
+    }
+
+    /// The timestamp counter value the guest observes now.
+    ///
+    /// Hardware applies the same wrapping addition to native `RDTSC` and
+    /// `RDTSCP` in guest mode. This is the matching answer for an intercepted
+    /// read of the architectural timestamp-counter register.
+    #[must_use]
+    pub fn guest_timestamp(&self) -> u64 {
+        processor::timestamp().wrapping_add(self.tsc_offset())
+    }
+
+    /// The offset hardware adds to this guest's timestamp counter.
+    #[must_use]
+    pub fn tsc_offset(&self) -> u64 {
+        self.control().tsc_offset
+    }
+
+    /// Changes the offset hardware adds to this guest's timestamp counter.
+    ///
+    /// The field belongs to the intercept clean group, so changing it also
+    /// makes the next entry reload that group rather than using a cached copy.
+    pub fn set_tsc_offset(&mut self, offset: u64) {
+        if self.control().tsc_offset == offset {
+            return;
+        }
+        self.control_mut().tsc_offset = offset;
+        self.soil(CleanBits::INTERCEPTS);
+    }
+
+    /// The guest's cumulative timestamp-counter adjustment.
+    #[must_use]
+    pub const fn tsc_adjust(&self) -> u64 {
+        self.tsc_adjust
+    }
+
+    /// Stores the guest's cumulative timestamp-counter adjustment.
+    pub const fn set_tsc_adjust(&mut self, adjustment: u64) {
+        self.tsc_adjust = adjustment;
     }
 
     /// Why the guest stopped, or `None` for a code the architecture does not
@@ -425,10 +473,9 @@ impl Vcpu {
     /// Which registers a guest may not have is policy, and policy does not
     /// belong here — this takes whichever ones the caller names and says
     /// nothing about what they are for. The registers this layer intercepts on
-    /// its own account are the three a guest could reach the machine's own
-    /// virtualization extension through, because a guest that saw the truth
-    /// there could try to use it, and one that wrote any of them would be
-    /// writing the extension it is itself running under.
+    /// its own account are the virtualization registers a guest could use to
+    /// reach the host's extension and the timestamp registers whose semantics
+    /// depend on this control block's offset.
     ///
     /// An index outside the three ranges the architecture gives the permission
     /// map is skipped rather than refused: the map cannot express one, so the
@@ -587,10 +634,10 @@ const _: () = assert!(
 );
 const _: () = {
     let mut index = 0;
-    while index < HIDDEN_MSRS.len() {
+    while index < INTERCEPTED_MSRS.len() {
         assert!(
-            msrpm_position(HIDDEN_MSRS[index]).is_some(),
-            "every register this layer hides must have a bit in the permission map",
+            msrpm_position(INTERCEPTED_MSRS[index]).is_some(),
+            "every register this layer intercepts must have a bit in the permission map",
         );
         index += 1;
     }
