@@ -2,9 +2,10 @@
 //! machine has.
 //!
 //! [`init`] picks a backend, installs a [`log`] logger that writes
-//! `[LEVEL module_path] message` lines to it, and never changes its mind
-//! afterwards. Two backends exist and the choice between them is not a
-//! preference:
+//! `[HH:MM:SS mmm] [LEVEL module_path] message` lines to it, and never changes
+//! its mind afterwards. The timestamp is uptime from the installed clock, or
+//! zero before that clock exists. Two backends exist and the choice between
+//! them is not a preference:
 //!
 //! - QEMU's **debug console**, a single write-only I/O port with no line rate,
 //!   no holding register to poll and no divisor to program. A byte costs one
@@ -17,9 +18,6 @@
 //! own interrupt path and one whose guest starves while it tries: a UART line
 //! long enough to be useful takes longer to send than the guest gets to run
 //! between two exits.
-//!
-//! Lines carry no timestamp: there is no reliable time source this early, and a
-//! fabricated one would mislead.
 //!
 //! The crate is safe to use from any number of cores. The chosen backend sits
 //! behind a spinlock that is held for one whole log line at a time, so
@@ -41,8 +39,9 @@ mod debugcon;
 mod uart;
 
 use core::{
-    fmt::{Arguments, Write},
+    fmt::{Arguments, Display, Formatter, Write},
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
+    time::Duration,
 };
 
 use log::{LevelFilter, Log, Metadata, Record};
@@ -89,6 +88,15 @@ const NONE_CHOSEN: u16 = 0;
 /// Its port number, which is outside the range of COM port bases and so tells
 /// the two backends apart on its own.
 const DEBUGCON_CHOSEN: u16 = 0xE9;
+
+/// Seconds in one minute.
+const SECONDS_PER_MINUTE: u64 = 60;
+
+/// Minutes in one hour.
+const MINUTES_PER_HOUR: u64 = 60;
+
+/// Seconds in one hour.
+const SECONDS_PER_HOUR: u64 = MINUTES_PER_HOUR * SECONDS_PER_MINUTE;
 
 /// The logger [`init`] installs; it forwards every record to [`OUTPUT`].
 static LOGGER: SerialLogger = SerialLogger;
@@ -196,6 +204,35 @@ pub fn emergency(args: Arguments<'_>) {
 /// acquisition.
 struct SerialLogger;
 
+/// A log record's elapsed-time prefix, in nanoseconds since clock startup.
+struct Uptime(Option<u64>);
+
+impl Uptime {
+    /// Reads the installed clock, or retains the pre-clock placeholder.
+    fn now() -> Self {
+        Self(clock::now().map(clock::Instant::nanos))
+    }
+}
+
+impl Display for Uptime {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> core::fmt::Result {
+        let Some(nanos) = self.0 else {
+            return formatter.write_str("00:00:00 000");
+        };
+        let elapsed = Duration::from_nanos(nanos);
+        let total_seconds = elapsed.as_secs();
+        let hours = total_seconds / SECONDS_PER_HOUR;
+        let minutes = total_seconds / SECONDS_PER_MINUTE % MINUTES_PER_HOUR;
+        let seconds = total_seconds % SECONDS_PER_MINUTE;
+
+        write!(
+            formatter,
+            "{hours:02}:{minutes:02}:{seconds:02} {:03}",
+            elapsed.subsec_millis()
+        )
+    }
+}
+
 impl Log for SerialLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= MAX_LEVEL
@@ -219,7 +256,8 @@ impl Log for SerialLogger {
                 // nowhere to report it from inside the logger.
                 let _ = writeln!(
                     output,
-                    "[{} {}] {}",
+                    "[{}] [{} {}] {}",
+                    Uptime::now(),
                     record.level(),
                     record.target(),
                     record.args()
@@ -229,4 +267,25 @@ impl Log for SerialLogger {
     }
 
     fn flush(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    //! Uptime prefix formatting.
+
+    extern crate std;
+
+    use super::Uptime;
+
+    #[test]
+    fn uptime_uses_zero_before_clock_startup() {
+        assert_eq!(std::format!("{}", Uptime(None)), "00:00:00 000");
+    }
+
+    #[test]
+    fn uptime_formats_elapsed_milliseconds() {
+        let nanos = 97_445_006_000_000;
+
+        assert_eq!(std::format!("{}", Uptime(Some(nanos))), "27:04:05 006");
+    }
 }
