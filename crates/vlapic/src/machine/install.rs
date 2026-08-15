@@ -2,16 +2,17 @@
 //! the state firmware left the real one in.
 //!
 //! Once, on the boot processor, after the roster is taken and before any
-//! processor is started: a controller has to exist before anything can deliver to
-//! it, and an application processor's controller has to exist before that
+//! processor is started: a controller has to exist before anything can deliver
+//! to it, and an application processor's controller has to exist before that
 //! processor does.
 //!
 //! # Nothing is published until everything that can fail has succeeded
 //!
 //! Both cells this crate keeps are written once and never cleared, so a failure
-//! between them would be permanent and a retry would find half a machine. A page
-//! installed without a doorbell is the worst of those halves: it can deliver an
-//! interrupt to a processor inside the guest and has no way to make it look.
+//! between them would be permanent and a retry would find half a machine. A
+//! page installed without a doorbell is the worst of those halves: it can
+//! deliver an interrupt to a processor inside the guest and has no way to make
+//! it look.
 
 use alloc::boxed::Box;
 

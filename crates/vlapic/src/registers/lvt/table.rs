@@ -1,8 +1,8 @@
 //! The table as the controller keeps it: what the guest wrote, what it reads
 //! back, and what a write is allowed to change.
 //!
-//! Three of the bits in an entry are the controller's rather than software's, so
-//! what the guest wrote and what the guest reads are deliberately two
+//! Three of the bits in an entry are the controller's rather than software's,
+//! so what the guest wrote and what the guest reads are deliberately two
 //! operations. Which bits exist in which entry is [`Entry::writable`]'s, and
 //! what any of it does to real hardware is [`crate::hardware::sources`]'s.
 

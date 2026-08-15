@@ -6,12 +6,12 @@
 //! real hardware, so INIT and start-up are forwarded to the real controller and
 //! the processor starts exactly as it would have bare metal.
 //!
-//! Once a processor is running the hypervisor's own code, forwarding would reset
-//! the *host*. From then on both are emulated, and neither is applied by the
-//! processor that sent it: an INIT and a start-up page are left where the target
-//! will find them, and the target applies them to itself at an exit boundary —
-//! which is what makes resetting a controller's whole register file safe without
-//! a lock.
+//! Once a processor is running the hypervisor's own code, forwarding would
+//! reset the *host*. From then on both are emulated, and neither is applied by
+//! the processor that sent it: an INIT and a start-up page are left where the
+//! target will find them, and the target applies them to itself at an exit
+//! boundary — which is what makes resetting a controller's whole register file
+//! safe without a lock.
 //!
 //! What closes the window is not the target's own claim, because a claim the
 //! target makes cannot say anything about a processor that never makes one.
@@ -98,8 +98,8 @@ pub(super) fn start(from: &Vlapic, target: &Vlapic, page: StartupPage) {
 /// at a page the guest chose, with no nested tables, no intercepts and no
 /// address space tag: the guest, on bare metal.
 ///
-/// So [`ownership::brought_up`] closes the window for the machine once the host has
-/// finished starting processors, and a processor firmware described as
+/// So [`ownership::brought_up`] closes the window for the machine once the host
+/// has finished starting processors, and a processor firmware described as
 /// unstartable never has one at all — the host was never going to start it, so
 /// there is no moment at which a real start-up aimed at it is anything but a
 /// processor the guest has taken.

@@ -283,6 +283,23 @@ pub(crate) const fn source_of(entry: Entry) -> Option<Source> {
     }
 }
 
+/// The two mappings above are written by hand in opposite directions, and
+/// nothing but this says they agree: one that had drifted would program a source
+/// from another source's entry, and would report a guest's read of one entry out
+/// of another's real register — invisibly, and only on the hardware that has the
+/// entries in question.
+const _: () = {
+    let mut index = 0;
+    while index < Source::ALL.len() {
+        let source = Source::ALL[index];
+        assert!(
+            matches!(source_of(of(source)), Some(same) if same as usize == source as usize),
+            "every source has to be the source of the entry it is the entry of"
+        );
+        index += 1;
+    }
+};
+
 /// How a pin asserts.
 const fn polarity(active_low: bool) -> Polarity {
     if active_low {

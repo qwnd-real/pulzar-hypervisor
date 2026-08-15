@@ -3,8 +3,8 @@
 //!
 //! The fields the rest of this tree reaches through named operations are
 //! declared in [`crate::registers`]; what is here is the three things that
-//! touch nearly all of them at once — construction, seeding and reset — plus the
-//! four facts about a controller that are fixed when it is built and cannot
+//! touch nearly all of them at once — construction, seeding and reset — plus
+//! the four facts about a controller that are fixed when it is built and cannot
 //! change afterwards.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};

@@ -64,15 +64,14 @@ mod clamp;
 mod deadline;
 mod inherit;
 
+use apic::{Divisor, LocalApic, Source, TimerMode as HardwareMode};
+use log::{trace, warn};
+
 pub use crate::hardware::timer::deadline::adjust_deadline;
 pub(crate) use crate::hardware::timer::{
     deadline::arm_deadline,
     inherit::{calibrate, inherit},
 };
-
-use apic::{Divisor, LocalApic, Source, TimerMode as HardwareMode};
-use log::{trace, warn};
-
 use crate::{
     hardware::{
         sources,
@@ -139,7 +138,7 @@ pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
         .then(|| entry.vector())
         .and_then(|vector| sources::armable(vlapic, vector));
     let divisor = divisor(vlapic);
-    match reconfigure(vlapic, timer, delivery, mode, divisor) {
+    match reconfigure(vlapic, &timer, delivery, mode, divisor) {
         Ok(()) => {
             report(vlapic, "configured");
             true

@@ -25,13 +25,18 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use descriptors::Vector;
 
 /// How many 32-bit registers it takes to give all 256 vectors a bit.
-pub(crate) const SLOTS: usize = 8;
+///
+/// The real controller's own count, because these registers are seeded from a
+/// capture of the real ones and read back a slot at a time by a guest reading
+/// the same bank. Two counts that had to agree and did not would be a guest
+/// register read answered out of the wrong word.
+pub(crate) const SLOTS: usize = apic::VECTOR_WORDS;
 
 /// How many vectors one register describes.
 const PER_SLOT: u8 = 32;
 
 /// One bit per vector, spread across eight registers.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Bitmap {
     slots: [AtomicU32; SLOTS],
 }
@@ -81,7 +86,11 @@ impl Bitmap {
     pub(crate) fn highest(&self) -> Option<Vector> {
         (0..SLOTS).rev().find_map(|slot| {
             let word = self.slots[slot].load(Ordering::Acquire);
-            (word != 0).then(|| vector_at(slot, highest_bit(word)))
+            // The highest set bit of a non-zero word, and nothing at all for an
+            // empty one — which is the whole of what makes this total. An
+            // arithmetic "thirty-one less the leading zeros" answers `-1` for an
+            // empty word, and a wrapping one at that.
+            Some(vector_at(slot, word.checked_ilog2()?))
         })
     }
 
@@ -130,11 +139,18 @@ impl Bitmap {
             .sum()
     }
 
-    /// One of the eight registers, as the guest reads it.
-    pub(crate) fn slot(&self, slot: usize) -> u32 {
+    /// One of the eight registers, as the guest reads it, or `None` for a slot
+    /// this bitmap does not have.
+    ///
+    /// Answering with the slot's absence rather than with a zero leaves what a
+    /// missing slot means to the caller — and its only callers are the three
+    /// guest bank readbacks, where the offset a slot came from is one of eight by
+    /// construction and a zero would be indistinguishable from an empty
+    /// register.
+    pub(crate) fn slot(&self, slot: usize) -> Option<u32> {
         self.slots
             .get(slot)
-            .map_or(0, |word| word.load(Ordering::Acquire))
+            .map(|word| word.load(Ordering::Acquire))
     }
 
     /// Clears every bit, which is what reset and INIT leave these.
@@ -169,13 +185,157 @@ fn place(vector: Vector) -> (usize, u32) {
 /// The vector a register's bit belongs to.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "eight slots of thirty-two bits is two hundred and fifty-six, which is the whole of a vector's range"
+    reason = "eight slots of thirty-two bits is two hundred and fifty-six, which is the whole of a vector's range — and the assertion below is what keeps that true"
 )]
 fn vector_at(slot: usize, bit: u32) -> Vector {
     Vector::new((slot as u8) * PER_SLOT + (bit as u8))
 }
 
-/// Which bit of a non-zero word is the highest set one.
-fn highest_bit(word: u32) -> u32 {
-    u32::BITS - 1 - word.leading_zeros()
+/// The eight registers have to cover exactly the vectors there are, because
+/// [`vector_at`] narrows a slot and a bit into one byte to name one: a ninth slot
+/// would wrap round and answer with a vector from the bottom of the range, and
+/// seven would leave the top of it unreachable.
+const _: () = assert!(
+    Bitmap::CAPACITY == Vector::COUNT,
+    "a bitmap must give every vector exactly one bit"
+);
+
+
+#[cfg(test)]
+mod tests {
+    //! The arithmetic is checked in both directions over every vector, because
+    //! getting it wrong is an interrupt delivered as a different one and nothing
+    //! downstream would notice.
+
+    use descriptors::Vector;
+
+    use super::{Bitmap, PER_SLOT, SLOTS, place, vector_at};
+
+    /// Every vector there is, which is what this module answers for.
+    fn all() -> impl Iterator<Item = Vector> {
+        (0..=u8::MAX).map(Vector::new)
+    }
+
+    #[test]
+    fn every_vector_has_its_own_bit_and_answers_to_it() {
+        for vector in all() {
+            let (slot, bit) = place(vector);
+            assert!(slot < SLOTS, "{vector} is in a slot that exists");
+            assert_eq!(
+                bit.count_ones(),
+                1,
+                "{vector} names exactly one bit of its slot"
+            );
+            assert_eq!(
+                vector_at(slot, bit.trailing_zeros()),
+                vector,
+                "{vector} has to come back out of the slot and bit it went into"
+            );
+        }
+    }
+
+    #[test]
+    fn the_slots_cover_every_vector_exactly_once() {
+        let mut seen = [false; Bitmap::CAPACITY];
+        for vector in all() {
+            let (slot, bit) = place(vector);
+            let index = slot * PER_SLOT as usize + bit.trailing_zeros() as usize;
+            assert!(!seen[index], "{vector} shares a bit with another vector");
+            seen[index] = true;
+        }
+        assert!(seen.into_iter().all(|used| used));
+    }
+
+    #[test]
+    fn an_empty_bitmap_holds_no_highest_vector() {
+        // The case the arithmetic used to answer wrongly: an empty word has no
+        // highest set bit at all, and computing one from its leading zeros
+        // produces a vector from the bottom of the range.
+        let bitmap = Bitmap::new();
+        assert_eq!(bitmap.highest(), None);
+        assert_eq!(bitmap.take_highest(), None);
+        assert!(bitmap.is_empty());
+        assert_eq!(bitmap.count(), 0);
+    }
+
+    #[test]
+    fn the_lowest_and_highest_vectors_are_both_reachable() {
+        for vector in [Vector::new(0), Vector::new(u8::MAX)] {
+            let bitmap = Bitmap::new();
+            assert!(!bitmap.set(vector), "the bit was not already set");
+            assert!(bitmap.get(vector));
+            assert_eq!(bitmap.highest(), Some(vector));
+            assert_eq!(bitmap.count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_repeated_set_says_the_bit_was_already_there() {
+        let bitmap = Bitmap::new();
+        let vector = Vector::new(0x42);
+
+        assert!(!bitmap.set(vector));
+        assert!(bitmap.set(vector), "a second arrival folds into the one bit");
+        assert_eq!(bitmap.count(), 1);
+        assert!(bitmap.clear(vector));
+        assert!(!bitmap.clear(vector), "clearing a clear bit took nothing");
+    }
+
+    #[test]
+    fn the_highest_vector_is_the_highest_number_whichever_slot_it_is_in() {
+        let bitmap = Bitmap::new();
+        // One in the lowest slot, one in the highest, and one in between.
+        for vector in [Vector::new(0x10), Vector::new(0x7F), Vector::new(0xF0)] {
+            bitmap.set(vector);
+        }
+        assert_eq!(bitmap.highest(), Some(Vector::new(0xF0)));
+        assert_eq!(bitmap.count(), 3);
+    }
+
+    #[test]
+    fn taking_the_highest_walks_down_in_priority_order() {
+        let bitmap = Bitmap::new();
+        let vectors = [Vector::new(0x21), Vector::new(0x5F), Vector::new(0xE0)];
+        for vector in vectors {
+            bitmap.set(vector);
+        }
+        for vector in vectors.into_iter().rev() {
+            assert_eq!(bitmap.take_highest(), Some(vector));
+        }
+        assert_eq!(bitmap.take_highest(), None);
+        assert!(bitmap.is_empty());
+    }
+
+    #[test]
+    fn a_guest_reads_the_slot_its_vectors_bits_are_in() {
+        let bitmap = Bitmap::new();
+        // The first vector of the second register, and the last of the first.
+        bitmap.set(Vector::new(32));
+        bitmap.set(Vector::new(31));
+
+        assert_eq!(bitmap.slot(0), Some(1 << 31));
+        assert_eq!(bitmap.slot(1), Some(1));
+        assert_eq!(bitmap.slot(2), Some(0));
+        assert_eq!(
+            bitmap.slot(SLOTS),
+            None,
+            "a slot past the eight the register file has is not a register"
+        );
+    }
+
+    #[test]
+    fn a_seeded_bitmap_reads_back_what_hardware_was_holding() {
+        let bitmap = Bitmap::new();
+        let mut words = [0; SLOTS];
+        words[0] = 0b101;
+        words[SLOTS - 1] = 1 << 31;
+        bitmap.seed(&words);
+
+        assert!(bitmap.get(Vector::new(0)) && bitmap.get(Vector::new(2)));
+        assert_eq!(bitmap.highest(), Some(Vector::new(u8::MAX)));
+        assert_eq!(bitmap.count(), 3);
+
+        bitmap.reset();
+        assert!(bitmap.is_empty());
+    }
 }

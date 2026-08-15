@@ -3,8 +3,8 @@
 //!
 //! The three bitmaps and the operations that move a vector between them. Which
 //! processor may perform which is the division of labour [`crate::registers`]
-//! states: any processor may accept an interrupt into a controller, and only the
-//! processor the controller belongs to may take one out again.
+//! states: any processor may accept an interrupt into a controller, and only
+//! the processor the controller belongs to may take one out again.
 
 use core::sync::atomic::Ordering;
 
@@ -12,23 +12,25 @@ use descriptors::Vector;
 use log::trace;
 
 use crate::{
+    lifecycle::ledger::InService,
     priority,
     registers::{Vlapic, error::Errors, icr::Trigger},
 };
 
 impl Vlapic {
-    /// One slot of the interrupt-request register, as the guest reads it.
-    pub(crate) fn request_slot(&self, slot: usize) -> u32 {
+    /// One slot of the interrupt-request register, as the guest reads it, or
+    /// `None` for a slot the register does not have.
+    pub(crate) fn request_slot(&self, slot: usize) -> Option<u32> {
         self.request.slot(slot)
     }
 
     /// One slot of the in-service register.
-    pub(crate) fn in_service_slot(&self, slot: usize) -> u32 {
+    pub(crate) fn in_service_slot(&self, slot: usize) -> Option<u32> {
         self.in_service.slot(slot)
     }
 
     /// One slot of the trigger-mode register.
-    pub(crate) fn trigger_mode_slot(&self, slot: usize) -> u32 {
+    pub(crate) fn trigger_mode_slot(&self, slot: usize) -> Option<u32> {
         self.trigger_mode.slot(slot)
     }
 
@@ -246,10 +248,14 @@ impl Vlapic {
     /// caller does afterwards, because the two must not come apart: a guest's
     /// acknowledgement is exactly the event that makes an acknowledgement to
     /// real hardware permissible, and nothing else ever will be.
-    pub(crate) fn end_of_interrupt(&self) -> Option<Vector> {
+    ///
+    /// `controller` is the real controller of the processor whose guest is
+    /// acknowledging, which is this processor: a guest's acknowledgement comes
+    /// out of the guest, and the guest runs nowhere else.
+    pub(crate) fn end_of_interrupt(&self, controller: &impl InService) -> Option<Vector> {
         let vector = self.in_service.take_highest()?;
         self.trigger_mode.clear(vector);
-        self.ledger.release(vector);
+        self.ledger.release(vector, controller);
         Some(vector)
     }
 

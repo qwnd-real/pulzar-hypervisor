@@ -142,12 +142,12 @@ impl Register {
     /// only two things that need it, and both are bounded by
     /// [`VECTOR_SLOTS`].
     const fn offset_by(self, slots: u32) -> Self {
-        Self(self.0 + slots * STRIDE)
+        Self(self.0 + slots * REGISTER_STRIDE)
     }
 
     /// The model-specific register x2APIC puts this register in.
     const fn msr(self) -> u32 {
-        X2APIC_BASE_MSR + self.0 / STRIDE
+        X2APIC_BASE_MSR + self.0 / REGISTER_STRIDE
     }
 }
 
@@ -257,12 +257,19 @@ pub(crate) const fn version_number(version: u32) -> u32 {
 }
 
 /// Index of the model-specific register the register at offset zero maps to.
-const X2APIC_BASE_MSR: u32 = 0x800;
+///
+/// Public because the emulated controller derives the same indices from the same
+/// offsets, and the derivation is the architecture's rather than either crate's:
+/// two copies of it would be two answers to the question of which register a
+/// guest's `RDMSR` names.
+pub const X2APIC_BASE_MSR: u32 = 0x800;
 
 /// Bytes between one memory-mapped register and the next. Each is 32 bits wide
 /// and each gets a 16-byte slot, which is why dividing by it turns an offset
 /// into a model-specific register index.
-const STRIDE: u32 = 16;
+///
+/// Public for the reason [`X2APIC_BASE_MSR`] is.
+pub const REGISTER_STRIDE: u32 = 16;
 
 /// The single model-specific register x2APIC gives the interrupt command, in
 /// place of the two the older interface splits it across.

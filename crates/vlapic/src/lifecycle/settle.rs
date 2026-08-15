@@ -67,7 +67,7 @@ pub(crate) fn applied(vlapic: &Vlapic) -> Resumption {
 /// issuing it is running on.
 fn discharge(vlapic: &Vlapic) {
     let quiet = sources::quiesce(vlapic) & timer::disarm(vlapic);
-    let settled = vlapic.ledger().settle();
+    let settled = vlapic.ledger().settle(&apic::local().ok());
     if quiet && settled {
         trace!(
             "vlapic: {} quieted its sources and settled its debts for a guest that was reset",

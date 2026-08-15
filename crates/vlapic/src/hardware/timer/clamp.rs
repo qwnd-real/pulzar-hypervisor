@@ -1,5 +1,5 @@
-//! Keeping a pathological period off physical hardware, and hiding nothing about
-//! having done it.
+//! Keeping a pathological period off physical hardware, and hiding nothing
+//! about having done it.
 //!
 //! A guest may ask its periodic timer for an interval shorter than the machine
 //! can answer without spending all of its time answering. The count put on
@@ -10,19 +10,75 @@
 
 use apic::{Divisor, TimerMode as HardwareMode};
 use clock::Frequency;
+use descriptors::Vector;
 use log::warn;
 
 use crate::{
     hardware::timer::divisor,
-    registers::{Vlapic, lvt::{Entry, TimerMode}},
+    registers::{
+        Vlapic,
+        lvt::{Entry, TimerMode},
+    },
 };
+
+/// What lengthening a period needs of the physical timer.
+///
+/// Three operations, and the reason they are a trait rather than
+/// [`apic::Timer`] itself is that the sequence they are performed in is the
+/// whole of this module's difficulty: a short count must never be visible on an
+/// unmasked entry, so the order is mask, reload, unmask, and getting it wrong
+/// is a storm of interrupts on a physical processor. Taking the timer as a
+/// parameter is what lets that order be checked without one.
+pub(super) trait Physical {
+    /// What the timer has left to count.
+    fn remaining(&self) -> u32;
+
+    /// Says what the timer delivers, in which mode, at what rate. Delivering
+    /// `None` is what masks it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the controller refused.
+    fn configure(
+        &self,
+        delivery: Option<Vector>,
+        mode: HardwareMode,
+        divisor: Divisor,
+    ) -> Result<(), apic::ApicError>;
+
+    /// Starts it counting down from `count`, or stops it for a count of zero.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the controller refused.
+    fn reload(&self, count: u32) -> Result<(), apic::ApicError>;
+}
+
+impl Physical for apic::Timer {
+    fn remaining(&self) -> u32 {
+        apic::Timer::remaining(*self)
+    }
+
+    fn configure(
+        &self,
+        delivery: Option<Vector>,
+        mode: HardwareMode,
+        divisor: Divisor,
+    ) -> Result<(), apic::ApicError> {
+        apic::Timer::configure(*self, delivery, mode, divisor)
+    }
+
+    fn reload(&self, count: u32) -> Result<(), apic::ApicError> {
+        apic::Timer::reload(*self, count)
+    }
+}
 
 /// Reconfigures a timer, lengthening an already-running unsafe period without
 /// exposing the short count on an unmasked physical entry.
 pub(super) fn reconfigure(
     vlapic: &Vlapic,
-    timer: apic::Timer,
-    delivery: Option<descriptors::Vector>,
+    timer: &impl Physical,
+    delivery: Option<Vector>,
     mode: HardwareMode,
     divisor: Divisor,
 ) -> Result<(), apic::ApicError> {

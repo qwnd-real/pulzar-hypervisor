@@ -73,7 +73,6 @@ mod tests {
         assert!(rest.legal(Mode::XApic));
     }
 
-
     #[test]
     fn the_vectorless_modes_must_be_sent_with_the_field_clear() {
         // A system-management interrupt and an INIT, each carrying a vector the
@@ -89,7 +88,6 @@ mod tests {
         // it clear, so one carrying a number is still a command.
         assert!(Command::from_bits(0x0000_0430).legal(Mode::XApic));
     }
-
 
     #[test]
     fn the_synchronisation_message_is_only_ever_a_broadcast() {

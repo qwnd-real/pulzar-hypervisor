@@ -23,9 +23,11 @@
 //! because their indices are reserved, and the self-interrupt register exists
 //! only in x2APIC because there is no offset it would sit at.
 
+use apic::{REGISTER_STRIDE, X2APIC_BASE_MSR};
+
 use crate::{
     hardware::model::Model,
-    registers::{base::Mode, lvt::Entry},
+    registers::{base::Mode, bitmap::SLOTS, lvt::Entry},
 };
 
 /// One of the controller's registers, named by its offset in the memory-mapped
@@ -106,7 +108,7 @@ impl Register {
     /// undefined, so an access to one of them is an access to a reserved
     /// address rather than to part of a register.
     pub(crate) const fn at(offset: u64) -> Option<Self> {
-        if offset >= PAGE || !offset.is_multiple_of(STRIDE as u64) {
+        if offset >= PAGE || !offset.is_multiple_of(REGISTER_STRIDE as u64) {
             return None;
         }
         #[expect(
@@ -121,7 +123,7 @@ impl Register {
         if index < X2APIC_BASE_MSR || index > X2APIC_LAST_MSR {
             return None;
         }
-        Some(Self((index - X2APIC_BASE_MSR) * STRIDE))
+        Some(Self((index - X2APIC_BASE_MSR) * REGISTER_STRIDE))
     }
 
     /// Its offset in the memory-mapped page.
@@ -131,11 +133,19 @@ impl Register {
 
     /// Which of a bank's eight slots this is, given the register the bank
     /// starts at.
+    ///
+    /// The count of slots is the bitmap's own rather than a second one, because
+    /// the bank a guest reads *is* that bitmap: a disagreement would be a guest
+    /// read of the register at the top of a bank answered out of nothing.
     pub(crate) const fn slot_of(self, first: Self) -> Option<usize> {
-        if self.0 < first.0 || self.0 >= first.0 + BANK_SLOTS * STRIDE {
+        if self.0 < first.0 {
             return None;
         }
-        Some(((self.0 - first.0) / STRIDE) as usize)
+        let slot = ((self.0 - first.0) / REGISTER_STRIDE) as usize;
+        if slot >= SLOTS {
+            return None;
+        }
+        Some(slot)
     }
 
     /// Which bank of one-bit-per-vector registers this is in, and which of its
@@ -189,7 +199,17 @@ impl Access {
     /// passed-through interrupt is routed by the *real* identifier, which is
     /// not the guest's to move.
     pub(crate) fn of(register: Register, mode: Mode, model: Model) -> Self {
-        let x2apic = matches!(mode, Mode::X2Apic);
+        // Matched exhaustively rather than compared against the one mode that
+        // answers differently, so that a mode added later cannot silently be
+        // answered for as though it were the older face. A switched-off
+        // controller has no registers at all in either face, and both callers
+        // establish the mode before asking — so what it is told here is never
+        // read, and the older face's answers are the honest thing to describe
+        // it with.
+        let x2apic = match mode {
+            Mode::X2Apic => true,
+            Mode::XApic | Mode::Disabled => false,
+        };
         match register {
             // An entry this controller does not have is not a register at all.
             // Three of the seven are optional, the model takes its count from
@@ -267,20 +287,17 @@ const fn banked(register: Register) -> Access {
     }
 }
 
-/// How many 32-bit registers one bank of one-bit-per-vector state spans.
-const BANK_SLOTS: u32 = 8;
-
-/// Bytes between one memory-mapped register and the next.
-///
-/// Each register is 32 bits wide and each gets a 16-byte slot, which is why
-/// dividing an offset by this turns it into a model-specific register index.
-const STRIDE: u32 = 16;
-
-/// Index of the model-specific register the register at offset zero maps to.
-pub(crate) const X2APIC_BASE_MSR: u32 = 0x800;
-
 /// The last index the architecture reserves for the controller.
+///
+/// Its own constant rather than the real controller's, because it bounds what
+/// this crate *intercepts* rather than what it can reach: an index in the range
+/// that names no register still has to be answered, with a fault, and one that
+/// is never intercepted is one a guest executes against real hardware.
 pub(crate) const X2APIC_LAST_MSR: u32 = 0x8FF;
 
 /// How long the memory-mapped register page is.
-const PAGE: u64 = 4096;
+///
+/// Where the page ends is what makes an offset past it a reserved address rather
+/// than a register, so this belongs to the register table and the aperture that
+/// answers for the page takes its length from here.
+pub(super) const PAGE: u64 = 4096;

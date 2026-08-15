@@ -56,7 +56,7 @@ use crate::{
     VlapicError,
     face::{
         dispatch,
-        table::{Access, Register},
+        table::{Access, PAGE, Register},
     },
     machine::registry::{Page, lapics},
     registers::{
@@ -73,7 +73,7 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`VlapicError::NotInstalled`] before [`install`].
+/// [`VlapicError::NotInstalled`] before [`crate::install`].
 pub fn region() -> Result<Region, VlapicError> {
     let page = lapics()?;
     Ok(Region {
@@ -282,15 +282,12 @@ const fn named(offset: u64, width: Width) -> Named {
     }
 }
 
-/// How long the memory-mapped register page is.
-const PAGE: u64 = 4096;
-
 #[cfg(test)]
 mod tests {
     //! What a controller does with a well-formed access is
-    //! [`crate::face::dispatch`]'s and is tested there. What is here is the whole of
-    //! what this face decides: which accesses reach it at all, and what a
-    //! malformed one names.
+    //! [`crate::face::dispatch`]'s and is tested there. What is here is the
+    //! whole of what this face decides: which accesses reach it at all, and
+    //! what a malformed one names.
     //!
     //! A controller cannot be built on a host — one is made from a roster
     //! entry, and a roster comes from firmware's tables — so the decisions

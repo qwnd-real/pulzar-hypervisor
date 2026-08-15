@@ -1,7 +1,7 @@
 //! Which of the named processors a redirectable interrupt goes to.
 //!
-//! The rule is the guest processor's own and the two vendors disagree about both
-//! halves of it, which is why the choice belongs to
+//! The rule is the guest processor's own and the two vendors disagree about
+//! both halves of it, which is why the choice belongs to
 //! [`crate::hardware::model`] and only its application is here.
 
 use crate::{hardware::model::Arbitration, registers::Vlapic};
@@ -18,7 +18,10 @@ use crate::{hardware::model::Arbitration, registers::Vlapic};
 /// Neither picks a processor that is not accepting: a controller that is
 /// switched off or software-disabled would refuse the interrupt, and selecting
 /// it would lose the delivery for every eligible processor as well.
-pub(super) fn least_busy<'a>(from: &Vlapic, targets: impl Iterator<Item = &'a Vlapic>) -> Option<&'a Vlapic> {
+pub(super) fn least_busy<'a>(
+    from: &Vlapic,
+    targets: impl Iterator<Item = &'a Vlapic>,
+) -> Option<&'a Vlapic> {
     let eligible = targets.filter(|target| target.accepting());
     match from.model().arbitration() {
         Arbitration::AmdArbitrationPriority => eligible.min_by(|left, right| {

@@ -29,9 +29,9 @@
 mod shape;
 mod table;
 
-pub(crate) use crate::registers::lvt::shape::{Delivery, Lvt, TimerMode};
 use descriptors::Vector;
 
+pub(crate) use crate::registers::lvt::shape::{Delivery, Lvt, TimerMode};
 use crate::{face::table::Register, hardware::model::Model};
 
 /// Which of the seven entries a value belongs to.
@@ -211,6 +211,31 @@ const COUNTING_MODE_FIELD: u8 = 0b01;
 
 /// The bit that masks a local-vector-table entry.
 pub(super) const MASKED: u32 = 1 << 16;
+
+/// A controller has exactly the first however-many of [`Entry::ALL`], and
+/// [`Model::has`] answers that from an entry's own position — so the list has to
+/// be in the order the discriminants are, or a guest would be handed an entry its
+/// controller does not have and refused one it does.
+const _: () = {
+    let mut index = 0;
+    while index < Entry::COUNT {
+        assert!(
+            Entry::ALL[index].index() == index,
+            "every entry has to sit at the position its own index names"
+        );
+        index += 1;
+    }
+};
+
+/// The table the guest programs has to be as long as the one the real controller
+/// has entries in, because a controller is seeded from a capture of those entries
+/// and every one of them is programmed back onto real hardware. A shorter table
+/// here would drop an entry firmware left armed; a longer one would offer the
+/// guest a register with no source behind it.
+const _: () = assert!(
+    Entry::COUNT == apic::LVT_ENTRIES,
+    "the guest's table and the real controller's have to have the same entries"
+);
 #[cfg(test)]
 mod tests {
     use descriptors::Vector;
@@ -247,7 +272,6 @@ mod tests {
         }
         assert_eq!(Entry::of(Register::SPURIOUS), None);
     }
-
 
     #[test]
     fn only_the_pins_describe_a_wire() {

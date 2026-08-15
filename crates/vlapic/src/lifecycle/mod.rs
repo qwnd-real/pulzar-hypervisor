@@ -4,8 +4,8 @@
 //! Two things that look unrelated and are the same subject. A guest that is
 //! reset stops existing: nothing it was in the middle of will be finished, and
 //! nothing it was owed will be collected. So the two questions a lifecycle
-//! boundary asks are what the new guest finds — [`settle`] — and what the machine
-//! is still holding for the old one — [`ledger`].
+//! boundary asks are what the new guest finds — [`settle()`] — and what the
+//! machine is still holding for the old one — [`ledger`].
 //!
 //! Every operation here is performed by a processor about itself, at an exit
 //! boundary. That is what makes resetting a whole register file safe without a
@@ -36,7 +36,7 @@ pub fn settle() -> Result<settle::Resumption, VlapicError> {
 /// is nothing to run, and there will be nothing to run until another processor
 /// starts this one, which may never happen. The processor halts, and the
 /// interrupt that wakes it is either the doorbell that says a message arrived
-/// or something unrelated — so a caller consults [`settle`] again rather than
+/// or something unrelated — so a caller consults [`settle()`] again rather than
 /// assuming the wait ended for the reason it was entered.
 ///
 /// # Errors

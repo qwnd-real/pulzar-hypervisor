@@ -1,9 +1,9 @@
 //! What every controller on the machine is doing, on demand.
 //!
 //! What is worth having here is the state that says something is stuck: a
-//! controller with interrupts requested and never taken, or one still owing real
-//! hardware an acknowledgement, is the shape both an interrupt storm and a lost
-//! wakeup show up as.
+//! controller with interrupts requested and never taken, or one still owing
+//! real hardware an acknowledgement, is the shape both an interrupt storm and a
+//! lost wakeup show up as.
 
 use log::info;
 

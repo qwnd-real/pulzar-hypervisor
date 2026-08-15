@@ -46,11 +46,10 @@ mod command;
 mod decode;
 mod legal;
 
-pub(crate) use crate::registers::icr::decode::{Delivery, DestinationMode, Shorthand, Trigger};
-
 use core::sync::atomic::Ordering;
 
 use crate::registers::Vlapic;
+pub(crate) use crate::registers::icr::decode::{Delivery, DestinationMode, Shorthand, Trigger};
 
 /// One interrupt command, in the sixty-four bits both faces describe it with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

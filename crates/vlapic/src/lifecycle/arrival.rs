@@ -1,21 +1,26 @@
-//! The seam every interrupt that arrived on real hardware and belongs to a guest
-//! reaches.
+//! The seam every interrupt that arrived on real hardware and belongs to a
+//! guest reaches.
 //!
-//! What arrives is a physical vector nothing in the hypervisor claimed, which on
-//! a machine whose I/O controllers are passed through means it was meant for the
-//! guest. Nothing is translated, and nothing has to be: every source the guest
-//! can reach is programmed onto real hardware with the guest's own vector.
+//! What arrives is a physical vector nothing in the hypervisor claimed, which
+//! on a machine whose I/O controllers are passed through means it was meant for
+//! the guest. Nothing is translated, and nothing has to be: every source the
+//! guest can reach is programmed onto real hardware with the guest's own
+//! vector.
 //!
-//! Whether real hardware may be acknowledged now is the whole of what is decided
-//! here, and the controller itself is asked — it recorded, as it accepted the
-//! interrupt, whether the interrupt arrived level triggered.
+//! Whether real hardware may be acknowledged now is the whole of what is
+//! decided here, and the controller itself is asked — it recorded, as it
+//! accepted the interrupt, whether the interrupt arrived level triggered.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use descriptors::Vector;
 use log::{trace, warn};
 
-use crate::{VlapicError, machine::current, registers::{Accepted, icr::Trigger}};
+use crate::{
+    VlapicError,
+    machine::current,
+    registers::{Accepted, icr::Trigger},
+};
 
 /// Gives this processor's guest an interrupt that arrived on real hardware.
 ///
@@ -36,7 +41,7 @@ use crate::{VlapicError, machine::current, registers::{Accepted, icr::Trigger}};
 ///
 /// # Errors
 ///
-/// [`VlapicError::NotInstalled`] before [`install`], or [`VlapicError::Apic`]
+/// [`VlapicError::NotInstalled`] before [`crate::install`], or [`VlapicError::Apic`]
 /// if the real controller could not be asked or acknowledged.
 pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     let vlapic = current()?;
@@ -93,7 +98,7 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
             // does not exist. Settling here is what stops a refused interrupt
             // occupying a real in-service slot for the life of the machine,
             // blocking everything of its priority or lower on this processor.
-            vlapic.ledger().release(vector);
+            vlapic.ledger().release(vector, &local);
             warn!(
                 "vlapic: {} received level {vector} but is not accepting it: {refused:?}, real in \
                  service {:?}",
@@ -104,7 +109,6 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     }
     Ok(())
 }
-
 
 /// How many interrupts have reached [`arrived`] on this machine.
 ///

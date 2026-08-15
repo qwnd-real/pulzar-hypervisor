@@ -2,10 +2,11 @@
 //!
 //! Two facts rather than one, and the second is the one a per-processor flag
 //! cannot be. A processor's own claim is made by that processor, so "not taken
-//! over yet" and "never going to be" read identically from the outside — and the
-//! difference between them is whether a guest's startup message may be put on
-//! real hardware. So the machine keeps a fence as well: once the host has
-//! finished starting processors, whatever has not been taken over never will be.
+//! over yet" and "never going to be" read identically from the outside — and
+//! the difference between them is whether a guest's startup message may be put
+//! on real hardware. So the machine keeps a fence as well: once the host has
+//! finished starting processors, whatever has not been taken over never will
+//! be.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,7 +48,7 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`VlapicError::NotInstalled`] before [`install`], [`VlapicError::NoLapic`]
+/// [`VlapicError::NotInstalled`] before [`crate::install`], [`VlapicError::NoLapic`]
 /// if the roster does not describe this processor, or [`VlapicError::Apic`] if
 /// the real timer cannot be measured.
 pub fn claim_processor(id: cpu::ApicId, joining: Joining) -> Result<(), VlapicError> {
@@ -110,7 +111,6 @@ pub(crate) fn owns(vlapic: &Vlapic) -> bool {
 pub(crate) fn brought_up() -> bool {
     BROUGHT_UP.load(Ordering::Acquire)
 }
-
 
 /// Whether every processor that will ever be this hypervisor's already is.
 ///

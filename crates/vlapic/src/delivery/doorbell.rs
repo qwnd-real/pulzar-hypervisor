@@ -1,26 +1,27 @@
 //! How a processor that has stopped looking at its controller is made to look
 //! again.
 //!
-//! Accepting an interrupt into another processor's controller is a bit set in an
-//! atomic, and it costs nothing. What costs something is that the target may
+//! Accepting an interrupt into another processor's controller is a bit set in
+//! an atomic, and it costs nothing. What costs something is that the target may
 //! have stopped looking — inside the guest, or halted waiting to be started —
-//! and will not look again until something makes it. So a real interrupt is sent
-//! to force one.
+//! and will not look again until something makes it. So a real interrupt is
+//! sent to force one.
 //!
-//! That pairing is where a lost wakeup would live, and the order on both sides is
-//! what stops one:
+//! That pairing is where a lost wakeup would live, and the order on both sides
+//! is what stops one:
 //!
 //! - Here: set the request bit, *then* read whether the target is away.
 //! - There: store that it is away, *then* re-read what has been left for it.
 //!
-//! Both stores are sequentially consistent, so at least one side sees the other.
-//! If this side misses the flag, the target's re-read finds the bit; if the
-//! target's re-read misses the bit, this side sees the flag and sends the
+//! Both stores are sequentially consistent, so at least one side sees the
+//! other. If this side misses the flag, the target's re-read finds the bit; if
+//! the target's re-read misses the bit, this side sees the flag and sends the
 //! interrupt. There is no interleaving in which both miss.
 //!
-//! And a doorbell that arrives while the target is between `CLGI` and `VMRUN` is
-//! not lost either: the interrupt is held by the cleared global interrupt flag,
-//! and the maskable-interrupt intercept turns it into an immediate exit on entry.
+//! And a doorbell that arrives while the target is between `CLGI` and `VMRUN`
+//! is not lost either: the interrupt is held by the cleared global interrupt
+//! flag, and the maskable-interrupt intercept turns it into an immediate exit
+//! on entry.
 
 use core::num::NonZeroU64;
 
@@ -28,7 +29,10 @@ use cpu::CpuIndex;
 use log::{trace, warn};
 use spin::Once;
 
-use crate::{VlapicError, registers::{Vlapic, error::Errors}};
+use crate::{
+    VlapicError,
+    registers::{Vlapic, error::Errors},
+};
 
 /// Acquires the interrupt this hypervisor rings a processor with.
 ///

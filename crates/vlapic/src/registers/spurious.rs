@@ -1,5 +1,5 @@
-//! The spurious-interrupt vector register, which is also the switch that decides
-//! whether the controller delivers anything at all.
+//! The spurious-interrupt vector register, which is also the switch that
+//! decides whether the controller delivers anything at all.
 //!
 //! Software-disabling a controller through it is a transition rather than a
 //! flag, and that is the whole reason this register is not simply stored: the

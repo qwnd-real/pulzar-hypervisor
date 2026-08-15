@@ -1,11 +1,11 @@
 //! What each processor's own exit loop asks of its controller.
 //!
-//! Every one of these is about the processor calling it, and every one of them is
-//! a question the exit path has to ask afresh each time: what the guest is owed,
-//! what it was actually given, what priority it is running at, and whether it is
-//! watching its controller at all. Nothing here decides anything — the decisions
-//! are the controller's, in [`crate::registers`] — so what is left is finding this
-//! processor's controller and reporting what it says.
+//! Every one of these is about the processor calling it, and every one of them
+//! is a question the exit path has to ask afresh each time: what the guest is
+//! owed, what it was actually given, what priority it is running at, and
+//! whether it is watching its controller at all. Nothing here decides anything
+//! — the decisions are the controller's, in [`crate::registers`] — so what is
+//! left is finding this processor's controller and reporting what it says.
 
 use descriptors::Vector;
 use log::trace;
@@ -30,7 +30,7 @@ use crate::{VlapicError, machine::current, registers::Vlapic};
 ///
 /// # Errors
 ///
-/// As [`read_msr`].
+/// As [`crate::read_msr`].
 pub fn select() -> Result<Option<Vector>, VlapicError> {
     current().map(Vlapic::select)
 }
@@ -53,7 +53,7 @@ pub fn select() -> Result<Option<Vector>, VlapicError> {
 ///
 /// # Errors
 ///
-/// As [`read_msr`].
+/// As [`crate::read_msr`].
 pub fn pending() -> Result<Option<Vector>, VlapicError> {
     current().map(Vlapic::pending)
 }
@@ -66,7 +66,7 @@ pub fn pending() -> Result<Option<Vector>, VlapicError> {
 ///
 /// # Errors
 ///
-/// As [`read_msr`].
+/// As [`crate::read_msr`].
 pub fn committed(vector: Vector) -> Result<(), VlapicError> {
     current().map(|vlapic| {
         if !vlapic.committed(vector) {
@@ -86,7 +86,7 @@ pub fn committed(vector: Vector) -> Result<(), VlapicError> {
 ///
 /// # Errors
 ///
-/// As [`read_msr`].
+/// As [`crate::read_msr`].
 pub fn take_nmi() -> Result<bool, VlapicError> {
     current().map(Vlapic::take_nmi)
 }
@@ -99,7 +99,7 @@ pub fn take_nmi() -> Result<bool, VlapicError> {
 ///
 /// # Errors
 ///
-/// As [`read_msr`].
+/// As [`crate::read_msr`].
 pub fn raise_nmi() -> Result<(), VlapicError> {
     current().map(Vlapic::raise_nmi)
 }
@@ -132,7 +132,7 @@ pub fn observe_task_priority(class: u8) {
 ///
 /// # Errors
 ///
-/// As [`read_msr`].
+/// As [`crate::read_msr`].
 pub fn task_priority() -> Result<u8, VlapicError> {
     current().map(|vlapic| vlapic.task_priority().get())
 }
@@ -141,14 +141,15 @@ pub fn task_priority() -> Result<u8, VlapicError> {
 ///
 /// The second half of the protocol that stops an interrupt being lost to a
 /// processor that was entering the guest as it arrived. A caller must store
-/// `true` and then consult [`take_deliverable`] once more before it actually
-/// enters, abandoning the entry if something appeared in between — and store
+/// `true` and then consult [`select`] and [`pending`] once more before it
+/// actually enters, abandoning the entry if something appeared in between — and
+/// store
 /// `false` on the way out, because a processor answering an exit will consult
 /// its controller again on its own and needs nothing to remind it.
 ///
 /// # Errors
 ///
-/// As [`read_msr`].
+/// As [`crate::read_msr`].
 pub fn set_away(away: bool) -> Result<(), VlapicError> {
     current().map(|vlapic| vlapic.set_away(away))
 }

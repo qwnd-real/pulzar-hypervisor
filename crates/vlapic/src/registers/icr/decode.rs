@@ -3,8 +3,8 @@
 //! Every field whose meaning depends on the face it arrived through takes the
 //! mode as an argument rather than being decoded twice, and every field the
 //! hardware reads past is answered here rather than at each caller: a caller
-//! given the bits software happened to leave in a field nothing reads would have
-//! to know which fields those are.
+//! given the bits software happened to leave in a field nothing reads would
+//! have to know which fields those are.
 
 use descriptors::Vector;
 

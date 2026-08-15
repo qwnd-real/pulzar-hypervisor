@@ -7,12 +7,10 @@
 //! identifier is and which logical model it matches by, and one command may
 //! reach controllers that disagree about both.
 
-use crate::{
-    registers::{
-        Vlapic,
-        base::Mode,
-        icr::{Command, DestinationMode, Shorthand},
-    },
+use crate::registers::{
+    Vlapic,
+    base::Mode,
+    icr::{Command, DestinationMode, Shorthand},
 };
 
 /// Which processors a command names.

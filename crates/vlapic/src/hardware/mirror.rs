@@ -1,21 +1,24 @@
 //! Bringing the real controller into agreement with the guest's, when the guest
 //! changes which face it uses.
 //!
-//! Two registers of the real controller are not the host's to choose, because the
-//! I/O controllers are passed through: the guest programs them with logical
-//! destinations directly, and hardware matches those against the *real* register.
-//! A disagreement is an interrupt delivered to the wrong processor or to none,
-//! which is how a guest ends up unable to find its own disk.
+//! Two registers of the real controller are not the host's to choose, because
+//! the I/O controllers are passed through: the guest programs them with logical
+//! destinations directly, and hardware matches those against the *real*
+//! register. A disagreement is an interrupt delivered to the wrong processor or
+//! to none, which is how a guest ends up unable to find its own disk.
 //!
 //! How agreement is reached differs between the faces, and in x2APIC it is
-//! reached by moving the real controller rather than by writing anything — which
-//! is the whole reason [`promote`] exists.
+//! reached by moving the real controller rather than by writing anything —
+//! which is the whole reason [`promote`] exists.
 
 use log::{info, trace, warn};
 
 use crate::{
     hardware::{sources, timer},
-    registers::{Vlapic, base::Mode, base::Transition},
+    registers::{
+        Vlapic,
+        base::{Mode, Transition},
+    },
 };
 
 /// Brings real hardware across a change of face, and says so.

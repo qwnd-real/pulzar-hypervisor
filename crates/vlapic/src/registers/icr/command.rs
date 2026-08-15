@@ -1,10 +1,10 @@
-//! The register as sixty-four bits: which of them software owns, and how the two
-//! faces divide them up.
+//! The register as sixty-four bits: which of them software owns, and how the
+//! two faces divide them up.
 //!
-//! Nothing here reads a field for its meaning; [`super::decode`] does that. What
-//! is here is the layout — stated once, as [`Field`]s — and the three writable
-//! masks built out of it, so that a mask cannot drift away from the fields it is
-//! made of.
+//! Nothing here reads a field for its meaning; [`super::decode`] does that.
+//! What is here is the layout — stated once, as [`Field`]s — and the three
+//! writable masks built out of it, so that a mask cannot drift away from the
+//! fields it is made of.
 
 use crate::registers::icr::Command;
 
@@ -163,8 +163,8 @@ pub(super) const DESTINATION_XAPIC: Field = Field::new(24, 8);
 
 #[cfg(test)]
 mod tests {
-    //! The masks are written out as the values a guest may write, so that a test
-    //! fails when a field moves rather than moving with it.
+    //! The masks are written out as the values a guest may write, so that a
+    //! test fails when a field moves rather than moving with it.
 
     use crate::registers::icr::Command;
 

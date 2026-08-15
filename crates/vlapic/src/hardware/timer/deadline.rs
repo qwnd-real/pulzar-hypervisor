@@ -1,15 +1,16 @@
 //! The timestamp-counter deadline, which is an appointment rather than a count.
 //!
-//! Nothing about it is mirrored in this crate. Hardware clears the register when
-//! the deadline fires, and nothing about that expiry is visible anywhere else, so
-//! a software copy would go stale exactly once per expiry and would then be
-//! re-armed by the next reconfiguration — firing immediately, from a moment
-//! already in the past.
+//! Nothing about it is mirrored in this crate. Hardware clears the register
+//! when the deadline fires, and nothing about that expiry is visible anywhere
+//! else, so a software copy would go stale exactly once per expiry and would
+//! then be re-armed by the next reconfiguration — firing immediately, from a
+//! moment already in the past.
 //!
-//! The guest's timestamp counter is offset from the host's by its control block,
-//! so a deadline is translated on the way in and out by the face that carries it.
-//! An offset change rebases the armed deadline here, before the new offset is
-//! published, so an absolute appointment stays the same guest-visible number.
+//! The guest's timestamp counter is offset from the host's by its control
+//! block, so a deadline is translated on the way in and out by the face that
+//! carries it. An offset change rebases the armed deadline here, before the new
+//! offset is published, so an absolute appointment stays the same guest-visible
+//! number.
 
 use apic::LocalApic;
 use log::warn;

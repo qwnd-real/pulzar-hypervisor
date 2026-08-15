@@ -4,10 +4,10 @@
 //! Everything here is written by one processor and read by another, which is
 //! what the orderings are for and why none of it can live with the exit loop
 //! that consumes it. A startup message arrives from whichever processor sent it
-//! and is applied by its target at an exit boundary; a non-maskable interrupt is
-//! counted by the sender and drained by the target; and the two flags — whether
-//! the target is watching its controller, and whether this hypervisor owns the
-//! processor at all — are each set by one side and read by the other.
+//! and is applied by its target at an exit boundary; a non-maskable interrupt
+//! is counted by the sender and drained by the target; and the two flags —
+//! whether the target is watching its controller, and whether this hypervisor
+//! owns the processor at all — are each set by one side and read by the other.
 //!
 //! What is *not* here is what any of it means. Applying a startup message is
 //! [`crate::lifecycle`]'s, and whether one may be put on real hardware is
@@ -138,8 +138,8 @@ impl Vlapic {
             .store(Startup::InitRequested as u8, Ordering::SeqCst);
     }
 
-    /// Offers a start-up page, which takes only if this processor is waiting for
-    /// one.
+    /// Offers a start-up page, which takes only if this processor is waiting
+    /// for one.
     pub(crate) fn request_sipi(&self, page: StartupPage) -> bool {
         if self.startup() != Startup::WaitingForSipi {
             return false;
@@ -171,8 +171,8 @@ impl Vlapic {
 /// the command that carries it: a processor released by one begins in real mode
 /// at the start of this page, and nothing is ever delivered on the number. The
 /// two are kept apart so that neither can be handed to the other's callers —
-/// which is a real hazard here, because the same eight bits of the same register
-/// are a vector under every other delivery mode.
+/// which is a real hazard here, because the same eight bits of the same
+/// register are a vector under every other delivery mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartupPage(u8);
 

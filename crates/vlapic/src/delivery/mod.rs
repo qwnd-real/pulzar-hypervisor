@@ -8,16 +8,16 @@
 //!
 //! # Delivering is setting a bit, and then telling somebody
 //!
-//! Both halves are needed and the second is the one easily forgotten: the target
-//! may not be looking at its controller. [`doorbell`] is that half, and the
-//! ordering that stops a wakeup being lost is stated there.
+//! Both halves are needed and the second is the one easily forgotten: the
+//! target may not be looking at its controller. [`doorbell`] is that half, and
+//! the ordering that stops a wakeup being lost is stated there.
 //!
 //! # Nothing here fails in a way the guest can see
 //!
 //! A command naming a mode the architecture reserves, or a processor that does
 //! not exist, is one real hardware would also do nothing useful with — so it is
-//! recorded in the sender's error status and dropped, which is what a controller
-//! does with a message nobody accepts.
+//! recorded in the sender's error status and dropped, which is what a
+//! controller does with a message nobody accepts.
 
 pub(crate) mod doorbell;
 
@@ -25,9 +25,8 @@ mod arbitration;
 mod destination;
 mod startup;
 
-use log::{trace, warn};
-
 use descriptors::Vector;
+use log::{trace, warn};
 
 use crate::{
     delivery::{

@@ -60,11 +60,11 @@
 
 mod transition;
 
-pub(crate) use crate::registers::base::transition::{BaseFault, Transition};
-
 use core::fmt::{self, Display, Formatter};
 
 use apic::Controller;
+
+pub(crate) use crate::registers::base::transition::{BaseFault, Transition};
 
 /// Which interface the guest's controller answers through, which is the whole
 /// of what the two enable bits mean.
@@ -214,17 +214,20 @@ impl ApicBase {
     /// The whole of the architectural address field, however wide this
     /// processor implements it.
     ///
-    /// Not the same question as [`ApicBase::page`], and the difference is what
-    /// a relocation check has to be made against. The reserved-bit test
-    /// above is derived from the processor's own physical-address width,
-    /// which on some processors is wider than the bits 51:12 the page mask
-    /// keeps — so a write setting an address bit above the mask would pass
-    /// the reserved test, disappear in the mask, and compare equal to where
-    /// the page already is. The guest would then have been told its page
-    /// moved while this hypervisor went on trapping the old one.
+    /// Every bit that is not one of the flags, which is bits 63:12 — deliberately
+    /// wider than the 4 KiB page the field's low bits would give. The
+    /// reserved-bit test a write is judged against is derived from the
+    /// processor's own physical-address width, which on some processors is wider
+    /// than a page mask of bits 51:12 would keep, so a write setting an address
+    /// bit above such a mask would pass the reserved test, disappear in the mask,
+    /// and compare equal to where the page already is. The guest would then have
+    /// been told its page moved while this hypervisor went on trapping the old
+    /// one — which is why [`ApicBase::written`] compares this and
+    /// [`ApicBase::page_of`] answers with it.
     const fn address(self) -> u64 {
         self.0 & !(RESERVED_LOW | BOOTSTRAP | X2APIC_ENABLE | GLOBAL_ENABLE)
     }
+
     /// Whether this is the processor the guest was started on.
     pub(crate) const fn bootstrap(self) -> bool {
         self.0 & BOOTSTRAP != 0

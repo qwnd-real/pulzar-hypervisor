@@ -1,12 +1,12 @@
 //! Who this controller is, and which logical destinations it answers to.
 //!
 //! Two questions the guest may read and one it may not. The identifier is
-//! read-only for the reason [`crate::registers`] gives, and the version register
-//! describes the hardware behind this controller rather than anything the guest
-//! chose. The logical destination is writable in the older face and derived by
-//! the architecture in x2APIC, which is why it is computed here in that face
-//! rather than stored: hardware computes the same thing from the same number,
-//! and a guest cannot get the two out of step.
+//! read-only for the reason [`crate::registers`] gives, and the version
+//! register describes the hardware behind this controller rather than anything
+//! the guest chose. The logical destination is writable in the older face and
+//! derived by the architecture in x2APIC, which is why it is computed here in
+//! that face rather than stored: hardware computes the same thing from the same
+//! number, and a guest cannot get the two out of step.
 
 use core::sync::atomic::Ordering;
 

@@ -17,7 +17,7 @@
 //! are intercepted through the permission map, and the exit handler calls
 //! [`read_msr`] and [`write_msr`] directly.
 
-use apic::IA32_TSC_DEADLINE;
+use apic::{IA32_TSC_DEADLINE, X2APIC_BASE_MSR};
 use descriptors::Vector;
 use log::{trace, warn};
 
@@ -25,7 +25,7 @@ use crate::{
     VlapicError,
     face::{
         dispatch::{self, Written, acted},
-        table::{Access, Register, X2APIC_BASE_MSR, X2APIC_LAST_MSR},
+        table::{Access, Register, X2APIC_LAST_MSR},
     },
     hardware::timer,
     machine::current,

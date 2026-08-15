@@ -1,13 +1,13 @@
 //! What a write to the base register does to the controller behind it.
 //!
 //! [`super::ApicBase`] decides whether a write is one the architecture allows;
-//! this is what the controller does about one that is. The three answers are the
-//! three the architecture distinguishes, and the difference between them is what
-//! survives: a write naming the state already held changes nothing, the move
-//! between the two faces preserves the whole register file, and everything else
-//! is a lifecycle boundary that leaves the file as reset leaves it — which is why
-//! the physical hardware behind it has to be brought across before anything
-//! virtual moves.
+//! this is what the controller does about one that is. The three answers are
+//! the three the architecture distinguishes, and the difference between them is
+//! what survives: a write naming the state already held changes nothing, the
+//! move between the two faces preserves the whole register file, and everything
+//! else is a lifecycle boundary that leaves the file as reset leaves it — which
+//! is why the physical hardware behind it has to be brought across before
+//! anything virtual moves.
 
 use core::sync::atomic::Ordering;
 
@@ -17,9 +17,7 @@ use crate::{
     hardware::{model::Model, sources, timer},
     registers::{
         Vlapic,
-        base::{
-            ApicBase, BOOTSTRAP, GLOBAL_ENABLE, Mode, RESERVED_LOW, X2APIC_ENABLE,
-        },
+        base::{ApicBase, BOOTSTRAP, GLOBAL_ENABLE, Mode, RESERVED_LOW, X2APIC_ENABLE},
     },
 };
 
@@ -90,8 +88,13 @@ impl Vlapic {
         // Before anything virtual moves, and in this order: a source that is
         // still armed can deliver into whatever comes next, and a debt that is
         // still outstanding needs the register file that records it.
+        //
+        // The controller the debts are paid through is this processor's, and it
+        // is this processor's because the write being taken came out of the guest
+        // running here — the same thing that makes quieting the sources and
+        // stopping the timer legitimate.
         let quiet = sources::quiesce(self) & timer::disarm(self);
-        let settled = self.ledger.settle();
+        let settled = self.ledger.settle(&apic::local().ok());
 
         self.base.store(next.bits(), Ordering::Release);
         self.reset_registers();

@@ -20,11 +20,11 @@
 //!
 //! # And some writes ask for more than a store
 //!
-//! A guest's write to a controller is very often not merely a value: it can send
-//! an interrupt to another processor, retire one on this one, or change what real
-//! hardware is doing. What the register file itself cannot finish is answered as
-//! a [`Written`] and performed by [`acted`], which is where the two faces stop
-//! being two code paths.
+//! A guest's write to a controller is very often not merely a value: it can
+//! send an interrupt to another processor, retire one on this one, or change
+//! what real hardware is doing. What the register file itself cannot finish is
+//! answered as a [`Written`] and performed by [`acted`], which is where the two
+//! faces stop being two code paths.
 
 use apic::LocalApic;
 use descriptors::Vector;
@@ -157,7 +157,14 @@ fn read_indexed(vlapic: &Vlapic, register: Register) -> u32 {
             Bank::InService => vlapic.in_service_slot(slot),
             Bank::TriggerMode => vlapic.trigger_mode_slot(slot),
             Bank::InterruptRequest => vlapic.request_slot(slot),
-        };
+        }
+        // A slot the register file does not have cannot arrive here:
+        // [`Register::bank`] answers only for the eight registers a bank spans,
+        // and a bank has exactly as many slots as those registers because both
+        // counts are the same constant. Answering zero is what a register that
+        // held nothing would answer, which is the closest thing to nothing this
+        // face can say.
+        .unwrap_or(0);
     }
     Entry::of(register)
         .filter(|entry| vlapic.model().has(*entry))
@@ -275,7 +282,12 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // discharging whatever real hardware was owed for it is part of the
         // acknowledgement rather than something done after it.
         Written::EndOfInterrupt => {
-            let retired = vlapic.end_of_interrupt();
+            // The controller the withheld acknowledgements are paid through is
+            // this processor's, and it is resolved once: the guest that is
+            // acknowledging runs here, so the debts it discharges are this
+            // processor's hardware's.
+            let local = apic::local().ok();
+            let retired = vlapic.end_of_interrupt(&local);
             trace!(
                 "vlapic: {} acknowledged {retired:?}, leaving {} in service and {} requested at \
                  task priority {}, real in service {:?}, hardware {}",
@@ -283,7 +295,7 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
                 vlapic.in_service_count(),
                 vlapic.requested_count(),
                 vlapic.task_priority(),
-                apic::local().ok().and_then(LocalApic::in_service_top),
+                local.and_then(LocalApic::in_service_top),
                 if vlapic.ledger().is_empty() {
                     "owed nothing"
                 } else {

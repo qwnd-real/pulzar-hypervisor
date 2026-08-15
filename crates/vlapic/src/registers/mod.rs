@@ -122,8 +122,8 @@ pub(crate) struct Vlapic {
     away: AtomicBool,
     nmi: AtomicU8,
     owned: AtomicBool,
-    /// The last selection state [`Vlapic::report_selection`] logged, packed by
-    /// [`SelectionState::bits`], so a controller whose answer has not changed
+    /// The last selection state `Vlapic::report_selection` logged, packed into
+    /// one word by that function, so a controller whose answer has not changed
     /// stays quiet. Diagnostic only: nothing reads it back but the report.
     reported: AtomicU64,
 }

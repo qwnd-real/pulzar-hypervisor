@@ -1,7 +1,7 @@
 //! The shape all seven entries share: the bit layout, and the two fields whose
 //! encodings mean something.
 //!
-//! Which of these fields exist in a given entry is [`super::Entry::writable`]'s
+//! Which of these fields exist in a given entry is [`Entry::writable`](super::Entry::writable)'s
 //! to say — a field reserved in the entry holding it reads back zero, because
 //! the write that would have set it had the bit removed first — and which
 //! delivery modes an entry accepts is [`crate::hardware::model`]'s.
@@ -14,7 +14,7 @@ use descriptors::Vector;
 /// One local vector table entry, in the layout all seven share.
 ///
 /// Which of these fields mean anything depends on which entry a value came
-/// from, and [`Entry::writable`] is what answers that. A field reserved in the
+/// from, and [`Entry::writable`](super::Entry::writable) is what answers that. A field reserved in the
 /// entry holding it reads back zero, because the write that would have set it
 /// had the bit removed first.
 pub(crate) struct Lvt {
