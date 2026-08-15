@@ -20,6 +20,18 @@
 //! is then an offset and a volatile load or store, with nothing allocated and
 //! nothing invalidated.
 //!
+//! # A device that answers out of itself gets no mapping
+//!
+//! Not every interposed region has hardware anybody reaches. An emulated
+//! interrupt controller answers every read out of its own registers and lets no
+//! write through, so a mapping of the real controller behind it would be a
+//! writable alias of somebody else's acknowledge and command registers at a
+//! host address nothing uses. Such a device says so —
+//! [`Hardware`](crate::Hardware) — and its region is registered without one. A
+//! window over it carries the length admission is checked against and no
+//! address at all, so an access that would have reached hardware answers that
+//! there is nowhere to make it rather than reaching something.
+//!
 //! # What an access to hardware is allowed to assume
 //!
 //! Rust's rules for a volatile access outside any allocation require the access
@@ -48,9 +60,14 @@ use crate::{
 /// finished, from another processor, with no admission proof and no guarantee
 /// the mapping still exists. Every path to one borrows it for the length of a
 /// single callback.
+///
+/// A region whose device declared it never reaches the hardware behind it has
+/// no mapping at all, and one of these describes that case too: the length is
+/// still what admission is checked against, and every access answers that there
+/// is nowhere to make it.
 #[derive(Debug)]
 pub(crate) struct Window {
-    base: VirtAddr,
+    base: Option<VirtAddr>,
     bytes: u64,
 }
 
@@ -66,11 +83,23 @@ impl Window {
     /// enforces this, which is why constructing one is unsafe and every
     /// access through it is checked.
     pub(crate) const unsafe fn new(base: VirtAddr, bytes: u64) -> Self {
-        Self { base, bytes }
+        Self {
+            base: Some(base),
+            bytes,
+        }
     }
 
-    /// Where the region begins, which is only ever printed.
-    pub(crate) const fn base(&self) -> VirtAddr {
+    /// A region that many bytes long with no mapping of the hardware behind it.
+    ///
+    /// Safe to make, because there is no mapping to promise anything about: an
+    /// access through it reaches nothing and says so.
+    pub(crate) const fn unmapped(bytes: u64) -> Self {
+        Self { base: None, bytes }
+    }
+
+    /// Where the region begins, which is only ever printed, or `None` for a
+    /// region whose hardware is never reached.
+    pub(crate) const fn base(&self) -> Option<VirtAddr> {
         self.base
     }
 
@@ -86,18 +115,21 @@ impl Window {
             .is_some_and(|end| end <= self.bytes)
     }
 
-    /// Reads the device.
+    /// Reads the device, or answers `None` for a region whose device declared
+    /// the hardware behind it untouched — where there is no mapping to read
+    /// through.
     ///
     /// The access is made at the width the guest used, because that is the
     /// transaction the guest asked for: a device is entitled to answer a
     /// four-byte read differently from four one-byte reads, and several do.
-    pub(crate) fn read(&self, admitted: &Admitted) -> Data {
+    pub(crate) fn read(&self, admitted: &Admitted) -> Option<Data> {
+        let base = self.base?;
         let offset = admitted.offset;
-        match admitted.width {
-            Width::Byte => Data::from_u64(u64::from(self.load::<u8>(offset)), Width::Byte),
-            Width::Word => Data::from_u64(u64::from(self.load::<u16>(offset)), Width::Word),
-            Width::Long => Data::from_u64(u64::from(self.load::<u32>(offset)), Width::Long),
-            Width::Quad => Data::from_u64(self.load::<u64>(offset), Width::Quad),
+        Some(match admitted.width {
+            Width::Byte => Data::from_u64(u64::from(load::<u8>(base, offset)), Width::Byte),
+            Width::Word => Data::from_u64(u64::from(load::<u16>(base, offset)), Width::Word),
+            Width::Long => Data::from_u64(u64::from(load::<u32>(base, offset)), Width::Long),
+            Width::Quad => Data::from_u64(load::<u64>(base, offset), Width::Quad),
             // Two quadwords, in ascending order. This is two bus transactions
             // where the guest made one, which is why a device that cannot
             // tolerate that is refused at registration rather than served here:
@@ -107,67 +139,73 @@ impl Window {
             Width::Vector => {
                 let mut bytes = [0; Width::Vector.bytes()];
                 let (low, high) = bytes.split_at_mut(Width::Quad.bytes());
-                low.copy_from_slice(&self.load::<u64>(offset).to_le_bytes());
-                high.copy_from_slice(&self.load::<u64>(offset + Width::Quad.span()).to_le_bytes());
+                low.copy_from_slice(&load::<u64>(base, offset).to_le_bytes());
+                high.copy_from_slice(&load::<u64>(base, offset + Width::Quad.span()).to_le_bytes());
                 Data::vector_from(bytes)
             }
-        }
+        })
     }
 
-    /// Writes the device, at the width the guest used and for the same reason.
+    /// Writes the device, at the width the guest used and for the same reason,
+    /// and says whether there was hardware to write.
     ///
     /// The value's width is not consulted: the admitted width is what decides
     /// the transaction, and [`Admitted::binds`] has already established
     /// that the value agrees with it. A device handler that returned a
     /// replacement of another width cannot reach this.
-    pub(crate) fn write(&self, admitted: &Admitted, value: &Data) {
+    #[must_use]
+    pub(crate) fn write(&self, admitted: &Admitted, value: &Data) -> bool {
+        let Some(base) = self.base else {
+            return false;
+        };
         let offset = admitted.offset;
         match admitted.width {
-            Width::Byte => self.store::<u8>(offset, narrow(value)),
-            Width::Word => self.store::<u16>(offset, narrow(value)),
-            Width::Long => self.store::<u32>(offset, narrow(value)),
-            Width::Quad => self.store::<u64>(offset, value.as_u64()),
+            Width::Byte => store::<u8>(base, offset, narrow(value)),
+            Width::Word => store::<u16>(base, offset, narrow(value)),
+            Width::Long => store::<u32>(base, offset, narrow(value)),
+            Width::Quad => store::<u64>(base, offset, value.as_u64()),
             // As in `read`, and in the same order: low quadword first, so a
             // device whose registers are a command pair sees them written the way
             // the guest wrote them.
             Width::Vector => {
                 let bytes = value.vector();
                 let (low, high) = bytes.split_at(Width::Quad.bytes());
-                self.store::<u64>(offset, quad(low));
-                self.store::<u64>(offset + Width::Quad.span(), quad(high));
+                store::<u64>(base, offset, quad(low));
+                store::<u64>(base, offset + Width::Quad.span(), quad(high));
             }
         }
+        true
     }
+}
 
-    /// One device register, read as the integer it is.
-    ///
-    /// The pointer is formed at `T` rather than cast to it from a byte pointer,
-    /// which is both what makes the alignment argument below hold and what
-    /// keeps it from being a claim about a cast the compiler cannot check.
-    fn load<T: Copy>(&self, offset: u64) -> T {
-        // SAFETY: an `Admitted` is the proof that this access lies inside a
-        // mapping this region has held since it was registered, is aligned to its
-        // own width — so to `T`, whose size is that width — and is one the device
-        // behind the mapping tolerates at this width and direction. The read is
-        // volatile because a device register is not memory: its value is not a
-        // function of what was last written there, and the read itself is what the
-        // device reacts to.
-        unsafe { self.register::<T>(offset).read_volatile() }
-    }
+/// One device register, read as the integer it is.
+///
+/// The pointer is formed at `T` rather than cast to it from a byte pointer,
+/// which is both what makes the alignment argument below hold and what
+/// keeps it from being a claim about a cast the compiler cannot check.
+fn load<T: Copy>(base: VirtAddr, offset: u64) -> T {
+    // SAFETY: an `Admitted` is the proof that this access lies inside a
+    // mapping this region has held since it was registered, is aligned to its
+    // own width — so to `T`, whose size is that width — and is one the device
+    // behind the mapping tolerates at this width and direction. The read is
+    // volatile because a device register is not memory: its value is not a
+    // function of what was last written there, and the read itself is what the
+    // device reacts to.
+    unsafe { register::<T>(base, offset).read_volatile() }
+}
 
-    /// One device register, written as the integer it is.
-    fn store<T>(&self, offset: u64, value: T) {
-        // SAFETY: as in `load`. The write is volatile because it is the point: a
-        // device register's whole purpose is that storing to it does something, so
-        // the store must happen, must happen once, and must happen here rather
-        // than being folded into a later one.
-        unsafe { self.register::<T>(offset).write_volatile(value) };
-    }
+/// One device register, written as the integer it is.
+fn store<T>(base: VirtAddr, offset: u64, value: T) {
+    // SAFETY: as in `load`. The write is volatile because it is the point: a
+    // device register's whole purpose is that storing to it does something, so
+    // the store must happen, must happen once, and must happen here rather
+    // than being folded into a later one.
+    unsafe { register::<T>(base, offset).write_volatile(value) };
+}
 
-    /// Where one device register of type `T` is.
-    fn register<T>(&self, offset: u64) -> *mut T {
-        (self.base + offset).as_mut_ptr::<T>()
-    }
+/// Where one device register of type `T` is.
+fn register<T>(base: VirtAddr, offset: u64) -> *mut T {
+    (base + offset).as_mut_ptr::<T>()
 }
 
 /// An access that has been checked against the region it is in and against what
@@ -346,5 +384,26 @@ mod tests {
                 "a {got:?} replacement must not commit to a Long access"
             );
         }
+    }
+
+    #[test]
+    fn a_region_with_no_mapping_is_still_bounded() {
+        // The length is what admission is checked against, and it has to hold
+        // for a region with no hardware behind it exactly as for one with some.
+        let window = Window::unmapped(4096);
+        assert_eq!(window.base(), None);
+        assert!(window.inside(4092, Width::Long));
+        assert!(!window.inside(4093, Width::Long));
+    }
+
+    #[test]
+    fn nothing_reaches_hardware_through_a_region_that_has_none() {
+        // Neither call dereferences anything: the point is that a device which
+        // declared its hardware untouched cannot read or write it even holding
+        // an admission proof.
+        let window = Window::unmapped(4096);
+        let admitted = Admitted::new(0x40, Width::Long);
+        assert_eq!(window.read(&admitted), None);
+        assert!(!window.write(&admitted, &Data::from_u64(0x1234, Width::Long)));
     }
 }

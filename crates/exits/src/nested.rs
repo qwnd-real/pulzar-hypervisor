@@ -1,7 +1,9 @@
 //! Guest physical addresses the second set of page tables had no answer for.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use descriptors::Vector;
-use emulate::{Fault, Outcome};
+use emulate::{EmulateError, Fault, Outcome};
 use inject::Pending;
 use log::error;
 use npt::Resolution;
@@ -21,7 +23,7 @@ pub(crate) fn exit(vcpu: &mut Vcpu, partition: &Partition, interrupts: &mut Pend
     let gpa = PhysAddr::new_truncate(vcpu.control().exit_info_2);
     match partition.resolve(gpa, cause) {
         Ok(Resolution::Mapped) => Flow::Resume,
-        Ok(Resolution::Shadowed) => discard(vcpu, partition, gpa),
+        Ok(Resolution::Shadowed) => step_over(vcpu, partition, gpa),
         Ok(Resolution::Trapped) => interposed(vcpu, partition, gpa, cause, interrupts),
         Err(error) => {
             error!("exits: nested fault at {gpa:#x} could not be resolved: {error}");
@@ -60,12 +62,59 @@ fn interposed(
         // nothing from us.
         Ok(Outcome::Stepped | Outcome::Repeating) => Flow::Resume,
         Ok(Outcome::Faulted(fault)) => raise(vcpu, fault, interrupts),
-        Err(error) => {
-            error!("exits: the access to {gpa:#x} could not be performed: {error}");
-            Flow::Leave
-        }
+        Err(error) => unserviceable(vcpu, partition, gpa, error),
     }
 }
+
+/// Steps the guest past an access to a device that no device can be asked
+/// about.
+///
+/// Scoped by *region* rather than by which failure it was, and that is the
+/// decision: this is reached only for an address the nested tables trap, which
+/// means a device aperture this hypervisor interposed on. A guest access to one
+/// of those in a shape the emulator cannot perform — a width or alignment the
+/// device does not decode, an access that begins in the region and ends outside
+/// it, a locked read-modify-write — is the guest doing something the
+/// architecture leaves undefined for the device it aimed at. Undefined is not
+/// fatal: real hardware answers such an access with unpredictable data and goes
+/// on executing, so dropping it and resuming is the closest thing to that, and
+/// ending the guest over it would stop a physical processor for good over one
+/// guest instruction.
+///
+/// Enumerating the failures instead would be the wrong seam. The same variant
+/// covers a malformed guest access and a device answering the wrong width, so
+/// it cannot tell a guest's mistake from a hypervisor's, and every refusal the
+/// emulator grows later would have to be classified again — while a failure
+/// anywhere *other* than a trapped region stays fatal on its own path:
+/// resolving the address, and a region nothing answers for, are both above
+/// this.
+///
+/// Said once. The shapes that reach here are ones a guest can execute in a
+/// loop, and a line per access through a serial port with interrupts masked
+/// would be a worse denial of service than the halt this replaces.
+fn unserviceable(
+    vcpu: &mut Vcpu,
+    partition: &Partition,
+    gpa: PhysAddr,
+    error: EmulateError,
+) -> Flow {
+    if REPORTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        error!(
+            "exits: the access to {gpa:#x} could not be performed: {error}; dropping it and \
+             stepping the guest past it, and saying nothing about later ones"
+        );
+    }
+    step_over(vcpu, partition, gpa)
+}
+
+/// Whether an unserviceable access has already been reported on this machine.
+///
+/// Never cleared: what it is for is that the first one is on the record and a
+/// guest cannot turn the rest into a stall.
+static REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Gives the guest an exception its own instruction earned.
 ///
@@ -91,13 +140,15 @@ fn raise(vcpu: &mut Vcpu, fault: Fault, interrupts: &mut Pending) -> Flow {
     Flow::Resume
 }
 
-/// Steps the guest past a write to memory that will never accept one.
+/// Steps the guest past an access this hypervisor is not going to perform.
 ///
-/// The hypervisor's own memory reads as a shared page of zeroes and has no page
-/// behind it to take a write. So the instruction is decoded for its length
-/// alone, its write is dropped, and the guest carries on after it — which is
-/// the only alternative to faulting on the same instruction forever.
-fn discard(vcpu: &mut Vcpu, partition: &Partition, gpa: PhysAddr) -> Flow {
+/// Two callers and one answer, because for both of them the only alternative is
+/// a guest faulting on the same instruction forever. The hypervisor's own
+/// memory reads as a shared page of zeroes and has no page behind it to take a
+/// write; and an access to a trapped region that no device can be asked about
+/// has nothing to perform either. So the instruction is decoded for its length
+/// alone, whatever it moved is dropped, and the guest carries on after it.
+fn step_over(vcpu: &mut Vcpu, partition: &Partition, gpa: PhysAddr) -> Flow {
     let addressing = Addressing::from_save(vcpu.save());
     match partition.with_memory(addressing, |guest| emulate::next_rip(vcpu, guest)) {
         Ok(next) => {
@@ -105,7 +156,7 @@ fn discard(vcpu: &mut Vcpu, partition: &Partition, gpa: PhysAddr) -> Flow {
             Flow::Resume
         }
         Err(error) => {
-            error!("exits: could not skip shadowed write at {gpa:#x}: {error}");
+            error!("exits: could not step past the access at {gpa:#x}: {error}");
             Flow::Leave
         }
     }

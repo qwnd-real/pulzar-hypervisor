@@ -190,8 +190,11 @@ impl<'a> Exits<'a> {
             Resumption::Carry => Ok(true),
             Resumption::Wait => Ok(false),
             Resumption::StartAt(page) => {
-                info!("exits: the guest started this processor at page {page:#x}");
-                vcpu.start_at(page);
+                info!(
+                    "exits: the guest started this processor at page {:#x}",
+                    page.number()
+                );
+                vcpu.start_at(page.number());
                 self.interrupts.reset(vcpu);
                 self.virtualization.reset();
                 Ok(true)

@@ -74,10 +74,10 @@ use apic::{Entry as HardwareEntry, LvtDelivery, Polarity, Source, Trigger as Har
 use descriptors::Vector;
 use log::{trace, warn};
 
-use crate::{
+use crate::registers::{
+    Vlapic,
     error::Errors,
     lvt::{Delivery, Entry},
-    state::Vlapic,
 };
 
 /// Brings every source the guest can reach into agreement with what it has

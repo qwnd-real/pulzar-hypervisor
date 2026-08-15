@@ -90,7 +90,8 @@ use x86_64::PhysAddr;
 
 pub use crate::{
     mmio::{
-        Capability, Commit, Device, Mmio, MmioError, Read, Region, Registrar, Teardown, Trap, Write,
+        Capability, Commit, Device, Hardware, Mmio, MmioError, Read, Region, Registrar, Teardown,
+        Trap, Write,
     },
     plan::Fault,
     value::{Data, Width},
@@ -511,6 +512,11 @@ pub enum Inadmissible {
     /// across a faultable access.
     #[error("this device requires a single sixteen-byte transaction, which cannot be made safely")]
     Indivisible,
+    /// A handler asked for a write to reach the hardware behind its region,
+    /// having declared that it never touches it — so there is no mapping to
+    /// perform the write through.
+    #[error("this device declared that it never reaches the hardware behind its region")]
+    Untouched,
     /// A handler answered with a value of a different width from the access it
     /// was asked about.
     #[error("the device answered {got:?} for a {wanted:?} access")]

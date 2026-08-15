@@ -12,23 +12,86 @@
 //!
 //! # These are entry points, not a device
 //!
-//! There is no page to trap, so nothing calls into here through
-//! [`emulate`](emulate). A guest in x2APIC mode reaches its controller with
-//! `RDMSR` and `WRMSR`, which are intercepted through the permission map, and
-//! the exit handler calls [`read`] and [`write`] directly.
+//! There is no page to trap, so nothing calls into here through [`emulate`]. A
+//! guest in x2APIC mode reaches its controller with `RDMSR` and `WRMSR`, which
+//! are intercepted through the permission map, and the exit handler calls
+//! [`read_msr`] and [`write_msr`] directly.
 
 use apic::IA32_TSC_DEADLINE;
 use descriptors::Vector;
+use log::{trace, warn};
 
 use crate::{
-    access::{self, Written},
-    base::ApicBase,
-    icr::Command,
-    lvt::{Entry, TimerMode},
-    register::{Access, Register, X2APIC_BASE_MSR, X2APIC_LAST_MSR},
-    state::Vlapic,
-    timer,
+    VlapicError,
+    face::{
+        dispatch::{self, Written, acted},
+        table::{Access, Register, X2APIC_BASE_MSR, X2APIC_LAST_MSR},
+    },
+    hardware::timer,
+    machine::current,
+    registers::{
+        Vlapic,
+        base::{ApicBase, BaseFault, Mode},
+        icr::Command,
+        lvt::{Entry, TimerMode},
+    },
 };
+
+/// What the guest reads from one of the controller's model-specific registers.
+///
+/// `tsc_offset` is the offset applied to this processor's guest timestamp and
+/// is used to translate timestamp-counter deadline readback into that domain.
+///
+/// # Errors
+///
+/// [`VlapicError::NotInstalled`] before [`crate::install`],
+/// [`VlapicError::NoLapic`] on a processor with no controller, or
+/// [`VlapicError::Fault`] if the guest should take a general protection fault
+/// for the access.
+pub fn read_msr(index: u32, tsc_offset: u64) -> Result<u64, VlapicError> {
+    let vlapic = current()?;
+    let value = read(vlapic, index, tsc_offset).map_err(|fault| {
+        warn!("vlapic: refusing a read of {index:#x}: {fault:?}");
+        VlapicError::Fault
+    })?;
+    trace!(
+        "vlapic: {} read {index:#05x} to its {value:#018x} model-specific register",
+        vlapic.index()
+    );
+    Ok(value)
+}
+
+/// What a write to one of the controller's model-specific registers does.
+///
+/// `tsc_offset` is the offset applied to this processor's guest timestamp and
+/// is used to translate a timestamp-counter deadline onto physical hardware.
+///
+/// # Errors
+///
+/// As [`read_msr`].
+pub fn write_msr(index: u32, value: u64, tsc_offset: u64) -> Result<(), VlapicError> {
+    let vlapic = current()?;
+    let written = write(vlapic, index, value, tsc_offset).map_err(|fault| {
+        warn!("vlapic: refusing a write of {value:#x} to {index:#x}: {fault:?}");
+        VlapicError::Fault
+    })?;
+    trace!(
+        "vlapic: {} wrote {value:#018x} to its {index:#05x} model-specific register",
+        vlapic.index()
+    );
+    acted(vlapic, written);
+    Ok(())
+}
+
+/// Every model-specific register the guest's controller answers for.
+///
+/// Handed to whatever programs the permission map. The whole of the range the
+/// architecture reserves for the controller is named, not merely the indices
+/// that hold a register: reaching an unassigned one is a fault the guest is
+/// entitled to, and it cannot be given one by code that never sees the access.
+pub fn intercepted() -> impl Iterator<Item = u32> {
+    (X2APIC_BASE_MSR..=X2APIC_LAST_MSR).chain([ApicBase::MSR, IA32_TSC_DEADLINE])
+}
 
 /// Whether an index is one this crate answers for.
 ///
@@ -74,7 +137,7 @@ pub(crate) fn read(vlapic: &Vlapic, index: u32, tsc_offset: u64) -> Result<u64, 
     if register == Register::COMMAND_LOW {
         return Ok(vlapic.command().bits());
     }
-    Ok(u64::from(access::read(vlapic, register)))
+    Ok(u64::from(dispatch::read(vlapic, register)))
 }
 
 /// What a write does.
@@ -147,7 +210,7 @@ pub(crate) fn write(
     if register == Register::SELF_IPI {
         return Ok(Written::SelfIpi(Vector::new(vector_of(narrow))));
     }
-    Ok(access::write(vlapic, register, narrow))
+    Ok(dispatch::write(vlapic, register, narrow))
 }
 
 /// Translates a physical deadline into the timestamp domain the guest reads.
@@ -205,7 +268,7 @@ fn addressable(vlapic: &Vlapic, index: u32) -> Result<Register, Fault> {
     // Reaching the controller's registers at all is a fault outside x2APIC:
     // the indices are reserved until the guest has enabled the mode that
     // assigns them.
-    if vlapic.mode() != crate::base::Mode::X2Apic {
+    if vlapic.mode() != Mode::X2Apic {
         return Err(Fault::NotX2Apic);
     }
     let register = Register::from_msr(index).ok_or(Fault::NoSuchRegister)?;
@@ -258,7 +321,7 @@ pub(crate) enum Fault {
     /// A bit the register reserves was written non-zero.
     Reserved,
     /// The base register refused the write.
-    Base(crate::base::BaseFault),
+    Base(BaseFault),
 }
 
 #[cfg(test)]

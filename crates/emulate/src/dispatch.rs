@@ -20,7 +20,7 @@ use svm::exit::NestedPageFault;
 use x86_64::PhysAddr;
 
 use crate::{
-    Capability, Commit, Data, Device, EmulateError, Outcome, Read, Width, Write,
+    Capability, Commit, Data, Device, EmulateError, Hardware, Outcome, Read, Width, Write,
     machine::tests::{Machine, Memory, PAGE},
     mmio::{Mmio, harness::Harness},
 };
@@ -65,6 +65,7 @@ pub(crate) enum Event {
 /// faithfully, and to be predictable.
 pub(crate) struct Recorder {
     capability: Capability,
+    hardware: Hardware,
     events: Arc<Mutex<Vec<Event>>>,
     answer: Answer,
     decision: Decision,
@@ -101,6 +102,7 @@ impl Recorder {
     pub(crate) fn new() -> Self {
         Self {
             capability: Capability::scalar(),
+            hardware: Hardware::Reached,
             events: Arc::new(Mutex::new(Vec::new())),
             answer: Answer::Hardware,
             decision: Decision::Hardware,
@@ -110,6 +112,13 @@ impl Recorder {
     /// The same, answering only what this capability allows.
     pub(crate) const fn answering(mut self, capability: Capability) -> Self {
         self.capability = capability;
+        self
+    }
+
+    /// The same, for a device that never reaches the hardware behind its
+    /// region — which is registered without a mapping of it.
+    pub(crate) const fn untouched(mut self) -> Self {
+        self.hardware = Hardware::Untouched;
         self
     }
 
@@ -136,19 +145,29 @@ impl Device for Recorder {
         self.capability
     }
 
+    fn hardware(&self) -> Hardware {
+        self.hardware
+    }
+
     fn read(&self, access: Read<'_>) -> Data {
         self.events.lock().push(Event::Read {
             offset: access.offset(),
             width: access.width(),
         });
         match self.answer {
-            Answer::Hardware => {
-                self.events.lock().push(Event::Hardware {
-                    offset: access.offset(),
-                    width: access.width(),
-                });
-                access.hardware()
-            }
+            Answer::Hardware => match access.hardware() {
+                Some(value) => {
+                    self.events.lock().push(Event::Hardware {
+                        offset: access.offset(),
+                        width: access.width(),
+                    });
+                    value
+                }
+                // A device with no aperture has nothing to read, and the log
+                // shows no transaction happened. Zero, because an answer of the
+                // asked-for width is still owed.
+                None => Data::from_u64(0, access.width()),
+            },
             Answer::Invented(value) => Data::from_u64(value, access.width()),
             Answer::Mismatched(width) => Data::from_u64(0xAA, width),
         }
@@ -656,6 +675,107 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(fixture.events(), []);
+    }
+
+    #[test]
+    fn a_device_that_answers_every_scalar_width_is_asked_about_a_byte_access() {
+        // The other side of the two tests above, and the property a device
+        // relies on to serve an access the architecture leaves undefined rather
+        // than have it refused before the device is consulted: what a malformed
+        // access does is the device's decision only if the device is asked.
+        //
+        // `mov al, [0x8000]`
+        const LOAD_AL: [u8; 7] = [0x8A, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00];
+        let mut fixture = Fixture::new(&LOAD_AL, Recorder::new().reads(Answer::Invented(0x5A)));
+        let outcome = fixture.run(false, 0).expect("a byte access is admitted");
+        assert_eq!(outcome, Outcome::Stepped);
+        assert_eq!(
+            fixture.events(),
+            [Event::Read {
+                offset: 0,
+                width: Width::Byte
+            }],
+            "the device is asked at the width the guest used"
+        );
+        assert_eq!(fixture.machine.gpr(0) & 0xFF, 0x5A);
+        assert_eq!(fixture.machine.save().rip, RIP + LOAD_AL.len() as u64);
+    }
+
+    #[test]
+    fn a_device_that_declares_being_split_harmless_is_asked_about_sixteen_bytes() {
+        // `movdqu xmm0, [0x8000]`
+        const LOAD_XMM: [u8; 9] = [0xF3, 0x0F, 0x6F, 0x04, 0x25, 0x00, 0x80, 0x00, 0x00];
+        let mut fixture = Fixture::new(
+            &LOAD_XMM,
+            Recorder::new()
+                .answering(Capability::scalar().split_vectors())
+                .reads(Answer::Invented(0x1234)),
+        );
+        let outcome = fixture
+            .run(false, 0)
+            .expect("splitting was declared harmless");
+        assert_eq!(outcome, Outcome::Stepped);
+        assert_eq!(
+            fixture.events(),
+            [Event::Read {
+                offset: 0,
+                width: Width::Vector
+            }],
+            "one guest access is one question, however many transactions it takes"
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_hardware_behind_it_reaches_none_and_still_answers() {
+        // A device that declared it never touches its hardware is registered
+        // without a mapping, so asking for the hardware value answers nothing
+        // and no transaction is made. The device still owes the guest an answer.
+        let mut fixture = Fixture::new(&LOAD_EAX, Recorder::new().untouched());
+        fixture.machine.set_gpr(0, 0x1111_2222_3333_4444);
+        let outcome = fixture.run(false, 0).expect("the read is still answered");
+        assert_eq!(outcome, Outcome::Stepped);
+        assert_eq!(
+            fixture.transactions(),
+            0,
+            "there is nothing to transact with"
+        );
+        assert_eq!(fixture.machine.gpr(0), 0, "the answer the device gave");
+    }
+
+    #[test]
+    fn a_write_cannot_be_let_through_to_hardware_a_device_declared_untouched() {
+        // The contract the missing mapping rests on. A device that declared it
+        // never reaches its hardware and then asks for a write to reach it is
+        // refused rather than served through some other address.
+        let mut fixture = Fixture::new(&STORE_EAX, Recorder::new().untouched());
+        fixture.machine.set_gpr(0, 0x1234_5678);
+        let error = fixture
+            .run(true, 0)
+            .expect_err("there is no mapping to write through");
+        assert!(
+            matches!(
+                error,
+                EmulateError::Inadmissible {
+                    reason: Inadmissible::Untouched,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        // The device asked — its log says so — and the framework is what refused
+        // it, which is the property the missing mapping needs.
+        assert_eq!(
+            fixture.events().last(),
+            Some(&Event::Hardware {
+                offset: 0,
+                width: Width::Long
+            })
+        );
+        assert_eq!(
+            fixture.machine.save().rip,
+            RIP,
+            "a refused commit must not retire the instruction"
+        );
     }
 
     /// `rep movsb` — the copy a driver writes when it means "move this buffer".

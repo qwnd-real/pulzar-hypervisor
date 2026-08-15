@@ -18,7 +18,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 
 use x86_64::{PhysAddr, VirtAddr};
 
-use super::{Aperture, Device, Interposed, Mmio};
+use super::{Aperture, Device, Hardware, Interposed, Mmio};
 
 /// Builds a set of regions over planted bytes.
 #[derive(Default)]
@@ -36,13 +36,17 @@ impl Harness {
     /// answered for by that device.
     ///
     /// The bytes behind it start as zeroes and are reached exactly as a real
-    /// aperture is.
+    /// aperture is — and, as at registration, a device that declares it never
+    /// reaches the hardware behind its region gets none of them.
     pub(crate) fn region(mut self, gpa: u64, bytes: u64, device: Box<dyn Device>) -> Self {
-        let planted = plant(bytes);
+        let aperture = match device.hardware() {
+            Hardware::Reached => plant(bytes),
+            Hardware::Untouched => Aperture::Untouched { bytes },
+        };
         self.regions.push(Interposed {
             gpa: PhysAddr::new(gpa),
             end: gpa + bytes,
-            aperture: planted,
+            aperture,
             device,
         });
         self

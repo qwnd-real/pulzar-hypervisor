@@ -23,7 +23,10 @@
 //! because their indices are reserved, and the self-interrupt register exists
 //! only in x2APIC because there is no offset it would sit at.
 
-use crate::{base::Mode, lvt::Entry, model::Model};
+use crate::{
+    hardware::model::Model,
+    registers::{base::Mode, lvt::Entry},
+};
 
 /// One of the controller's registers, named by its offset in the memory-mapped
 /// page.

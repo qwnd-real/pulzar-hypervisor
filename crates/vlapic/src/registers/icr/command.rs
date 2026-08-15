@@ -1,0 +1,194 @@
+//! The register as sixty-four bits: which of them software owns, and how the two
+//! faces divide them up.
+//!
+//! Nothing here reads a field for its meaning; [`super::decode`] does that. What
+//! is here is the layout — stated once, as [`Field`]s — and the three writable
+//! masks built out of it, so that a mask cannot drift away from the fields it is
+//! made of.
+
+use crate::registers::icr::Command;
+
+impl Command {
+    /// The destination every processor answers to in x2APIC, in the logical
+    /// destination mode as much as the physical one.
+    ///
+    /// The memory-mapped face spells the same thing with all eight bits of its
+    /// narrower field set, which is what this value truncates to.
+    pub(crate) const BROADCAST: u32 = u32::MAX;
+
+    /// Which bits of the low half software may set.
+    ///
+    /// Every field a guest owns and nothing else: the delivery-status bit at 12
+    /// is the controller's own report of whether a command is still going out,
+    /// and bits 13, 17:16 and 31:20 are reserved. A write through the
+    /// memory-mapped face is masked with this, which is what keeps a guest's
+    /// stray bits from being read back; the wide face has no delivery-status
+    /// bit at all and faults on a reserved bit rather than dropping it.
+    pub(crate) const WRITABLE_LOW: u32 = VECTOR.mask()
+        | DELIVERY.mask()
+        | DESTINATION_MODE.mask()
+        | LEVEL.mask()
+        | TRIGGER.mask()
+        | SHORTHAND.mask();
+
+    /// Which bits of the high half software may set through the memory-mapped
+    /// face.
+    ///
+    /// The destination is the top byte and everything below it is reserved. A
+    /// guest that writes one of those must read it back as zero, and the
+    /// destination arithmetic reads only the top byte anyway — so storing the
+    /// rest would be state that is wrong without being consulted, which is the
+    /// kind that survives until something starts consulting it.
+    pub(crate) const WRITABLE_HIGH: u32 = DESTINATION_XAPIC.mask();
+
+    /// Which bits the whole register may hold in x2APIC.
+    ///
+    /// Narrower than the memory-mapped face in exactly the places where the
+    /// older one kept bus-era fields. The delivery-status bit is gone, because
+    /// an x2APIC write does not return until the command has been accepted and
+    /// there is nothing to report; and level and trigger mode are gone with the
+    /// bus they described, which is why the INIT de-assert cannot be expressed
+    /// here at all.
+    ///
+    /// Reserved here means `RsvdZ`: writing a non-zero value into one is a
+    /// general protection fault rather than something quietly dropped.
+    pub(crate) const WRITABLE_X2APIC: u64 =
+        (VECTOR.mask() | DELIVERY.mask() | DESTINATION_MODE.mask() | SHORTHAND.mask()) as u64
+            | (u32::MAX as u64) << HALF;
+
+    /// The command sixty-four bits describe, as x2APIC presents them.
+    pub(crate) const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// The command a pair of memory-mapped halves describes, the destination
+    /// being the top byte of `high`.
+    pub(crate) const fn from_halves(low: u32, high: u32) -> Self {
+        Self::from_bits(((high as u64) << HALF) | low as u64)
+    }
+
+    /// The whole register, as x2APIC reads and writes it.
+    pub(crate) const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// The half a guest writes to send the command.
+    pub(crate) const fn low(self) -> u32 {
+        truncate(self.bits())
+    }
+
+    /// The half that carries the destination, in whichever width the face gives
+    /// it.
+    pub(crate) const fn high(self) -> u32 {
+        truncate(self.bits() >> HALF)
+    }
+}
+
+/// A run of adjacent bits in the register, named by where it starts and how
+/// wide it is.
+///
+/// The layout is stated once, here and in the constants below, so that no
+/// accessor spells out a shift or a mask of its own and the writable mask
+/// cannot drift away from the fields it is made of.
+#[derive(Clone, Copy)]
+pub(super) struct Field {
+    /// How far above bit zero the field starts.
+    shift: u32,
+    /// How many bits it spans.
+    width: u32,
+}
+
+impl Field {
+    /// The field of `width` bits starting at `shift`.
+    pub(super) const fn new(shift: u32, width: u32) -> Self {
+        Self { shift, width }
+    }
+
+    /// The field's value, brought down to bit zero.
+    pub(super) const fn get(self, bits: u32) -> u32 {
+        (bits & self.mask()) >> self.shift
+    }
+
+    /// Whether any of the field's bits are set, which for a one-bit field is
+    /// the field itself.
+    pub(super) const fn test(self, bits: u32) -> bool {
+        bits & self.mask() != 0
+    }
+
+    /// The field's bits, where they sit.
+    pub(super) const fn mask(self) -> u32 {
+        ((1 << self.width) - 1) << self.shift
+    }
+}
+
+/// The low thirty-two bits of a quadword.
+///
+/// One place where the upper half is dropped, so that splitting the register
+/// into the halves the memory-mapped face presents is the only thing that ever
+/// narrows it.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "discarding the upper half is the whole of what this does"
+)]
+const fn truncate(bits: u64) -> u32 {
+    bits as u32
+}
+
+/// How many bits one half of the register spans, and so how far above the low
+/// half the high one sits.
+const HALF: u32 = 32;
+
+/// The vector, which is the interrupt itself for the delivery modes that carry
+/// one and reserved for the rest.
+pub(super) const VECTOR: Field = Field::new(0, 8);
+
+/// Which of the eight delivery modes the command names.
+pub(super) const DELIVERY: Field = Field::new(8, 3);
+
+/// Whether the destination is an identifier or a logical mask.
+pub(super) const DESTINATION_MODE: Field = Field::new(11, 1);
+
+/// Assert or de-assert, read only for the INIT de-assert.
+pub(super) const LEVEL: Field = Field::new(14, 1);
+
+/// Edge or level, read only for the INIT de-assert.
+pub(super) const TRIGGER: Field = Field::new(15, 1);
+
+/// Which shorthand, if any, names the targets in place of the destination.
+pub(super) const SHORTHAND: Field = Field::new(18, 2);
+
+/// The destination within the high half of the memory-mapped register, where it
+/// is a byte at the top rather than the whole word.
+pub(super) const DESTINATION_XAPIC: Field = Field::new(24, 8);
+
+#[cfg(test)]
+mod tests {
+    //! The masks are written out as the values a guest may write, so that a test
+    //! fails when a field moves rather than moving with it.
+
+    use crate::registers::icr::Command;
+
+    #[test]
+    fn the_wide_face_reserves_the_bus_era_fields() {
+        // Level and trigger mode, which x2APIC does not have.
+        assert_eq!(Command::WRITABLE_X2APIC & (1 << 14 | 1 << 15), 0);
+        // The delivery-status bit, which it does not have either.
+        assert_eq!(Command::WRITABLE_X2APIC & (1 << 12), 0);
+        // What it does have: vector, delivery mode, destination mode,
+        // shorthand, and the whole of the upper half for the destination.
+        assert_eq!(Command::WRITABLE_X2APIC, 0xFFFF_FFFF_000C_0FFF);
+    }
+
+    #[test]
+    fn the_high_half_keeps_only_the_destination() {
+        assert_eq!(Command::WRITABLE_HIGH, 0xFF00_0000);
+    }
+
+    #[test]
+    fn only_the_fields_a_guest_owns_are_writable() {
+        // Vector, delivery mode and destination mode; level and trigger mode;
+        // the shorthand. Not the delivery-status bit at 12, and not bit 13,
+        // bits 17:16 or bits 31:20.
+        assert_eq!(Command::WRITABLE_LOW, 0x000C_CFFF);
+    }
+}

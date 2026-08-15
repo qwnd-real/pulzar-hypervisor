@@ -46,14 +46,25 @@
 //! and [`BaseFault::Relocated`] is kept distinct from the architectural faults
 //! so that a caller can tell the two apart in a log.
 //!
+//! The same fact decides what happens on a machine whose *firmware* had moved
+//! the page before pulzar ran, and there the answer cannot be a fault: there is
+//! no guest instruction to fault. Everything outside the one trapped page is an
+//! identity map of machine physical memory, so a guest on such a machine would
+//! reach the *real* local APIC at firmware's address, untrapped — able to mask
+//! the host's interrupts, acknowledge them, reset the host's processors and
+//! rename them. So [`ApicBase::misplaced`] answers that question before any
+//! guest exists and [`crate::install`] refuses the machine outright.
+//!
 //! Firmware and operating systems do not relocate the page in practice; the
 //! default address is what every one of them expects to find.
 
+mod transition;
+
+pub(crate) use crate::registers::base::transition::{BaseFault, Transition};
+
 use core::fmt::{self, Display, Formatter};
 
-use thiserror::Error;
-
-use crate::model::Model;
+use apic::Controller;
 
 /// Which interface the guest's controller answers through, which is the whole
 /// of what the two enable bits mean.
@@ -119,12 +130,13 @@ impl ApicBase {
     /// Everything the architecture reserves is dropped, so that a guest reading
     /// the register back sees what it promises.
     ///
-    /// The address is *not* firmware's. The register page is trapped once,
-    /// before any guest has run, and nothing here can re-trap a range while
-    /// processors are executing — the same reason [`BaseFault::Relocated`]
-    /// refuses a guest's own attempt to move it. Firmware that had moved its
-    /// page is told about rather than followed, which is what
-    /// [`ApicBase::relocated`] is for.
+    /// The address is the default one rather than firmware's, and the two are
+    /// the same address wherever this is reached: the page is trapped once,
+    /// before any guest has run, so a machine whose firmware had put it
+    /// anywhere else is refused by [`crate::install`] and no controller on it
+    /// is ever seeded. Writing the constant rather than carrying the field
+    /// through is what makes that a property of this type rather than of
+    /// the caller.
     ///
     /// The bootstrap flag is not firmware's either, and for a different reason:
     /// it is the roster's, established when the controller was built, and no
@@ -133,6 +145,32 @@ impl ApicBase {
     pub(crate) fn seeded(value: u64, bootstrap: bool) -> Self {
         let flag = if bootstrap { BOOTSTRAP } else { 0 };
         Self((value & (GLOBAL_ENABLE | X2APIC_ENABLE)) | Self::DEFAULT_PAGE | flag)
+    }
+
+    /// Where firmware left the register page, if it is not where this
+    /// hypervisor traps one.
+    ///
+    /// The question [`crate::install`] refuses a machine on, and it is asked of
+    /// the capture rather than of hardware so that every way of failing to read
+    /// the controller reaches the same decision. Four of the five say something
+    /// about the address field: a controller that was read, one firmware had
+    /// switched off, one whose page is outside the window the capture could
+    /// reach — which is a page that was moved a long way — and one whose two
+    /// mode bits name no state at all. The address field is meaningful in every
+    /// one of those, and in each of them the real controller ends up decoding
+    /// at that address once the host switches it on, whatever the guest is
+    /// shown.
+    ///
+    /// The exception is a processor with no controller at all, where there is
+    /// no register to have read and the captured value is a zero nobody
+    /// wrote. Such a machine has already been refused — installing the real
+    /// controllers needs one — so answering `None` here leaves that refusal
+    /// where it belongs rather than reporting a page at address zero.
+    pub(crate) const fn misplaced(controller: Controller, value: u64) -> Option<u64> {
+        if matches!(controller, Controller::Absent) || !Self::relocated(value) {
+            return None;
+        }
+        Some(Self::page_of(value))
     }
 
     /// Whether a value read out of real hardware puts the register page
@@ -191,132 +229,22 @@ impl ApicBase {
     pub(crate) const fn bootstrap(self) -> bool {
         self.0 & BOOTSTRAP != 0
     }
-
-    /// What this register becomes when the guest writes `value`, or why it may
-    /// not.
-    ///
-    /// The checks run in the order the guest would meet them on real hardware:
-    /// reserved bits first, then the transition, and only then this
-    /// hypervisor's own refusal to let the page move. A write that is both
-    /// architecturally illegal and moves the page is reported as the fault the
-    /// processor would have raised, because that is the one the guest has to be
-    /// told about.
-    ///
-    /// # Errors
-    ///
-    /// [`BaseFault::Reserved`] if any bit the architecture reserves was written
-    /// non-zero, [`BaseFault::IllegalTransition`] if the two enable bits name a
-    /// state this one cannot go to, or [`BaseFault::Relocated`] if the address
-    /// field changed.
-    pub(crate) fn written(self, value: u64, model: Model) -> Result<Self, BaseFault> {
-        if value & reserved() != 0 {
-            return Err(BaseFault::Reserved);
-        }
-
-        // The bootstrap flag records which processor the machine came up on.
-        // Software cannot make a processor into that one, so the written bit is
-        // dropped and the one already here carried through.
-        let next = Self((value & !BOOTSTRAP) | (self.0 & BOOTSTRAP));
-
-        // Checked against the raw value rather than against `next.mode()`,
-        // which reports a controller with `EXTD` set and `EN` clear as merely
-        // disabled and would let this through as a legal move.
-        if value & X2APIC_ENABLE != 0 && value & GLOBAL_ENABLE == 0 {
-            return Err(BaseFault::IllegalTransition);
-        }
-        // A guest whose `CPUID` says the processor has no x2APIC must not be
-        // able to enter it. `CPUID` is passed through, so this is the real
-        // processor's answer, and a guest allowed to enter a mode its own
-        // feature test denies would be one whose feature tests mean nothing.
-        if value & X2APIC_ENABLE != 0 && !model.x2apic() {
-            return Err(BaseFault::Reserved);
-        }
-        if !permitted(self.mode(), next.mode()) {
-            return Err(BaseFault::IllegalTransition);
-        }
-        // Compared across the whole architectural field rather than the page
-        // this hypervisor traps, so that a guest cannot move the register page
-        // by writing address bits above the ones the mask keeps.
-        if next.address() != self.address() {
-            return Err(BaseFault::Relocated);
-        }
-        Ok(next)
-    }
-}
-
-/// Why a write to `IA32_APIC_BASE` did not take.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub(crate) enum BaseFault {
-    /// A bit the architecture reserves was written non-zero: one of the eight
-    /// below the flags, the one between the bootstrap flag and the enables, or
-    /// one above the physical address space this processor implements.
-    #[error("a reserved bit of the apic base register was written non-zero")]
-    Reserved,
-    /// The two enable bits name a state that cannot be reached from the one the
-    /// controller is in, or a combination that is not a state at all.
-    #[error("the apic base register cannot go to that mode from this one")]
-    IllegalTransition,
-    /// The write moved the memory-mapped register page.
-    ///
-    /// The page is trapped in the nested page tables once, before any guest has
-    /// run, and nothing here can re-trap a range while processors are
-    /// executing. Taking the write would leave the guest's controller at an
-    /// address that is not intercepted and the interception on an address the
-    /// guest no longer uses, which is a controller that silently stops working;
-    /// refusing it keeps the two in agreement and gives the caller something it
-    /// can report.
-    #[error("the apic register page cannot be moved while the guest is running")]
-    Relocated,
-}
-
-/// Whether the architecture allows a controller in `from` to be written into
-/// `to`.
-///
-/// Staying put is allowed from everywhere. Of the moves that go somewhere, the
-/// asymmetry is that x2APIC is entered only from the older interface and left
-/// only into disabled: there is no edge from x2APIC back to xAPIC and none from
-/// disabled straight into x2APIC.
-const fn permitted(from: Mode, to: Mode) -> bool {
-    matches!(
-        (from, to),
-        (Mode::Disabled, Mode::Disabled | Mode::XApic)
-            | (Mode::XApic, Mode::XApic | Mode::X2Apic | Mode::Disabled)
-            | (Mode::X2Apic, Mode::X2Apic | Mode::Disabled)
-    )
-}
-
-/// Every bit a write must leave clear.
-fn reserved() -> u64 {
-    RESERVED_LOW | beyond_physical()
-}
-
-/// The bits at and above the width of a physical address on this processor.
-///
-/// The guest is given the machine's own width, so what it may put in the
-/// address field is what the processor would have accepted. A processor
-/// reporting a width of 64 or more would make the shift overflow, and a guest's
-/// register write is not the place to discover that, so an unshiftable width
-/// reserves nothing rather than panicking.
-fn beyond_physical() -> u64 {
-    u64::MAX
-        .checked_shl(u32::from(processor::physical_address_bits()))
-        .unwrap_or(0)
 }
 
 /// The reserved bits that sit below the address field: the low eight, and the
 /// one between the bootstrap flag and the two enables.
-const RESERVED_LOW: u64 = 0xFF | (1 << 9);
+pub(super) const RESERVED_LOW: u64 = 0xFF | (1 << 9);
 
 /// `BSP`: set on the processor the machine started on, and read-only to
 /// software.
-const BOOTSTRAP: u64 = 1 << 8;
+pub(super) const BOOTSTRAP: u64 = 1 << 8;
 
 /// `EXTD`: the controller answers through model-specific registers. Meaningless
 /// without [`GLOBAL_ENABLE`], and writing it without that one faults.
-const X2APIC_ENABLE: u64 = 1 << 10;
+pub(super) const X2APIC_ENABLE: u64 = 1 << 10;
 
 /// `EN`: the controller is switched on.
-const GLOBAL_ENABLE: u64 = 1 << 11;
+pub(super) const GLOBAL_ENABLE: u64 = 1 << 11;
 
 #[cfg(test)]
 mod tests {
@@ -324,8 +252,8 @@ mod tests {
     //! space is not asserted here: that width comes from the `CPUID` of
     //! whatever processor the test runs on, and is not the guest's machine.
 
-    use super::{ApicBase, BOOTSTRAP, BaseFault, GLOBAL_ENABLE, Mode, X2APIC_ENABLE};
-    use crate::model::{self, Model};
+    use super::{ApicBase, BOOTSTRAP, BaseFault, Controller, GLOBAL_ENABLE, Mode, X2APIC_ENABLE};
+    use crate::hardware::model::{self, Model};
 
     /// The model the transition tests use: one whose processor has x2APIC, so
     /// that entering it is refused for the state machine's reasons and never
@@ -420,5 +348,53 @@ mod tests {
             state(Mode::XApic).written(elsewhere, MODEL),
             Err(BaseFault::Relocated)
         );
+    }
+
+    /// Every way the capture can describe the controller it read, so that a new
+    /// one cannot be added without a decision about it here.
+    const CONTROLLERS: [Controller; 5] = [
+        Controller::Read,
+        Controller::Absent,
+        Controller::Disabled,
+        Controller::Unreachable,
+        Controller::Malformed,
+    ];
+
+    #[test]
+    fn firmware_leaving_the_page_where_it_belongs_is_not_misplaced() {
+        for controller in CONTROLLERS {
+            assert_eq!(
+                ApicBase::misplaced(controller, bits(Mode::XApic)),
+                None,
+                "{controller:?} at the default page"
+            );
+        }
+    }
+
+    #[test]
+    fn firmware_moving_the_page_is_misplaced_however_the_controller_was_read() {
+        // Every one of these ends with the real controller decoding at the
+        // address in the register once the host switches it on, so every one of
+        // them has to reach the same refusal — including the two the relocation
+        // check used to sit behind.
+        let elsewhere = 0xFEC0_0000 | GLOBAL_ENABLE;
+        for controller in CONTROLLERS
+            .into_iter()
+            .filter(|controller| *controller != Controller::Absent)
+        {
+            assert_eq!(
+                ApicBase::misplaced(controller, elsewhere),
+                Some(0xFEC0_0000),
+                "{controller:?} with the page moved"
+            );
+        }
+    }
+
+    #[test]
+    fn a_processor_with_no_controller_has_no_page_to_have_moved() {
+        // The captured value is a zero nobody wrote, and answering "the page is
+        // at zero" would refuse a machine for the wrong reason — installing the
+        // real controllers has already refused it for the right one.
+        assert_eq!(ApicBase::misplaced(Controller::Absent, 0), None);
     }
 }

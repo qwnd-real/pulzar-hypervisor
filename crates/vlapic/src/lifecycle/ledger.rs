@@ -47,7 +47,7 @@
 use descriptors::Vector;
 use x86_64::instructions::interrupts;
 
-use crate::vectors::Bitmap;
+use crate::registers::bitmap::Bitmap;
 
 /// The debts one processor's real controller is holding for its guest.
 #[derive(Debug, Default)]

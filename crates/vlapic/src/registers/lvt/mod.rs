@@ -26,137 +26,13 @@
 //! last in the count and first in memory — so nothing may derive one order from
 //! the other.
 
-use bitfield_struct::bitfield;
+mod shape;
+mod table;
+
+pub(crate) use crate::registers::lvt::shape::{Delivery, Lvt, TimerMode};
 use descriptors::Vector;
 
-use crate::{model::Model, register::Register};
-
-#[bitfield(u32)]
-#[derive(PartialEq, Eq)]
-/// One local vector table entry, in the layout all seven share.
-///
-/// Which of these fields mean anything depends on which entry a value came
-/// from, and [`Entry::writable`] is what answers that. A field reserved in the
-/// entry holding it reads back zero, because the write that would have set it
-/// had the bit removed first.
-pub(crate) struct Lvt {
-    /// The vector this source is delivered on.
-    ///
-    /// Read only for fixed delivery. The other modes are events the processor
-    /// takes by their own architectural entry point, and the vector is ignored
-    /// for them.
-    #[bits(8, from = Vector::new, into = Vector::number)]
-    pub(crate) vector: Vector,
-    /// How the interrupt is delivered, in the encoding [`Delivery::from_bits`]
-    /// decodes. Reserved in the timer and error entries, which deliver fixed
-    /// and nothing else.
-    #[bits(3)]
-    pub(crate) delivery: u8,
-    /// Reserved.
-    __: bool,
-    /// Whether a delivery from this source is still in flight: clear while the
-    /// controller is idle with respect to it, set from the moment the interrupt
-    /// is accepted for delivery until delivery completes. The controller writes
-    /// this; software cannot.
-    pub(crate) send_pending: bool,
-    /// Whether the pin is asserted low rather than high. Reserved outside the
-    /// two pin entries, since only they describe a wire.
-    pub(crate) active_low: bool,
-    /// Whether a level-triggered interrupt from this pin has been accepted and
-    /// not yet acknowledged. Set when the controller accepts the interrupt and
-    /// cleared by the guest's end-of-interrupt, and meaningless for an
-    /// edge-triggered one. Reserved outside the two pin entries, and written by
-    /// the controller rather than by software.
-    pub(crate) remote_irr: bool,
-    /// Whether the pin is level triggered rather than edge triggered, which is
-    /// what decides whether an acknowledgement is owed for it. Reserved outside
-    /// the two pin entries.
-    pub(crate) level_triggered: bool,
-    /// Whether this source is stopped from delivering anything. Set at reset in
-    /// every entry, so that a source cannot fire on a vector nobody chose.
-    pub(crate) masked: bool,
-    /// How the timer counts, in the encoding [`TimerMode::from_bits`] decodes.
-    /// Reserved outside the timer entry.
-    #[bits(2)]
-    pub(crate) timer_mode: u8,
-    /// Reserved.
-    #[bits(13)]
-    __: u32,
-}
-
-/// How an entry's interrupt is delivered to the processor.
-///
-/// Three of the eight encodings a three-bit field can hold are reserved, and no
-/// entry accepts one; a further two are accepted only by the entries that
-/// describe a pin, because they are how an external controller's own signalling
-/// is carried in over a wire rather than a mode a local source may choose.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum Delivery {
-    /// Delivered on the vector in the entry, which is the only mode that reads
-    /// it.
-    Fixed = 0b000,
-    /// Delivered as a system-management interrupt, which the processor takes
-    /// through its own entry point.
-    SystemManagement = 0b010,
-    /// Delivered as a non-maskable interrupt, which no masking holds off.
-    NonMaskable = 0b100,
-    /// Delivered as an INIT, resetting the processor's state without a start-up
-    /// message.
-    Init = 0b101,
-    /// Delivered as though from an external interrupt controller, whose
-    /// acknowledgement cycle supplies the vector.
-    External = 0b111,
-}
-
-impl Delivery {
-    /// The mode this encoding names, or `None` for one no entry accepts.
-    ///
-    /// A reserved encoding is retained rather than rejected: the field is
-    /// writable in every entry that has one, so a guest that writes a reserved
-    /// mode reads it back, exactly as it would from hardware. What refuses it
-    /// is everything downstream — nothing decodes it to a mode, and a
-    /// source holding one is programmed masked rather than programmed with
-    /// a delivery mode real hardware calls undefined. Every caller of this
-    /// therefore has to handle `None`, and handling it means delivering
-    /// nothing.
-    pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
-        match bits {
-            0b000 => Some(Self::Fixed),
-            0b010 => Some(Self::SystemManagement),
-            0b100 => Some(Self::NonMaskable),
-            0b101 => Some(Self::Init),
-            0b111 => Some(Self::External),
-            _ => None,
-        }
-    }
-}
-
-/// How the timer counts, which the timer entry alone carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum TimerMode {
-    /// Counts the initial count down once and stops.
-    OneShot = 0b00,
-    /// Counts it down and reloads it, so the interrupt repeats at a fixed
-    /// period.
-    Periodic = 0b01,
-    /// Ignores the counters entirely and fires when the time-stamp counter
-    /// reaches the value in the deadline register.
-    Deadline = 0b10,
-}
-
-impl TimerMode {
-    /// The mode this encoding names, or `None` for the reserved one.
-    pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
-        match bits {
-            0b00 => Some(Self::OneShot),
-            0b01 => Some(Self::Periodic),
-            0b10 => Some(Self::Deadline),
-            _ => None,
-        }
-    }
-}
+use crate::{face::table::Register, hardware::model::Model};
 
 /// Which of the seven entries a value belongs to.
 ///
@@ -333,15 +209,8 @@ const TIMER_MODE_FIELD: u8 = 0b11;
 /// the two modes every controller's timer has.
 const COUNTING_MODE_FIELD: u8 = 0b01;
 
-/// Every entry the architecture defines has to be in the order it counts them,
-/// because a model with fewer than all of them keeps exactly the first however
-/// many — so a table shorter than the list would silently hand a guest an entry
-/// its controller does not have.
-const _: () = assert!(
-    Entry::ALL.len() == Entry::COUNT && Entry::FEWEST >= 1,
-    "the table must list every entry, and a controller must have at least one"
-);
-
+/// The bit that masks a local-vector-table entry.
+pub(super) const MASKED: u32 = 1 << 16;
 #[cfg(test)]
 mod tests {
     use descriptors::Vector;
@@ -350,7 +219,7 @@ mod tests {
         Delivery, Entry, Lvt, TimerMode, WRITABLE_COUNTING_MODE, WRITABLE_DELIVERY, WRITABLE_PIN,
         WRITABLE_TIMER_MODE,
     };
-    use crate::{model, register::Register};
+    use crate::{face::table::Register, hardware::model};
 
     #[test]
     fn reset_is_masked_and_nothing_more() {
@@ -379,12 +248,6 @@ mod tests {
         assert_eq!(Entry::of(Register::SPURIOUS), None);
     }
 
-    #[test]
-    fn reserved_delivery_encodings_name_nothing() {
-        for bits in [0b001, 0b011, 0b110] {
-            assert_eq!(Delivery::from_bits(bits), None);
-        }
-    }
 
     #[test]
     fn only_the_pins_describe_a_wire() {

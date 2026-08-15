@@ -141,7 +141,16 @@ impl Firmware {
     fn handed(&mut self, vcpu: &mut Vcpu) -> Flow {
         if self.stage == Stage::Portal {
             info!("exits: About to boot APICs");
-            match apic::start(self.boot.trampoline, self.boot.attach) {
+            let started = apic::start(self.boot.trampoline, self.boot.attach);
+            // Whatever came of it, and before the guest is let go: every
+            // processor that was going to become this hypervisor's has done so,
+            // so from here on a startup message the guest sends can only be one
+            // aimed at a processor the guest itself owns. One that failed to
+            // start is the sharpest case — it sits in firmware's wait-for-startup
+            // state, where a forwarded message would give the guest a processor
+            // with no nested tables at all.
+            vlapic::bring_up_finished();
+            match started {
                 Ok(started) => {
                     self.stage = Stage::Handed;
                     info!(

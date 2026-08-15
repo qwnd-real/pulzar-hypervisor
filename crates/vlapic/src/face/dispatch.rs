@@ -17,18 +17,35 @@
 //! interrupt command register is how an interrupt is sent, and writing the
 //! error status register is what makes a subsequent read report anything at
 //! all.
+//!
+//! # And some writes ask for more than a store
+//!
+//! A guest's write to a controller is very often not merely a value: it can send
+//! an interrupt to another processor, retire one on this one, or change what real
+//! hardware is doing. What the register file itself cannot finish is answered as
+//! a [`Written`] and performed by [`acted`], which is where the two faces stop
+//! being two code paths.
 
+use apic::LocalApic;
 use descriptors::Vector;
-use log::warn;
+use log::{trace, warn};
 
 use crate::{
-    error::Errors,
-    icr::Command,
-    lvt::Entry,
+    delivery,
+    face::table::{Bank, Register},
+    hardware::{
+        mirror::{entered, mirror_logical_destination},
+        sources, timer,
+    },
+    machine::registry::lapics,
     priority,
-    register::{Bank, Register},
-    state::{Transition, Vlapic},
-    timer,
+    registers::{
+        Vlapic,
+        base::Transition,
+        error::Errors,
+        icr::{Command, Trigger},
+        lvt::Entry,
+    },
 };
 
 /// What the guest sees when it reads a register.
@@ -230,15 +247,85 @@ pub(crate) enum Written {
 /// Only that face: reaching a reserved index through the model-specific
 /// registers is a general protection fault instead, and the architecture is
 /// explicit that this bit is not set for one.
-pub(crate) fn illegal_register(vlapic: &Vlapic, register: Option<Register>) {
+///
+/// `offset` is the raw offset the guest named rather than a register, because
+/// the whole reason this is reached is that no register sits there.
+pub(crate) fn illegal_register(vlapic: &Vlapic, offset: u64) {
     if vlapic.errors().record(Errors::ILLEGAL_REGISTER_ADDRESS) {
         // Only the first, because a guest probing its register page produces
         // one of these per probe and the error status register latches them all
         // into the same bit anyway.
         warn!(
-            "vlapic: {} named a reserved register at offset {:#x}",
-            vlapic.index(),
-            register.map_or(0, Register::offset)
+            "vlapic: {} named a reserved register at offset {offset:#x}",
+            vlapic.index()
         );
+    }
+}
+
+/// Performs what a guest's write asked for beyond the value being stored.
+///
+/// Shared by both faces deliberately: a guest that sent an interrupt through
+/// the memory-mapped command register and one that sent it through a
+/// model-specific register have asked for exactly the same thing, and this is
+/// where that stops being two code paths.
+pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
+    match written {
+        Written::Nothing => {}
+        // The architecture defines acknowledging nothing as doing nothing, and
+        // discharging whatever real hardware was owed for it is part of the
+        // acknowledgement rather than something done after it.
+        Written::EndOfInterrupt => {
+            let retired = vlapic.end_of_interrupt();
+            trace!(
+                "vlapic: {} acknowledged {retired:?}, leaving {} in service and {} requested at \
+                 task priority {}, real in service {:?}, hardware {}",
+                vlapic.index(),
+                vlapic.in_service_count(),
+                vlapic.requested_count(),
+                vlapic.task_priority(),
+                apic::local().ok().and_then(LocalApic::in_service_top),
+                if vlapic.ledger().is_empty() {
+                    "owed nothing"
+                } else {
+                    "still owed an acknowledgement"
+                }
+            );
+        }
+        Written::Timer => {
+            timer::reprogram(vlapic);
+        }
+        // The one write that starts a counting timer. What it delivers and in
+        // which mode was settled when those registers were written, so this
+        // does not reconfigure anything — reconfiguring here is what would move
+        // the phase of a periodic tick on every unrelated write.
+        Written::TimerStarted => timer::reload(vlapic),
+        Written::TimerDeadline(deadline) => timer::arm_deadline(vlapic, deadline),
+        Written::LocalVectorTable => {
+            sources::reprogram(vlapic);
+        }
+        // Software-disabling masked every stored entry, and the timer is
+        // programmed from its own entry rather than with the rest, so both have
+        // to follow. Neither is disarmed: masking suppresses delivery and does
+        // not stop a count the guest may still be reading.
+        Written::Disabled => {
+            sources::reprogram(vlapic);
+            timer::reprogram(vlapic);
+        }
+        Written::LogicalDestination => mirror_logical_destination(vlapic),
+        Written::ModeChanged(transition) => entered(vlapic, transition),
+        Written::Command(command) => match lapics() {
+            Ok(page) => delivery::send(vlapic, page.all(), command),
+            Err(error) => warn!("vlapic: a command could not be delivered: {error}"),
+        },
+        // A guest sending itself an interrupt is the sender, so a vector no
+        // controller may deliver is its error to be told about rather than the
+        // receiver's — even though the two are the same controller here.
+        Written::SelfIpi(vector) => {
+            if priority::legal(vector) {
+                vlapic.accept(vector, Trigger::Edge);
+            } else {
+                vlapic.errors().record(Errors::SEND_ILLEGAL_VECTOR);
+            }
+        }
     }
 }

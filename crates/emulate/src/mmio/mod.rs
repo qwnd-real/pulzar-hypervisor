@@ -103,6 +103,17 @@ pub trait Device: Send + Sync {
     /// declaration with a stated meaning rather than a hint.
     fn capability(&self) -> Capability;
 
+    /// Whether this device ever reaches the hardware behind its region.
+    ///
+    /// Checked at registration, and it decides whether a mapping is made at
+    /// all: a device that answers every read out of its own state and lets no
+    /// write through has no use for one, and a mapping nothing uses is a
+    /// writable alias of a device's registers at a host address for no reason.
+    /// A device that declares [`Hardware::Untouched`] finds
+    /// [`Read::hardware`] answering `None`, and a write it asks to let through
+    /// is refused rather than performed.
+    fn hardware(&self) -> Hardware;
+
     /// What the guest should see.
     ///
     /// Call [`Read::hardware`] for what the device really holds, or do not, and
@@ -114,6 +125,23 @@ pub trait Device: Send + Sync {
 
     /// What should become of what the guest wrote.
     fn write(&self, access: Write<'_>) -> Commit;
+}
+
+/// Whether the hardware behind a region is reached at all.
+///
+/// The question is not whether a device *has* registers of its own — every one
+/// of these stands for something — but whether this hypervisor touches them.
+/// An emulated controller whose whole point is that the guest must not reach
+/// the real one behind it answers every access out of its own state, and a
+/// mapping of the real registers would then be a standing writable alias of
+/// them that nothing reads and nothing writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hardware {
+    /// The device's registers are mapped for as long as the region exists, so a
+    /// handler may read them and may let a write through to them.
+    Reached,
+    /// Nothing behind the region is ever touched, so nothing maps it.
+    Untouched,
 }
 
 /// Which accesses a device can be asked to answer.
@@ -344,7 +372,9 @@ impl Read<'_> {
         self.admitted.width()
     }
 
-    /// What the device really holds there, read now.
+    /// What the device really holds there, read now, or `None` for a device
+    /// that declared [`Hardware::Untouched`] and so has no mapping to read
+    /// through.
     ///
     /// The access is made when this is called and not before, so a handler that
     /// does not need it does not make it. Calling it twice makes two device
@@ -352,7 +382,7 @@ impl Read<'_> {
     /// different answers — that is the device's behaviour, faithfully, and
     /// not something to hide behind a cache.
     #[must_use]
-    pub fn hardware(&self) -> Data {
+    pub fn hardware(&self) -> Option<Data> {
         self.window.read(&self.admitted)
     }
 }
@@ -393,13 +423,14 @@ impl Write<'_> {
         self.value
     }
 
-    /// What the device holds there now, read before anything is written.
+    /// What the device holds there now, read before anything is written, or
+    /// `None` for a device that declared [`Hardware::Untouched`].
     ///
     /// For the registers where what the guest wrote is only part of the answer:
     /// a bit to set in a field that must otherwise be left alone, or a
     /// write-to-clear register whose other bits must survive.
     #[must_use]
-    pub fn hardware(&self) -> Data {
+    pub fn hardware(&self) -> Option<Data> {
         self.window.read(&self.admitted)
     }
 }
@@ -442,8 +473,9 @@ impl<'a> Registrar<'a> {
     /// Takes over a region of the guest's physical memory.
     ///
     /// Either the whole region is taken over or nothing is. Three things have
-    /// to happen — the device's registers are mapped, the nested tables are
-    /// told to trap the region, and the device is remembered — and each of
+    /// to happen — the device's registers are mapped where the device reaches
+    /// them at all, the nested tables are told to trap the region, and the
+    /// device is remembered — and each of
     /// them can fail, so each is undone if a later one does. The order is
     /// chosen so that the failure of one leaves the least to undo: room to
     /// remember the region is reserved first, because a reservation is the
@@ -479,24 +511,30 @@ impl<'a> Registrar<'a> {
         // that cannot be undone by putting something back the way it was.
         self.reserve(1)?;
 
-        // SAFETY: this is a device aperture rather than memory — the caller is
-        // registering it precisely because hardware answers there — so there is
-        // nothing for a writable alias to conflict with. The range is checked
-        // above to be page aligned, a whole number of pages, and within the
-        // processor's physical address width. Uncached is what a device register
-        // needs: a write that sat in a cache line would never reach the bus.
-        let mapping = unsafe {
-            self.space
-                .map_physical(gpa, bytes, Protection::ReadWrite, CacheType::UncachedMinus)
-        }?;
+        let aperture = match region.device.hardware() {
+            // SAFETY: this is a device aperture rather than memory — the caller is
+            // registering it precisely because hardware answers there — so there is
+            // nothing for a writable alias to conflict with. The range is checked
+            // above to be page aligned, a whole number of pages, and within the
+            // processor's physical address width. Uncached is what a device register
+            // needs: a write that sat in a cache line would never reach the bus.
+            Hardware::Reached => Aperture::Mapped(unsafe {
+                self.space
+                    .map_physical(gpa, bytes, Protection::ReadWrite, CacheType::UncachedMinus)
+            }?),
+            // Nothing to map. The device answers out of its own state and lets
+            // nothing through, so a mapping of the registers behind it would be a
+            // writable alias of somebody's hardware that no access ever reaches.
+            Hardware::Untouched => Aperture::Untouched { bytes },
+        };
         if let Err(error) = self
             .npt
             .protect(self.space.frames(), gpa, bytes, region.trap)
         {
-            // SAFETY: the mapping was made one statement ago, nothing has been
-            // handed its address, and the region is not in the list — so nothing
-            // derived from it exists anywhere.
-            if let Err(unmapping) = unsafe { self.space.unmap(mapping) } {
+            // The aperture was made one statement ago, nothing has been handed its
+            // address, and the region is not in the list — so nothing derived from
+            // it exists anywhere.
+            if let Some(unmapping) = aperture.release(self.space) {
                 // The trap is gone but the window is not, and the address space
                 // has retired the run rather than handing it back. Reported rather
                 // than logged: a caller that carries on believing the region was
@@ -514,7 +552,7 @@ impl<'a> Registrar<'a> {
         self.regions.push(Interposed {
             gpa,
             end,
-            aperture: Aperture::Mapped(mapping),
+            aperture,
             device: region.device,
         });
         Ok(())
@@ -587,12 +625,16 @@ impl Mmio {
         for region in &self.regions {
             // The last byte rather than one past it: one past the end of a region
             // at the top of the address space is not an address at all.
-            info!(
-                "{who}: interposing on guest physical {:#x}..={:#x}, reached at {:#x}",
-                region.gpa.as_u64(),
-                region.end - 1,
-                region.window().base(),
-            );
+            let (gpa, last) = (region.gpa.as_u64(), region.end - 1);
+            match region.window().base() {
+                Some(base) => info!(
+                    "{who}: interposing on guest physical {gpa:#x}..={last:#x}, reached at {base:#x}"
+                ),
+                None => info!(
+                    "{who}: interposing on guest physical {gpa:#x}..={last:#x}, whose device \
+                     answers without reaching the hardware behind it"
+                ),
+            }
         }
     }
 
@@ -830,7 +872,12 @@ impl Mmio {
         // has checked the handler's answer until here, and a wider one would write
         // past the end of a mapping through a misaligned pointer.
         admitted.binds(&committed).map_err(inadmissible)?;
-        window.write(&admitted, &committed);
+        // A device that declared the hardware behind its region untouched has no
+        // mapping to write through, so a handler asking for one is a contract
+        // error rather than something to perform.
+        if !window.write(&admitted, &committed) {
+            return Err(inadmissible(Inadmissible::Untouched));
+        }
         Ok(())
     }
 
@@ -964,7 +1011,7 @@ impl Interposed {
 
 /// Where a region's registers are reachable, and what keeps them reachable.
 ///
-/// One variant in the hypervisor and one more in the tests. The distinction is
+/// Two variants in the hypervisor and one more in the tests. The distinction is
 /// deliberately at this level and no deeper: everything above it — admission,
 /// commit binding, the width of a transaction — is the same code either way, so
 /// what the tests exercise is what runs on a machine.
@@ -972,6 +1019,13 @@ enum Aperture {
     /// A mapping of the device's real aperture, held for as long as the region
     /// is.
     Mapped(Mapping),
+    /// No mapping at all, for a device that declared the hardware behind its
+    /// region untouched. The length is still kept, because admission is checked
+    /// against it whether or not anything can be reached.
+    Untouched {
+        /// How long the region is.
+        bytes: u64,
+    },
     /// Bytes standing in for a device's registers.
     ///
     /// Leaked rather than owned, because a window is reached through a raw
@@ -997,6 +1051,7 @@ impl Aperture {
             // aperture, and is held by this value — so it outlives every window
             // made from it, which cannot escape the callback it is lent to.
             Self::Mapped(mapping) => unsafe { Window::new(mapping.addr(), mapping.bytes()) },
+            Self::Untouched { bytes } => Window::unmapped(*bytes),
             // SAFETY: the bytes were leaked at construction, so they are live for
             // the rest of the process and nothing else holds a reference to them.
             #[cfg(test)]
@@ -1010,10 +1065,15 @@ impl Aperture {
     /// reachable afterwards.
     fn release(self, space: &mut AddressSpace) -> Option<PagingError> {
         match self {
-            // SAFETY: the caller of `teardown` guarantees no processor is running
-            // the guest and that nothing derived from the window is in use. The
-            // aperture is consumed here, so no further access is representable.
+            // SAFETY: two callers, and each establishes the same thing. A failed
+            // registration has given the mapping's address to nothing and has not
+            // put the region in the list, and `teardown`'s caller guarantees no
+            // processor is running the guest and that nothing derived from the
+            // window is in use. The aperture is consumed here either way, so no
+            // further access is representable.
             Self::Mapped(mapping) => unsafe { space.unmap(mapping) }.err(),
+            // Nothing was mapped, so there is nothing to give back.
+            Self::Untouched { .. } => None,
             // Deliberately leaked, and so nothing to give back: the bytes stand in
             // for a device aperture, which is not memory this process allocated.
             #[cfg(test)]

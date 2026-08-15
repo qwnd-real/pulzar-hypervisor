@@ -195,7 +195,8 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // controller with it.
     let apic = Apic::install(&mut space, acpi.madt(), host_apic_mode(firmware))?;
     apic.describe("core");
-    cpu::attach(apic::local()?.id())?;
+    let here = apic::local()?.id();
+    cpu::attach(here)?;
     ipi::install()?;
     // After the interprocessor interrupts it takes a vector from, and before
     // any other processor is started: a controller has to exist before anything
@@ -203,7 +204,7 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     vlapic::install(firmware)?;
     // Running, because this is the processor the guest is entered on. Every
     // other one joins the guest held, however long it has been executing.
-    vlapic::claim_processor(Joining::Running)?;
+    vlapic::claim_processor(here, Joining::Running)?;
 
     // After the block, because enabling virtualization snapshots host state that
     // includes the `GS` base a block is reached through, and before any other
@@ -381,13 +382,19 @@ fn attach() -> Result<(cpu::ApicId, Descriptors), CoreError> {
     // in x2APIC this processor arrives there and stays, and the emulated
     // controller its guest has not started yet catches up when the guest asks.
     let id = apic::LocalApic::enable()?.id();
-    cpu::attach(id)?;
     // The moment this processor can answer for itself, and not a step later: a
     // startup message the guest sends before this is forwarded to real hardware,
     // and real hardware would reset the host out from under whatever this
     // processor is doing. Held rather than running, because the guest has not
     // started this processor and does not know it exists.
-    vlapic::claim_processor(Joining::WaitingForSipi)?;
+    //
+    // Before publishing itself as one of the machine's, deliberately. Whoever
+    // started this processor waits for exactly that publication and then carries
+    // on — so a processor that published first and claimed afterwards would leave
+    // a window in which the rest of the machine believes it is up while a guest
+    // start-up aimed at it still reaches real silicon.
+    vlapic::claim_processor(id, Joining::WaitingForSipi)?;
+    cpu::attach(id)?;
     Ok((id, descriptors))
 }
 

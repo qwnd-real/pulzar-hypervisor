@@ -46,8 +46,8 @@ use descriptors::Vector;
 use processor::Features;
 
 use crate::{
-    lvt::{Delivery, Entry},
     priority::{self, Priority},
+    registers::lvt::{Delivery, Entry},
 };
 
 /// The controller a guest is given, as everything above this module sees it.
@@ -240,7 +240,7 @@ pub(crate) mod tests {
     //! vendor.
 
     use super::{Arbitration, Model, Vendor};
-    use crate::lvt::Entry;
+    use crate::registers::lvt::Entry;
 
     /// A controller with every entry, on a processor implementing both optional
     /// interfaces, following AMD's rules.
