@@ -101,16 +101,14 @@ pub(crate) fn installed() -> bool {
 /// a device is handed over as a boxed trait object. One allocation for the life
 /// of the machine is the honest cost of that.
 ///
-/// Answers the controllers and whether this call is the one that built them. A
-/// second caller is told rather than silently sharing the first one's, and
-/// nothing is allocated for it.
-pub(crate) fn publish(lapics: Box<[Vlapic]>) -> (&'static Page, bool) {
-    let mut built = false;
-    let page = LAPICS.call_once(|| {
-        built = true;
-        &*Box::leak(Box::new(Page::new(lapics)))
-    });
-    (page, built)
+/// Nothing is answered about whether this call is the one that built them,
+/// because there is no second call to answer it for: [`crate::install`] runs on
+/// the boot processor before any other processor exists and refuses at its
+/// first line if the cell is already full. A check here would be one after a
+/// vector had been acquired, and the only path it could take is one that leaks
+/// it.
+pub(crate) fn publish(lapics: Box<[Vlapic]>) -> &'static Page {
+    LAPICS.call_once(|| &*Box::leak(Box::new(Page::new(lapics))))
 }
 
 /// Built once, by the boot processor, before any other processor is started.

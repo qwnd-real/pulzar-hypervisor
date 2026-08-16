@@ -117,7 +117,7 @@ pub use crate::{
     capture::{Controller, FirmwareState, LVT_ENTRIES, LocalState, VECTOR_WORDS, capture},
     icr::{Command, Delivery, Target},
     lvt::{Delivery as LvtDelivery, Entry, Polarity, Trigger},
-    register::{REGISTER_STRIDE, X2APIC_BASE_MSR},
+    register::{REGISTER_STRIDE, X2APIC_BASE_MSR, lvt_entries, version_number},
     smp::{Started, start},
     timer::{Divisor, IA32_TSC_DEADLINE, Mode as TimerMode, Timer},
 };

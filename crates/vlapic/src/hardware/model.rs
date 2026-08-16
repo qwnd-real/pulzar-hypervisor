@@ -3,59 +3,73 @@
 //! A guest works out what its controller can do from three places, and a
 //! hypervisor that lets them disagree has handed it a machine that does not
 //! exist. `CPUID` says which optional features the processor implements; the
-//! version register says how many local vector table entries the controller
-//! has; and the registers themselves say what may be written into them. This
-//! module is the one place those three are decided together, so that every
-//! later question — is this entry present, may this mode be entered, which
-//! arbitration rule applies, what does this reserved field fault on — is
-//! answered from one description rather than from a constant somewhere.
+//! version register says which version of the controller it is and how many
+//! local vector table entries it has; and the registers themselves say what may
+//! be written into them. This module is the one place those three are decided
+//! together, so that every later question — is this entry present, may this
+//! mode be entered, what does this reserved field fault on — is answered from
+//! one description rather than from a constant somewhere.
 //!
 //! # Why it is derived rather than chosen
 //!
 //! Pulzar passes `CPUID` through. A guest therefore reads the real vendor,
 //! family and model of the processor it is running on, and every optional
 //! feature that processor reports. Inventing a controller that contradicts that
-//! would be inventing a processor: an AMD guest computing an Intel arbitration
-//! priority, or a controller offering a corrected-machine-check entry on
-//! hardware whose own controller has none and would refuse to be programmed for
-//! it.
+//! would be inventing a processor: a controller offering a
+//! corrected-machine-check entry on hardware whose own controller has none and
+//! would refuse to be programmed for it, or reporting a version its own entry
+//! count contradicts.
 //!
 //! So the model is built from the machine — the vendor out of `CPUID`, the
-//! entry count out of the real controller's version register reconciled with
-//! the machine-check capability the same guest reads, the optional interfaces
-//! out of the reported features — and every processor's controller carries a
-//! copy of it.
+//! version and the entry count out of one read of the real controller's version
+//! register reconciled with the machine-check capability the same guest reads,
+//! the optional interfaces out of the reported features — and every processor's
+//! controller carries a copy of it.
 //!
-//! # What the two vendors actually disagree about
+//! Both halves of the version register come from the same read, and that is not
+//! only tidiness. A controller reporting a machine-derived entry count beside
+//! an invented version number describes a part that never shipped, and software
+//! that keys off the version — the boundary the architecture puts between the
+//! discrete controller and this one is a version number, not a feature bit —
+//! draws its conclusions about the count from it.
 //!
-//! Less than the register layout suggests, and never cosmetically.
+//! # Whose manual this follows, and why there is no vendor dispatch
 //!
-//! The arbitration priority is computed differently, and the difference is
-//! visible to a guest that reads the register. Intel's P6 definition combines
-//! the task and in-service classes with a bitwise AND; AMD's is the maximum of
-//! the task, in-service and request priorities, keeping the task subclass when
-//! the task priority is what wins. The two disagree whenever the classes share
-//! no bits, which is most of the time.
+//! AMD's. Pulzar is an SVM hypervisor, and SVM exists on AMD and on Hygon,
+//! whose parts are AMD-derived and follow AMD's manual; no other vendor
+//! implements it, so no other vendor's machine can execute this code. The two
+//! places the vendors' controllers genuinely differ are therefore settled
+//! rather than dispatched, and both are recorded here because the code no
+//! longer shows them:
 //!
-//! The error entry has a message-type field on AMD and does not on Intel, where
-//! its delivery is fixed by the architecture. A guest that programs one on a
-//! machine reporting an AMD processor and reads back a fixed delivery has been
-//! told its write did not happen.
+//! - The arbitration priority is computed differently. AMD's is the greatest of
+//!   the task, in-service and request priorities, keeping the task subclass
+//!   when the task priority is what wins; Intel's P6 definition combines the
+//!   task and in-service classes with a bitwise AND instead. The two disagree
+//!   whenever those classes share no bits, which is most of the time.
+//!   [`crate::priority`] implements AMD's, unconditionally.
+//! - The error entry has a message-type field in bits 10:8 on AMD, where the
+//!   whole of 11:8 is reserved on Intel. So a guest may program the mode of its
+//!   own error interrupt here, and a vector left in that entry is an illegal
+//!   one only when the mode is fixed.
 //!
-//! What they do *not* disagree about, as far as anything here is concerned, is
-//! which processor a redirectable interrupt goes to. That was the chipset's
-//! choice rather than the processor's, neither vendor specifies it, and
-//! [`crate::delivery`] makes it without asking the model.
+//! [`Vendor`] is still read, and is reported rather than branched on: a machine
+//! that names itself something else is one where the controller being presented
+//! and the processor the guest reads are described by different manuals, and
+//! that is a fact worth having in a log rather than a branch worth taking.
+//!
+//! What the vendors do *not* disagree about, as far as anything here is
+//! concerned, is which processor a redirectable interrupt goes to. That was the
+//! chipset's choice rather than the processor's, neither vendor specifies it,
+//! and [`crate::delivery`] makes it without asking the model.
+
+use core::fmt::{self, Display, Formatter};
 
 use apic::LocalApic;
-use descriptors::Vector;
-use log::warn;
+use log::{info, warn};
 use processor::Features;
 
-use crate::{
-    priority::{self, Priority},
-    registers::lvt::{Delivery, Entry},
-};
+use crate::registers::lvt::Entry;
 
 /// The controller a guest is given, as everything above this module sees it.
 ///
@@ -66,6 +80,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Model {
     vendor: Vendor,
+    version: u32,
     entries: usize,
     x2apic: bool,
     deadline: bool,
@@ -74,30 +89,32 @@ pub(crate) struct Model {
 impl Model {
     /// The model this machine's own controller and processor describe.
     ///
-    /// The entry count comes from the real controller because the sources
-    /// behind those entries are the real ones: an entry the hardware does
-    /// not have is an entry nothing could deliver from, so offering it to a
-    /// guest would be offering a source that can never fire. A controller
-    /// that cannot be asked — which happens only if this is called before
-    /// the local controller is up — is taken to have the architectural
-    /// minimum rather than assumed to have everything, since advertising an
-    /// absent entry is the failure that silently misleads a guest and
-    /// advertising too few merely offers it less.
+    /// `local` is the controller of the processor this runs on, which is the
+    /// boot processor's: [`crate::install`] has already established that it can
+    /// be reached, and taking it as a parameter is what leaves this with no
+    /// answer to invent for a controller that cannot be asked. That the whole
+    /// machine is described by the one it reads is an assumption, and the one
+    /// every part this hypervisor can run on satisfies — the version and the
+    /// entry count are fixed at reset and uniform across a package, exactly as
+    /// the features [`processor::features`] caches from one processor are.
     ///
-    /// The count is then reconciled with the machine's machine-check
+    /// The version and the entry count come from one read of the version
+    /// register, so the two halves of what a guest reads back cannot describe
+    /// different controllers. The entry count is the real controller's because
+    /// the sources behind those entries are the real ones: an entry the
+    /// hardware does not have is an entry nothing could deliver from, so
+    /// offering it to a guest would be offering a source that can never
+    /// fire. It is then reconciled with the machine's machine-check
     /// capability, which is the other half of the same fact; see
     /// [`corrected_machine_check_entries`].
-    pub(crate) fn of_machine() -> Self {
+    pub(crate) fn of_machine(local: LocalApic) -> Self {
         let features = processor::features();
-        let entries = apic::local()
-            .map(LocalApic::entries)
-            .map_or(Entry::FEWEST, |entries| {
-                usize::try_from(entries).unwrap_or(Entry::FEWEST)
-            })
-            .clamp(Entry::FEWEST, Entry::COUNT);
+        let version = local.version();
+        let entries = apic::lvt_entries(version) as usize;
         Self {
             vendor: Vendor::of_machine(),
-            entries: corrected_machine_check_entries(entries),
+            version: apic::version_number(version),
+            entries: corrected_machine_check_entries(entries.clamp(Entry::FEWEST, Entry::COUNT)),
             x2apic: features.contains(Features::X2APIC),
             deadline: features.contains(Features::TSC_DEADLINE),
         }
@@ -112,18 +129,22 @@ impl Model {
         entry.index() < self.entries
     }
 
-    /// What the version register reports, which is one less than the number of
-    /// entries.
+    /// What the version register reports: the controller's own version in the
+    /// low byte, and one less than its number of entries in the third.
     ///
     /// One less so that a controller always has at least one entry and the
-    /// field cannot wrap, which is why [`Model::of_machine`] refuses to
-    /// build a model with none.
+    /// field cannot wrap, which is why [`Model::of_machine`] clamps the count
+    /// to at least the fewest any implementation has reported.
+    ///
+    /// The bit that says the extended register space is present is deliberately
+    /// not reported: the low byte is taken out of the machine's word on its
+    /// own, and this crate does not model that space.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the entry count is clamped to the seven the architecture defines, so one less than it fits the byte the field occupies"
     )]
-    pub(crate) const fn max_lvt(self) -> u32 {
-        (self.entries - 1) as u32
+    pub(crate) const fn version(self) -> u32 {
+        ((self.entries - 1) as u32) << MAX_LVT_SHIFT | self.version
     }
 
     /// Whether the guest may put its controller into x2APIC mode.
@@ -139,82 +160,44 @@ impl Model {
     pub(crate) const fn deadline(self) -> bool {
         self.deadline
     }
+}
 
-    /// Whether an entry accepts a delivery mode in this model.
-    ///
-    /// The two pins accept the modes the architecture defines for a wire an
-    /// external controller signals over, which is all of them. The rest accept
-    /// the modes a source the controller raises itself can meaningfully ask
-    /// for, which excludes INIT and an external interrupt. The error entry
-    /// is where the vendors part: it has no delivery field at all on Intel
-    /// and a message type on AMD.
-    ///
-    /// The one exception to all of that is a system-management interrupt, which
-    /// no entry accepts, and that is this hypervisor's own departure rather
-    /// than either vendor's rule. These entries are programmed onto the
-    /// machine's own controller, so a guest that chose that mode would take
-    /// the *host* into system-management mode over host state, running
-    /// firmware's handler against a context it was not written for — and
-    /// the guest would see nothing of it either way. The interrupt command
-    /// register refuses to send one for exactly the same reason, and the
-    /// decision belongs in one place rather than in both.
-    ///
-    /// INIT and an external interrupt reach a pin's entry from here and are
-    /// refused where the entry is turned into a physical one, because what is
-    /// wrong with them is not the shape of the entry;
-    /// [`crate::hardware::sources`] is where that is stated.
-    pub(crate) const fn allows(self, entry: Entry, delivery: Delivery) -> bool {
-        match delivery {
-            Delivery::Fixed => true,
-            Delivery::NonMaskable => self.has_delivery(entry),
-            Delivery::SystemManagement => false,
-            Delivery::Init | Delivery::External => matches!(entry, Entry::Lint0 | Entry::Lint1),
-        }
-    }
-
-    /// Whether an entry has a delivery-mode field software may write.
-    ///
-    /// The timer never does: its delivery is fixed by the architecture on both
-    /// vendors. The error entry does on AMD alone.
-    pub(crate) const fn has_delivery(self, entry: Entry) -> bool {
-        match entry {
-            Entry::Timer => false,
-            Entry::Error => matches!(self.vendor, Vendor::Amd),
-            _ => true,
-        }
-    }
-
-    /// The arbitration priority this model computes.
-    ///
-    /// Vestigial in the sense that no processor Pulzar runs on arbitrates over
-    /// a bus, and not vestigial in the sense that matters: the register is
-    /// readable, a guest that reads it gets a number, and the number has to be
-    /// the one its processor would have produced.
-    pub(crate) fn arbitration_priority(
-        self,
-        task: Priority,
-        in_service: Option<Vector>,
-        requested: Option<Vector>,
-    ) -> Priority {
-        match self.vendor {
-            Vendor::Amd => priority::amd_arbitration(task, in_service, requested),
-            Vendor::Intel => priority::intel_arbitration(task, in_service, requested),
-        }
+impl Display for Model {
+    /// Everything the model decided, because which of these a machine reports
+    /// is what explains the paths this crate takes on it — and the one line
+    /// a misbehaving part is diagnosed from.
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} version {:#x}, {} lvt entries, {} x2apic, {} deadline timer",
+            self.vendor,
+            self.version,
+            self.entries,
+            if self.x2apic { "with" } else { "without" },
+            if self.deadline { "with" } else { "without" },
+        )
     }
 }
 
-/// Whose architecture the guest's controller follows.
+/// Whose architecture the processor behind this controller names itself with.
 ///
-/// Not a preference. It is read out of the same `CPUID` leaf the guest reads,
-/// so that the controller and the processor it is part of agree about whose
-/// manual describes them.
+/// Read out of the same `CPUID` leaf the guest reads, and reported rather than
+/// acted on. Everything this crate presents follows AMD's manual, because SVM
+/// is AMD's and nothing else can execute this code — so what this answers is
+/// not which rules to apply but whether the machine is one those rules
+/// describe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Vendor {
     /// `AuthenticAMD`.
     Amd,
-    /// `GenuineIntel`, and anything else: the Intel definitions are the ones
-    /// every other implementation of this architecture followed.
+    /// `HygonGenuine`: AMD-derived parts that implement SVM and follow AMD's
+    /// manual.
+    Hygon,
+    /// `GenuineIntel`, which implements no SVM and so cannot be running this.
     Intel,
+    /// Anything else, which is what a processor whose vendor string has been
+    /// rewritten underneath this hypervisor reports.
+    Unknown,
 }
 
 impl Vendor {
@@ -224,15 +207,51 @@ impl Vendor {
         // The twelve characters are spread across three registers in an order
         // that is not the order they are read in, which is the whole reason this
         // is written out rather than compared as a number.
-        if [leaf.ebx, leaf.edx, leaf.ecx] == AMD {
-            Self::Amd
-        } else {
-            Self::Intel
+        match [leaf.ebx, leaf.edx, leaf.ecx] {
+            AMD => Self::Amd,
+            HYGON => Self::Hygon,
+            INTEL => Self::Intel,
+            _ => Self::Unknown,
         }
+    }
+
+    /// Whether this is a vendor whose controller AMD's manual describes, which
+    /// is the manual everything here follows.
+    const fn amd_family(self) -> bool {
+        matches!(self, Self::Amd | Self::Hygon)
     }
 }
 
-/// The entry count this controller and the machine's machine-check reporting
+impl Display for Vendor {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Amd => "amd",
+            Self::Hygon => "hygon",
+            Self::Intel => "intel",
+            Self::Unknown => "an unrecognised vendor",
+        })
+    }
+}
+
+/// Says what was decided, and says so on the machine where it is not the whole
+/// truth.
+///
+/// The one line a part that misbehaves is diagnosed from, in a codebase where
+/// every other subsystem describes itself at boot: from the count of
+/// controllers alone there is no telling which controller the guest was given.
+pub(crate) fn describe(who: &str, model: Model) {
+    info!("{who}: presenting {model}");
+    if !model.vendor.amd_family() {
+        warn!(
+            "{who}: this processor names itself {} and the controller its guest is being given \
+             follows AMD's manual, which is the only one this hypervisor implements — the two \
+             disagree about the arbitration priority and about the error entry's message type",
+            model.vendor
+        );
+    }
+}
+
+/// The entry count this controller and the machine's machine-check reporting///
 /// both stand behind.
 ///
 /// The corrected-machine-check entry is the last of the seven the architecture
@@ -308,27 +327,49 @@ const VENDOR_LEAF: u32 = 0;
 /// `AuthenticAMD`, as the three registers hold it.
 const AMD: [u32; 3] = [0x6874_7541, 0x6974_6E65, 0x444D_4163];
 
+/// `HygonGenuine`.
+const HYGON: [u32; 3] = [0x6F67_7948, 0x6E65_476E, 0x656E_6975];
+
+/// `GenuineIntel`.
+const INTEL: [u32; 3] = [0x756E_6547, 0x4965_6E69, 0x6C65_746E];
+
+/// Bits the local-vector-table entry count is shifted by in the version
+/// register, which is where the guest reads it beside the version itself.
+const MAX_LVT_SHIFT: u32 = 16;
+
 #[cfg(test)]
 pub(crate) mod tests {
     //! Models are written out rather than derived from the machine the test
-    //! runs on, which is not the guest's machine and is not necessarily either
-    //! vendor.
+    //! runs on, which is not the guest's machine and is not necessarily a
+    //! machine this hypervisor could boot on at all.
+    //!
+    //! [`Vendor::of_machine`] is the exception, and is checked against the
+    //! strings themselves: it is pure data, it is the one thing here that
+    //! silently answers about the wrong machine if a digit is wrong, and it
+    //! cannot be exercised by running on a processor because a test runs on
+    //! whatever processor it runs on.
+
+    use alloc::{format, string::String};
 
     use super::{Model, Vendor};
-    use crate::registers::lvt::{Delivery, Entry};
+    use crate::registers::lvt::Entry;
 
     /// A controller with every entry, on a processor implementing both optional
-    /// interfaces, following AMD's rules.
+    /// interfaces.
     pub(crate) const AMD: Model = Model {
         vendor: Vendor::Amd,
+        version: 0x14,
         entries: Entry::COUNT,
         x2apic: true,
         deadline: true,
     };
 
-    /// The same, following Intel's.
+    /// The same, on a machine that names itself Intel — which no machine this
+    /// hypervisor can boot on does, and which therefore changes nothing about
+    /// what the model decides.
     pub(crate) const INTEL: Model = Model {
         vendor: Vendor::Intel,
+        version: 0x14,
         entries: Entry::COUNT,
         x2apic: true,
         deadline: true,
@@ -338,15 +379,55 @@ pub(crate) mod tests {
     /// with neither optional interface.
     pub(crate) const SPARSE: Model = Model {
         vendor: Vendor::Amd,
+        version: 0x10,
         entries: 4,
         x2apic: false,
         deadline: false,
     };
 
+    /// The twelve characters of a vendor string, in the register order the
+    /// architecture spreads them across.
+    fn spelled(registers: [u32; 3]) -> String {
+        registers
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .map(char::from)
+            .collect()
+    }
+
     #[test]
-    fn the_version_register_reports_one_less_than_the_count() {
-        assert_eq!(AMD.max_lvt(), 6);
-        assert_eq!(SPARSE.max_lvt(), 3);
+    fn the_vendor_registers_spell_the_strings_in_the_order_cpuid_returns_them() {
+        // The three registers are `ebx`, `edx`, `ecx` — not the order they are
+        // read in — and each holds four characters little-endian. Every
+        // vendor-dependent statement in this crate was decided from these twelve
+        // bytes, so a wrong digit is a machine described by the wrong manual with
+        // nothing to notice it.
+        assert_eq!(spelled(super::AMD), "AuthenticAMD");
+        assert_eq!(spelled(super::HYGON), "HygonGenuine");
+        assert_eq!(spelled(super::INTEL), "GenuineIntel");
+    }
+
+    #[test]
+    fn the_three_vendor_strings_are_distinct_and_amd_is_the_default() {
+        // Which is the whole of `Vendor::of_machine`: three comparisons and a
+        // fall-through. The fall-through has to be an unrecognised vendor rather
+        // than a named one, because running at all means the processor implements
+        // SVM — so an unrecognised string is a machine whose vendor was rewritten
+        // underneath this hypervisor, not a machine following another manual.
+        assert_ne!(super::AMD, super::HYGON);
+        assert_ne!(super::AMD, super::INTEL);
+        assert_ne!(super::HYGON, super::INTEL);
+        assert!(Vendor::Amd.amd_family() && Vendor::Hygon.amd_family());
+        assert!(!Vendor::Intel.amd_family() && !Vendor::Unknown.amd_family());
+    }
+
+    #[test]
+    fn the_version_register_carries_both_halves_of_what_the_machine_reported() {
+        // The count in the third byte and the version in the low one, out of one
+        // read of the real register — a machine-derived count beside an invented
+        // version describes a part that never shipped.
+        assert_eq!(AMD.version(), 0x0006_0014);
+        assert_eq!(SPARSE.version(), 0x0003_0010);
     }
 
     #[test]
@@ -374,18 +455,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn no_entry_delivers_a_system_management_interrupt() {
-        // The one delivery mode refused everywhere, including in the two entries
-        // whose architectural shape accepts it: taking it would put the host into
-        // system-management mode over host state, and the interrupt command
-        // register refuses to send one for the same reason.
-        for model in [AMD, INTEL, SPARSE] {
-            for entry in Entry::ALL {
-                assert!(
-                    !model.allows(entry, Delivery::SystemManagement),
-                    "{entry:?}"
-                );
-            }
+    fn the_model_says_what_it_decided() {
+        // The one line a misbehaving part is diagnosed from on a machine that has
+        // a serial port at all, and the fact the count of controllers alone does
+        // not carry.
+        assert_eq!(
+            format!("{AMD}"),
+            "amd version 0x14, 7 lvt entries, with x2apic, with deadline timer"
+        );
+        assert_eq!(
+            format!("{SPARSE}"),
+            "amd version 0x10, 4 lvt entries, without x2apic, without deadline timer"
+        );
+    }
+
+    #[test]
+    fn nothing_the_model_decides_depends_on_the_vendor() {
+        // The decision this crate makes about vendors, as a test: the controller
+        // presented is AMD's whatever the processor calls itself, because nothing
+        // that calls itself anything else implements the extension this
+        // hypervisor is built on. Two models alike but for the vendor therefore
+        // answer every question identically — and the moment one of them stops,
+        // there is a second architecture description in the crate that no machine
+        // can select and nothing exercises.
+        assert_ne!(AMD.vendor, INTEL.vendor);
+        assert_eq!(AMD.version(), INTEL.version());
+        assert_eq!(AMD.x2apic(), INTEL.x2apic());
+        assert_eq!(AMD.deadline(), INTEL.deadline());
+        for entry in Entry::ALL {
+            assert_eq!(AMD.has(entry), INTEL.has(entry), "{entry:?}");
         }
     }
 

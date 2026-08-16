@@ -53,7 +53,7 @@ use ipi::IpiError;
 use log::{trace, warn};
 use spin::Once;
 
-use crate::{VlapicError, registers::Vlapic};
+use crate::{VlapicError, machine::diagnostics::Report, registers::Vlapic};
 
 /// Acquires the interrupt this hypervisor rings a processor with.
 ///
@@ -109,12 +109,17 @@ pub(super) fn nudge(from: &Vlapic, target: &Vlapic) {
             Err(error) => error,
         };
         if attempt + 1 == DOORBELL_ATTEMPTS || !worth_retrying(error) {
-            warn!(
-                "vlapic: {} left {} un-interrupted; it will not act until it exits for another \
-                 reason: {error}",
-                from.index(),
-                target.index()
-            );
+            // Once per target. The failures a retry cannot cure are facts about
+            // the machine, so they are the same fact on every message — and a
+            // guest can send messages as fast as it can write a register.
+            if target.diagnostics().say(Report::Undelivered) {
+                warn!(
+                    "vlapic: {} left {} un-interrupted; it will not act until it exits for another \
+                     reason: {error}",
+                    from.index(),
+                    target.index()
+                );
+            }
             return;
         }
         trace!(
@@ -156,8 +161,9 @@ static DOORBELL: Once<ipi::Ipi> = Once::new();
 ///
 /// The arrival is the whole message: it forces the target out of the guest, and
 /// what to do about that is decided by reading the controller, not by reading a
-/// payload. A constant is needed only because a send must carry something.
-const RING: NonZeroU64 = NonZeroU64::new(1).unwrap();
+/// payload. A constant is needed only because a send must carry something, and
+/// it is the smallest value the type can hold.
+const RING: NonZeroU64 = NonZeroU64::MIN;
 
 /// What runs on a processor a doorbell was sent to.
 ///

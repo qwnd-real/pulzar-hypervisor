@@ -11,7 +11,7 @@
 //! that something might would put a bit position in the codebase that no code
 //! reads.
 //!
-//! [`svm`] is the deliberate exception. Its leaf is read whole, because those
+//! [`svm()`] is the deliberate exception. Its leaf is read whole, because those
 //! bits do not merely gate behaviour — they describe which fields the
 //! virtualization structures actually have, and a hypervisor that guesses
 //! wrong there builds a control block the processor reads differently than it

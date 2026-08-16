@@ -93,6 +93,7 @@ use crate::{
         sources::{self, Refusal},
         timer::clamp::{Reconfigured, floor, reconfigure},
     },
+    machine::diagnostics::Report,
     registers::{
         Vlapic,
         lvt::{Entry, TimerMode},
@@ -358,18 +359,20 @@ fn hardware_mode(vlapic: &Vlapic) -> Option<HardwareMode> {
 }
 
 /// Says once that this guest's periodic timer is being given a longer period
-/// than it asked for.
+/// than it asked for, and counts every time it happens.
 ///
 /// `programmed` is the count that was going to be reloaded and `given` is what
 /// is reloaded instead.
 ///
-/// Once per controller, because the guest can rewrite the count as fast as it
-/// can take an exit and each of those would otherwise be a line of serial
-/// output with a machine-wide lock held. The guest is not relying on the log to
-/// find out: its current-count reads are hardware's, so the period it is being
-/// given is one it can measure.
+/// The line is once per controller, because the guest can rewrite the count as
+/// fast as it can take an exit and each of those would otherwise be a line of
+/// serial output with a machine-wide lock held. The count is every time,
+/// because that is the record a machine with no serial port leaves behind — and
+/// the guest is not relying on either to find out: its current-count reads are
+/// hardware's, so the period it is being given is one it can measure.
 fn report_floor(vlapic: &Vlapic, programmed: u32, given: u32) {
-    if vlapic.report_timer_clamp_once() {
+    vlapic.diagnostics().clamped();
+    if vlapic.diagnostics().say(Report::TimerFloor) {
         warn!(
             "vlapic: {} is running its guest's periodic timer from a count of {given:#x} where \
              {programmed:#x} was programmed, that being the shortest period this hypervisor puts \

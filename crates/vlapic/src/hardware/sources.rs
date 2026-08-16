@@ -137,12 +137,9 @@ use apic::{
 use descriptors::Vector;
 use log::{trace, warn};
 
-use crate::{
-    hardware::model::Model,
-    registers::{
-        Vlapic,
-        lvt::{Delivery, Entry, Lvt},
-    },
+use crate::registers::{
+    Vlapic,
+    lvt::{Delivery, Entry, Lvt},
 };
 
 /// Brings every source the guest can reach into agreement with what it has
@@ -241,7 +238,7 @@ pub(crate) fn mask(vlapic: &Vlapic, source: Source) -> bool {
 /// Answers whether it was brought into agreement.
 fn program(vlapic: &Vlapic, local: LocalApic, source: Source) -> bool {
     let entry = of(source);
-    let described = match describe(entry, vlapic.lvt(entry), vlapic.model()) {
+    let described = match describe(entry, vlapic.lvt(entry)) {
         Ok(described) => described,
         Err(refusal) => {
             refused(vlapic, entry, refusal);
@@ -275,9 +272,9 @@ fn written(vlapic: &Vlapic, local: LocalApic, source: Source, entry: HardwareEnt
 
 /// What the real entry should say, given what the guest's says.
 ///
-/// Decided from three things and nothing else — which entry it is, what the
-/// guest wrote in it, and what the model says that entry can do — so that every
-/// shape a guest can write is answerable without a controller.
+/// Decided from two things and nothing else — which entry it is, and what the
+/// guest wrote in it — so that every shape a guest can write is answerable
+/// without a controller.
 ///
 /// A masked entry is programmed masked, which is the whole of what masking
 /// means: the hardware delivers nothing and there is nothing to inject.
@@ -286,16 +283,16 @@ fn written(vlapic: &Vlapic, local: LocalApic, source: Source, entry: HardwareEnt
 ///
 /// The [`Refusal`] for a configuration that will not be put on real hardware.
 /// Programming such a source masked instead is the caller's.
-fn describe(entry: Entry, guest: Lvt, model: Model) -> Result<HardwareEntry, Refusal> {
+fn describe(entry: Entry, guest: Lvt) -> Result<HardwareEntry, Refusal> {
     if guest.masked() {
         return Ok(HardwareEntry::masked());
     }
     // An entry that does not accept the mode the guest asked for is one the
-    // model has already answered for — including the three modes it refuses for
-    // every entry — and a reserved encoding is something a controller given it
-    // does nothing defined with.
+    // entry itself has already answered for — including the two modes no entry
+    // accepts — and a reserved encoding is something a controller given it does
+    // nothing defined with.
     let asked = Delivery::from_bits(guest.delivery())
-        .filter(|delivery| model.allows(entry, *delivery))
+        .filter(|delivery| entry.allows(*delivery))
         .ok_or(Refusal::Delivery(guest.delivery()))?;
     let delivery = match asked {
         Delivery::Fixed => {
@@ -308,13 +305,10 @@ fn describe(entry: Entry, guest: Lvt, model: Model) -> Result<HardwareEntry, Ref
         // This one carries no vector, so there is nothing to admit and the
         // guest's chosen delivery is programmed as it stands.
         Delivery::NonMaskable => LvtDelivery::NonMaskable,
-        // A system-management interrupt is refused by the model for every entry,
-        // and the arm is written out rather than answered by a wildcard so that a
-        // mode the model starts allowing has to be decided here as well.
-        //
-        // INIT through a local vector table entry would reset this processor,
-        // which is the host — and no entry the guest can reach is allowed to
-        // deliver it anyway.
+        // A system-management interrupt and an INIT are refused for every entry
+        // before they get here, and the arm is written out rather than answered
+        // by a wildcard so that a mode the entries start allowing has to be
+        // decided here as well.
         //
         // An external interrupt is refused for a subtler reason. It means the
         // processor runs an acknowledge cycle to a legacy controller and takes
@@ -355,7 +349,7 @@ fn describe(entry: Entry, guest: Lvt, model: Model) -> Result<HardwareEntry, Ref
 /// place would otherwise have a line of serial output per unrelated register
 /// write — with a machine-wide lock held and interrupts off for each of them.
 pub(crate) fn refused(vlapic: &Vlapic, entry: Entry, refusal: Refusal) {
-    if vlapic.report_refusal_once(entry, refusal) {
+    if vlapic.diagnostics().say_refusal(entry, refusal) {
         warn!(
             "vlapic: {} is not giving its {entry:?} source what its guest asked of it: {refusal}",
             vlapic.index()
@@ -525,10 +519,7 @@ mod tests {
     use descriptors::{Disposition, Interrupt, Vector};
 
     use super::{Refusal, arms, describe, polarity};
-    use crate::{
-        hardware::model,
-        registers::lvt::{Delivery, Entry, Lvt},
-    };
+    use crate::registers::lvt::{Delivery, Entry, Lvt};
 
     /// A vector nothing else in this crate's tests uses, standing in for one
     /// the host has taken.
@@ -593,7 +584,7 @@ mod tests {
                     .with_vector(Vector::new(0x08))
                     .with_level_triggered(true);
                 assert_eq!(
-                    describe(entry, guest, model::tests::AMD),
+                    describe(entry, guest),
                     Ok(HardwareEntry::masked()),
                     "{entry:?} with delivery {delivery:#05b}"
                 );
@@ -611,11 +602,7 @@ mod tests {
             } else {
                 armed
             };
-            assert_eq!(
-                describe(entry, guest, model::tests::AMD),
-                Ok(expected),
-                "{entry:?}"
-            );
+            assert_eq!(describe(entry, guest), Ok(expected), "{entry:?}");
         }
     }
 
@@ -625,11 +612,11 @@ mod tests {
         // from: an entry masked with nothing said is the defect this closes.
         let exception = Lvt::new().with_vector(Vector::new(0x1F));
         assert_eq!(
-            describe(Entry::Thermal, exception, model::tests::AMD),
+            describe(Entry::Thermal, exception),
             Err(Refusal::Vector(Vector::new(0x1F)))
         );
         assert_eq!(
-            describe(Entry::Timer, exception, model::tests::AMD),
+            describe(Entry::Timer, exception),
             Err(Refusal::Vector(Vector::new(0x1F)))
         );
     }
@@ -640,7 +627,7 @@ mod tests {
             for delivery in [0b001, 0b011, 0b110] {
                 let guest = Lvt::new().with_delivery(delivery).with_vector(GUEST);
                 assert_eq!(
-                    describe(entry, guest, model::tests::AMD),
+                    describe(entry, guest),
                     Err(Refusal::Delivery(delivery)),
                     "{entry:?}"
                 );
@@ -665,7 +652,7 @@ mod tests {
                 let bits = delivery as u8;
                 let guest = Lvt::new().with_delivery(bits).with_vector(GUEST);
                 assert_eq!(
-                    describe(entry, guest, model::tests::AMD),
+                    describe(entry, guest),
                     Err(Refusal::Delivery(bits)),
                     "{entry:?} with {delivery:?}"
                 );
@@ -696,21 +683,13 @@ mod tests {
             } else {
                 armed
             };
-            assert_eq!(
-                describe(entry, guest, model::tests::AMD),
-                Ok(expected),
-                "{entry:?}"
-            );
+            assert_eq!(describe(entry, guest), Ok(expected), "{entry:?}");
         }
-        // And the two entries whose delivery is the architecture's rather than
-        // the guest's refuse it: the timer on both vendors, the error entry on
-        // Intel.
+        // And the one entry whose delivery is the architecture's rather than
+        // the guest's refuses it: the timer, which has no message-type field at
+        // all.
         assert_eq!(
-            describe(Entry::Timer, guest, model::tests::AMD),
-            Err(Refusal::Delivery(Delivery::NonMaskable as u8))
-        );
-        assert_eq!(
-            describe(Entry::Error, guest, model::tests::INTEL),
+            describe(Entry::Timer, guest),
             Err(Refusal::Delivery(Delivery::NonMaskable as u8))
         );
     }
@@ -728,11 +707,7 @@ mod tests {
             } else {
                 armed
             };
-            assert_eq!(
-                describe(entry, guest, model::tests::AMD),
-                Ok(expected),
-                "{entry:?}"
-            );
+            assert_eq!(describe(entry, guest), Ok(expected), "{entry:?}");
         }
     }
 
@@ -743,41 +718,37 @@ mod tests {
         // range. What is asserted is the property the whole module exists for —
         // that what reaches hardware is either nothing at all or exactly what
         // the guest asked for, on the vector the guest chose.
-        for model in [model::tests::AMD, model::tests::INTEL, model::tests::SPARSE] {
-            for entry in Entry::ALL {
-                for delivery in 0..8 {
-                    for wiring in 0..4 {
-                        for vector in [
-                            Vector::new(0),
-                            Vector::new(0x1F),
-                            Vector::FIRST_EXTERNAL,
-                            GUEST,
-                            apic::SPURIOUS,
-                        ] {
-                            let guest = Lvt::new()
-                                .with_delivery(delivery)
-                                .with_vector(vector)
-                                .with_masked(wiring & 0b100 != 0)
-                                .with_level_triggered(wiring & 0b01 != 0)
-                                .with_active_low(wiring & 0b10 != 0);
-                            let described =
-                                describe(entry, guest, model).unwrap_or(HardwareEntry::masked());
-                            assert!(
-                                permitted(entry, guest).contains(&described),
-                                "{entry:?} armed something else from delivery {delivery:#05b} \
-                                 {vector}"
+        for entry in Entry::ALL {
+            for delivery in 0..8 {
+                for wiring in 0..8 {
+                    for vector in [
+                        Vector::new(0),
+                        Vector::new(0x1F),
+                        Vector::FIRST_EXTERNAL,
+                        GUEST,
+                        apic::SPURIOUS,
+                    ] {
+                        let guest = Lvt::new()
+                            .with_delivery(delivery)
+                            .with_vector(vector)
+                            .with_masked(wiring & 0b100 != 0)
+                            .with_level_triggered(wiring & 0b01 != 0)
+                            .with_active_low(wiring & 0b10 != 0);
+                        let described = describe(entry, guest).unwrap_or(HardwareEntry::masked());
+                        assert!(
+                            permitted(entry, guest).contains(&described),
+                            "{entry:?} armed something else from delivery {delivery:#05b} {vector}"
+                        );
+                        // The two the module refuses outright, whatever else is
+                        // set: an exception vector, and a masked entry.
+                        if vector.is_exception() && delivery == Delivery::Fixed as u8
+                            || guest.masked()
+                        {
+                            assert_eq!(
+                                described,
+                                HardwareEntry::masked(),
+                                "{entry:?} with {vector}"
                             );
-                            // The two the module refuses outright, whatever else
-                            // is set: an exception vector, and a masked entry.
-                            if vector.is_exception() && delivery == Delivery::Fixed as u8
-                                || guest.masked()
-                            {
-                                assert_eq!(
-                                    described,
-                                    HardwareEntry::masked(),
-                                    "{entry:?} with {vector}"
-                                );
-                            }
                         }
                     }
                 }

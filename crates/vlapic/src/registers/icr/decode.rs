@@ -25,9 +25,15 @@ impl Command {
     ///
     /// Asked separately from [`Command::delivery`] because the interesting case
     /// is exactly the one that decodes to nothing: a controller in x2APIC has
-    /// no lowest-priority delivery, and the architecture has it record an
-    /// error of its own rather than treat the request as an unrecognised
-    /// encoding.
+    /// no lowest-priority delivery, so the request is dropped as a reserved
+    /// encoding — and a guest that asked for one has asked for something the
+    /// older face would have delivered, which is worth telling apart in the log
+    /// from a mode that means nothing in either face.
+    ///
+    /// Intel's controllers record an error of their own for this. The processor
+    /// presented here reserves that bit, so nothing is recorded;
+    /// [`crate::registers::error`] is where the set this controller can report
+    /// is stated.
     pub(crate) const fn wants_lowest_priority(self) -> bool {
         DELIVERY.get(self.low()) == LOWEST_PRIORITY
     }

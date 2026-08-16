@@ -123,6 +123,11 @@ extern "efiapi" fn efi_main(argument: *const c_void) -> Status {
         Ok(never) => match never {},
         Err(error) => {
             error!("core: bring-up failed: {error}");
+            // Last, because this is the one moment a machine that has stopped can
+            // still be asked what its interrupt controllers were doing — and what
+            // they were doing is what an interrupt storm, a lost wakeup and a
+            // stranded acknowledgement all show up as.
+            vlapic::describe("core");
             halt()
         }
     }
@@ -249,6 +254,7 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     heap.describe("core");
     cpu::describe("core");
     ipi::describe("core");
+    vlapic::describe("core");
     paging::with(|space| self_check(space, handoff))??;
     info!("core: host bring-up complete, entering the firmware guest");
     run_guest(&mut vcpu, partition, portal, handoff)

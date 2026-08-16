@@ -4,13 +4,38 @@
 //! Three unrelated things share `IA32_APIC_BASE`: whether this processor is the
 //! one the machine started on, where the memory-mapped register page sits, and
 //! the two bits that between them choose the interface. The last of those is
-//! what the rest of this crate reads. With `EN` clear the controller answers
-//! nothing at all; with `EN` alone it answers through the page; with `EN` and
+//! what the rest of this crate reads. With `EN` clear the controller is
+//! switched off; with `EN` alone it answers through the page; with `EN` and
 //! `EXTD` together it answers through model-specific registers instead, which
 //! is the same register file reached by index, with wider identifiers and
 //! different rules about what faults. A guest changing those two bits is a
 //! guest changing which of the two faces every later access arrives through, so
 //! the value here is state this crate keeps rather than a number it stores.
+//!
+//! # What a switched-off controller still takes
+//!
+//! Architecturally, nothing: the enable bit is what makes a controller accept
+//! interrupt messages at all, and clearing it leaves the processor as though it
+//! had no on-chip controller. Everything that goes through
+//! [`Vlapic::accept`](crate::registers::Vlapic::accept) honours that.
+//!
+//! Three messages do not go through it, and this is a deliberate deviation
+//! rather than an oversight: a non-maskable interrupt, an INIT and a start-up
+//! message are delivered to the *processor* rather than into the register file,
+//! and this crate delivers them whatever the mode. What they are refused for is
+//! a *software* disable — the enable bit of the spurious-vector register —
+//! which the architecture says leaves all three deliverable, so refusing them
+//! there would be the error in the other direction.
+//!
+//! The reason for the deviation is that a processor whose guest switched its
+//! controller off is still a processor that guest may reset and restart, and
+//! the only way it can be restarted is one of those three messages. Software
+//! that shuts a controller down on its way out — which is what an operating
+//! system does before handing the machine to a new kernel — would otherwise
+//! leave every processor it had shut down unstartable, with nothing in the
+//! architecture saying it should be. What a guest can get out of the deviation
+//! is a non-maskable interrupt in a state hardware would not have delivered one
+//! in, which is a message it sent itself.
 //!
 //! # Which writes are refused
 //!
@@ -79,8 +104,11 @@ pub(crate) use crate::registers::base::transition::{BaseFault, Transition};
 /// of what the two enable bits mean.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// Switched off: the register page decodes to nothing and the
-    /// model-specific registers are not there.
+    /// Switched off: the register page decodes to nothing, the model-specific
+    /// registers are not there, and nothing offered to the controller is
+    /// accepted. The three messages delivered to the processor rather than to
+    /// the register file are the documented exception; see this module's own
+    /// summary.
     Disabled,
     /// The page of memory-mapped registers, with eight-bit identifiers.
     XApic,
@@ -124,7 +152,7 @@ impl ApicBase {
     /// only ever reads it finds what it expects. `bootstrap` is set for the one
     /// processor the guest starts on and for no other, and no later write can
     /// change that.
-    pub(crate) fn reset(bootstrap: bool) -> Self {
+    pub(crate) const fn reset(bootstrap: bool) -> Self {
         let flag = if bootstrap { BOOTSTRAP } else { 0 };
         Self(Self::DEFAULT_PAGE | GLOBAL_ENABLE | flag)
     }
@@ -160,7 +188,7 @@ impl ApicBase {
     /// it is the roster's, established when the controller was built, and no
     /// value read from anywhere can change which processor the machine came up
     /// on.
-    pub(crate) fn seeded(value: u64, bootstrap: bool) -> Self {
+    pub(crate) const fn seeded(value: u64, bootstrap: bool) -> Self {
         let flag = if bootstrap { BOOTSTRAP } else { 0 };
         let enables = value & (GLOBAL_ENABLE | X2APIC_ENABLE);
         let enables = if enables & GLOBAL_ENABLE == 0 {
@@ -460,5 +488,48 @@ mod tests {
         // at zero" would refuse a machine for the wrong reason — installing the
         // real controllers has already refused it for the right one.
         assert_eq!(ApicBase::misplaced(Controller::Absent, 0), None);
+    }
+
+    #[test]
+    fn where_a_captured_value_puts_the_page_is_the_whole_field_above_the_flags() {
+        // The predicate a machine is refused on, asked directly. The field is
+        // bits 63:12 rather than a page mask of 51:12, because the reserved-bit
+        // test a *write* is judged against comes from the processor's own
+        // physical-address width — so an address bit above 51 that passed that
+        // test would otherwise vanish here, and firmware's page would be reported
+        // as the one this hypervisor traps.
+        assert!(!ApicBase::relocated(ApicBase::DEFAULT_PAGE | GLOBAL_ENABLE));
+        assert_eq!(
+            ApicBase::page_of(ApicBase::DEFAULT_PAGE | GLOBAL_ENABLE | BOOTSTRAP),
+            ApicBase::DEFAULT_PAGE
+        );
+        for elsewhere in [0xFEC0_0000, 0x1000, 1 << 60] {
+            assert!(ApicBase::relocated(elsewhere), "{elsewhere:#x}");
+            assert_eq!(ApicBase::page_of(elsewhere | GLOBAL_ENABLE), elsewhere);
+        }
+        // The bits below the field are not part of it, whichever of them is set.
+        assert_eq!(ApicBase::page_of(0xFFF | X2APIC_ENABLE), 0);
+    }
+
+    #[test]
+    fn a_controller_already_in_a_state_that_does_not_exist_can_only_be_switched_off() {
+        // `EXTD` without `EN` is reachable only through `from_bits`, which is what
+        // a capture would reach if `seeded` did not drop the bit. From there the
+        // register reads as merely disabled, so the moves out of it are the
+        // disabled ones — and the write that would look like a repair, setting the
+        // enable bit it is missing, is a move from disabled straight into x2APIC
+        // and faults.
+        let invalid = ApicBase::from_bits(ApicBase::DEFAULT_PAGE | X2APIC_ENABLE);
+        assert_eq!(invalid.mode(), Mode::Disabled);
+        assert_eq!(
+            invalid
+                .written(bits(Mode::XApic), MODEL)
+                .map(ApicBase::mode),
+            Ok(Mode::XApic)
+        );
+        assert_eq!(
+            invalid.written(bits(Mode::X2Apic), MODEL),
+            Err(BaseFault::IllegalTransition)
+        );
     }
 }

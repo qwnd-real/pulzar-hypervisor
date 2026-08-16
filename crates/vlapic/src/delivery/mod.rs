@@ -16,8 +16,9 @@
 //!
 //! A command naming a mode the architecture reserves, or a processor that does
 //! not exist, is one real hardware would also do nothing useful with — so it is
-//! recorded in the sender's error status and dropped, which is what a
-//! controller does with a message nobody accepts.
+//! dropped, and said once. A message no processor accepted is the one of those
+//! the architecture gives a bit for, and it is recorded in the sender's error
+//! status as well.
 //!
 //! # Limitations
 //!
@@ -30,6 +31,7 @@
 //! controller owns.
 
 pub(crate) mod doorbell;
+pub(crate) mod error;
 
 mod arbitration;
 mod destination;
@@ -44,7 +46,7 @@ use crate::{
         doorbell::nudge,
         startup::{initialize, start},
     },
-    machine::ownership,
+    machine::{diagnostics::Report, ownership},
     priority,
     registers::{
         Accepted, StartupPage, Vlapic,
@@ -57,33 +59,40 @@ use crate::{
 ///
 /// Nothing here fails in a way the guest can see. A command naming a mode the
 /// architecture reserves, or a processor that does not exist, is one real
-/// hardware would also do nothing useful with — so it is recorded and dropped,
-/// which is what a controller does with a message nobody accepts.
+/// hardware would also do nothing useful with — so it is dropped, and a message
+/// no processor accepted is recorded as well, which is what a controller does
+/// with one.
 pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
     let mode = from.mode();
     let Some(delivery) = command.delivery(mode) else {
-        // Lowest priority is the one reserved encoding with an error of its own:
-        // the architecture has a controller that cannot send a redirectable
-        // interrupt say so, rather than merely doing nothing.
-        if command.wants_lowest_priority() {
-            from.errors().record(Errors::REDIRECTABLE_IPI);
+        // Lowest priority is the one reserved encoding worth telling apart in the
+        // log: x2APIC removed it, so a guest that asks for one in that face has
+        // asked for something the older face would have delivered.
+        if from.diagnostics().say(Report::ReservedCommand) {
+            warn!(
+                "vlapic: {} sent a command with {}: {:#x}",
+                from.index(),
+                if command.wants_lowest_priority() {
+                    "a lowest-priority delivery, which the wide face does not have"
+                } else {
+                    "a reserved delivery mode"
+                },
+                command.bits()
+            );
         }
-        warn!(
-            "vlapic: {} sent a command with a reserved delivery mode: {:#x}",
-            from.index(),
-            command.bits()
-        );
         return;
     };
     // Judged whole, before a single processor is named. A command the
     // architecture does not define must not have reset, started or interrupted
     // half the machine by the time that is noticed.
     if !command.legal(mode) {
-        warn!(
-            "vlapic: {} sent a command no processor would send: {:#x}",
-            from.index(),
-            command.bits()
-        );
+        if from.diagnostics().say(Report::IllegalCommand) {
+            warn!(
+                "vlapic: {} sent a command no processor would send: {:#x}",
+                from.index(),
+                command.bits()
+            );
+        }
         return;
     }
     // A synchronisation message that reloads arbitration identifiers and does
@@ -104,7 +113,7 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
     if matches!(delivery, Delivery::Fixed | Delivery::LowestPriority)
         && !priority::legal(command.vector())
     {
-        from.errors().record(Errors::SEND_ILLEGAL_VECTOR);
+        error::noticed(from, Errors::SEND_ILLEGAL_VECTOR);
         return;
     }
 
@@ -133,10 +142,14 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
                 accept(from, target, delivery, command);
             }
         }
-        // A non-maskable interrupt reaches a controller that is switched off or
-        // software-disabled, which is the whole of what makes it non-maskable —
-        // so it deliberately does not go through the acceptance that would
-        // refuse it.
+        // A non-maskable interrupt is delivered to the processor rather than to
+        // the register file, so it deliberately does not go through the
+        // acceptance that would refuse it. That is right for a controller its
+        // guest has *software*-disabled, which the architecture says still takes
+        // one; it is wider than the architecture allows for one whose guest has
+        // switched it off through the base register, which takes nothing at all.
+        // So is INIT and so is a start-up message, and the deviation is stated
+        // where the modes are: [`crate::registers::base`].
         Delivery::NonMaskable => {
             for target in targets(from, lapics, command) {
                 raise(from, target);
@@ -165,10 +178,15 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
         // So the guest's interrupt command register cannot send this one thing,
         // and a guest whose firmware or operating system relies on an SMI
         // rendezvous will not get one.
-        Delivery::SystemManagement => warn!(
-            "vlapic: {} sent a system-management interrupt, which this machine does not deliver",
-            from.index()
-        ),
+        Delivery::SystemManagement => {
+            if from.diagnostics().say(Report::SystemManagement) {
+                warn!(
+                    "vlapic: {} sent a system-management interrupt, which this machine does not \
+                     deliver",
+                    from.index()
+                );
+            }
+        }
     }
 }
 
@@ -197,9 +215,23 @@ fn accept(from: &Vlapic, target: &Vlapic, delivery: Delivery, command: Command) 
             nudge(from, target);
             true
         }
-        // The refusals the architecture defines, and both are the target's own
-        // state to answer with rather than anything that went wrong.
-        Accepted::Illegal | Accepted::Refused => {
+        // A vector no controller may deliver is the receiver's to report, and is
+        // reported on the receiver: the sender has already been refused for
+        // exactly this on every path that reaches here, so nothing but a
+        // mis-decode gets this far. The record is made here rather than inside
+        // the acceptance because raising the interrupt it arms needs both
+        // controllers — the target's to publish into, and this one's to ring the
+        // doorbell with.
+        Accepted::Illegal => {
+            target.diagnostics().declined();
+            error::record(from, target, Errors::RECEIVE_ILLEGAL_VECTOR);
+            false
+        }
+        // The refusal the architecture defines: a controller its guest switched
+        // off or software-disabled, saying no to something it is entitled to say
+        // no to.
+        Accepted::Refused => {
+            target.diagnostics().declined();
             trace!(
                 "vlapic: {} offered {vector} to {}, which did not take it",
                 from.index(),
@@ -210,12 +242,15 @@ fn accept(from: &Vlapic, target: &Vlapic, delivery: Delivery, command: Command) 
         // Not one of those: the interrupt was not recorded anywhere, so nothing
         // will deliver it and nothing will report it but this.
         Accepted::Resetting => {
-            warn!(
-                "vlapic: {} offered {vector} to {}, whose register file was being reset, and it \
-                 was not delivered",
-                from.index(),
-                target.index()
-            );
+            target.diagnostics().dropped();
+            if from.diagnostics().say(Report::Resetting) {
+                warn!(
+                    "vlapic: {} offered {vector} to {}, whose register file was being reset, and \
+                     it was not delivered",
+                    from.index(),
+                    target.index()
+                );
+            }
             false
         }
     }
@@ -244,10 +279,12 @@ fn raise(from: &Vlapic, target: &Vlapic) {
 /// these.
 ///
 /// Recorded as a message no processor accepted, which is exactly what happened,
-/// and said once per re-armed error status rather than once per message: a
-/// guest can send these as fast as it can write a register.
+/// and said once per controller rather than once per message: a guest can send
+/// these as fast as it can write a register.
 fn refused(from: &Vlapic, target: &Vlapic, delivery: Delivery) {
-    if from.errors().record(Errors::SEND_ACCEPT) {
+    target.diagnostics().dropped();
+    error::noticed(from, Errors::SEND_ACCEPT);
+    if from.diagnostics().say(Report::Unrun) {
         warn!(
             "vlapic: {} sent {delivery:?} to {}, which this hypervisor does not run",
             from.index(),
@@ -267,11 +304,14 @@ fn refused(from: &Vlapic, target: &Vlapic, delivery: Delivery) {
 /// guest's state changing and cannot be closed from here.
 ///
 /// Recorded as a message no processor accepted, which is what happened, and
-/// said once per re-armed error status rather than once per message: a guest
-/// that offlines a processor with a redirectable interrupt in flight can
-/// produce these as fast as it can write a register.
+/// said once per controller rather than once per message: a guest that offlines
+/// a processor with a redirectable interrupt in flight can produce these as
+/// fast as it can write a register. The loss is counted against the sender,
+/// because a command nobody took had no one target to count it against.
 fn refused_by_all(from: &Vlapic, delivery: Delivery, command: Command) {
-    if from.errors().record(Errors::SEND_ACCEPT) {
+    from.diagnostics().dropped();
+    error::noticed(from, Errors::SEND_ACCEPT);
+    if from.diagnostics().say(Report::Unaccepted) {
         warn!(
             "vlapic: {} sent {delivery:?} {} to processors none of which took it",
             from.index(),

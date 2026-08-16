@@ -14,8 +14,6 @@
 //! priority class the host keeps for itself would hold the host's own
 //! interrupts off with it.
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
 use apic::LocalApic;
 use descriptors::Vector;
 use log::{trace, warn};
@@ -64,14 +62,22 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     // owed — and a source the guest has masked was programmed masked and did
     // not deliver at all.
     let level = local.arrived_level(vector);
+    // Counted in the controller rather than in a machine-wide word, and counted
+    // unconditionally: what it answers is "did the source fire once, or is it
+    // firing and nothing is taking it", and on a machine with no serial port the
+    // count is the only place that answer can be read from afterwards. The line
+    // it replaces was a machine-global read-modify-write on the hottest path in
+    // the crate, executed on every arrival for a trace the configured level
+    // discards — and its plain increment panicked in a debug build once the
+    // machine had seen `u32::MAX` of them, inside an interrupt handler.
+    vlapic.diagnostics().arrived(level);
     // The real controller's own in-service bank is what says whether a source
     // can go on delivering: it refuses everything of a held vector's priority or
     // lower, so a vector left in service there is a source that has stopped for
     // good, and the acknowledgement below is the only thing that ever clears it.
-    let seen = ARRIVALS.fetch_add(1, Ordering::Relaxed) + 1;
     trace!(
-        "vlapic: {} arrival {seen} of {vector}, {} triggered: real in service {:?}, guest requested \
-         {:?}, {} in service, task priority {}, hardware {}",
+        "vlapic: {} took {vector}, {} triggered: real in service {:?}, guest requested {:?}, {} \
+         in service, task priority {}, hardware {}",
         vlapic.index(),
         if level { "level" } else { "edge" },
         local.in_service_top(),
@@ -130,11 +136,14 @@ fn acknowledge(vlapic: &Vlapic, local: LocalApic, vector: Vector, level: bool) {
         // A controller that was mid-reset has dropped an interrupt that reached
         // this machine, which is this hypervisor losing one rather than a guest
         // declining it.
-        Accepted::Resetting => warn!(
-            "vlapic: {} dropped real {vector}, which arrived while its register file was being \
-             reset",
-            vlapic.index()
-        ),
+        Accepted::Resetting => {
+            vlapic.diagnostics().dropped();
+            warn!(
+                "vlapic: {} dropped real {vector}, which arrived while its register file was being \
+                 reset",
+                vlapic.index()
+            );
+        }
         // Level, and so retired before the guest has done anything with it. Worth
         // its own line: it is the one arrival handed over already acknowledged,
         // and the reason is nothing about the interrupt itself.
@@ -144,6 +153,9 @@ fn acknowledge(vlapic: &Vlapic, local: LocalApic, vector: Vector, level: bool) {
             vlapic.index()
         ),
         Accepted::Requested | Accepted::Coalesced | Accepted::Illegal | Accepted::Refused => {
+            if matches!(accepted, Accepted::Illegal | Accepted::Refused) {
+                vlapic.diagnostics().declined();
+            }
             trace!(
                 "vlapic: {} acknowledged real {vector} at once, leaving real in service {:?}",
                 vlapic.index(),
@@ -184,6 +196,11 @@ fn withhold(vlapic: &Vlapic, local: LocalApic, vector: Vector) {
             // the I/O controller that sent it, and the still-asserted line
             // arrives again at once, into a controller that has just refused it.
             vlapic.ledger().abandon(vector);
+            vlapic.diagnostics().declined();
+            // Not latched, and bounded without one: the abandoned debt leaves the
+            // vector in service on the real controller, which then refuses
+            // everything of its class or lower — so the line that produced this
+            // cannot produce another.
             warn!(
                 "vlapic: {} received level {vector} but is not accepting it: {refused:?}, so real \
                  hardware goes on holding it — {}",
@@ -193,14 +210,6 @@ fn withhold(vlapic: &Vlapic, local: LocalApic, vector: Vector) {
         }
     }
 }
-
-/// How many interrupts have reached [`arrived`] on this machine.
-///
-/// One counter for every processor rather than one each, because what it is for
-/// is telling "the source fired once" from "the source is firing and nothing is
-/// taking it", and a single number answers that whichever processor the
-/// arrivals landed on.
-static ARRIVALS: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(test)]
 mod tests {

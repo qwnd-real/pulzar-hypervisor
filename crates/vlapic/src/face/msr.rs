@@ -27,7 +27,7 @@ use crate::{
         table::{Access, Register, X2APIC_LAST_MSR},
     },
     hardware::{model::Model, timer},
-    machine::current,
+    machine::{current, diagnostics::Report},
     registers::{
         SPURIOUS_WRITABLE, TASK_PRIORITY_MASK, TIMER_DIVIDE_MASK, Vlapic,
         base::{ApicBase, BaseFault, Mode},
@@ -50,7 +50,7 @@ use crate::{
 pub fn read_msr(index: u32, tsc_offset: u64) -> Result<u64, VlapicError> {
     let vlapic = current()?;
     let value = read(vlapic, index, tsc_offset).map_err(|fault| {
-        warn!("vlapic: refusing a read of {index:#x}: {fault:?}");
+        refused(vlapic, Report::RefusedRead, index, fault);
         VlapicError::Fault
     })?;
     trace!(
@@ -71,7 +71,7 @@ pub fn read_msr(index: u32, tsc_offset: u64) -> Result<u64, VlapicError> {
 pub fn write_msr(index: u32, value: u64, tsc_offset: u64) -> Result<(), VlapicError> {
     let vlapic = current()?;
     let written = write(vlapic, index, value, tsc_offset).map_err(|fault| {
-        warn!("vlapic: refusing a write of {value:#x} to {index:#x}: {fault:?}");
+        refused(vlapic, Report::RefusedWrite, index, fault);
         VlapicError::Fault
     })?;
     trace!(
@@ -80,6 +80,30 @@ pub fn write_msr(index: u32, value: u64, tsc_offset: u64) -> Result<(), VlapicEr
     );
     acted(vlapic, written);
     Ok(())
+}
+
+/// Says once that this face refused an access, and traces the rest.
+///
+/// The guest is told about every one of these already, and told by the
+/// architecture: it takes a general protection fault. So the log is for whoever
+/// is working out *why*, and one line naming the index and the reason is the
+/// whole of that — where a line per access is a denial of service, because the
+/// shortest guest loop that reaches here is three instructions. Reading a
+/// controller's registers before enabling x2APIC is refused, faults, and can be
+/// retried for as long as the guest likes.
+fn refused(vlapic: &Vlapic, report: Report, index: u32, fault: Fault) {
+    if vlapic.diagnostics().say(report) {
+        warn!(
+            "vlapic: {} refusing an access to {index:#x}: {fault:?}; later refusals on this \
+             controller are traced rather than reported",
+            vlapic.index()
+        );
+        return;
+    }
+    trace!(
+        "vlapic: {} refusing an access to {index:#x}: {fault:?}",
+        vlapic.index()
+    );
 }
 
 /// Every model-specific register the guest's controller answers for.

@@ -60,10 +60,17 @@ impl Vlapic {
 
     /// The version register.
     ///
-    /// The entry count is the real controller's, because the sources behind
-    /// those entries are the real ones. A guest told it has an entry its
-    /// hardware does not would be told about a source that can never fire and
-    /// handed a register that cannot be programmed.
+    /// Both of its fields are the real controller's, out of one read of the
+    /// real register: the version this controller is, and how many local
+    /// vector table entries it has. The entry count has to be the machine's
+    /// because the sources behind those entries are the real ones — a guest
+    /// told it has an entry its hardware does not would be told about a
+    /// source that can never fire and handed a register that cannot be
+    /// programmed — and the version has to come from the same place,
+    /// because the architecture's own boundary between the discrete
+    /// controller and this one is a version number and software draws
+    /// conclusions about the rest of the register from it.
+    /// [`crate::hardware::model`] is where both are read.
     ///
     /// End-of-interrupt broadcast suppression is deliberately reported as
     /// unsupported. The bit would let a guest ask that acknowledging a
@@ -72,8 +79,12 @@ impl Vlapic {
     /// performed by real hardware when the real acknowledgement is issued, and
     /// nothing here can suppress it. Reporting it unsupported is what stops a
     /// guest asking for something that would then silently not happen.
+    ///
+    /// So is the bit that says the extended register space is present, for the
+    /// same kind of reason: that space is not modelled, and
+    /// [`crate::face::table`] carries the limitation.
     pub(crate) const fn version(&self) -> u32 {
-        self.model.max_lvt() << MAX_LVT_SHIFT | VERSION_NUMBER
+        self.model.version()
     }
 
     /// Which logical destinations this controller answers to, in `mode`.
@@ -119,14 +130,6 @@ const XAPIC_ID_SHIFT: u32 = 24;
 
 /// The part of an identifier the older interface's field can hold.
 const XAPIC_ID_MASK: u32 = 0xFF;
-
-/// The version this controller reports: an integrated one, which is what every
-/// processor since the discrete controller reports.
-const VERSION_NUMBER: u32 = 0x10;
-
-/// Bits the local-vector-table entry count is shifted by in the version
-/// register.
-const MAX_LVT_SHIFT: u32 = 16;
 
 /// The part of the logical destination register that holds anything.
 pub(super) const LOGICAL_DESTINATION_MASK: u32 = 0xFF00_0000;

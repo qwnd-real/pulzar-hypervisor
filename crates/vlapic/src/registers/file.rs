@@ -16,11 +16,13 @@ use x86_64::instructions::interrupts;
 use crate::{
     hardware::model::Model,
     lifecycle::ledger::Ledger,
+    machine::diagnostics::Diagnostics,
     registers::{
         Phase, Startup, Vlapic,
         base::ApicBase,
         bitmap::Bitmap,
         error::ErrorStatus,
+        icr::Command,
         identity::{DESTINATION_FORMAT_MASK, FLAT_DESTINATION_FORMAT, LOGICAL_DESTINATION_MASK},
         interrupts::NOTHING_REPORTED,
         lvt::Entry,
@@ -62,7 +64,6 @@ impl Vlapic {
             timer_divide: AtomicU32::new(0),
             timer_initial: AtomicU32::new(0),
             timer_frequency: AtomicU64::new(0),
-            timer_clamp_reported: AtomicBool::new(false),
             command: AtomicU64::new(0),
             errors: ErrorStatus::new(),
             ledger: Ledger::new(),
@@ -71,7 +72,7 @@ impl Vlapic {
             away: AtomicBool::new(false),
             nmi: AtomicU8::new(0),
             owned: AtomicBool::new(false),
-            refusals_reported: AtomicU32::new(0),
+            diagnostics: Diagnostics::new(),
             reported: AtomicU64::new(NOTHING_REPORTED),
         };
         this.reset_registers();
@@ -126,19 +127,22 @@ impl Vlapic {
     }
 
     /// The seeding itself, with nothing said about who else can see it.
+    ///
+    /// Every value is narrowed to what the register may hold, and that is not
+    /// the same thing as narrowing it to what a *guest* may write: two of these
+    /// registers have reserved fields that read as ones or as zeroes whoever
+    /// wrote them, and the interrupt command register has a whole face's worth
+    /// of them. What came out of hardware is by definition what the register
+    /// holds, and what a guest reads back has to be something the architecture
+    /// says that register can answer with — so firmware's reserved bits are
+    /// dropped here rather than carried through to a guest's first read.
     fn seeded(&self, firmware: &LocalState, base: u64) {
-        self.base.store(
-            ApicBase::seeded(base, self.base().bootstrap()).bits(),
-            Ordering::Release,
-        );
+        let base = ApicBase::seeded(base, self.base().bootstrap());
+        self.base.store(base.bits(), Ordering::Release);
         self.task_priority.store(
             firmware.task_priority & TASK_PRIORITY_MASK,
             Ordering::Release,
         );
-        // Stored raw rather than through the setters, which mask to what a guest
-        // may write: these came out of hardware, so what they hold is by
-        // definition what the register holds, and a guest reading one back has to
-        // find firmware's value rather than a narrowed one.
         self.logical_destination.store(
             firmware.logical_destination & LOGICAL_DESTINATION_MASK,
             Ordering::Release,
@@ -156,7 +160,15 @@ impl Vlapic {
             .store(firmware.timer_divide & TIMER_DIVIDE_MASK, Ordering::Release);
         self.timer_initial
             .store(firmware.timer_initial_count, Ordering::Release);
-        self.command.store(firmware.command, Ordering::Release);
+        // Narrowed in the face the controller is being seeded into, because that
+        // is what decides how wide the destination half is. Left whole, this is
+        // the one register that hands a guest firmware's reserved bits — the
+        // delivery-status bit above all, which a guest reading the register and
+        // writing back what it read would then be faulted for.
+        self.command.store(
+            firmware.command & Command::seedable(base.mode()),
+            Ordering::Release,
+        );
         self.errors.seed(firmware.error_status);
         self.request.seed(&firmware.interrupt_request);
         self.trigger_mode.seed(&firmware.trigger_mode);
@@ -196,6 +208,20 @@ impl Vlapic {
     /// What real hardware is holding in service on this guest's behalf.
     pub(crate) const fn ledger(&self) -> &Ledger {
         &self.ledger
+    }
+
+    /// What has happened to this controller, and what it has already said about
+    /// it.
+    ///
+    /// Deliberately outside everything [`Vlapic::reset_registers`] clears. It
+    /// is not register file: it is the record of what this *processor's*
+    /// controller has done since the machine came up, which is what a
+    /// machine with no serial port is debugged from, and an `INIT` is not
+    /// an event that makes any of it untrue. Clearing the latches with the
+    /// register file would also hand a guest that resets its own processor
+    /// in a loop the log flood they exist to stop.
+    pub(crate) const fn diagnostics(&self) -> &Diagnostics {
+        &self.diagnostics
     }
 
     /// Everything an INIT leaves behind, which is everything but the

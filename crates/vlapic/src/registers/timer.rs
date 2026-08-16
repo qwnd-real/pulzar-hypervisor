@@ -63,18 +63,6 @@ impl Vlapic {
         self.timer_frequency.store(frequency, Ordering::Release);
     }
 
-    /// Whether this controller has already said that its guest's periodic timer
-    /// is being given a longer period than it asked for.
-    ///
-    /// Latched rather than counted: the guest can rewrite the count as fast as
-    /// it can take an exit, and what an operator needs is the fact rather than
-    /// one line per write.
-    pub(crate) fn report_timer_clamp_once(&self) -> bool {
-        self.timer_clamp_reported
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
     /// Which mode the timer's entry selects, or `None` for the encoding the
     /// architecture reserves.
     pub(crate) fn timer_mode(&self) -> Option<TimerMode> {

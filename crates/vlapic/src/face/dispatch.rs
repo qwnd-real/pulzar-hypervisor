@@ -39,14 +39,14 @@ use descriptors::Vector;
 use log::{trace, warn};
 
 use crate::{
-    delivery,
+    delivery::{self, error},
     face::table::{Bank, Register},
     hardware::{
         mirror::{entered, mirror_logical_destination},
         sources, timer,
     },
     lifecycle::settle,
-    machine::registry::lapics,
+    machine::{diagnostics::Report, registry::lapics},
     priority,
     registers::{
         Accepted, Vlapic,
@@ -242,8 +242,8 @@ fn write_indexed(vlapic: &Vlapic, register: Register, value: u32) -> Written {
     // Judged on what the write left in the entry rather than on a fresh read of
     // it, because the two are the same thing and only one of them is certain to
     // be: the value is already in hand.
-    if vlapic.delivers_a_vector(entry, written) && !priority::legal(written.vector()) {
-        vlapic.errors().record(Errors::RECEIVE_ILLEGAL_VECTOR);
+    if entry.delivers_a_vector(written) && !priority::legal(written.vector()) {
+        error::noticed(vlapic, Errors::RECEIVE_ILLEGAL_VECTOR);
     }
     match entry {
         // The timer's entry carries the mode it counts in, so writing it can
@@ -293,7 +293,9 @@ fn quiet_source(vlapic: &Vlapic, entry: Entry) {
 /// the guest may still be reading, which is what the architecture has a
 /// software-disabled controller do to the entries it masks.
 fn quiet_controller(vlapic: &Vlapic) {
-    if !(sources::quiesce(vlapic) & timer::mask(vlapic)) {
+    if !(sources::quiesce(vlapic) & timer::mask(vlapic))
+        && vlapic.diagnostics().say(Report::DisableArmed)
+    {
         warn!(
             "vlapic: {} software-disabled its controller and something behind it is still armed",
             vlapic.index()
@@ -364,11 +366,17 @@ pub(crate) enum Written {
 ///
 /// `offset` is the raw offset the guest named rather than a register, because
 /// the whole reason this is reached is that no register sits there.
+///
+/// The record and the log line are latched on different things, and that is the
+/// point of there being two. The record arms the guest's own error interrupt
+/// and is re-armed whenever the guest writes its error status register, which
+/// is what the architecture says. The line is latched once per controller and
+/// nothing clears it: a guest that alternates a reserved offset with a write to
+/// that register would otherwise produce one line of serial output per pair of
+/// stores, each one taken with a machine-wide lock held and interrupts off.
 pub(crate) fn illegal_register(vlapic: &Vlapic, offset: u64) {
-    if vlapic.errors().record(Errors::ILLEGAL_REGISTER_ADDRESS) {
-        // Only the first, because a guest probing its register page produces
-        // one of these per probe and the error status register latches them all
-        // into the same bit anyway.
+    error::noticed(vlapic, Errors::ILLEGAL_REGISTER_ADDRESS);
+    if vlapic.diagnostics().say(Report::IllegalRegister) {
         warn!(
             "vlapic: {} named a reserved register at offset {offset:#x}",
             vlapic.index()
@@ -458,16 +466,31 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
 /// therefore only worth saying — and it is worth saying, because a controller
 /// that refused its own guest's interrupt to itself has dropped something the
 /// guest has no other way to notice.
+///
+/// A vector no controller may deliver is recorded twice, on both sides, because
+/// a self-interrupt is the one message whose sender and receiver are the same
+/// controller: the architecture names the self-interrupt register among the
+/// writes that set the send-side bit, and names a self-interrupt among the
+/// things that set the receive-side one. An interrupt-command register directed
+/// at this processor is deliberately send-side only — the command is refused
+/// before a single target is worked out, so nothing was ever received.
 fn self_ipi(vlapic: &Vlapic, vector: Vector) {
     if !priority::legal(vector) {
-        vlapic.errors().record(Errors::SEND_ILLEGAL_VECTOR);
+        error::noticed(
+            vlapic,
+            Errors::SEND_ILLEGAL_VECTOR | Errors::RECEIVE_ILLEGAL_VECTOR,
+        );
         return;
     }
     match vlapic.accept(vector, Trigger::Edge) {
         Accepted::Requested | Accepted::Coalesced => {}
-        declined => trace!(
-            "vlapic: {} sent itself {vector}, which its own controller did not take: {declined:?}",
-            vlapic.index()
-        ),
+        declined => {
+            vlapic.diagnostics().declined();
+            trace!(
+                "vlapic: {} sent itself {vector}, which its own controller did not take: \
+                 {declined:?}",
+                vlapic.index()
+            );
+        }
     }
 }

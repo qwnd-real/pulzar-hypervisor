@@ -246,13 +246,22 @@ pub(crate) fn has_lvt(register: Register, entries: u32) -> bool {
 /// one and the arithmetic cannot wrap. A controller reporting more than the
 /// architecture defines is not trusted beyond that: [`lvt_present`] stops at
 /// the entries this crate knows the offsets of.
-pub(crate) const fn lvt_entries(version: u32) -> u32 {
+///
+/// Public together with [`version_number`] because both halves of that one
+/// register describe the controller to whoever is presenting it — a hypervisor
+/// handing a guest a local controller has to report both, and reading the
+/// register twice to get them is two answers where the architecture gives one.
+#[must_use]
+pub const fn lvt_entries(version: u32) -> u32 {
     ((version >> LVT_COUNT_SHIFT) & VERSION_FIELD) + 1
 }
 
 /// The controller's version, out of the register that also carries the entry
 /// count.
-pub(crate) const fn version_number(version: u32) -> u32 {
+///
+/// Public for the reason [`lvt_entries`] is.
+#[must_use]
+pub const fn version_number(version: u32) -> u32 {
     version & VERSION_FIELD
 }
 

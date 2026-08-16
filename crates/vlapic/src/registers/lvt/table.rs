@@ -9,10 +9,10 @@
 use core::sync::atomic::Ordering;
 
 use crate::{
-    hardware::sources::{self, Refusal},
+    hardware::sources,
     registers::{
         Vlapic,
-        lvt::{Delivery, Entry, Lvt, MASKED, TimerMode},
+        lvt::{Entry, Lvt, MASKED, TimerMode},
     },
 };
 
@@ -51,8 +51,9 @@ impl Vlapic {
     /// by reading the whole of it, changing the field and writing it back, so
     /// an invented mask bit does not merely mislead: the guest's next write
     /// stores it, and the source is off for good with the guest's own
-    /// registers saying it asked for that. Where a configuration is
-    /// refused, the error status register is what says so.
+    /// registers saying it asked for that. Where a configuration is refused,
+    /// the log is what says so and the register file says nothing —
+    /// [`crate::hardware::sources`] carries that as a limitation.
     pub(crate) fn lvt_readback(&self, entry: Entry) -> Lvt {
         let stored = self.lvt(entry);
         let Some(source) = sources::source_of(entry) else {
@@ -102,36 +103,6 @@ impl Vlapic {
     pub(crate) fn masks(&self, entry: Entry, value: u32) -> bool {
         masking(self.lvt(entry), Lvt::from_bits(value))
     }
-
-    /// Whether a refusal of an entry's configuration is one this controller has
-    /// not reported yet, and records that it now has.
-    ///
-    /// One bit per entry per kind of refusal, because a guest can rewrite a
-    /// refused entry as fast as it can take an exit and every reprogram derives
-    /// the refusal again — so the alternative is a line of serial output, with
-    /// a machine-wide lock held and interrupts off, per unrelated register
-    /// write. Per kind as well as per entry so that a vector refused in an
-    /// entry cannot silence a delivery mode refused in the same one.
-    pub(crate) fn report_refusal_once(&self, entry: Entry, refusal: Refusal) -> bool {
-        let bit = 1 << (entry.index() * Refusal::COUNT + refusal.kind());
-        self.refusals_reported.fetch_or(bit, Ordering::AcqRel) & bit == 0
-    }
-
-    /// Whether an entry, as it stands, would actually deliver a vector.
-    ///
-    /// Which is the only condition under which its vector field means anything.
-    /// Every other delivery mode is an event the processor takes by its own
-    /// architectural entry point and reads no vector for, so a number left in
-    /// the field is not a vector at all and reporting it as an illegal one
-    /// would be reporting an error about a field nothing reads.
-    ///
-    /// Asked of a value rather than of the stored register, so that a caller
-    /// deciding this about a write it has just performed decides it about what
-    /// it wrote.
-    pub(crate) fn delivers_a_vector(&self, entry: Entry, lvt: Lvt) -> bool {
-        !self.model.has_delivery(entry)
-            || Delivery::from_bits(lvt.delivery()) == Some(Delivery::Fixed)
-    }
 }
 
 /// Whether going from one value of an entry to another stops a source that was
@@ -142,14 +113,6 @@ impl Vlapic {
 const fn masking(stored: Lvt, wanted: Lvt) -> bool {
     !stored.masked() && wanted.masked()
 }
-
-/// The refusal latch is one word, so every kind of refusal of every entry has
-/// to have a bit of its own in it — an entry whose bit fell outside would
-/// silence another entry's report instead of its own.
-const _: () = assert!(
-    Entry::COUNT * Refusal::COUNT <= u32::BITS as usize,
-    "every entry needs a bit per kind of refusal"
-);
 
 /// Whether a timer entry selects the mode that counts nothing, and so the mode
 /// the count registers mean nothing in.

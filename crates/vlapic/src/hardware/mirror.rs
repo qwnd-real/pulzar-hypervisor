@@ -10,11 +10,32 @@
 //! How agreement is reached differs between the faces, and in x2APIC it is
 //! reached by moving the real controller rather than by writing anything —
 //! which is the whole reason [`promote`] exists.
+//!
+//! # Limitations
+//!
+//! The move is one-way. Once the real controller has been taken into x2APIC
+//! behind a guest it stays there for the life of the machine, and a guest may
+//! legally come back out — x2APIC to disabled to the older face is the path the
+//! architecture defines, and it is what a kexec or a warm reboot into software
+//! that does not use x2APIC performs. After that the guest's controller is in
+//! the older face while the real one is not, so the guest's eight-bit logical
+//! identifier cannot be written to a register hardware derives from the
+//! processor's own, and every passed-through interrupt the guest addresses
+//! logically is matched against something it did not ask for: those interrupts
+//! reach the wrong processor or none. Physically addressed ones are unaffected,
+//! which is everything the host itself sends and most of what a guest sends.
+//!
+//! The disagreement is detected and said once per controller rather than
+//! repaired, because repairing it means taking the real controller back out of
+//! x2APIC — a state machine on the *host's* own controller, whose registers the
+//! host reaches through a face that would be changing underneath it. Nothing in
+//! this crate can do that; [`apic`] is where it would belong.
 
 use log::{info, trace, warn};
 
 use crate::{
     hardware::{sources, timer},
+    machine::diagnostics::Report,
     registers::{
         Vlapic,
         base::{Mode, Transition},
@@ -43,11 +64,16 @@ pub(crate) fn entered(vlapic: &Vlapic, transition: Transition) {
         // Worth a line rather than a trace: real hardware was left holding
         // something across a boundary the guest believes cleared it, and that is
         // a state nothing later in the guest's life will explain.
-        Transition::Changed { quiet, debts } if !quiet || !debts.is_empty() => warn!(
-            "vlapic: {} changed face without fully settling hardware: sources {}, hardware {debts}",
-            vlapic.index(),
-            if quiet { "quiet" } else { "still armed" },
-        ),
+        Transition::Changed { quiet, debts }
+            if (!quiet || !debts.is_empty()) && vlapic.diagnostics().say(Report::FaceUnsettled) =>
+        {
+            warn!(
+                "vlapic: {} changed face without fully settling hardware: sources {}, hardware \
+                 {debts}",
+                vlapic.index(),
+                if quiet { "quiet" } else { "still armed" },
+            );
+        }
         Transition::Preserved | Transition::Changed { .. } => {}
     }
     promote(vlapic);
@@ -56,14 +82,21 @@ pub(crate) fn entered(vlapic: &Vlapic, transition: Transition) {
     // of one table and a caller that has just changed face needs the whole of it:
     // a source left as it was is one that can still deliver on a vector the
     // guest's new face may not even be able to name.
-    if !(sources::reprogram(vlapic) & timer::reprogram(vlapic)) {
+    if !(sources::reprogram(vlapic) & timer::reprogram(vlapic))
+        && vlapic.diagnostics().say(Report::FaceUnprogrammed)
+    {
         warn!(
             "vlapic: {} changed face and something behind its controller does not agree with the \
              table it was left holding",
             vlapic.index()
         );
     }
-    info!("vlapic: {} entered {}", vlapic.index(), vlapic.mode());
+    // Once per controller. A guest may walk the faces as fast as it can write the
+    // base register, and one line per processor per machine is what a boot needs
+    // out of this.
+    if vlapic.diagnostics().say(Report::FaceEntered) {
+        info!("vlapic: {} entered {}", vlapic.index(), vlapic.mode());
+    }
 }
 
 /// Brings the real controller's logical destination into agreement with the
@@ -108,11 +141,16 @@ pub(crate) fn mirror_logical_destination(vlapic: &Vlapic) {
         );
         return;
     }
-    warn!(
-        "vlapic: {} answers logical destination {real:#x} and its guest believes {wanted:#x}; \
-         interrupts addressed logically will not reach it",
-        vlapic.index()
-    );
+    // Once per controller: a guest that walks back out of x2APIC leaves this
+    // permanently disagreeing, and every later write to the register or change of
+    // face would say so again. What it means is in this module's limitations.
+    if vlapic.diagnostics().say(Report::LogicalDestination) {
+        warn!(
+            "vlapic: {} answers logical destination {real:#x} and its guest believes {wanted:#x}; \
+             interrupts addressed logically will not reach it",
+            vlapic.index()
+        );
+    }
 }
 
 /// Takes the real controller into x2APIC behind a guest that has just gone
@@ -134,7 +172,8 @@ pub(crate) fn mirror_logical_destination(vlapic: &Vlapic) {
 /// that switches its controller off is not followed: the host needs its own
 /// controller for the doorbells and shootdowns that keep the machine running,
 /// and an emulated controller that is off already refuses everything offered to
-/// it.
+/// it. What a guest that comes back out of x2APIC is left with is this module's
+/// stated limitation.
 fn promote(vlapic: &Vlapic) {
     if vlapic.mode() != Mode::X2Apic {
         return;
@@ -153,10 +192,15 @@ fn promote(vlapic: &Vlapic) {
         // Worth a line of its own rather than being folded into the mirror
         // warning below it: this is the reason the two will disagree, and it says
         // the machine cannot do what the guest asked rather than that something
-        // went wrong doing it.
-        Err(error) => warn!(
-            "vlapic: {} could not take its real controller into x2apic: {error}",
-            vlapic.index()
-        ),
+        // went wrong doing it. Once per controller, because a guest that walks
+        // the faces retries it on every pass.
+        Err(error) => {
+            if vlapic.diagnostics().say(Report::Unpromoted) {
+                warn!(
+                    "vlapic: {} could not take its real controller into x2apic: {error}",
+                    vlapic.index()
+                );
+            }
+        }
     }
 }

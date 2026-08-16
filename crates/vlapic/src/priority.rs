@@ -145,6 +145,17 @@ pub(crate) const fn legal(vector: Vector) -> bool {
 /// branch here. Nothing delivered depends on the choice in any case:
 /// [`deliverable`] compares classes only, and the subclass exists so that a
 /// guest's read of the register returns a defined value.
+///
+/// # The subclass is arithmetically right and currently unobservable
+///
+/// The branch that keeps it cannot be reached through a guest. The exit path
+/// stores the control block's four-bit task-priority class over the emulated
+/// register as the first thing every exit does, and a guest's read of any of
+/// these three registers is itself an exit — so the byte this is asked about
+/// always has a zero subclass, and the byte it answers with always has one too.
+/// The arithmetic is kept faithful rather than simplified to match, because
+/// what makes the subclass unobservable is a decision one crate away
+/// ([`crate::observe_task_priority`]) and not anything the architecture says.
 pub(crate) fn processor_priority(task: Priority, in_service: Option<Vector>) -> Priority {
     let serviced = in_service.map_or(Priority::NONE, Priority::of);
     if task.class() >= serviced.class() {
@@ -154,43 +165,30 @@ pub(crate) fn processor_priority(task: Priority, in_service: Option<Vector>) -> 
     }
 }
 
-/// The arbitration priority as Intel's P6 processors define it.
+/// The arbitration priority, as AMD defines it.
 ///
-/// It described the priority a processor would bid with on the external APIC
-/// bus during lowest-priority arbitration. No processor this hypervisor runs on
-/// arbitrates over a bus, so the register is vestigial and computing it exists
-/// to make a guest's read return the value its processor would have produced.
+/// It described the priority a processor would bid with during lowest-priority
+/// arbitration. No processor this hypervisor runs on arbitrates that way — the
+/// choice of target is [`crate::delivery`]'s and does not consult this — so the
+/// register is vestigial, and computing it exists so that a guest's read
+/// returns the value its own processor would have produced.
 ///
 /// `in_service` and `requested` are the highest vectors with a bit set in the
 /// in-service and interrupt-request registers, or `None` when the register is
-/// empty. The fallback path combines the task and serviced classes with a
-/// bitwise AND rather than a maximum: that is what the P6 definition specifies,
-/// odd as it reads, and the two disagree whenever the classes share no bits.
-pub(crate) fn intel_arbitration(
-    task: Priority,
-    in_service: Option<Vector>,
-    requested: Option<Vector>,
-) -> Priority {
-    let serviced = in_service.map_or(Priority::NONE, Priority::of);
-    let request = requested.map_or(Priority::NONE, Priority::of);
-    if task.class() >= request.class() && task.class() > serviced.class() {
-        task
-    } else {
-        Priority::of_class((task.class() & serviced.class()).max(request.class()))
-    }
-}
-
-/// The arbitration priority as AMD defines it.
+/// empty. The class is the greatest of the three priorities; the subclass is
+/// the task priority's when the task priority is what won — including when it
+/// merely ties, which is why the comparison is on classes and the result keeps
+/// the whole byte — and zero otherwise. As with [`processor_priority`], that
+/// subclass is arithmetically right and unobservable through a guest.
 ///
-/// The maximum of the three priorities rather than Intel's bitwise combination,
-/// and the whole task-priority byte rather than a class floor whenever the task
-/// priority is what wins — including when it merely ties, which is why the
-/// comparison below is on classes and the result keeps the subclass.
-///
-/// The two definitions agree only by coincidence. A task class of 2 against a
-/// serviced class of 4 gives 4 here and 0 under the P6 rule, because 2 and 4
-/// share no bits.
-pub(crate) fn amd_arbitration(
+/// Intel's P6 processors defined the same register differently, combining the
+/// task and in-service classes with a bitwise AND rather than taking a maximum;
+/// the two disagree whenever those classes share no bits. That rule is not
+/// implemented, and [`crate::hardware::model`] is where the reason is written
+/// down: nothing that names itself Intel implements the extension this
+/// hypervisor is built on, so there is no machine on which the other answer
+/// would be the right one.
+pub(crate) fn arbitration_priority(
     task: Priority,
     in_service: Option<Vector>,
     requested: Option<Vector>,
@@ -255,11 +253,11 @@ const SUBCLASS_MASK: u8 = 0x0F;
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use descriptors::Vector;
 
-    use super::{
-        Priority, amd_arbitration, deliverable, intel_arbitration, legal, processor_priority,
-    };
+    use super::{Priority, arbitration_priority, deliverable, legal, processor_priority};
 
     /// Every vector there is, which is what the exhaustive checks below run
     /// over.
@@ -270,6 +268,19 @@ mod tests {
     /// Every interrupt-priority class there is.
     fn classes() -> impl Iterator<Item = u8> {
         0..=0x0F
+    }
+
+    #[test]
+    fn a_priority_is_two_nibbles_and_says_so() {
+        assert_eq!(Priority::NONE.get(), 0);
+        assert_eq!((Priority::NONE.class(), Priority::NONE.subclass()), (0, 0));
+        let priority = Priority::new(0x35);
+        assert_eq!((priority.class(), priority.subclass()), (3, 5));
+        assert_eq!(priority.get(), 0x35);
+        // What every task-priority log line in this crate goes through, and the
+        // only consumer of the subclass outside the arithmetic.
+        assert_eq!(format!("{priority}"), "3:5");
+        assert_eq!(format!("{}", Priority::NONE), "0:0");
     }
 
     #[test]
@@ -317,50 +328,59 @@ mod tests {
     }
 
     #[test]
-    fn intel_arbitration_ands_the_classes_on_the_fallback_path() {
-        // Task class 2 does not outrank the serviced class 4, so the fallback
-        // applies: 2 AND 4 is 0, and the requested class 1 wins the maximum.
-        let priority = intel_arbitration(
+    fn arbitration_takes_the_greatest_of_the_three_priorities() {
+        // Task class 2 against a serviced class of 4 and a requested class of 1:
+        // the serviced class is the greatest, and the subclass is floored because
+        // the task priority is not what won.
+        let priority = arbitration_priority(
             Priority::new(0x27),
             Some(Vector::new(0x4A)),
             Some(Vector::new(0x1B)),
         );
-        assert_eq!(priority, Priority::new(0x10));
+        assert_eq!(priority, Priority::new(0x40));
     }
 
     #[test]
-    fn amd_arbitration_takes_the_maximum_where_intel_takes_an_and() {
-        // The same inputs: AMD answers with the serviced class 4, which is the
-        // greatest of the three, where the P6 rule answered with 1.
-        let task = Priority::new(0x27);
-        let serviced = Some(Vector::new(0x4A));
-        let requested = Some(Vector::new(0x1B));
-        assert_eq!(
-            amd_arbitration(task, serviced, requested),
-            Priority::new(0x40)
-        );
-        assert_eq!(
-            intel_arbitration(task, serviced, requested),
-            Priority::new(0x10)
-        );
-    }
-
-    #[test]
-    fn amd_arbitration_keeps_the_task_subclass_on_a_tie() {
-        // The task class equals the serviced class, so the task priority wins
-        // and its subclass survives rather than being floored to the class. As
-        // above, the subclass is the arithmetic's and not a state a guest
-        // reaches.
-        let priority = amd_arbitration(Priority::new(0x45), Some(Vector::new(0x4A)), None);
+    fn arbitration_keeps_the_task_subclass_when_the_task_priority_wins() {
+        // Including a tie, which is why the comparison is on classes and the
+        // result keeps the whole byte. As with the processor priority, the
+        // subclass is the arithmetic's and not a state a guest reaches.
+        let priority = arbitration_priority(Priority::new(0x45), Some(Vector::new(0x4A)), None);
         assert_eq!(priority, Priority::new(0x45));
+        let higher = arbitration_priority(Priority::new(0x55), Some(Vector::new(0x4A)), None);
+        assert_eq!(higher, Priority::new(0x55));
     }
 
     #[test]
-    fn amd_arbitration_counts_what_is_merely_requested() {
+    fn arbitration_counts_what_is_merely_requested() {
         // Nothing in service and a task priority of zero: the request alone
-        // decides, which is the contribution the P6 fallback can lose.
-        let priority = amd_arbitration(Priority::NONE, None, Some(Vector::new(0x6C)));
+        // decides, which is the contribution the rule this hypervisor does not
+        // implement can lose.
+        let priority = arbitration_priority(Priority::NONE, None, Some(Vector::new(0x6C)));
         assert_eq!(priority, Priority::new(0x60));
+    }
+
+    #[test]
+    fn arbitration_and_processor_priority_agree_wherever_the_request_takes_no_part() {
+        // The two rules differ in exactly one input, and a guest reads both
+        // registers: everywhere the interrupt-request register is empty they have
+        // to answer the same byte, and nothing but a change to one of them can
+        // make them disagree there.
+        let serviced = classes().map(|class| Some(Vector::new(Priority::of_class(class).get())));
+        for in_service in serviced.chain(core::iter::once(None)) {
+            for class in classes() {
+                let task = Priority::of_class(class);
+                assert_eq!(
+                    arbitration_priority(task, in_service, None),
+                    processor_priority(task, in_service),
+                    "task {task} against in service {in_service:?}"
+                );
+            }
+        }
+        assert_eq!(
+            arbitration_priority(Priority::NONE, None, None),
+            Priority::NONE
+        );
     }
 
     #[test]

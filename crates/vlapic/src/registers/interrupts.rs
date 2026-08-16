@@ -14,7 +14,7 @@ use log::{Level, log_enabled, trace};
 use crate::{
     lifecycle::ledger::InService,
     priority::{self, Priority},
-    registers::{Vlapic, error::Errors, icr::Trigger},
+    registers::{Vlapic, icr::Trigger},
 };
 
 impl Vlapic {
@@ -53,12 +53,19 @@ impl Vlapic {
     /// Answers what became of it. A vector already requested and not yet
     /// accepted collapses into the one bit, exactly as hardware does, and is
     /// not a second interrupt.
+    ///
+    /// Nothing is recorded in the error status here, and that is what keeps
+    /// this out of the error interrupt's way. An illegal vector is an error
+    /// the *receiving* controller reports, and reporting it means possibly
+    /// raising that controller's error interrupt — which needs a processor
+    /// to raise it on and a doorbell to make that processor look, neither
+    /// of which is in reach from inside an acceptance. So this refuses the
+    /// vector and says so, and [`crate::delivery::error`] is where the
+    /// report is made from a caller that holds both controllers.
     #[must_use]
     pub(crate) fn accept(&self, vector: Vector, trigger: Trigger) -> Accepted {
-        // The controller never sets a request bit in the illegal range, and
-        // records that it was asked to.
+        // The controller never sets a request bit in the illegal range.
         if !priority::legal(vector) {
-            self.errors.record(Errors::RECEIVE_ILLEGAL_VECTOR);
             return Accepted::Illegal;
         }
         // A controller that is switched off or software-disabled does not accept
@@ -209,9 +216,10 @@ impl Vlapic {
     ///
     /// The request bit is cleared before the in-service bit is set, matching
     /// the controller's transition order. A concurrent reader can briefly see
-    /// neither bit. Answers whether the vector really was still requested: a
-    /// reset between the selection and the commitment leaves nothing to move,
-    /// and nothing is then put in service.
+    /// neither bit. Answers whether the vector really was still requested,
+    /// which is a consistency check rather than a race: only this processor
+    /// clears a request bit, and it does not do so between a nomination and the
+    /// commitment.
     pub(crate) fn committed(&self, vector: Vector) -> bool {
         if !self.request.clear(vector) {
             return false;
@@ -344,6 +352,11 @@ pub(crate) enum Accepted {
     /// Already requested and not yet accepted, so it folded into the one bit.
     Coalesced,
     /// Named a vector no controller may deliver, and was refused.
+    ///
+    /// The architectural report for one belongs to this controller and is made
+    /// by the caller, because raising the error interrupt it arms needs a
+    /// processor to raise it on. [`crate::delivery::error`] is where that is
+    /// done.
     Illegal,
     /// Offered to a controller that is not accepting interrupts.
     Refused,

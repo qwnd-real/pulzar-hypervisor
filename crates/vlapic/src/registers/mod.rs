@@ -78,6 +78,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64};
 use cpu::{ApicId, CpuIndex};
 
 pub(crate) use crate::registers::{
+    error::Raise,
     interrupts::Accepted,
     spurious::SPURIOUS_WRITABLE,
     startup::{Phase, Startup},
@@ -88,6 +89,7 @@ pub use crate::registers::{interrupts::Nomination, startup::StartupPage};
 use crate::{
     hardware::model::Model,
     lifecycle::ledger::Ledger,
+    machine::diagnostics::Diagnostics,
     registers::{bitmap::Bitmap, error::ErrorStatus, lvt::Entry},
 };
 
@@ -116,7 +118,6 @@ pub(crate) struct Vlapic {
     timer_divide: AtomicU32,
     timer_initial: AtomicU32,
     timer_frequency: AtomicU64,
-    timer_clamp_reported: AtomicBool,
     command: AtomicU64,
     errors: ErrorStatus,
     ledger: Ledger,
@@ -125,12 +126,12 @@ pub(crate) struct Vlapic {
     away: AtomicBool,
     nmi: AtomicU8,
     owned: AtomicBool,
-    /// Which refusals of a local-vector-table entry's configuration have
-    /// already been reported, one bit per entry per kind of refusal.
-    /// Diagnostic only: nothing reads it back but the report that sets it.
-    refusals_reported: AtomicU32,
-    /// The last selection state `Vlapic::report_selection` logged, packed into
-    /// one word by that function, so a controller whose answer has not changed
-    /// stays quiet. Diagnostic only: nothing reads it back but the report.
+    /// What has happened to this controller and what it has already said about
+    /// it. Diagnostic only: nothing above reads it back except the report that
+    /// writes it and [`crate::describe`].
+    diagnostics: Diagnostics,
+    /// The last selection state `Vlapic::report` logged, packed into one word
+    /// by that function, so a controller whose answer has not changed stays
+    /// quiet. Diagnostic only: nothing reads it back but the report.
     reported: AtomicU64,
 }

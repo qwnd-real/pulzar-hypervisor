@@ -10,6 +10,7 @@ use x86_64::instructions::interrupts;
 
 use crate::{
     hardware::{sources, timer},
+    machine::diagnostics::Report,
     registers::{Phase, StartupPage, Vlapic},
 };
 
@@ -28,6 +29,13 @@ use crate::{
 /// message that arrives before the reset has been applied: the two are sent
 /// microseconds apart, so the message is kept where the INIT can be seen to
 /// precede it and is applied on the way out of this same function.
+///
+/// Both transitions say what they did once per controller. A normal boot is
+/// therefore one line per processor for the reset and one for the start-up
+/// message, which is exactly the evidence a bring-up is read from; a guest that
+/// resets and restarts a processor in a loop produces no more than that, where
+/// each iteration would otherwise be two lines of serial output with a
+/// machine-wide lock held and interrupts off.
 pub(crate) fn applied(vlapic: &Vlapic) -> Resumption {
     if matches!(vlapic.startup().phase(), Phase::InitRequested(_)) {
         discharge(vlapic);
@@ -37,11 +45,13 @@ pub(crate) fn applied(vlapic: &Vlapic) -> Resumption {
         vlapic.discard_nmi();
         let bootstrap = vlapic.base().bootstrap();
         vlapic.startup().initialized(bootstrap);
-        info!(
-            "vlapic: {} reset by an init and {}",
-            vlapic.index(),
-            if bootstrap { "restarting" } else { "waiting" }
-        );
+        if vlapic.diagnostics().say(Report::Initialized) {
+            info!(
+                "vlapic: {} reset by an init and {}",
+                vlapic.index(),
+                if bootstrap { "restarting" } else { "waiting" }
+            );
+        }
         if bootstrap {
             // Only application processors are held. The processor the machine
             // came up on is the one that sends the start-up messages, so a
@@ -59,11 +69,13 @@ pub(crate) fn applied(vlapic: &Vlapic) -> Resumption {
             // mode with no interrupt descriptor table, and a non-maskable
             // interrupt the old guest was owed would be the first thing it took.
             vlapic.discard_nmi();
-            info!(
-                "vlapic: {} started at page {:#x}",
-                vlapic.index(),
-                page.number()
-            );
+            if vlapic.diagnostics().say(Report::Started) {
+                info!(
+                    "vlapic: {} started at page {:#x}",
+                    vlapic.index(),
+                    page.number()
+                );
+            }
             Resumption::StartAt(page)
         }
         None if vlapic.startup().running() => Resumption::Carry,
@@ -113,11 +125,13 @@ fn discharge(vlapic: &Vlapic) {
         );
         return;
     }
-    warn!(
-        "vlapic: {} was reset with sources {} and hardware {debts}",
-        vlapic.index(),
-        if quiet { "quiet" } else { "still armed" },
-    );
+    if vlapic.diagnostics().say(Report::ResetUnsettled) {
+        warn!(
+            "vlapic: {} was reset with sources {} and hardware {debts}",
+            vlapic.index(),
+            if quiet { "quiet" } else { "still armed" },
+        );
+    }
 }
 
 /// Settles everything real hardware is owed for a guest that has switched its
@@ -147,11 +161,13 @@ pub(crate) fn disabled(vlapic: &Vlapic) {
         );
         return;
     }
-    warn!(
-        "vlapic: {} switched its controller off while real hardware was holding \
-         interrupts for it: {debts}",
-        vlapic.index()
-    );
+    if vlapic.diagnostics().say(Report::DisableUnsettled) {
+        warn!(
+            "vlapic: {} switched its controller off while real hardware was holding \
+             interrupts for it: {debts}",
+            vlapic.index()
+        );
+    }
 }
 
 /// What a processor should do after its startup state has been settled.

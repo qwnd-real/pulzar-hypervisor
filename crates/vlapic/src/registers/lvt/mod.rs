@@ -67,9 +67,9 @@ pub(crate) enum Entry {
 impl Entry {
     /// How many entries the local vector table has at most.
     ///
-    /// How many a particular controller has is [`Model::max_lvt`]'s to say, and
-    /// is usually fewer: three of these are optional. This is the size of the
-    /// array they are stored in and the largest a model may claim.
+    /// How many a particular controller has is [`Model::version`]'s to report,
+    /// and is usually fewer: three of these are optional. This is the size of
+    /// the array they are stored in and the largest a model may claim.
     pub(crate) const COUNT: usize = 7;
 
     /// How few a controller may have.
@@ -131,6 +131,65 @@ impl Entry {
             .find(|entry| entry.register() == register)
     }
 
+    /// Whether this entry has a delivery-mode field software may write.
+    ///
+    /// Only the timer does not: its delivery is fixed by the architecture and
+    /// the bits the field would occupy are reserved. Every other entry has one,
+    /// the error entry included — which is where the controller this crate
+    /// presents differs from Intel's, whose error entry reserves those bits as
+    /// the timer's does. [`crate::hardware::model`] is where the choice of
+    /// manual is argued.
+    pub(crate) const fn has_delivery(self) -> bool {
+        !matches!(self, Self::Timer)
+    }
+
+    /// Whether this entry accepts a delivery mode.
+    ///
+    /// Four modes exist in an entry: a fixed interrupt on the vector it names,
+    /// a system-management interrupt, a non-maskable one, and an external
+    /// interrupt signalled over a wire. INIT is *not* among them — the
+    /// architecture defines that encoding for the interrupt command register
+    /// and not for these entries — and an external interrupt means a wire,
+    /// so it belongs to the two entries that describe one.
+    ///
+    /// The exception to all of that is a system-management interrupt, which no
+    /// entry accepts, and that is this hypervisor's own departure rather than
+    /// the architecture's. These entries are programmed onto the machine's
+    /// own controller, so a guest that chose that mode would take the
+    /// *host* into system-management mode over host state, running
+    /// firmware's handler against a context it was not written for — and
+    /// the guest would see nothing of it either way. The interrupt command
+    /// register refuses to send one for exactly the same reason, and the
+    /// decision belongs in one place rather than in both.
+    ///
+    /// An external interrupt reaches a pin's entry from here and is refused
+    /// where the entry is turned into a physical one, because what is wrong
+    /// with it is not the shape of the entry;
+    /// [`crate::hardware::sources`] is where that is stated.
+    pub(crate) const fn allows(self, delivery: Delivery) -> bool {
+        match delivery {
+            Delivery::Fixed => true,
+            Delivery::NonMaskable => self.has_delivery(),
+            Delivery::SystemManagement | Delivery::Init => false,
+            Delivery::External => matches!(self, Self::Lint0 | Self::Lint1),
+        }
+    }
+
+    /// Whether this entry, holding `lvt`, would actually deliver a vector.
+    ///
+    /// Which is the only condition under which its vector field means anything.
+    /// Every other delivery mode is an event the processor takes by its own
+    /// architectural entry point and reads no vector for, so a number left in
+    /// the field is not a vector at all and reporting it as an illegal one
+    /// would be reporting an error about a field nothing reads.
+    ///
+    /// Asked of a value rather than of the stored register, so that a caller
+    /// deciding this about a write it has just performed decides it about what
+    /// it wrote.
+    pub(crate) const fn delivers_a_vector(self, lvt: Lvt) -> bool {
+        !self.has_delivery() || matches!(Delivery::from_bits(lvt.delivery()), Some(Delivery::Fixed))
+    }
+
     /// Which bits of this entry software may set, in this model. Everything
     /// else is reserved in it and is dropped from a write rather than
     /// stored.
@@ -150,7 +209,7 @@ impl Entry {
     /// reserved, and a guest allowed to set it would select a mode its own
     /// `CPUID` denies and real hardware would refuse to be programmed for.
     pub(crate) const fn writable(self, model: Model) -> u32 {
-        let delivery = if model.has_delivery(self) {
+        let delivery = if self.has_delivery() {
             WRITABLE_DELIVERY
         } else {
             0
@@ -355,42 +414,81 @@ mod tests {
     }
 
     #[test]
-    fn the_timer_carries_no_delivery_mode_on_either_vendor() {
-        for model in [model::tests::AMD, model::tests::INTEL] {
-            assert!(!model.has_delivery(Entry::Timer));
-            assert_eq!(Entry::Timer.writable(model) & WRITABLE_DELIVERY, 0);
-            assert!(model.allows(Entry::Timer, Delivery::Fixed));
-            assert!(!model.allows(Entry::Timer, Delivery::NonMaskable));
+    fn the_timer_is_the_one_entry_with_no_delivery_mode() {
+        assert!(!Entry::Timer.has_delivery());
+        assert_eq!(
+            Entry::Timer.writable(model::tests::AMD) & WRITABLE_DELIVERY,
+            0
+        );
+        assert!(Entry::Timer.allows(Delivery::Fixed));
+        assert!(!Entry::Timer.allows(Delivery::NonMaskable));
+        for entry in Entry::ALL
+            .into_iter()
+            .filter(|entry| *entry != Entry::Timer)
+        {
+            assert!(entry.has_delivery(), "{entry:?}");
+            assert_eq!(
+                entry.writable(model::tests::AMD) & WRITABLE_DELIVERY,
+                WRITABLE_DELIVERY,
+                "{entry:?}"
+            );
         }
     }
 
     #[test]
-    fn the_error_entry_takes_a_message_type_on_amd_alone() {
-        let amd = model::tests::AMD;
-        let intel = model::tests::INTEL;
-        assert_eq!(Entry::Error.writable(amd) & WRITABLE_DELIVERY, {
+    fn the_error_entry_takes_a_message_type() {
+        // The one entry the two vendors' manuals shape differently: AMD gives it
+        // a message type in bits 10:8 and Intel reserves the whole of 11:8. This
+        // crate presents AMD's controller unconditionally, so the field is here —
+        // and a vector left in the entry is an illegal one only while the mode is
+        // fixed, which is what makes the difference observable at all.
+        assert!(Entry::Error.has_delivery());
+        assert_eq!(
+            Entry::Error.writable(model::tests::AMD) & WRITABLE_DELIVERY,
             WRITABLE_DELIVERY
-        });
-        assert_eq!(Entry::Error.writable(intel) & WRITABLE_DELIVERY, 0);
-        assert!(amd.allows(Entry::Error, Delivery::NonMaskable));
-        assert!(!intel.allows(Entry::Error, Delivery::NonMaskable));
-        // Neither vendor lets the error entry reach for a wire's modes.
-        assert!(!amd.allows(Entry::Error, Delivery::External));
-        assert!(!amd.allows(Entry::Error, Delivery::Init));
+        );
+        assert!(Entry::Error.allows(Delivery::NonMaskable));
+        // It still has no wire, so neither of the modes that describe one.
+        assert!(!Entry::Error.allows(Delivery::External));
+        assert!(!Entry::Error.allows(Delivery::Init));
     }
 
     #[test]
     fn corrected_machine_check_refuses_everything_but_a_vector_and_a_pin_signal() {
-        let model = model::tests::AMD;
         let entry = Entry::CorrectedMachineCheck;
-        assert!(model.allows(entry, Delivery::Fixed));
-        assert!(model.allows(entry, Delivery::NonMaskable));
+        assert!(entry.allows(Delivery::Fixed));
+        assert!(entry.allows(Delivery::NonMaskable));
         // Not the architecture's rule for this entry: a system-management
         // interrupt would take the host into system-management mode, which is
         // refused in every entry rather than in this one.
-        assert!(!model.allows(entry, Delivery::SystemManagement));
-        assert!(!model.allows(entry, Delivery::Init));
-        assert!(!model.allows(entry, Delivery::External));
+        assert!(!entry.allows(Delivery::SystemManagement));
+        assert!(!entry.allows(Delivery::Init));
+        assert!(!entry.allows(Delivery::External));
+    }
+
+    #[test]
+    fn no_entry_delivers_a_system_management_interrupt_or_an_init() {
+        // Two modes refused everywhere. A system-management interrupt is refused
+        // by this hypervisor rather than by the architecture: taking it would put
+        // the host into system-management mode over host state, and the interrupt
+        // command register refuses to send one for the same reason. INIT is
+        // refused by the architecture, which defines that encoding for the
+        // interrupt command register and not for these entries.
+        for entry in Entry::ALL {
+            assert!(!entry.allows(Delivery::SystemManagement), "{entry:?}");
+            assert!(!entry.allows(Delivery::Init), "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_pin_takes_an_external_interrupt() {
+        for entry in Entry::ALL {
+            assert_eq!(
+                entry.allows(Delivery::External),
+                entry.is_pin(),
+                "{entry:?}"
+            );
+        }
     }
 
     /// Bit 12: the controller's report that a delivery from the source is still
@@ -405,20 +503,19 @@ mod tests {
     fn what_software_may_store_in_each_entry() {
         // Written out as literals rather than composed from the same constants
         // the masks are, so that a field moving fails a test instead of moving
-        // with it. Vector 7:0 and mask 16 everywhere; delivery mode 10:8 where
-        // the entry has one; polarity 13 and trigger mode 15 in the two pins;
-        // timer mode 18:17 in the timer.
-        for (entry, amd, intel) in [
-            (Entry::Timer, 0x0007_00FF, 0x0007_00FF),
-            (Entry::Lint0, 0x0001_A7FF, 0x0001_A7FF),
-            (Entry::Lint1, 0x0001_A7FF, 0x0001_A7FF),
-            (Entry::Error, 0x0001_07FF, 0x0001_00FF),
-            (Entry::Performance, 0x0001_07FF, 0x0001_07FF),
-            (Entry::Thermal, 0x0001_07FF, 0x0001_07FF),
-            (Entry::CorrectedMachineCheck, 0x0001_07FF, 0x0001_07FF),
+        // with it. Vector 7:0 and mask 16 everywhere; delivery mode 10:8 in
+        // every entry but the timer; polarity 13 and trigger mode 15 in the two
+        // pins; timer mode 18:17 in the timer.
+        for (entry, writable) in [
+            (Entry::Timer, 0x0007_00FF),
+            (Entry::Lint0, 0x0001_A7FF),
+            (Entry::Lint1, 0x0001_A7FF),
+            (Entry::Error, 0x0001_07FF),
+            (Entry::Performance, 0x0001_07FF),
+            (Entry::Thermal, 0x0001_07FF),
+            (Entry::CorrectedMachineCheck, 0x0001_07FF),
         ] {
-            assert_eq!(entry.writable(model::tests::AMD), amd, "{entry:?}");
-            assert_eq!(entry.writable(model::tests::INTEL), intel, "{entry:?}");
+            assert_eq!(entry.writable(model::tests::AMD), writable, "{entry:?}");
         }
         // A processor without the timestamp-counter deadline has one bit of the
         // timer's mode field rather than two.
@@ -430,17 +527,16 @@ mod tests {
         // The complement of the mask above, less the two bits the controller
         // reports through: those are read-only rather than reserved, so a write
         // of one is dropped and not refused.
-        for (entry, amd, intel) in [
-            (Entry::Timer, 0xFFF8_EF00, 0xFFF8_EF00),
-            (Entry::Lint0, 0xFFFE_0800, 0xFFFE_0800),
-            (Entry::Lint1, 0xFFFE_0800, 0xFFFE_0800),
-            (Entry::Error, 0xFFFE_E800, 0xFFFE_EF00),
-            (Entry::Performance, 0xFFFE_E800, 0xFFFE_E800),
-            (Entry::Thermal, 0xFFFE_E800, 0xFFFE_E800),
-            (Entry::CorrectedMachineCheck, 0xFFFE_E800, 0xFFFE_E800),
+        for (entry, reserved) in [
+            (Entry::Timer, 0xFFF8_EF00),
+            (Entry::Lint0, 0xFFFE_0800),
+            (Entry::Lint1, 0xFFFE_0800),
+            (Entry::Error, 0xFFFE_E800),
+            (Entry::Performance, 0xFFFE_E800),
+            (Entry::Thermal, 0xFFFE_E800),
+            (Entry::CorrectedMachineCheck, 0xFFFE_E800),
         ] {
-            assert_eq!(entry.reserved(model::tests::AMD), amd, "{entry:?}");
-            assert_eq!(entry.reserved(model::tests::INTEL), intel, "{entry:?}");
+            assert_eq!(entry.reserved(model::tests::AMD), reserved, "{entry:?}");
         }
         assert_eq!(Entry::Timer.reserved(model::tests::SPARSE), 0xFFFC_EF00);
     }
@@ -454,7 +550,7 @@ mod tests {
         // flight, or held an unacknowledged level-triggered interrupt from a
         // pin, that value has the bit set — and refusing it would be a general
         // protection fault for writing back what the guest was just given.
-        for model in [model::tests::AMD, model::tests::INTEL] {
+        for model in [model::tests::AMD, model::tests::SPARSE] {
             for entry in Entry::ALL {
                 assert_eq!(
                     entry.reserved(model) & DELIVERY_STATUS,

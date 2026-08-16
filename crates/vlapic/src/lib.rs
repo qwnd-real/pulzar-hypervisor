@@ -56,6 +56,31 @@
 //! halves, one of them by the processor against fields another crate writes
 //! into a control block, so [`Priority`] is public and is the workspace's
 //! single statement of what an interrupt-priority class is.
+//!
+//! # What is tested, and what cannot be
+//!
+//! Every decision this crate makes is tested where it can be reached without a
+//! machine, which is why so much of it is written as a function of values
+//! rather than as a method on a controller: which register an access names,
+//! what a command asks for, which processors a destination names, what an entry
+//! becomes on real hardware, which writes are ordered against hardware, what a
+//! debt becomes, and the whole of the priority arithmetic and the startup state
+//! machine.
+//!
+//! What has no test is what needs a controller, and no host
+//! test can have one: a controller is built from a roster entry,
+//! `cpu::CpuIndex` has no public constructor, and construction resets the
+//! register file — which holds this processor's interrupts off with an
+//! instruction a test process may not execute. So the modules that only pair a
+//! controller with the machine behind it — `machine/{install, ownership,
+//! registry, exits}`, `face/dispatch`, `delivery/{mod, doorbell, error}`,
+//! `hardware/mirror`, `hardware/timer/{mod, inherit}`, `lifecycle/{mod,
+//! settle}` and the `registers` files that are accessors over its fields — are
+//! covered through the pure decisions they call and by inspection of the
+//! sequencing, and the module roots hold documentation rather than code. Making
+//! the rest reachable needs a constructor for a processor index and a
+//! controller that can be built without masking interrupts, neither of which is
+//! this crate's to add.
 
 #![no_std]
 

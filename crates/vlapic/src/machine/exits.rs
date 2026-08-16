@@ -55,9 +55,15 @@ pub fn nominate() -> Result<Nomination, VlapicError> {
 pub fn committed(vector: Vector) -> Result<(), VlapicError> {
     current().map(|vlapic| {
         if !vlapic.committed(vector) {
-            // The request was withdrawn between the two halves, which a reset
-            // arriving in that window does. Nothing is put in service: the
-            // interrupt belonged to a guest that no longer exists.
+            // A consistency check rather than a race this can lose. Only the
+            // processor a controller belongs to clears a request bit, and the
+            // only thing that clears one wholesale is a reset that processor
+            // performs at an exit boundary — never between a nomination and the
+            // commitment, both of which happen on the way into the guest with
+            // interrupts and the global interrupt flag both off. So the request
+            // being gone would mean that invariant has been broken, and the
+            // interrupt is not put in service because there is no guest left
+            // that was owed it.
             trace!(
                 "vlapic: {} was given {vector}, which its controller no longer had requested",
                 vlapic.index()
@@ -92,9 +98,12 @@ pub fn raise_nmi() -> Result<(), VlapicError> {
 /// Records the priority class the guest set through `CR8`.
 ///
 /// With interrupt masking virtualized, the processor keeps `CR8` in the control
-/// block and writes it back on every exit. Observing it on every exit also
-/// covers a write of the same class already present, which matters because a
-/// `CR8` write clears the APIC task-priority subclass.
+/// block and writes it back on every exit, so this is called on every exit and
+/// not only after a write to that register. What the control block carries is
+/// four bits, so what this records is a class with a zero subclass — including
+/// on an exit that followed a write to the *emulated* task-priority register,
+/// whose subclass is therefore not observable by the guest that wrote it. The
+/// register file's own accessor is where that deviation is argued.
 ///
 /// `class` is the four bits the control block carries, which is the whole of
 /// what that control register holds.

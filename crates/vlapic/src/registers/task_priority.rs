@@ -4,9 +4,8 @@
 //! arbitration priorities are computed from it and from the bitmaps on every
 //! read, because the architecture defines them as functions of that state and a
 //! stored copy is a copy that can be wrong. The arithmetic itself is
-//! [`crate::priority`]'s and the vendor's disagreement about it is
-//! [`crate::hardware::model`]'s; what is here is only which state each rule is
-//! applied to.
+//! [`crate::priority`]'s; what is here is only which state each rule is applied
+//! to.
 
 use core::sync::atomic::Ordering;
 
@@ -34,9 +33,21 @@ impl Vlapic {
     /// Records the priority class the guest set through its control register.
     ///
     /// The control block carries only the four bits of the class, because that
-    /// is all the control register carries. Every write clears the subclass,
-    /// including a write of the class already present, so the exit path stores
-    /// the hardware-maintained value unconditionally.
+    /// is all the control register carries — so what survives a world switch is
+    /// the class and nothing else, and this stores the class over the whole
+    /// byte.
+    ///
+    /// That is wider than a control-register write would be. A write to that
+    /// register really does clear the task priority's subclass, but this runs
+    /// on *every* exit, including exits that followed a write to the
+    /// emulated register itself: a guest that stores `0x35` through its
+    /// controller reads `0x30` back, because its read is an exit and the
+    /// exit gets here first. The deviation is deliberate and matches what a
+    /// hypervisor using this processor's task-priority virtualization can
+    /// do. Nothing delivered depends on it —
+    /// [`crate::priority::deliverable`] compares classes only —
+    /// so what a guest loses is four bits of a register it wrote and no
+    /// behaviour.
     ///
     /// `class` is those four bits, and turning them back into a priority is
     /// [`Priority::of_class`]'s so that the workspace has one statement of
@@ -60,10 +71,13 @@ impl Vlapic {
 
     /// The arbitration priority, which exists only in the older face.
     ///
-    /// Computed by the rule the guest's own processor follows, which is not the
-    /// same rule on both vendors and is visible to a guest that reads it.
+    /// Vestigial on every processor this hypervisor can run on — nothing
+    /// arbitrates over a bus and [`crate::delivery`] chooses a redirectable
+    /// interrupt's target without asking — and computed anyway, because the
+    /// register is readable and a guest that reads it is owed the number its
+    /// own processor would have produced.
     pub(crate) fn arbitration_priority(&self) -> Priority {
-        self.model.arbitration_priority(
+        priority::arbitration_priority(
             self.task_priority(),
             self.in_service.highest(),
             self.request.highest(),

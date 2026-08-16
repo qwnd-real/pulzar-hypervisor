@@ -23,7 +23,11 @@ use snapshot::FirmwareContext;
 use crate::{
     VlapicError,
     delivery::doorbell,
-    hardware::{mirror::mirror_logical_destination, model::Model, sources, timer},
+    hardware::{
+        mirror::mirror_logical_destination,
+        model::{self, Model},
+        sources, timer,
+    },
     machine::registry,
     registers::{Vlapic, base::ApicBase},
 };
@@ -59,9 +63,11 @@ use crate::{
 /// to be asked which one it is.
 pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     // Asked before anything is acquired so that a second call is cheap and
-    // leaves nothing behind. It is not what makes this safe against two callers
-    // at once — nothing is, and nothing needs to be: this runs on the boot
-    // processor before any other processor exists.
+    // leaves nothing behind. It is also the whole of the check: `install` runs on
+    // the boot processor before any other processor exists, so nothing can be
+    // between this and the publication below — and a second check after the
+    // publication would be an early return with a vector already acquired, which
+    // is the one thing this ordering exists to make impossible.
     if registry::installed() {
         return Err(VlapicError::AlreadyInstalled);
     }
@@ -75,13 +81,11 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     {
         return Err(VlapicError::MisplacedPage { page });
     }
-    let here = apic::local()?.id();
+    let local = apic::local()?;
+    let here = local.id();
     let roster = cpu::roster()?;
-    // Firmware lists the boot processor first, and the bootstrap flag in the
-    // base register records which processor the machine came up on. Nothing
-    // else in the roster distinguishes it.
-    let bootstrap = roster.entries().first().map(cpu::Entry::apic_id);
-    let model = Model::of_machine();
+    let model = Model::of_machine(local);
+    model::describe("vlapic", model);
     let lapics: Box<[_]> = roster
         .entries()
         .iter()
@@ -89,13 +93,23 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
             Vlapic::new(
                 entry.index(),
                 entry.apic_id(),
-                Some(entry.apic_id()) == bootstrap,
+                // The processor running this is the one the machine came up on,
+                // and its own controller is what says which processor that is.
+                // Firmware lists processors in whatever order it likes, so taking
+                // the flag from the roster's first entry gave the real bootstrap
+                // processor a guest that believed it was an application one.
+                entry.apic_id() == here,
                 entry.startable(),
                 model,
             )
         })
         .collect();
-    if let Some(vlapic) = lapics.iter().find(|vlapic| vlapic.apic_id() == here) {
+    // Found once. Both things this processor's own controller needs — a
+    // calibrated timer before anything is published, and firmware's registers
+    // after everything is — are about the same row, and searching for it twice
+    // was two answers to a question with one.
+    let mine = lapics.iter().position(|vlapic| vlapic.apic_id() == here);
+    if let Some(vlapic) = mine.and_then(|index| lapics.get(index)) {
         timer::calibrate(vlapic)?;
     }
 
@@ -106,10 +120,7 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     // them would be permanent and a retry would find the page already there.
     let doorbell = doorbell::acquire()?;
 
-    let (page, built) = registry::publish(lapics);
-    if !built {
-        return Err(VlapicError::AlreadyInstalled);
-    }
+    let page = registry::publish(lapics);
     doorbell::publish(doorbell);
     info!(
         "vlapic: {} emulated controllers, reported as version {:#x}",
@@ -136,7 +147,7 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     // that could not be seeded is still a working controller, so a machine whose
     // firmware left nothing to inherit is one this leaves at reset rather than
     // one it refuses.
-    if let Some(vlapic) = page.all().iter().find(|vlapic| vlapic.apic_id() == here) {
+    if let Some(vlapic) = mine.and_then(|index| page.all().get(index)) {
         inherit(vlapic, firmware);
     } else {
         warn!("vlapic: {here} is not in the roster, so nothing inherited firmware's controller");

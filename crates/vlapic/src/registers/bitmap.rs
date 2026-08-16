@@ -5,9 +5,24 @@
 //! controller uses them a bit at a time; and a bit belonging to one processor
 //! is set by any of the others, because sending an interrupt is exactly that.
 //!
-//! So they are atomics, and the whole of this module exists to make sure the
-//! vector arithmetic that turns a vector into a slot and a bit is written once.
-//! Getting it wrong is an interrupt delivered as a different one.
+//! So they are atomics, and this module exists so that the arithmetic turning a
+//! vector into a slot and a bit is written once *for the controller a guest
+//! sees*. Getting it wrong is an interrupt delivered as a different one.
+//!
+//! # Once here is not once in the machine
+//!
+//! The real controller has the same three registers and its own arithmetic for
+//! them, in [`apic`], and there is no way to have one copy: that one addresses
+//! real registers through whichever face the host is using, and this one
+//! addresses an array of atomics. The two meet in
+//! [`crate::lifecycle::ledger`], which compares a vector this module produced
+//! against one the real controller reported — so what has to agree is the
+//! *vector*, which is a [`Vector`] on both sides and not a slot or a bit.
+//!
+//! What could disagree is the number of slots, and it cannot: [`SLOTS`] is
+//! [`apic::VECTOR_WORDS`]. A divergence there would corrupt a guest's read of
+//! the top of one of these banks rather than lose an interrupt, because the
+//! only consumers of a slot are the three readbacks a guest performs.
 //!
 //! # Which orderings, and why
 //!

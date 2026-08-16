@@ -6,7 +6,7 @@
 //! writable masks built out of it, so that a mask cannot drift away from the
 //! fields it is made of.
 
-use crate::registers::icr::Command;
+use crate::registers::{base::Mode, icr::Command};
 
 impl Command {
     /// The destination every processor answers to in x2APIC, in the logical
@@ -75,6 +75,30 @@ impl Command {
     /// The command sixty-four bits describe, as x2APIC presents them.
     pub(crate) const fn from_bits(bits: u64) -> Self {
         Self(bits)
+    }
+
+    /// Which bits of the whole register a controller may be seeded with, in the
+    /// face it is being seeded into.
+    ///
+    /// The one register seeded from hardware whose stored value both faces read
+    /// back, and the one whose reserved set depends on which of them: through
+    /// the page the destination is a byte at the top of the high half and the
+    /// rest of that half reads as zero, and in x2APIC the whole of it is the
+    /// destination. A controller seeded with firmware's word entire hands its
+    /// guest bits the architecture says the register does not have — the
+    /// delivery-status bit above all, since a guest that read the register and
+    /// wrote back what it read would take a general protection fault for it.
+    ///
+    /// A controller seeded from a switched-off one is narrowed by the older
+    /// face's rules, which are the ones that apply the moment its guest
+    /// switches it on: that is the only face it can be switched on into.
+    pub(crate) const fn seedable(mode: Mode) -> u64 {
+        match mode {
+            Mode::X2Apic => Self::WRITABLE_X2APIC,
+            Mode::XApic | Mode::Disabled => {
+                Self::from_halves(Self::WRITABLE_LOW, Self::WRITABLE_HIGH).bits()
+            }
+        }
     }
 
     /// The command a pair of memory-mapped halves describes, the destination
@@ -189,7 +213,7 @@ mod tests {
     //! The masks are written out as the values a guest may write, so that a
     //! test fails when a field moves rather than moving with it.
 
-    use crate::registers::icr::Command;
+    use crate::registers::{base::Mode, icr::Command};
 
     #[test]
     fn the_wide_face_keeps_the_fields_software_is_told_to_write() {
@@ -225,5 +249,27 @@ mod tests {
         // the shorthand. Not the delivery-status bit at 12, and not bit 13,
         // bits 17:16 or bits 31:20.
         assert_eq!(Command::WRITABLE_LOW, 0x000C_CFFF);
+    }
+
+    #[test]
+    fn a_controller_is_seeded_with_only_what_the_face_it_comes_up_in_can_hold() {
+        // The one register seeded from hardware that both faces read back, so the
+        // one whose reserved set depends on which of them. Left whole, it hands
+        // the guest firmware's delivery-status bit — and a guest that reads the
+        // register and writes back what it read is then faulted for it.
+        assert_eq!(Command::seedable(Mode::X2Apic), Command::WRITABLE_X2APIC);
+        assert_eq!(Command::seedable(Mode::XApic), 0xFF00_0000_000C_CFFF);
+        assert_eq!(
+            Command::seedable(Mode::Disabled),
+            Command::seedable(Mode::XApic),
+            "the only face a switched-off controller can be switched on into"
+        );
+        for mode in [Mode::XApic, Mode::X2Apic, Mode::Disabled] {
+            assert_eq!(
+                Command::seedable(mode) & (1 << 12),
+                0,
+                "the delivery status is the controller's in {mode}"
+            );
+        }
     }
 }

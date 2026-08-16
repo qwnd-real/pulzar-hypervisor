@@ -23,7 +23,7 @@ use log::{info, warn};
 
 use crate::{
     delivery::doorbell::nudge,
-    machine::ownership,
+    machine::{diagnostics::Report, ownership},
     registers::{StartupPage, Vlapic},
 };
 
@@ -37,16 +37,25 @@ use crate::{
 /// boundary — so applying one to this processor is the same deferral as
 /// applying one to any other, and the exit loop refuses to re-enter a guest
 /// that has been reset.
+///
+/// Said once per *target* rather than once per message. A normal bring-up sends
+/// one INIT per processor, so a boot still records every one of them; a guest
+/// that resets a processor in a loop is a guest that can otherwise produce a
+/// line of serial output per iteration, with a machine-wide lock held and
+/// interrupts off. What the target then did about it is
+/// [`mod@crate::lifecycle::settle`]'s to say.
 pub(super) fn initialize(from: &Vlapic, target: &Vlapic) {
     if forwardable(target) {
         forward(from, target, HardwareDelivery::Init);
         return;
     }
-    info!(
-        "vlapic: {} sent an init to {}",
-        from.index(),
-        target.index()
-    );
+    if target.diagnostics().say(Report::InitSent) {
+        info!(
+            "vlapic: {} sent an init to {}",
+            from.index(),
+            target.index()
+        );
+    }
     target.startup().requested_init();
     nudge(from, target);
 }
@@ -73,17 +82,22 @@ pub(super) fn start(from: &Vlapic, target: &Vlapic, page: StartupPage) {
     // of the pair a guest sends harmless: the first starts the processor, and
     // the second finds it already running.
     let taken = target.startup().offered(page);
-    info!(
-        "vlapic: {} sent a startup at page {:#x} to {}, {}",
-        from.index(),
-        page.number(),
-        target.index(),
-        if taken {
-            "which was waiting for one"
-        } else {
-            "which was not waiting for one"
-        }
-    );
+    // Once per target, for the reason [`initialize`] gives — and the message that
+    // is *not* taken is the one worth reporting first, so a bring-up records the
+    // pair's second message only if the first did not arrive.
+    if target.diagnostics().say(Report::StartupSent) {
+        info!(
+            "vlapic: {} sent a startup at page {:#x} to {}, {}",
+            from.index(),
+            page.number(),
+            target.index(),
+            if taken {
+                "which was waiting for one"
+            } else {
+                "which was not waiting for one"
+            }
+        );
+    }
     if taken {
         nudge(from, target);
     }
