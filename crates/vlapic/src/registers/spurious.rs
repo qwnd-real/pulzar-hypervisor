@@ -80,4 +80,7 @@ pub(super) const SPURIOUS_RESET: u32 = 0xFF;
 /// meaning on any processor this runs on, and the second is reported
 /// unsupported in the version register because the broadcast is performed by
 /// hardware this hypervisor passes through.
-pub(super) const SPURIOUS_WRITABLE: u32 = 0x1FF;
+///
+/// Reached by the model-specific-register face as well, which has to fault on
+/// exactly the bits this drops.
+pub(crate) const SPURIOUS_WRITABLE: u32 = 0x1FF;

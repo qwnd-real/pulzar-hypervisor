@@ -25,7 +25,7 @@ pub fn describe(who: &str) {
             "{who}: {} {} {} in {}{}, task priority {}, {} requested, {} in service{}",
             vlapic.index(),
             vlapic.apic_id(),
-            if vlapic.running() {
+            if vlapic.startup().running() {
                 "running"
             } else {
                 "waiting to be started"

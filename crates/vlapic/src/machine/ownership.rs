@@ -14,7 +14,7 @@ use crate::{
     VlapicError,
     hardware::timer,
     machine::of,
-    registers::{Startup, Vlapic},
+    registers::{Phase, Vlapic},
 };
 
 /// Records that this hypervisor now runs this processor, so that a startup
@@ -48,12 +48,12 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`VlapicError::NotInstalled`] before [`crate::install`], [`VlapicError::NoLapic`]
-/// if the roster does not describe this processor, or [`VlapicError::Apic`] if
-/// the real timer cannot be measured.
+/// [`VlapicError::NotInstalled`] before [`crate::install`],
+/// [`VlapicError::NoLapic`] if the roster does not describe this processor, or
+/// [`VlapicError::Apic`] if the real timer cannot be measured.
 pub fn claim_processor(id: cpu::ApicId, joining: Joining) -> Result<(), VlapicError> {
     let vlapic = of(id)?;
-    vlapic.set_startup(joining.startup());
+    vlapic.startup().join(joining.phase());
     vlapic.take_ownership();
     timer::calibrate(vlapic)?;
     Ok(())
@@ -90,11 +90,11 @@ pub enum Joining {
 }
 
 impl Joining {
-    /// The startup state this is.
-    const fn startup(self) -> Startup {
+    /// The phase this is.
+    const fn phase(self) -> Phase {
         match self {
-            Self::Running => Startup::Running,
-            Self::WaitingForSipi => Startup::WaitingForSipi,
+            Self::Running => Phase::Running,
+            Self::WaitingForSipi => Phase::WaitingForSipi(None),
         }
     }
 }

@@ -144,8 +144,8 @@ impl Bitmap {
     ///
     /// Answering with the slot's absence rather than with a zero leaves what a
     /// missing slot means to the caller — and its only callers are the three
-    /// guest bank readbacks, where the offset a slot came from is one of eight by
-    /// construction and a zero would be indistinguishable from an empty
+    /// guest bank readbacks, where the offset a slot came from is one of eight
+    /// by construction and a zero would be indistinguishable from an empty
     /// register.
     pub(crate) fn slot(&self, slot: usize) -> Option<u32> {
         self.slots
@@ -163,9 +163,11 @@ impl Bitmap {
     /// Puts every register at what a real controller was holding.
     ///
     /// Only ever used to seed a controller from a capture of the hardware it
-    /// stands for, before any guest has run and before anything can be
-    /// delivering into it — which is what makes storing the registers one at a
-    /// time rather than as one step correct here and nowhere else.
+    /// stands for. Storing the registers one at a time rather than as one step
+    /// is safe there because the caller brackets them with the controller's
+    /// reset count, exactly as it brackets a reset: an arrival that races
+    /// the seeding sees the count move and publishes again into the seeded
+    /// register.
     pub(crate) fn seed(&self, words: &[u32; SLOTS]) {
         for (slot, word) in self.slots.iter().zip(words) {
             slot.store(*word, Ordering::Release);
@@ -192,20 +194,19 @@ fn vector_at(slot: usize, bit: u32) -> Vector {
 }
 
 /// The eight registers have to cover exactly the vectors there are, because
-/// [`vector_at`] narrows a slot and a bit into one byte to name one: a ninth slot
-/// would wrap round and answer with a vector from the bottom of the range, and
-/// seven would leave the top of it unreachable.
+/// [`vector_at`] narrows a slot and a bit into one byte to name one: a ninth
+/// slot would wrap round and answer with a vector from the bottom of the range,
+/// and seven would leave the top of it unreachable.
 const _: () = assert!(
     Bitmap::CAPACITY == Vector::COUNT,
     "a bitmap must give every vector exactly one bit"
 );
 
-
 #[cfg(test)]
 mod tests {
     //! The arithmetic is checked in both directions over every vector, because
-    //! getting it wrong is an interrupt delivered as a different one and nothing
-    //! downstream would notice.
+    //! getting it wrong is an interrupt delivered as a different one and
+    //! nothing downstream would notice.
 
     use descriptors::Vector;
 
@@ -275,7 +276,10 @@ mod tests {
         let vector = Vector::new(0x42);
 
         assert!(!bitmap.set(vector));
-        assert!(bitmap.set(vector), "a second arrival folds into the one bit");
+        assert!(
+            bitmap.set(vector),
+            "a second arrival folds into the one bit"
+        );
         assert_eq!(bitmap.count(), 1);
         assert!(bitmap.clear(vector));
         assert!(!bitmap.clear(vector), "clearing a clear bit took nothing");

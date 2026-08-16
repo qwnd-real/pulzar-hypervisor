@@ -258,10 +258,10 @@ pub(crate) const fn version_number(version: u32) -> u32 {
 
 /// Index of the model-specific register the register at offset zero maps to.
 ///
-/// Public because the emulated controller derives the same indices from the same
-/// offsets, and the derivation is the architecture's rather than either crate's:
-/// two copies of it would be two answers to the question of which register a
-/// guest's `RDMSR` names.
+/// Public because the emulated controller derives the same indices from the
+/// same offsets, and the derivation is the architecture's rather than either
+/// crate's: two copies of it would be two answers to the question of which
+/// register a guest's `RDMSR` names.
 pub const X2APIC_BASE_MSR: u32 = 0x800;
 
 /// Bytes between one memory-mapped register and the next. Each is 32 bits wide

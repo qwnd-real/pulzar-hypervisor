@@ -31,29 +31,38 @@
 //!
 //! # The register page does not move, and that is part of the machine
 //!
-//! The address field is architecturally writable on real hardware and is
-//! refused here, so this is a way in which the machine Pulzar presents is
+//! The address field is architecturally writable on real hardware and is not
+//! writable here, so this is a way in which the machine Pulzar presents is
 //! narrower than the one its `CPUID` describes. It is stated rather than
 //! hidden: the guest's controller lives at [`ApicBase::DEFAULT_PAGE`] for the
-//! whole life of the guest, and a write that would move it takes a general
-//! protection fault.
+//! whole life of the guest, and a write naming any other address leaves it
+//! where it is — so a guest that reads the register back finds the address it
+//! did not get.
 //!
 //! The reason is that the page is trapped in the nested page tables once,
 //! before any guest has run, and nothing in this codebase can re-trap a range
-//! while processors are executing. A guest whose write was accepted would go on
+//! while processors are executing. A guest whose write was honoured would go on
 //! faulting on the old address and reading plain memory at the new one — a
-//! controller that silently stopped working — so refusing is the honest answer
-//! and [`BaseFault::Relocated`] is kept distinct from the architectural faults
-//! so that a caller can tell the two apart in a log.
+//! controller that silently stopped working.
+//!
+//! Ignoring the field is the narrower of the two deviations available. Raising
+//! a general protection fault instead would invent an architectural fault for a
+//! write the architecture defines, and would kill the software most likely to
+//! make one: enabling a controller by writing the enable bit together with the
+//! address firmware's own tables reported is how that is normally written, and
+//! an unexpected fault at that point in a boot is a triple fault and a machine
+//! with no output. A guest that reads back what it wrote and checks is instead
+//! told the truth, which is that its controller did not move.
 //!
 //! The same fact decides what happens on a machine whose *firmware* had moved
-//! the page before pulzar ran, and there the answer cannot be a fault: there is
-//! no guest instruction to fault. Everything outside the one trapped page is an
-//! identity map of machine physical memory, so a guest on such a machine would
-//! reach the *real* local APIC at firmware's address, untrapped — able to mask
-//! the host's interrupts, acknowledge them, reset the host's processors and
-//! rename them. So [`ApicBase::misplaced`] answers that question before any
-//! guest exists and [`crate::install`] refuses the machine outright.
+//! the page before pulzar ran, and there the answer cannot be to ignore a
+//! write: there is no guest instruction to ignore. Everything outside the one
+//! trapped page is an identity map of machine physical memory, so a guest on
+//! such a machine would reach the *real* local APIC at firmware's address,
+//! untrapped — able to mask the host's interrupts, acknowledge them, reset the
+//! host's processors and rename them. So [`ApicBase::misplaced`] answers that
+//! question before any guest exists and [`crate::install`] refuses the machine
+//! outright.
 //!
 //! Firmware and operating systems do not relocate the page in practice; the
 //! default address is what every one of them expects to find.
@@ -130,6 +139,15 @@ impl ApicBase {
     /// Everything the architecture reserves is dropped, so that a guest reading
     /// the register back sees what it promises.
     ///
+    /// The wider enable is dropped on its own if the global one did not
+    /// survive. `EXTD` without `EN` is not a state the architecture
+    /// defines, and a controller seeded with it would answer through
+    /// neither face while every recovery a guest could attempt — reading
+    /// the register, setting the enable bit, writing it back — took a
+    /// general protection fault for a transition out of a state that does
+    /// not exist. The check belongs here because this is the one producer
+    /// of this register that is handed a value read out of hardware.
+    ///
     /// The address is the default one rather than firmware's, and the two are
     /// the same address wherever this is reached: the page is trapped once,
     /// before any guest has run, so a machine whose firmware had put it
@@ -144,7 +162,13 @@ impl ApicBase {
     /// on.
     pub(crate) fn seeded(value: u64, bootstrap: bool) -> Self {
         let flag = if bootstrap { BOOTSTRAP } else { 0 };
-        Self((value & (GLOBAL_ENABLE | X2APIC_ENABLE)) | Self::DEFAULT_PAGE | flag)
+        let enables = value & (GLOBAL_ENABLE | X2APIC_ENABLE);
+        let enables = if enables & GLOBAL_ENABLE == 0 {
+            0
+        } else {
+            enables
+        };
+        Self(enables | Self::DEFAULT_PAGE | flag)
     }
 
     /// Where firmware left the register page, if it is not where this
@@ -197,10 +221,11 @@ impl ApicBase {
     /// Which interface the controller currently answers through.
     ///
     /// The global enable decides on its own: with it clear the controller is
-    /// off whatever `EXTD` says. That combination is not a state a guest
-    /// can write — [`written`](Self::written) refuses it — so it is
-    /// reachable only by handing [`from_bits`](Self::from_bits) a value
-    /// that never came from a guest.
+    /// off whatever `EXTD` says. That combination is not a state, and neither
+    /// producer of this register can build one — [`written`](Self::written)
+    /// refuses a guest's attempt and [`seeded`](Self::seeded) drops the wider
+    /// bit out of firmware's value — so it is reachable only by handing
+    /// [`from_bits`](Self::from_bits) a word that came from neither.
     pub(crate) const fn mode(self) -> Mode {
         if self.0 & GLOBAL_ENABLE == 0 {
             Mode::Disabled
@@ -214,16 +239,15 @@ impl ApicBase {
     /// The whole of the architectural address field, however wide this
     /// processor implements it.
     ///
-    /// Every bit that is not one of the flags, which is bits 63:12 — deliberately
-    /// wider than the 4 KiB page the field's low bits would give. The
-    /// reserved-bit test a write is judged against is derived from the
-    /// processor's own physical-address width, which on some processors is wider
-    /// than a page mask of bits 51:12 would keep, so a write setting an address
-    /// bit above such a mask would pass the reserved test, disappear in the mask,
-    /// and compare equal to where the page already is. The guest would then have
-    /// been told its page moved while this hypervisor went on trapping the old
-    /// one — which is why [`ApicBase::written`] compares this and
-    /// [`ApicBase::page_of`] answers with it.
+    /// Every bit that is not one of the flags, which is bits 63:12 —
+    /// deliberately wider than the 4 KiB page the field's low bits would
+    /// give. The reserved-bit test a write is judged against is derived
+    /// from the processor's own physical-address width, which on some
+    /// processors is wider than a page mask of bits 51:12 would keep, so an
+    /// address bit above such a mask would pass the reserved test and then
+    /// disappear in the mask — which for [`ApicBase::page_of`], the question
+    /// a machine is refused on, would be firmware's page reported as the one
+    /// this hypervisor traps.
     const fn address(self) -> u64 {
         self.0 & !(RESERVED_LOW | BOOTSTRAP | X2APIC_ENABLE | GLOBAL_ENABLE)
     }
@@ -345,12 +369,49 @@ mod tests {
     }
 
     #[test]
-    fn moving_the_page_is_refused() {
+    fn moving_the_page_is_ignored_rather_than_refused() {
+        // Architecturally writable, and not writable here: the page is trapped
+        // once before any guest runs. What a guest gets is the write it made
+        // minus the part this machine cannot honour, rather than a fault the
+        // architecture does not define for it.
         let elsewhere = (ApicBase::DEFAULT_PAGE + 0x1_0000) | GLOBAL_ENABLE;
-        assert_eq!(
-            state(Mode::XApic).written(elsewhere, MODEL),
-            Err(BaseFault::Relocated)
-        );
+        let written = state(Mode::XApic)
+            .written(elsewhere, MODEL)
+            .expect("a relocating write is taken, with the address left where it is");
+
+        assert_eq!(written, state(Mode::XApic));
+        assert_eq!(ApicBase::page_of(written.bits()), ApicBase::DEFAULT_PAGE);
+    }
+
+    #[test]
+    fn enabling_a_controller_at_a_relocated_address_still_enables_it() {
+        // The write the refusal used to kill: the enable bit set together with an
+        // address out of firmware's tables, which is how software that does not
+        // read-modify-write this register enables a controller.
+        let forced = 0xFEC0_0000 | GLOBAL_ENABLE;
+        let written = state(Mode::Disabled)
+            .written(forced, MODEL)
+            .expect("switching a controller on is a legal transition");
+
+        assert_eq!(written.mode(), Mode::XApic);
+        assert_eq!(ApicBase::page_of(written.bits()), ApicBase::DEFAULT_PAGE);
+    }
+
+    #[test]
+    fn a_controller_is_never_seeded_into_a_state_that_does_not_exist() {
+        // `EXTD` without `EN` is not a state, and every recovery from one faults:
+        // the guest reads the register, sets the enable bit it is missing, and
+        // writes back a move from disabled straight into x2APIC.
+        let malformed = ApicBase::DEFAULT_PAGE | X2APIC_ENABLE;
+        let seeded = ApicBase::seeded(malformed, false);
+
+        assert_eq!(seeded.mode(), Mode::Disabled);
+        assert_eq!(seeded.bits() & X2APIC_ENABLE, 0);
+        // And what firmware really having been in x2APIC seeds, which is the
+        // whole reason the enable bits are taken from it at all.
+        let both = ApicBase::DEFAULT_PAGE | GLOBAL_ENABLE | X2APIC_ENABLE;
+
+        assert_eq!(ApicBase::seeded(both, false).mode(), Mode::X2Apic);
     }
 
     /// Every way the capture can describe the controller it read, so that a new

@@ -116,8 +116,8 @@ use x86_64::PhysAddr;
 pub use crate::{
     capture::{Controller, FirmwareState, LVT_ENTRIES, LocalState, VECTOR_WORDS, capture},
     icr::{Command, Delivery, Target},
-    register::{REGISTER_STRIDE, X2APIC_BASE_MSR},
     lvt::{Delivery as LvtDelivery, Entry, Polarity, Trigger},
+    register::{REGISTER_STRIDE, X2APIC_BASE_MSR},
     smp::{Started, start},
     timer::{Divisor, IA32_TSC_DEADLINE, Mode as TimerMode, Timer},
 };

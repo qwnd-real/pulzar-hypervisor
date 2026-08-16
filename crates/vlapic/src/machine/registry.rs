@@ -1,10 +1,10 @@
 //! The controllers themselves, and the three ways of reaching one.
 //!
-//! By roster position, which is what a [`cpu::CpuIndex`] is and what the array is
-//! indexed by; by identifier, which is a search because an identifier is not a
-//! position; and "this processor's", which is the first of those applied to the
-//! processor asking. That last mapping is written once, here, because it is the
-//! whole of what makes indexing the array sound.
+//! By roster position, which is what a [`cpu::CpuIndex`] is and what the array
+//! is indexed by; by identifier, which is a search because an identifier is not
+//! a position; and "this processor's", which is the first of those applied to
+//! the processor asking. That last mapping is written once, here, because it is
+//! the whole of what makes indexing the array sound.
 
 use alloc::boxed::Box;
 

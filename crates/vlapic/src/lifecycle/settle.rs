@@ -9,7 +9,7 @@ use log::{info, trace, warn};
 
 use crate::{
     hardware::{sources, timer},
-    registers::{Startup, StartupPage, Vlapic},
+    registers::{Phase, StartupPage, Vlapic},
 };
 
 /// Applies whatever startup message arrived for this processor, and says what
@@ -20,25 +20,47 @@ use crate::{
 /// this processor is not part-way through injecting anything.
 ///
 /// The two transitions are separate steps deliberately. Applying an `INIT`
-/// leaves the processor waiting, and it stays waiting across however many exits
-/// it takes for a start-up message to arrive — including none at all, which is
-/// what an operating system that never uses a processor leaves it doing for the
-/// rest of its life.
+/// leaves an application processor waiting, and it stays waiting across however
+/// many exits it takes for a start-up message to arrive — including none at
+/// all, which is what an operating system that never uses a processor leaves it
+/// doing for the rest of its life. What it does not do is *refuse* a start-up
+/// message that arrives before the reset has been applied: the two are sent
+/// microseconds apart, so the message is kept where the INIT can be seen to
+/// precede it and is applied on the way out of this same function.
 pub(crate) fn applied(vlapic: &Vlapic) -> Resumption {
-    if vlapic.startup() == Startup::InitRequested {
+    if matches!(vlapic.startup().phase(), Phase::InitRequested(_)) {
         discharge(vlapic);
         // Exactly what hardware leaves behind: the identifier and the face
         // survive, everything else is as it was at reset.
         vlapic.reset_registers();
-        vlapic.set_startup(Startup::WaitingForSipi);
-        info!("vlapic: {} reset by an init and waiting", vlapic.index());
+        // Not part of the register file, and so not part of that: this is a count
+        // of interrupts the processor has already been given, and an INIT is one
+        // of the two transitions that discard one.
+        vlapic.discard_nmi();
+        let bootstrap = vlapic.base().bootstrap();
+        vlapic.startup().initialized(bootstrap);
+        info!(
+            "vlapic: {} reset by an init and {}",
+            vlapic.index(),
+            if bootstrap { "restarting" } else { "waiting" }
+        );
+        if bootstrap {
+            // Only application processors are held. The processor the machine
+            // came up on is the one that sends the start-up messages, so a
+            // bootstrap processor waiting for one would be waiting for itself —
+            // and the guest would be down the processor every other one waits
+            // on. It resumes at the reset vector instead, which is where the
+            // architecture puts a processor an INIT has reset.
+            return Resumption::Restart;
+        }
     }
-    if vlapic.startup() != Startup::WaitingForSipi {
-        return Resumption::Carry;
-    }
-    match vlapic.take_sipi() {
+    match vlapic.startup().started() {
         Some(page) => {
-            vlapic.set_startup(Startup::Running);
+            // The other transition that discards them, and for a sharper reason
+            // than the INIT's: this processor is about to begin executing in real
+            // mode with no interrupt descriptor table, and a non-maskable
+            // interrupt the old guest was owed would be the first thing it took.
+            vlapic.discard_nmi();
             info!(
                 "vlapic: {} started at page {:#x}",
                 vlapic.index(),
@@ -46,6 +68,7 @@ pub(crate) fn applied(vlapic: &Vlapic) -> Resumption {
             );
             Resumption::StartAt(page)
         }
+        None if vlapic.startup().running() => Resumption::Carry,
         None => Resumption::Wait,
     }
 }
@@ -93,4 +116,10 @@ pub enum Resumption {
     /// Begin executing the guest in real mode at the start of this page, which
     /// is what a start-up message names.
     StartAt(StartupPage),
+    /// Reset, and running again from the machine's reset vector.
+    ///
+    /// What an INIT does to the processor the machine came up on: only
+    /// application processors are held waiting to be started, because the
+    /// bootstrap processor is the one that starts them.
+    Restart,
 }

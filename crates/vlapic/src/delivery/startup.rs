@@ -28,18 +28,16 @@ use crate::{
 };
 
 /// Resets a processor and leaves it waiting to be started.
+///
+/// Including the processor that sent it, which is not a special case and must
+/// not be one: a guest resetting its machine does it with a single broadcast
+/// INIT, and refusing the sender's own copy left that guest carrying on in the
+/// old image with every other processor held. Nothing here resets anything —
+/// the INIT is recorded and the target applies it to itself at its next exit
+/// boundary — so applying one to this processor is the same deferral as
+/// applying one to any other, and the exit loop refuses to re-enter a guest
+/// that has been reset.
 pub(super) fn initialize(from: &Vlapic, target: &Vlapic) {
-    // A processor cannot reset itself this way. Real hardware permits the
-    // command and the result is a processor that resets out from under the code
-    // that sent it, which no sensible guest asks for and which here would take
-    // down the virtual processor mid-exit.
-    if target.index() == from.index() {
-        warn!(
-            "vlapic: {} sent itself an init, which is refused",
-            from.index()
-        );
-        return;
-    }
     if forwardable(target) {
         forward(from, target, HardwareDelivery::Init);
         return;
@@ -49,24 +47,32 @@ pub(super) fn initialize(from: &Vlapic, target: &Vlapic) {
         from.index(),
         target.index()
     );
-    target.request_init();
+    target.startup().requested_init();
     nudge(from, target);
 }
 
 /// Releases a processor from waiting, at the address the vector gives the page
 /// number of.
+///
+/// The sender included, and nothing is lost by it. What keeps a processor from
+/// releasing itself is not a comparison here but [`Command::legal`]: a start-up
+/// addressed to the sender alone, or to all including the sender, is refused as
+/// a whole command, because a processor waiting for a start-up is not executing
+/// the instruction that sends one. What reaches this with the sender among its
+/// targets is a start-up whose *destination* names it — and if it has reset
+/// itself with an INIT, releasing it is what the message asks for and what
+/// hardware would do.
+///
+/// [`Command::legal`]: crate::registers::icr::Command::legal
 pub(super) fn start(from: &Vlapic, target: &Vlapic, page: StartupPage) {
-    if target.index() == from.index() {
-        return;
-    }
     if forwardable(target) {
         forward(from, target, HardwareDelivery::Startup(page.number()));
         return;
     }
-    // Refused unless the target is waiting for one, which is what makes the
-    // second of the pair a guest sends harmless: the first starts the
-    // processor, and the second finds it already running.
-    let taken = target.request_sipi(page);
+    // Refused unless the target has been reset, which is what makes the second
+    // of the pair a guest sends harmless: the first starts the processor, and
+    // the second finds it already running.
+    let taken = target.startup().offered(page);
     info!(
         "vlapic: {} sent a startup at page {:#x} to {}, {}",
         from.index(),

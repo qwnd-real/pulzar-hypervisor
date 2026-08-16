@@ -29,18 +29,30 @@ impl Vlapic {
 
     /// One local-vector-table entry as the guest reads it.
     ///
-    /// Three bits of an entry are the controller's and not software's, and all
-    /// three are answered from the real entry rather than from anything stored
-    /// here — because the source behind the entry is the real one, and the real
-    /// controller is what maintains them.
+    /// Two bits of an entry are the controller's and not software's, and both
+    /// are answered from the real entry rather than from anything stored here —
+    /// because the source behind the entry is the real one, and the real
+    /// controller is what maintains them. The delivery-status bit says a
+    /// delivery from this source has been accepted and not yet handed to the
+    /// processor, and the remote-IRR bit says a level-triggered interrupt from
+    /// this pin has been accepted and not yet acknowledged.
     ///
-    /// The delivery-status bit says a delivery from this source is still in
-    /// flight. The remote-IRR bit says a level-triggered interrupt from this
-    /// pin has been accepted and not yet acknowledged. And the mask bit is
-    /// not purely software's either: hardware sets it itself on the
-    /// performance-counter entry when the counter overflows, so a guest that
-    /// armed that source and reads it back unmasked would be told a source is
-    /// live that hardware has already stopped.
+    /// The mask bit is answered from the stored entry, with one exception, and
+    /// the exception is the only case the architecture has: hardware masks the
+    /// performance-counter entry itself when the counter overflows, so a guest
+    /// that armed that source and read it back unmasked would be told a source
+    /// is live that hardware has already stopped.
+    ///
+    /// Nowhere else, because everywhere else the real entry may be masked for a
+    /// reason of this hypervisor's rather than of the architecture's — a
+    /// delivery mode or a vector it refuses to put on hardware, or a
+    /// programming failure — and answering with that would be a mask bit the
+    /// guest never wrote. Software changes one field of one of these registers
+    /// by reading the whole of it, changing the field and writing it back, so
+    /// an invented mask bit does not merely mislead: the guest's next write
+    /// stores it, and the source is off for good with the guest's own
+    /// registers saying it asked for that. Where a configuration is
+    /// refused, the error status register is what says so.
     pub(crate) fn lvt_readback(&self, entry: Entry) -> Lvt {
         let stored = self.lvt(entry);
         let Some(source) = sources::source_of(entry) else {
@@ -49,10 +61,11 @@ impl Vlapic {
         let Ok(real) = apic::local().and_then(|local| local.source(source)) else {
             return stored;
         };
+        let overflowed = matches!(entry, Entry::Performance) && real.is_masked();
         stored
             .with_send_pending(real.pending())
             .with_remote_irr(entry.is_pin() && real.remote_irr())
-            .with_masked(stored.masked() || real.is_masked())
+            .with_masked(stored.masked() || overflowed)
     }
 
     /// Takes a write to a local-vector-table entry, and answers with what the
@@ -93,9 +106,13 @@ impl Vlapic {
     /// architectural entry point and reads no vector for, so a number left in
     /// the field is not a vector at all and reporting it as an illegal one
     /// would be reporting an error about a field nothing reads.
-    pub(crate) fn delivers_a_vector(&self, entry: Entry) -> bool {
+    ///
+    /// Asked of a value rather than of the stored register, so that a caller
+    /// deciding this about a write it has just performed decides it about what
+    /// it wrote.
+    pub(crate) fn delivers_a_vector(&self, entry: Entry, lvt: Lvt) -> bool {
         !self.model.has_delivery(entry)
-            || Delivery::from_bits(self.lvt(entry).delivery()) == Some(Delivery::Fixed)
+            || Delivery::from_bits(lvt.delivery()) == Some(Delivery::Fixed)
     }
 }
 

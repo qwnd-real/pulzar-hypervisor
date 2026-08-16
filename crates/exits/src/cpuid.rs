@@ -22,6 +22,9 @@ const EXTENDED_FEATURES: u32 = 0x8000_0001;
 /// The virtualization extension's bit in that word.
 const SVM: u32 = 1 << 2;
 
+/// The extended APIC register space's bit in the same word.
+const EXTENDED_APIC_SPACE: u32 = 1 << 3;
+
 /// The first leaf of the range reserved for hypervisor use. Neither vendor
 /// assigns architectural meaning here; it exists so a hypervisor has
 /// somewhere to answer without colliding with real leaves.
@@ -33,8 +36,8 @@ const HYPERVISOR_LEAF_BASE: u32 = 0x4000_0000;
 const HYPERVISOR_LEAF_LIMIT: u32 = 0x4000_00FF;
 
 /// Answers the guest with the machine's own answer, less the virtualization
-/// extension, the hypervisor-present bit, and anything in the hypervisor
-/// leaf range.
+/// extension, the extended APIC register space, the hypervisor-present bit,
+/// and anything in the hypervisor leaf range.
 ///
 /// Hiding these is not concealment for its own sake. Every attempt the guest
 /// makes to use the virtualization extension is intercepted, because a guest
@@ -46,12 +49,20 @@ const HYPERVISOR_LEAF_LIMIT: u32 = 0x4000_00FF;
 /// announces them: a guest that skips the check and probes the range
 /// directly should find it as empty as one that trusted the bit would have
 /// expected.
+///
+/// The extended APIC register space is the same argument about a different
+/// capability. The guest's interrupt controller is emulated and does not model
+/// the registers that space holds, so a guest told the space is there finds
+/// nothing in it — and the one thing worse than a missing capability is a
+/// capability whose registers read as though something else had already claimed
+/// them, which is how an operating system reads a zero out of an extended local
+/// vector table entry.
 pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
     let leaf = low(vcpu.save().rax);
     let subleaf = low(vcpu.registers().rcx);
     let mut result = processor::cpuid(leaf, subleaf);
     if leaf == EXTENDED_FEATURES {
-        result.ecx &= !SVM;
+        result.ecx &= !(SVM | EXTENDED_APIC_SPACE);
     }
     if leaf == STANDARD_FEATURES {
         result.ecx &= !HYPERVISOR_PRESENT;

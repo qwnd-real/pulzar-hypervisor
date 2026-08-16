@@ -100,4 +100,7 @@ impl Vlapic {
 
 /// The timer's divide configuration is three bits, and not three adjacent
 /// ones: bit two is reserved and sits in the middle of them.
-pub(super) const TIMER_DIVIDE_MASK: u32 = 0b1011;
+///
+/// Reached by the model-specific-register face as well, which has to fault on
+/// exactly the bits this drops — the reserved bit between them included.
+pub(crate) const TIMER_DIVIDE_MASK: u32 = 0b1011;

@@ -41,8 +41,9 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`VlapicError::NotInstalled`] before [`crate::install`], or [`VlapicError::Apic`]
-/// if the real controller could not be asked or acknowledged.
+/// [`VlapicError::NotInstalled`] before [`crate::install`], or
+/// [`VlapicError::Apic`] if the real controller could not be asked or
+/// acknowledged.
 pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
     let vlapic = current()?;
     let local = apic::local()?;
@@ -73,13 +74,28 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
         }
     );
     if !level {
-        vlapic.accept(vector, Trigger::Edge);
+        let accepted = vlapic.accept(vector, Trigger::Edge);
         local.end_of_interrupt();
-        trace!(
-            "vlapic: {} acknowledged real {vector} at once, leaving real in service {:?}",
-            vlapic.index(),
-            local.in_service_top()
-        );
+        // Acknowledged whatever became of it, and the two outcomes are worth
+        // different lines. An edge-triggered interrupt is finished with once
+        // taken, so the acknowledgement is owed to hardware however the guest's
+        // controller answered — but a controller that was mid-reset has dropped
+        // an interrupt that reached this machine, which is this hypervisor
+        // losing one rather than a guest declining it.
+        match accepted {
+            Accepted::Resetting => warn!(
+                "vlapic: {} dropped real {vector}, which arrived while its register file was \
+                 being reset",
+                vlapic.index()
+            ),
+            Accepted::Requested | Accepted::Coalesced | Accepted::Illegal | Accepted::Refused => {
+                trace!(
+                    "vlapic: {} acknowledged real {vector} at once, leaving real in service {:?}",
+                    vlapic.index(),
+                    local.in_service_top()
+                );
+            }
+        }
         return Ok(());
     }
     // The debt is recorded before the guest is given the interrupt, so that a
@@ -91,6 +107,17 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
              in service {:?}",
             vlapic.index(),
             local.in_service_top()
+        ),
+        // Not a refusal the guest made, so the debt is not one nothing will ever
+        // discharge: the register file is between one guest and the next, and
+        // whichever guest comes out of the reset may still acknowledge this
+        // vector. Paying it here on the grounds that nobody will is what would
+        // issue the real acknowledgement while the line is still asserted, and
+        // the source would re-fire into a controller that has just dropped it.
+        Accepted::Resetting => warn!(
+            "vlapic: {} kept real {vector}'s acknowledgement owed: it arrived while the register \
+             file was being reset",
+            vlapic.index()
         ),
         refused => {
             // The guest was not given it and will therefore never acknowledge

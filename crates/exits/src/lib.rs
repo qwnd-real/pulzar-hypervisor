@@ -199,6 +199,16 @@ impl<'a> Exits<'a> {
                 self.virtualization.reset();
                 Ok(true)
             }
+            // The bootstrap processor's answer to the same message, and the only
+            // one that does not wait: it is the processor that sends the start-up
+            // messages, so nothing would ever release it.
+            Resumption::Restart => {
+                info!("exits: the guest reset this processor, which restarts at the reset vector");
+                vcpu.restart();
+                self.interrupts.reset(vcpu);
+                self.virtualization.reset();
+                Ok(true)
+            }
         }
     }
 

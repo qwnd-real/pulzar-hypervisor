@@ -53,12 +53,12 @@ use crate::registers::bitmap::Bitmap;
 /// What the ledger needs of the controller holding its debts.
 ///
 /// Two operations, which are the whole of what paying a debt is: ask what the
-/// controller is holding highest, and retire it. Taken as a parameter rather than
-/// reached for through [`apic::local`], because *which* controller a debt is paid
-/// through is the one thing that must not be assumed — the acknowledgement
-/// register carries no vector, so paying through the wrong controller retires an
-/// interrupt belonging to somebody else and strands the one that should have been
-/// retired for the life of the machine.
+/// controller is holding highest, and retire it. Taken as a parameter rather
+/// than reached for through [`apic::local`], because *which* controller a debt
+/// is paid through is the one thing that must not be assumed — the
+/// acknowledgement register carries no vector, so paying through the wrong
+/// controller retires an interrupt belonging to somebody else and strands the
+/// one that should have been retired for the life of the machine.
 ///
 /// Passing it in is also what makes every interleaving in this module a test:
 /// nothing here has to be on a processor that has a controller at all.
@@ -74,11 +74,11 @@ pub(crate) trait InService {
     /// Runs `paying` with nothing else on this processor able to reach the
     /// controller.
     ///
-    /// Part of the seam rather than of the bookkeeping, because it is a property
-    /// of the *controller* and not of the debts: every pass of a payment is a
-    /// read of a real register followed by a write that depends on what it said,
-    /// and a handler interposing between the two would be answered about one
-    /// vector and paid for another.
+    /// Part of the seam rather than of the bookkeeping, because it is a
+    /// property of the *controller* and not of the debts: every pass of a
+    /// payment is a read of a real register followed by a write that
+    /// depends on what it said, and a handler interposing between the two
+    /// would be answered about one vector and paid for another.
     fn exclusively(&self, paying: impl FnOnce());
 }
 
@@ -99,9 +99,9 @@ impl InService for LocalApic {
 /// A controller that may not have been reachable when it was asked for.
 ///
 /// Answering as though it were holding nothing is what leaves every debt where
-/// it was: a debt that could not be paid is a real in-service entry with nothing
-/// left that would retire it, and inventing an acknowledgement would retire
-/// whatever the controller does hold instead.
+/// it was: a debt that could not be paid is a real in-service entry with
+/// nothing left that would retire it, and inventing an acknowledgement would
+/// retire whatever the controller does hold instead.
 impl InService for Option<LocalApic> {
     fn in_service_top(&self) -> Option<Vector> {
         self.as_ref().and_then(InService::in_service_top)
@@ -244,10 +244,10 @@ mod tests {
     /// A controller holding a stack of in-service vectors, retiring the top one
     /// when it is acknowledged.
     ///
-    /// Which is what the real one does: interrupts nest by priority, the highest
-    /// is the one being serviced, and the acknowledgement register takes no
-    /// vector — so a test that let one be named would be testing something the
-    /// hardware cannot do.
+    /// Which is what the real one does: interrupts nest by priority, the
+    /// highest is the one being serviced, and the acknowledgement register
+    /// takes no vector — so a test that let one be named would be testing
+    /// something the hardware cannot do.
     struct Holding {
         /// Highest last, so the top of the stack is the vector in service.
         held: RefCell<Vec<Vector>>,
@@ -282,16 +282,16 @@ mod tests {
             }
         }
 
-        /// Nothing else reaches this controller: it is one test's own, and a test
-        /// process may not execute the instruction that holds a real processor's
-        /// interrupts off.
+        /// Nothing else reaches this controller: it is one test's own, and a
+        /// test process may not execute the instruction that holds a
+        /// real processor's interrupts off.
         fn exclusively(&self, paying: impl FnOnce()) {
             paying();
         }
     }
 
-    /// A controller that cannot be reached, which is what a failure to find this
-    /// processor's own leaves a caller holding.
+    /// A controller that cannot be reached, which is what a failure to find
+    /// this processor's own leaves a caller holding.
     struct Unreachable;
 
     impl InService for Unreachable {

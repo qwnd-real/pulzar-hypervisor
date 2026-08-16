@@ -1,10 +1,11 @@
 //! The shape all seven entries share: the bit layout, and the two fields whose
 //! encodings mean something.
 //!
-//! Which of these fields exist in a given entry is [`Entry::writable`](super::Entry::writable)'s
-//! to say — a field reserved in the entry holding it reads back zero, because
-//! the write that would have set it had the bit removed first — and which
-//! delivery modes an entry accepts is [`crate::hardware::model`]'s.
+//! Which of these fields exist in a given entry is
+//! [`Entry::writable`](super::Entry::writable)'s to say — a field reserved in
+//! the entry holding it reads back zero, because the write that would have set
+//! it had the bit removed first — and which delivery modes an entry accepts is
+//! [`crate::hardware::model`]'s.
 
 use bitfield_struct::bitfield;
 use descriptors::Vector;
@@ -14,15 +15,15 @@ use descriptors::Vector;
 /// One local vector table entry, in the layout all seven share.
 ///
 /// Which of these fields mean anything depends on which entry a value came
-/// from, and [`Entry::writable`](super::Entry::writable) is what answers that. A field reserved in the
-/// entry holding it reads back zero, because the write that would have set it
-/// had the bit removed first.
+/// from, and [`Entry::writable`](super::Entry::writable) is what answers that.
+/// A field reserved in the entry holding it reads back zero, because the write
+/// that would have set it had the bit removed first.
 pub(crate) struct Lvt {
     /// The vector this source is delivered on.
     ///
-    /// Read only for fixed delivery. The other modes are events the processor
-    /// takes by their own architectural entry point, and the vector is ignored
-    /// for them.
+    /// Consulted only for fixed delivery. The other modes are events the
+    /// processor takes by their own architectural entry point, and the field is
+    /// not read for them.
     #[bits(8, from = Vector::new, into = Vector::number)]
     pub(crate) vector: Vector,
     /// How the interrupt is delivered, in the encoding [`Delivery::from_bits`]
@@ -32,10 +33,12 @@ pub(crate) struct Lvt {
     pub(crate) delivery: u8,
     /// Reserved.
     __: bool,
-    /// Whether a delivery from this source is still in flight: clear while the
-    /// controller is idle with respect to it, set from the moment the interrupt
-    /// is accepted for delivery until delivery completes. The controller writes
-    /// this; software cannot.
+    /// Whether a delivery from this source has been accepted by the controller
+    /// and not yet handed to the processor: set from the moment the interrupt
+    /// is accepted for delivery until it reaches the request register, and
+    /// clear while the controller is idle with respect to the source. The
+    /// controller writes this; software cannot, and a write of it is
+    /// ignored rather than refused.
     pub(crate) send_pending: bool,
     /// Whether the pin is asserted low rather than high. Reserved outside the
     /// two pin entries, since only they describe a wire.
@@ -44,7 +47,8 @@ pub(crate) struct Lvt {
     /// not yet acknowledged. Set when the controller accepts the interrupt and
     /// cleared by the guest's end-of-interrupt, and meaningless for an
     /// edge-triggered one. Reserved outside the two pin entries, and written by
-    /// the controller rather than by software.
+    /// the controller rather than by software — a write of it inside them is
+    /// ignored rather than refused.
     pub(crate) remote_irr: bool,
     /// Whether the pin is level triggered rather than edge triggered, which is
     /// what decides whether an acknowledgement is owed for it. Reserved outside

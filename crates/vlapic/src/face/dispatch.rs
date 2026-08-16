@@ -44,7 +44,7 @@ use crate::{
         base::Transition,
         error::Errors,
         icr::{Command, Trigger},
-        lvt::Entry,
+        lvt::{Entry, TimerMode},
     },
 };
 
@@ -107,10 +107,17 @@ pub(crate) fn write(vlapic: &Vlapic, register: Register, value: u32) -> Written 
             // flag: it masks every stored entry, and those entries are what
             // real hardware is programmed from, so the sources and the timer
             // both have to be brought back into agreement with them.
+            //
+            // Every other write to this register changes nothing hardware is
+            // programmed from. The spurious vector itself never reaches the real
+            // register — that one holds the bit which software-enables the
+            // machine's own controller and is the host's — and re-enabling
+            // leaves every entry masked, so there is nothing to reprogram until
+            // the guest unmasks one.
             if vlapic.set_spurious(value) {
                 Written::Disabled
             } else {
-                Written::LocalVectorTable
+                Written::Nothing
             }
         }
         Register::END_OF_INTERRUPT => Written::EndOfInterrupt,
@@ -125,6 +132,11 @@ pub(crate) fn write(vlapic: &Vlapic, register: Register, value: u32) -> Written 
             vlapic.set_command_high(value);
             Written::Nothing
         }
+        // Sending oneself an interrupt, which is the same thing as a command
+        // with the self shorthand and a fixed delivery. Only the wide face has
+        // this register at all — there is no offset it sits at — and it is
+        // answered here rather than there because what a register means is one
+        // statement whichever face reaches it.
         Register::SELF_IPI => Written::SelfIpi(Vector::new(vector_of(value))),
         // The write the architecture defines as starting a counting timer, and
         // the only one that does. Ignored entirely in deadline mode, where the
@@ -143,7 +155,16 @@ pub(crate) fn write(vlapic: &Vlapic, register: Register, value: u32) -> Written 
         // own expiry indefinitely by touching an unrelated register.
         Register::TIMER_DIVIDE => {
             vlapic.set_timer_divide(value);
-            Written::Timer
+            // Inert in deadline mode, where the timer counts nothing at all and
+            // the divide takes no part in when it fires. Reporting a timer
+            // action for a write the architecture makes inert is what would send
+            // the whole configuration path at the real timer's entry and divide
+            // while a deadline is live.
+            if vlapic.timer_mode() == Some(TimerMode::Deadline) {
+                Written::Nothing
+            } else {
+                Written::Timer
+            }
         }
         other => write_indexed(vlapic, other, value),
     }
@@ -177,14 +198,18 @@ fn write_indexed(vlapic: &Vlapic, register: Register, value: u32) -> Written {
     let Some(entry) = Entry::of(register).filter(|entry| vlapic.model().has(*entry)) else {
         return Written::Nothing;
     };
-    vlapic.write_lvt(entry, value);
+    let written = vlapic.write_lvt(entry, value);
     // An illegal vector is an error the architecture reports whether or not the
     // entry is masked — but only for an entry that would actually deliver one.
     // Every other delivery mode is an event the processor takes by its own
     // entry point and reads no vector for, so the field holds a number nothing
     // will ever look at, and reporting an error about it would be reporting one
     // the guest cannot act on and hardware would not have raised.
-    if vlapic.delivers_a_vector(entry) && !priority::legal(vlapic.lvt(entry).vector()) {
+    //
+    // Judged on what the write left in the entry rather than on a fresh read of
+    // it, because the two are the same thing and only one of them is certain to
+    // be: the value is already in hand.
+    if vlapic.delivers_a_vector(entry, written) && !priority::legal(written.vector()) {
         vlapic.errors().record(Errors::RECEIVE_ILLEGAL_VECTOR);
     }
     match entry {
@@ -192,6 +217,12 @@ fn write_indexed(vlapic: &Vlapic, register: Register, value: u32) -> Written {
         // change what the real timer is doing — though not, on its own, start
         // it.
         Entry::Timer => Written::Timer,
+        // The one entry with no source behind it. A controller's report of its
+        // own errors is the host's, because the errors are the real
+        // controller's; the guest's are delivered from its own error status
+        // register instead, so nothing it writes here reaches hardware and there
+        // is nothing to bring into agreement.
+        Entry::Error => Written::Nothing,
         _ => Written::LocalVectorTable,
     }
 }
@@ -319,6 +350,15 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // programmed from its own entry rather than with the rest, so both have
         // to follow. Neither is disarmed: masking suppresses delivery and does
         // not stop a count the guest may still be reading.
+        //
+        // Hardware masks the entries in the same instant it clears the bit.
+        // Here they are separate accesses with host interrupts deliverable
+        // between them, so a physical source can still fire after the guest's
+        // controller has stopped accepting. Nothing is delivered to the guest
+        // either way — its controller refuses it, which is what hardware's
+        // masked entry would have achieved — but an interrupt already on its way
+        // when the bit cleared is refused where hardware would have latched it
+        // in the request register and held it.
         Written::Disabled => {
             sources::reprogram(vlapic);
             timer::reprogram(vlapic);

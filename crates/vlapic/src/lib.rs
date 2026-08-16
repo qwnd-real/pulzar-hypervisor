@@ -41,15 +41,14 @@
 //! - `machine` — one controller per processor, and everything true of the
 //!   machine rather than of any one of them: installation, the registry, which
 //!   processors this hypervisor owns, and what each exit loop asks of its own.
-//! - `face` — how a guest reaches its controller: the page, the
-//!   model-specific registers, and the one statement of what each register
-//!   means that both of them share.
+//! - `face` — how a guest reaches its controller: the page, the model-specific
+//!   registers, and the one statement of what each register means that both of
+//!   them share.
 //! - `registers` — the register file itself, one file per register family.
 //! - `delivery` — which processors a command names, and how they are told.
-//! - `lifecycle` — what becomes of a controller between one guest and the
-//!   next, and what real hardware is owed across it.
-//! - `hardware` — the surface where the guest's registers become physical
-//!   ones.
+//! - `lifecycle` — what becomes of a controller between one guest and the next,
+//!   and what real hardware is owed across it.
+//! - `hardware` — the surface where the guest's registers become physical ones.
 //!
 //! `priority` is on its own because it is the one rule everything else
 //! compares against, and it holds no state at all.

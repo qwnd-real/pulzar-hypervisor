@@ -78,7 +78,13 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64};
 use cpu::{ApicId, CpuIndex};
 
 pub use crate::registers::startup::StartupPage;
-pub(crate) use crate::registers::{interrupts::Accepted, startup::Startup};
+pub(crate) use crate::registers::{
+    interrupts::Accepted,
+    spurious::SPURIOUS_WRITABLE,
+    startup::{Phase, Startup},
+    task_priority::TASK_PRIORITY_MASK,
+    timer::TIMER_DIVIDE_MASK,
+};
 use crate::{
     hardware::model::Model,
     lifecycle::ledger::Ledger,
@@ -117,8 +123,7 @@ pub(crate) struct Vlapic {
     errors: ErrorStatus,
     ledger: Ledger,
     epoch: AtomicU64,
-    startup: AtomicU8,
-    sipi_vector: AtomicU32,
+    startup: Startup,
     away: AtomicBool,
     nmi: AtomicU8,
     owned: AtomicBool,

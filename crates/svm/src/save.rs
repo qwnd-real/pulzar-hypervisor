@@ -375,38 +375,28 @@ impl SaveArea {
         }
     }
 
-    /// The state a processor is in the instant a start-up message naming `page`
-    /// has released it.
+    /// The state a processor is in the instant a reset or an `INIT` has left
+    /// it, which is executing at the reset vector.
     ///
-    /// Two architectural states in one, because a processor only ever reaches
-    /// the second through the first. `INIT` leaves every register below at the
-    /// value written here — real mode, no paging, protection off, each segment
-    /// sixty-four kibibytes long from address zero, and the descriptor-table
-    /// registers likewise. A start-up message then changes exactly three
-    /// things: the code segment's selector and base, which the message's
-    /// vector gives the page number of, and the instruction pointer, which
-    /// becomes zero. So execution begins at the very start of the page the
-    /// message named.
+    /// Real mode, no paging, protection off, each segment sixty-four kibibytes
+    /// long from address zero and the descriptor-table registers likewise —
+    /// with the one exception that is the reset vector itself: the code
+    /// segment's base is the top of the first four gigabytes less
+    /// sixty-four kibibytes, its selector is that base's top sixteen bits,
+    /// and the instruction pointer is sixteen bytes below the end of it.
+    /// Which is where firmware's first instruction sits, and where a
+    /// processor an `INIT` reset resumes.
     ///
-    /// The one deliberate departure is the code segment's limit and the data
-    /// segments', which the architecture leaves at sixty-four kibibytes even
-    /// though the base can be anywhere in the first megabyte. That is real
-    /// mode, not an approximation of it: sixteen-bit code addresses nothing
-    /// beyond its own segment.
-    ///
-    /// Not on its own a control block a guest can be entered from. The extended
-    /// feature register is zero here because that is what reset leaves it, and
-    /// a guest whose virtualization-enable bit is clear is one the
-    /// processor refuses — supplying it is the caller's, along with
-    /// anything else the hypervisor rather than the architecture decides.
+    /// Not on its own a control block a guest can be entered from, for the
+    /// reason [`SaveArea::started_at`] gives.
     #[must_use]
-    pub fn started_at(page: u8) -> Self {
+    pub fn at_reset() -> Self {
         let mut save = Self::zeroed();
         save.cs = Segment {
-            selector: u16::from(page) << STARTUP_SELECTOR_SHIFT,
+            selector: RESET_SELECTOR,
             attributes: CODE_SEGMENT,
             limit: REAL_MODE_LIMIT,
-            base: u64::from(page) << STARTUP_BASE_SHIFT,
+            base: RESET_SEGMENT_BASE,
         };
         let data = Segment {
             selector: 0,
@@ -439,10 +429,58 @@ impl SaveArea {
         save.dr6 = DR6_AT_RESET;
         save.dr7 = DR7_AT_RESET;
         save.rflags = RFLAGS_AT_RESET;
+        save.rip = RESET_INSTRUCTION_POINTER;
+        save
+    }
+
+    /// The state a processor is in the instant a start-up message naming `page`
+    /// has released it.
+    ///
+    /// Two architectural states in one, because a processor only ever reaches
+    /// the second through the first. `INIT` leaves every register at the value
+    /// [`SaveArea::at_reset`] writes, and a start-up message then changes
+    /// exactly three things: the code segment's selector and base, which the
+    /// message's vector gives the page number of, and the instruction pointer,
+    /// which becomes zero. So execution begins at the very start of the page
+    /// the message named.
+    ///
+    /// The one deliberate departure is the code segment's limit and the data
+    /// segments', which the architecture leaves at sixty-four kibibytes even
+    /// though the base can be anywhere in the first megabyte. That is real
+    /// mode, not an approximation of it: sixteen-bit code addresses nothing
+    /// beyond its own segment.
+    ///
+    /// Not on its own a control block a guest can be entered from. The extended
+    /// feature register is zero here because that is what reset leaves it, and
+    /// a guest whose virtualization-enable bit is clear is one the
+    /// processor refuses — supplying it is the caller's, along with
+    /// anything else the hypervisor rather than the architecture decides.
+    #[must_use]
+    pub fn started_at(page: u8) -> Self {
+        let mut save = Self::at_reset();
+        save.cs = Segment {
+            selector: u16::from(page) << STARTUP_SELECTOR_SHIFT,
+            attributes: CODE_SEGMENT,
+            limit: REAL_MODE_LIMIT,
+            base: u64::from(page) << STARTUP_BASE_SHIFT,
+        };
         save.rip = 0;
         save
     }
 }
+
+/// The code segment's selector at the reset vector, which is its base's top
+/// sixteen bits.
+const RESET_SELECTOR: u16 = 0xF000;
+
+/// The code segment's base at the reset vector: the top of the first four
+/// gigabytes, less the sixty-four kibibytes the segment is long.
+const RESET_SEGMENT_BASE: u64 = 0xFFFF_0000;
+
+/// Where in that segment a processor starts, which is sixteen bytes below its
+/// end — the whole of the room the architecture leaves for the jump firmware
+/// puts there.
+const RESET_INSTRUCTION_POINTER: u64 = 0xFFF0;
 
 /// Bits a start-up message's vector is shifted by to give the code segment's
 /// selector.

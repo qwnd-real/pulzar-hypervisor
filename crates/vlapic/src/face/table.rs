@@ -17,11 +17,31 @@
 //!   protection fault, and so is writing a read-only register, reading a
 //!   write-only one, or putting a non-zero value in any reserved bit.
 //!
-//! Three registers exist on one face and not the other, and that asymmetry is
-//! in [`Access::of`] rather than in a convention: the destination format
-//! register and the high half of the interrupt command are gone in x2APIC
-//! because their indices are reserved, and the self-interrupt register exists
-//! only in x2APIC because there is no offset it would sit at.
+//! Five registers exist on one face and not the other, and that asymmetry is in
+//! [`Access::of`] rather than in a convention. The destination format register
+//! and the high half of the interrupt command are gone in x2APIC because their
+//! indices are reserved there — the format register has nothing left to select
+//! between, and the destination is the upper half of one wide register. The
+//! arbitration priority and remote read registers are gone with the bus they
+//! belonged to. And the self-interrupt register exists only in x2APIC, because
+//! there is no offset it would sit at.
+//!
+//! Those last two are answered as read-only through the page rather than as
+//! absent, and the distinction is the architecture's own: the register table
+//! names exactly those two as the registers for which the
+//! illegal-register-access error is *not* raised. So a guest reading either
+//! through the page gets a value and no error, where a guest naming a genuinely
+//! reserved offset gets zero and the error.
+//!
+//! # Limitations
+//!
+//! The extended APIC register space AMD defines at 0x400–0x530 is not modelled.
+//! `CPUID Fn8000_0001_ECX[3]` is therefore cleared for the guest, so software
+//! that honours the capability bit never reaches those registers. Software that
+//! probes the space regardless reads zero and records an illegal-register
+//! error. Modelling it would require the extended interrupt-enable and extended
+//! local vector table registers, and the machine-check and
+//! instruction-based-sampling sources that use them.
 
 use apic::{REGISTER_STRIDE, X2APIC_BASE_MSR};
 
@@ -35,7 +55,7 @@ use crate::{
 ///
 /// The offset is the canonical name even for a guest using x2APIC, because it
 /// is what the model-specific register index is computed from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Register(u32);
 
 impl Register {
@@ -119,11 +139,17 @@ impl Register {
     }
 
     /// The register a model-specific register index names, if any.
+    ///
+    /// Bounded by the page as well as by the range x2APIC reserves, because the
+    /// architecture reserves four times as many indices as the page has
+    /// registers: the ones whose derived offset would be past its end name
+    /// nothing at all, and are answered here rather than turned into a
+    /// [`Register`] that is outside the page it is an offset into.
     pub(crate) const fn from_msr(index: u32) -> Option<Self> {
         if index < X2APIC_BASE_MSR || index > X2APIC_LAST_MSR {
             return None;
         }
-        Some(Self((index - X2APIC_BASE_MSR) * REGISTER_STRIDE))
+        Self::at((index - X2APIC_BASE_MSR) as u64 * REGISTER_STRIDE as u64)
     }
 
     /// Its offset in the memory-mapped page.
@@ -137,7 +163,11 @@ impl Register {
     /// The count of slots is the bitmap's own rather than a second one, because
     /// the bank a guest reads *is* that bitmap: a disagreement would be a guest
     /// read of the register at the top of a bank answered out of nothing.
-    pub(crate) const fn slot_of(self, first: Self) -> Option<usize> {
+    ///
+    /// Private, because unchecked offset arithmetic is how a register leaves
+    /// the bank it was promised to be in: [`Register::bank`] is the answer
+    /// every caller wants, and it names the bank the slot belongs to.
+    const fn slot_of(self, first: Self) -> Option<usize> {
         if self.0 < first.0 {
             return None;
         }
@@ -201,14 +231,17 @@ impl Access {
     pub(crate) fn of(register: Register, mode: Mode, model: Model) -> Self {
         // Matched exhaustively rather than compared against the one mode that
         // answers differently, so that a mode added later cannot silently be
-        // answered for as though it were the older face. A switched-off
-        // controller has no registers at all in either face, and both callers
-        // establish the mode before asking — so what it is told here is never
-        // read, and the older face's answers are the honest thing to describe
-        // it with.
+        // answered for as though it were the older face.
         let x2apic = match mode {
             Mode::X2Apic => true,
-            Mode::XApic | Mode::Disabled => false,
+            Mode::XApic => false,
+            // A switched-off controller has no registers at all: the page
+            // decodes to nothing and the indices are not assigned. Answered
+            // here rather than left to the callers to know, so that the
+            // function is total — both of them do establish the mode first, and
+            // a third caller that did not would otherwise be handed the older
+            // face's answers for a controller that has no face.
+            Mode::Disabled => return Self::Absent,
         };
         match register {
             // An entry this controller does not have is not a register at all.
@@ -293,11 +326,260 @@ const fn banked(register: Register) -> Access {
 /// this crate *intercepts* rather than what it can reach: an index in the range
 /// that names no register still has to be answered, with a fault, and one that
 /// is never intercepted is one a guest executes against real hardware.
-pub(crate) const X2APIC_LAST_MSR: u32 = 0x8FF;
+///
+/// So it is the end of the range the architecture dedicates to the controller
+/// and not the end of the quarter of it that holds registers. Three quarters of
+/// these indices name nothing, and a guest reaching one of them is entitled to
+/// a general protection fault — which it cannot be given by code that never
+/// sees the access, because interception here is default-allow.
+pub(crate) const X2APIC_LAST_MSR: u32 = 0xBFF;
 
 /// How long the memory-mapped register page is.
 ///
-/// Where the page ends is what makes an offset past it a reserved address rather
-/// than a register, so this belongs to the register table and the aperture that
-/// answers for the page takes its length from here.
+/// Where the page ends is what makes an offset past it a reserved address
+/// rather than a register, so this belongs to the register table and the
+/// aperture that answers for the page takes its length from here.
 pub(super) const PAGE: u64 = 4096;
+
+#[cfg(test)]
+mod tests {
+    //! A table is the one kind of code a wrong hex digit survives review in, so
+    //! every offset, every index derived from one, every bank boundary and
+    //! every access class is asserted here rather than read.
+
+    use apic::{REGISTER_STRIDE, X2APIC_BASE_MSR};
+
+    use super::{Access, Bank, PAGE, Register, X2APIC_LAST_MSR};
+    use crate::{
+        hardware::model,
+        registers::{base::Mode, bitmap::SLOTS},
+    };
+
+    /// Every register the table names, with what may be done with it through
+    /// the page and through the model-specific registers.
+    ///
+    /// Written out rather than derived, so that a register added without a
+    /// decision about either face, or a cell that changes, fails a test rather
+    /// than being answered for by a fall-through. Two cells are worth naming
+    /// here because they are the ones a reader is likely to take for a mistake:
+    /// the identifier is read-only through the page as well, because every
+    /// interrupt this hypervisor passes through is routed by the *real*
+    /// identifier and a guest that renamed its controller could no longer be
+    /// delivered to; and the error status register is writable although the
+    /// architecture's table calls it read only, because a write is what latches
+    /// it and software has to perform one before a read answers anything.
+    const MATRIX: [(Register, Access, Access); 27] = [
+        (Register::ID, Access::ReadOnly, Access::ReadOnly),
+        (Register::VERSION, Access::ReadOnly, Access::ReadOnly),
+        (
+            Register::TASK_PRIORITY,
+            Access::ReadWrite,
+            Access::ReadWrite,
+        ),
+        (
+            Register::ARBITRATION_PRIORITY,
+            Access::ReadOnly,
+            Access::Absent,
+        ),
+        (
+            Register::PROCESSOR_PRIORITY,
+            Access::ReadOnly,
+            Access::ReadOnly,
+        ),
+        (
+            Register::END_OF_INTERRUPT,
+            Access::WriteOnly,
+            Access::WriteOnly,
+        ),
+        (Register::REMOTE_READ, Access::ReadOnly, Access::Absent),
+        (
+            Register::LOGICAL_DESTINATION,
+            Access::ReadWrite,
+            Access::ReadOnly,
+        ),
+        (
+            Register::DESTINATION_FORMAT,
+            Access::ReadWrite,
+            Access::Absent,
+        ),
+        (Register::SPURIOUS, Access::ReadWrite, Access::ReadWrite),
+        (Register::IN_SERVICE, Access::ReadOnly, Access::ReadOnly),
+        (Register::TRIGGER_MODE, Access::ReadOnly, Access::ReadOnly),
+        (
+            Register::INTERRUPT_REQUEST,
+            Access::ReadOnly,
+            Access::ReadOnly,
+        ),
+        (Register::ERROR_STATUS, Access::ReadWrite, Access::ReadWrite),
+        (
+            Register::LVT_CORRECTED_MACHINE_CHECK,
+            Access::ReadWrite,
+            Access::ReadWrite,
+        ),
+        (Register::COMMAND_LOW, Access::ReadWrite, Access::ReadWrite),
+        (Register::COMMAND_HIGH, Access::ReadWrite, Access::Absent),
+        (Register::LVT_TIMER, Access::ReadWrite, Access::ReadWrite),
+        (Register::LVT_THERMAL, Access::ReadWrite, Access::ReadWrite),
+        (
+            Register::LVT_PERFORMANCE,
+            Access::ReadWrite,
+            Access::ReadWrite,
+        ),
+        (Register::LVT_LINT0, Access::ReadWrite, Access::ReadWrite),
+        (Register::LVT_LINT1, Access::ReadWrite, Access::ReadWrite),
+        (Register::LVT_ERROR, Access::ReadWrite, Access::ReadWrite),
+        (
+            Register::TIMER_INITIAL_COUNT,
+            Access::ReadWrite,
+            Access::ReadWrite,
+        ),
+        (
+            Register::TIMER_CURRENT_COUNT,
+            Access::ReadOnly,
+            Access::ReadOnly,
+        ),
+        (Register::TIMER_DIVIDE, Access::ReadWrite, Access::ReadWrite),
+        (Register::SELF_IPI, Access::Absent, Access::WriteOnly),
+    ];
+
+    #[test]
+    fn what_may_be_done_with_each_register_in_each_face() {
+        for (register, xapic, x2apic) in MATRIX {
+            assert_eq!(
+                Access::of(register, Mode::XApic, model::tests::AMD),
+                xapic,
+                "{register:?} through the page"
+            );
+            assert_eq!(
+                Access::of(register, Mode::X2Apic, model::tests::AMD),
+                x2apic,
+                "{register:?} through the model-specific registers"
+            );
+            // A controller its guest has switched off has no registers in either
+            // face, and that is the whole of what switching one off means.
+            assert_eq!(
+                Access::of(register, Mode::Disabled, model::tests::AMD),
+                Access::Absent,
+                "{register:?} on a switched-off controller"
+            );
+        }
+    }
+
+    #[test]
+    fn every_register_sits_on_a_128_bit_boundary_inside_the_page() {
+        for (register, ..) in MATRIX {
+            assert!(u64::from(register.offset()) < PAGE, "{register:?}");
+            assert!(
+                register.offset().is_multiple_of(REGISTER_STRIDE),
+                "{register:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_and_an_offset_name_the_same_register() {
+        // The whole of the range the architecture dedicates to the controller,
+        // not merely the quarter of it that holds registers: the two
+        // constructors have to agree about which offsets are registers, and
+        // three quarters of these indices derive an offset past the end of the
+        // page.
+        for index in X2APIC_BASE_MSR..=X2APIC_LAST_MSR {
+            let offset = u64::from(index - X2APIC_BASE_MSR) * u64::from(REGISTER_STRIDE);
+            assert_eq!(
+                Register::from_msr(index),
+                Register::at(offset),
+                "{index:#x}"
+            );
+        }
+        // Either side of the range, and the first index whose offset is past the
+        // end of the page — which is where the registers stop, long before the
+        // indices do.
+        assert_eq!(Register::from_msr(X2APIC_BASE_MSR - 1), None);
+        assert_eq!(Register::from_msr(X2APIC_LAST_MSR + 1), None);
+        assert_eq!(Register::from_msr(0x900), None);
+        assert_eq!(Register::from_msr(0x83F), Some(Register::SELF_IPI));
+    }
+
+    #[test]
+    fn a_bank_is_eight_consecutive_registers_and_stops_below_the_next() {
+        // Eight slots of sixteen bytes, the stride being the one the boundary
+        // test above pins to the architecture's.
+        for (bank, first) in [
+            (Bank::InService, 0x100_u64),
+            (Bank::TriggerMode, 0x180),
+            (Bank::InterruptRequest, 0x200),
+        ] {
+            let slots = (first..first + 0x80).step_by(0x10);
+            assert_eq!(slots.clone().count(), SLOTS, "{bank:?}");
+            for (slot, offset) in slots.enumerate() {
+                let register = Register::at(offset).expect("a bank sits inside the page");
+                assert_eq!(register.bank(), Some((bank, slot)), "{offset:#x}");
+            }
+        }
+        // The register one slot past the last bank is the error status and not a
+        // ninth word of the interrupt request register. One slot more would
+        // answer a guest's read of its error status out of a bitmap; one fewer
+        // would make the top thirty-two vectors a reserved address.
+        assert_eq!(Register::at(0x280), Some(Register::ERROR_STATUS));
+        assert_eq!(Register::ERROR_STATUS.bank(), None);
+        // Nor is the slot below the first bank part of one.
+        assert_eq!(Register::SPURIOUS.bank(), None);
+    }
+
+    #[test]
+    fn only_an_offset_on_a_boundary_inside_the_page_names_a_register() {
+        assert_eq!(Register::at(0x20), Some(Register::ID));
+        // Four-byte aligned inside a register's own slot, which the
+        // architecture leaves undefined and this table answers as a reserved
+        // address rather than as part of the register.
+        assert_eq!(Register::at(0x24), None);
+        // The last aligned dword of the page, and the first offset past it.
+        assert_eq!(Register::at(0xFFC), None);
+        assert_eq!(Register::at(PAGE), None);
+        assert!(Register::at(PAGE - u64::from(REGISTER_STRIDE)).is_some());
+    }
+
+    #[test]
+    fn the_offsets_the_architecture_assigns_nothing_to_are_registers_in_neither_face() {
+        // Every reserved slot of the page, including the extended space AMD
+        // defines from 0x400 and this crate does not model.
+        let reserved = [0x000_u64, 0x010]
+            .into_iter()
+            .chain((0x040..0x080).step_by(0x10))
+            .chain((0x290..0x2F0).step_by(0x10))
+            .chain((0x3A0..0x3E0).step_by(0x10))
+            .chain((0x400..PAGE).step_by(0x10));
+        for offset in reserved {
+            let register = Register::at(offset).expect("an aligned offset inside the page");
+            for mode in [Mode::XApic, Mode::X2Apic, Mode::Disabled] {
+                assert_eq!(
+                    Access::of(register, mode, model::tests::AMD),
+                    Access::Absent,
+                    "{offset:#x} in {mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_the_controller_does_not_have_is_not_a_register() {
+        // The three optional local vector table entries, on a controller
+        // reporting the fewest the architecture describes. A guest reaching one
+        // of these finds a reserved address through the page and a fault through
+        // the model-specific registers, rather than a register it can program
+        // with no source behind it.
+        for register in [
+            Register::LVT_PERFORMANCE,
+            Register::LVT_THERMAL,
+            Register::LVT_CORRECTED_MACHINE_CHECK,
+        ] {
+            for mode in [Mode::XApic, Mode::X2Apic] {
+                assert_eq!(
+                    Access::of(register, mode, model::tests::SPARSE),
+                    Access::Absent,
+                    "{register:?}"
+                );
+            }
+        }
+    }
+}

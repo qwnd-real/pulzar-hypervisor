@@ -22,8 +22,9 @@ impl Command {
     /// is the controller's own report of whether a command is still going out,
     /// and bits 13, 17:16 and 31:20 are reserved. A write through the
     /// memory-mapped face is masked with this, which is what keeps a guest's
-    /// stray bits from being read back; the wide face has no delivery-status
-    /// bit at all and faults on a reserved bit rather than dropping it.
+    /// stray bits from being read back; the wide face, which permits the same
+    /// fields and is built from this, faults on a bit outside it rather than
+    /// dropping it.
     pub(crate) const WRITABLE_LOW: u32 = VECTOR.mask()
         | DELIVERY.mask()
         | DESTINATION_MODE.mask()
@@ -43,18 +44,30 @@ impl Command {
 
     /// Which bits the whole register may hold in x2APIC.
     ///
-    /// Narrower than the memory-mapped face in exactly the places where the
-    /// older one kept bus-era fields. The delivery-status bit is gone, because
-    /// an x2APIC write does not return until the command has been accepted and
-    /// there is nothing to report; and level and trigger mode are gone with the
-    /// bus they described, which is why the INIT de-assert cannot be expressed
-    /// here at all.
+    /// The same fields of the low half as the older face, because software
+    /// forms a command the same way whichever face it writes it through, and
+    /// the whole of the upper half instead of one byte of it, because that is
+    /// where the wider destination went.
     ///
     /// Reserved here means `RsvdZ`: writing a non-zero value into one is a
-    /// general protection fault rather than something quietly dropped.
-    pub(crate) const WRITABLE_X2APIC: u64 =
-        (VECTOR.mask() | DELIVERY.mask() | DESTINATION_MODE.mask() | SHORTHAND.mask()) as u64
-            | (u32::MAX as u64) << HALF;
+    /// general protection fault rather than something quietly dropped, so what
+    /// this permits is what conforming software is able to send at all. That is
+    /// why level and trigger mode are in it. Neither describes anything any
+    /// more — the bus they asserted over is gone, and hardware reads past them
+    /// — but the architecture tells software the level bit must be set for
+    /// every delivery mode except the INIT de-assert, and software does exactly
+    /// that: an operating system's start-up sequence writes the level bit with
+    /// its INIT, and firmware sets it on every interrupt it sends. A controller
+    /// that faulted on it could not be given a command by conforming software
+    /// at all.
+    ///
+    /// The delivery-status bit is not in it, and that is the one place this
+    /// face is genuinely narrower: an x2APIC write does not return until
+    /// the command has been accepted, so there is no delivery in flight for
+    /// software to be told about, and this vendor requires the bit to be
+    /// written as zero. Bit 13, bits 17:16 and bits 31:20 are reserved on
+    /// both faces.
+    pub(crate) const WRITABLE_X2APIC: u64 = Self::WRITABLE_LOW as u64 | (u32::MAX as u64) << HALF;
 
     /// The command sixty-four bits describe, as x2APIC presents them.
     pub(crate) const fn from_bits(bits: u64) -> Self {
@@ -169,14 +182,26 @@ mod tests {
     use crate::registers::icr::Command;
 
     #[test]
-    fn the_wide_face_reserves_the_bus_era_fields() {
-        // Level and trigger mode, which x2APIC does not have.
-        assert_eq!(Command::WRITABLE_X2APIC & (1 << 14 | 1 << 15), 0);
-        // The delivery-status bit, which it does not have either.
+    fn the_wide_face_keeps_the_fields_software_is_told_to_write() {
+        // Level and trigger mode. Hardware reads past both in this face, and
+        // software sets them anyway because the architecture tells it to — so a
+        // controller that treated them as reserved would fault every conforming
+        // interprocessor interrupt and the whole start-up sequence with them.
+        assert_eq!(
+            Command::WRITABLE_X2APIC & (1 << 14 | 1 << 15),
+            1 << 14 | 1 << 15
+        );
+        // The delivery-status bit, which this face does not have and this
+        // vendor requires to be written as zero.
         assert_eq!(Command::WRITABLE_X2APIC & (1 << 12), 0);
-        // What it does have: vector, delivery mode, destination mode,
-        // shorthand, and the whole of the upper half for the destination.
-        assert_eq!(Command::WRITABLE_X2APIC, 0xFFFF_FFFF_000C_0FFF);
+        // What is left: the same low-half fields as the older face, and the
+        // whole of the upper half for the wider destination.
+        assert_eq!(Command::WRITABLE_X2APIC, 0xFFFF_FFFF_000C_CFFF);
+        assert_eq!(
+            Command::WRITABLE_X2APIC & u64::from(u32::MAX),
+            u64::from(Command::WRITABLE_LOW),
+            "the two faces permit the same fields of the half that sends the command"
+        );
     }
 
     #[test]

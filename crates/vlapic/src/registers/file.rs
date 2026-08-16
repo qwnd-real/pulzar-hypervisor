@@ -11,12 +11,13 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use apic::LocalState;
 use cpu::{ApicId, CpuIndex};
+use x86_64::instructions::interrupts;
 
 use crate::{
     hardware::model::Model,
     lifecycle::ledger::Ledger,
     registers::{
-        Startup, Vlapic,
+        Phase, Startup, Vlapic,
         base::ApicBase,
         bitmap::Bitmap,
         error::ErrorStatus,
@@ -24,7 +25,6 @@ use crate::{
         interrupts::NOTHING_REPORTED,
         lvt::Entry,
         spurious::{SPURIOUS_RESET, SPURIOUS_WRITABLE},
-        startup::NO_SIPI,
         task_priority::TASK_PRIORITY_MASK,
         timer::TIMER_DIVIDE_MASK,
     },
@@ -69,8 +69,7 @@ impl Vlapic {
             errors: ErrorStatus::new(),
             ledger: Ledger::new(),
             epoch: AtomicU64::new(0),
-            startup: AtomicU8::new(Startup::Running as u8),
-            sipi_vector: AtomicU32::new(NO_SIPI),
+            startup: Startup::new(Phase::Running),
             away: AtomicBool::new(false),
             nmi: AtomicU8::new(0),
             owned: AtomicBool::new(false),
@@ -112,7 +111,23 @@ impl Vlapic {
     /// with, because every passed-through interrupt is routed by it, and the
     /// second describes the hardware behind this controller rather than what
     /// firmware saw.
+    ///
+    /// # Published as one step
+    ///
+    /// Bracketed by the reset count for the same reason
+    /// [`Vlapic::reset_registers`] is, and not because anything is expected
+    /// to be delivering here yet. The controllers are published to the
+    /// machine before this runs, so what makes a lone store safe is an
+    /// argument about interrupt masking two crates away — and the argument
+    /// that would have to hold is the one the epoch exists to
+    /// make unnecessary. An arrival that does race this publishes again into
+    /// the seeded file, exactly as one racing a reset does.
     pub(crate) fn seed(&self, firmware: &LocalState, base: u64) {
+        self.between_epochs(|| self.seeded(firmware, base));
+    }
+
+    /// The seeding itself, with nothing said about who else can see it.
+    fn seeded(&self, firmware: &LocalState, base: u64) {
         self.base.store(
             ApicBase::seeded(base, self.base().bootstrap()).bits(),
             Ordering::Release,
@@ -193,12 +208,20 @@ impl Vlapic {
     /// move, and publishes again — so no interrupt is left with its request bit
     /// set and its trigger mode cleared, which is the state that costs a real
     /// acknowledgement and kills a line.
+    ///
+    /// What is *not* cleared here is the count of non-maskable interrupts the
+    /// processor has already been delivered. That is not register file, and the
+    /// transitions that discard it are not the ones that reset a register file:
+    /// see [`Vlapic::discard_nmi`].
     pub(crate) fn reset_registers(&self) {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.between_epochs(|| self.clear());
+    }
+
+    /// The clearing itself, with nothing said about who else can see it.
+    fn clear(&self) {
         self.request.reset();
         self.in_service.reset();
         self.trigger_mode.reset();
-        self.nmi.store(0, Ordering::Release);
         self.task_priority.store(0, Ordering::Release);
         self.logical_destination.store(0, Ordering::Release);
         self.destination_format
@@ -213,15 +236,40 @@ impl Vlapic {
         self.set_timer_periodic_running(false);
         self.command.store(0, Ordering::Release);
         self.errors.reset();
-        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Publishes a set of stores as one step, as far as anything delivering
+    /// into this controller is concerned.
+    ///
+    /// The reset count is odd for exactly as long as `publishing` runs, and a
+    /// deliverer that sees it move republishes into whatever was left behind.
+    ///
+    /// Host interrupts are held off for the whole of it, and that is not
+    /// belt-and-braces either: both callers run on the processor the controller
+    /// belongs to, with interrupts enabled, and a physical interrupt landing
+    /// inside the odd window reaches [`Vlapic::accept`] *on the same processor*
+    /// — where no amount of waiting can finish the stores it interrupted,
+    /// because the frame that would finish them is the one it interrupted.
+    /// It would spin out its patience and drop the interrupt. A
+    /// non-maskable interrupt arriving there is not held off and does not
+    /// need to be: it is counted, in one atomic, by a path that never
+    /// consults the count.
+    fn between_epochs(&self, publishing: impl FnOnce()) {
+        interrupts::without_interrupts(|| {
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            publishing();
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+        });
     }
 
     /// The reset count, once no reset is in progress.
     ///
-    /// Odd means one is running. `None` says one has been running for longer
-    /// than a reset can take, which is a broken invariant rather than
-    /// contention: a reset is a few dozen stores by a processor that is not
-    /// part-way through anything else.
+    /// Odd means one is running, and one is only ever run by the processor the
+    /// controller belongs to, with interrupts held off — so an odd count is
+    /// always a *remote* processor part-way through a few dozen stores, and the
+    /// wait is that long and no longer. `None` says one has been running for
+    /// longer than that can take, which is a broken invariant rather than
+    /// contention.
     pub(super) fn settled_epoch(&self) -> Option<u64> {
         (0..EPOCH_SPINS).find_map(|_| {
             let epoch = self.epoch.load(Ordering::SeqCst);
@@ -236,4 +284,9 @@ impl Vlapic {
 
 /// How many times a deliverer re-reads a reset count that says a reset is
 /// running before giving up on it.
+///
+/// Generous by design and not a tuned number: what it waits for is another
+/// processor finishing a few dozen stores with interrupts held off, so a
+/// deliverer that exhausts it has not met contention — it has met a processor
+/// that stopped part-way through one, and no larger number would help.
 const EPOCH_SPINS: u32 = 100_000;

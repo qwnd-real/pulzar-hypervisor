@@ -284,10 +284,10 @@ pub(crate) const fn source_of(entry: Entry) -> Option<Source> {
 }
 
 /// The two mappings above are written by hand in opposite directions, and
-/// nothing but this says they agree: one that had drifted would program a source
-/// from another source's entry, and would report a guest's read of one entry out
-/// of another's real register — invisibly, and only on the hardware that has the
-/// entries in question.
+/// nothing but this says they agree: one that had drifted would program a
+/// source from another source's entry, and would report a guest's read of one
+/// entry out of another's real register — invisibly, and only on the hardware
+/// that has the entries in question.
 const _: () = {
     let mut index = 0;
     while index < Source::ALL.len() {

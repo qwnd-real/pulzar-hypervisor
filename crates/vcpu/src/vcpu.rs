@@ -510,6 +510,23 @@ impl Vcpu {
     /// start-up message naming `page` has released it.
     ///
     /// What a hypervisor does when the guest starts one of its own processors.
+    pub fn start_at(&mut self, page: u8) {
+        self.reborn(SaveArea::started_at(page));
+    }
+
+    /// Puts this virtual processor into the state a real one is in when an
+    /// `INIT` has reset it, which is executing at the machine's reset vector.
+    ///
+    /// What a hypervisor does when the guest resets the processor it came up
+    /// on: only application processors are held waiting to be started,
+    /// because the bootstrap processor is the one that starts them.
+    pub fn restart(&mut self) {
+        self.reborn(SaveArea::at_reset());
+    }
+
+    /// Replaces everything this virtual processor was with the state a
+    /// processor coming out of reset has.
+    ///
     /// Nothing is edited: the whole state-save area is replaced, because a
     /// processor coming out of reset keeps nothing of what it was doing before,
     /// and an edit would leave whatever this virtual processor was last running
@@ -527,8 +544,7 @@ impl Vcpu {
     /// guest's cached translations on this processor: everything the processor
     /// remembers about this virtual processor describes one that no longer
     /// exists.
-    pub fn start_at(&mut self, page: u8) {
-        let mut save = SaveArea::started_at(page);
+    fn reborn(&mut self, mut save: SaveArea) {
         save.efer |= EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE.bits();
         save.g_pat = paging::cpu::PAT_POLICY;
         *self.save_mut() = save;

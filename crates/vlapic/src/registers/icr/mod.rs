@@ -20,20 +20,28 @@
 //! trigger-mode bit set is a synchronisation message that resets every target's
 //! arbitration identifier and delivers nothing else.
 //!
+//! Both bits are writable through both faces, because software writes them
+//! through both: the architecture tells it to set the level bit for every
+//! delivery mode but that one, so refusing them in x2APIC would refuse the
+//! commands conforming software actually forms. What differs between the faces
+//! is only how wide the destination is.
+//!
 //! # Deciding here rather than at every caller
 //!
-//! A guest may write any sixty-four bits it likes, and most of what the
-//! architecture says about them is of the form "this combination is not a
-//! command". Those rules are applied here rather than at every caller, and they
-//! are in two places because they are two different kinds of rule.
+//! A guest may write any sixty-four bits it likes, and the architecture says
+//! rather less about them than the vendors' tables of valid combinations
+//! suggest: most of those rows are requirements on software, not refusals a
+//! controller makes. The two that are the controller's are applied here rather
+//! than at every caller, and they are in two places because they are two
+//! different kinds of rule.
 //!
 //! [`Command::delivery`] decodes the field: the two reserved encodings and
 //! lowest priority in x2APIC answer with nothing, because no mode is named.
-//! [`Command::legal`] judges the whole command — which shorthands a mode may be
-//! addressed with, which fields it must leave clear — and is asked before a
-//! single target is worked out. That order is the point of it: a command
-//! resolved first and judged afterwards has already reset or started some of
-//! the processors it named.
+//! [`Command::legal`] judges the whole command — today that is the one
+//! combination with nowhere to go, a start-up addressed to the processor that
+//! would have to send it — and is asked before a single target is worked out.
+//! That order is the point of it: a command resolved first and judged
+//! afterwards has already reset or started some of the processors it named.
 //!
 //! Fields the hardware reads past are answered the same way.
 //! [`Command::trigger`] reports [`Trigger::Edge`] for everything but the one

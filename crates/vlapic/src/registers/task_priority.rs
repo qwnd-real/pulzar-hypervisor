@@ -76,4 +76,9 @@ const PRIORITY_CLASS_SHIFT: u32 = 4;
 
 /// The task priority register's reserved bits are everything above the low
 /// byte.
-pub(super) const TASK_PRIORITY_MASK: u32 = 0xFF;
+///
+/// Reached by the model-specific-register face as well as by the store here,
+/// because that face has to fault on exactly the bits this drops: a bit a guest
+/// may not set has to be refused there and discarded here, and two spellings of
+/// one mask would eventually disagree about which.
+pub(crate) const TASK_PRIORITY_MASK: u32 = 0xFF;

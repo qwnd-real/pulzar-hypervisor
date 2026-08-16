@@ -18,6 +18,16 @@
 //! not exist, is one real hardware would also do nothing useful with — so it is
 //! recorded in the sender's error status and dropped, which is what a
 //! controller does with a message nobody accepts.
+//!
+//! # Limitations
+//!
+//! A system-management interrupt directed through the interrupt command
+//! register is not delivered: the guest's system-management mode is not
+//! virtualised, and there is no state in which the target could execute an SMI
+//! handler. Chipset-initiated system management is unaffected, since it
+//! bypasses this controller entirely. Software that uses an interrupt-command
+//! SMI to rendezvous its processors will wait indefinitely for the ones this
+//! controller owns.
 
 pub(crate) mod doorbell;
 
@@ -25,7 +35,6 @@ mod arbitration;
 mod destination;
 mod startup;
 
-use descriptors::Vector;
 use log::{trace, warn};
 
 use crate::{
@@ -35,11 +44,12 @@ use crate::{
         doorbell::nudge,
         startup::{initialize, start},
     },
+    machine::ownership,
     priority,
     registers::{
         Accepted, StartupPage, Vlapic,
         error::Errors,
-        icr::{Command, Delivery, Trigger},
+        icr::{Command, Delivery},
     },
 };
 
@@ -104,12 +114,12 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
         // universal one.
         Delivery::LowestPriority => {
             if let Some(target) = least_busy(from, targets(from, lapics, command)) {
-                accept(from, target, command.vector(), command.trigger());
+                accept(from, target, delivery, command);
             }
         }
         Delivery::Fixed => {
             for target in targets(from, lapics, command) {
-                accept(from, target, command.vector(), command.trigger());
+                accept(from, target, delivery, command);
             }
         }
         // A non-maskable interrupt reaches a controller that is switched off or
@@ -118,8 +128,7 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
         // refuse it.
         Delivery::NonMaskable => {
             for target in targets(from, lapics, command) {
-                target.raise_nmi();
-                nudge(from, target);
+                raise(from, target);
             }
         }
         Delivery::Init => {
@@ -158,14 +167,65 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
 /// what a real one does — and it is refused at the target rather than filtered
 /// here, because whether a controller is accepting is the target's own state
 /// and may change between the two.
-fn accept(from: &Vlapic, target: &Vlapic, vector: Vector, trigger: Trigger) {
-    if matches!(target.accept(vector, trigger), Accepted::Refused) {
-        trace!(
-            "vlapic: {} offered {vector} to {}, which is not accepting",
+fn accept(from: &Vlapic, target: &Vlapic, delivery: Delivery, command: Command) {
+    if !ownership::owns(target) {
+        refused(from, target, delivery);
+        return;
+    }
+    let vector = command.vector();
+    match target.accept(vector, command.trigger()) {
+        // It is in the target's register file now, and the target may not be
+        // looking at it.
+        Accepted::Requested | Accepted::Coalesced => nudge(from, target),
+        // The refusals the architecture defines, and both are the target's own
+        // state to answer with rather than anything that went wrong.
+        Accepted::Illegal | Accepted::Refused => trace!(
+            "vlapic: {} offered {vector} to {}, which did not take it",
+            from.index(),
+            target.index()
+        ),
+        // Not one of those: the interrupt was not recorded anywhere, so nothing
+        // will deliver it and nothing will report it but this.
+        Accepted::Resetting => warn!(
+            "vlapic: {} offered {vector} to {}, whose register file was being reset, and it was \
+             not delivered",
+            from.index(),
+            target.index()
+        ),
+    }
+}
+
+/// Gives one processor a non-maskable interrupt, and makes sure it notices.
+fn raise(from: &Vlapic, target: &Vlapic) {
+    if !ownership::owns(target) {
+        refused(from, target, Delivery::NonMaskable);
+        return;
+    }
+    target.raise_nmi();
+    nudge(from, target);
+}
+
+/// Records that a message could not be given to a processor this hypervisor
+/// does not run, and says so once.
+///
+/// Such a processor is executing firmware's own code on real hardware and is
+/// not looking at its emulated controller: a request bit set in it is one
+/// nothing will ever consume, and a non-maskable interrupt counted there is one
+/// the processor is handed as the first event it sees if the guest ever starts
+/// it — in real mode, before it has an interrupt descriptor table to take it
+/// through. INIT and start-up are the two messages that have somewhere else to
+/// go in that window, and [`startup`] is where they go; there is nowhere to put
+/// these.
+///
+/// Recorded as a message no processor accepted, which is exactly what happened,
+/// and said once per re-armed error status rather than once per message: a
+/// guest can send these as fast as it can write a register.
+fn refused(from: &Vlapic, target: &Vlapic, delivery: Delivery) {
+    if from.errors().record(Errors::SEND_ACCEPT) {
+        warn!(
+            "vlapic: {} sent {delivery:?} to {}, which this hypervisor does not run",
             from.index(),
             target.index()
         );
-        return;
     }
-    nudge(from, target);
 }

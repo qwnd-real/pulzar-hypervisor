@@ -17,7 +17,7 @@ pub(crate) mod arrival;
 pub(crate) mod ledger;
 pub(crate) mod settle;
 
-use crate::{VlapicError, machine::current, registers::Vlapic};
+use crate::{VlapicError, machine::current};
 
 /// What this processor should do before entering the guest again, having
 /// applied whatever startup message arrived for it.
@@ -49,7 +49,7 @@ pub fn hold() -> Result<(), VlapicError> {
     // message the test below finds, and a test that misses the message is one
     // the sender's doorbell wakes.
     vlapic.set_away(true);
-    descriptors::wait_until(|| vlapic.signalled());
+    descriptors::wait_until(|| vlapic.startup().signalled());
     vlapic.set_away(false);
     Ok(())
 }
@@ -64,5 +64,5 @@ pub fn hold() -> Result<(), VlapicError> {
 ///
 /// As [`crate::read_msr`].
 pub fn running() -> Result<bool, VlapicError> {
-    current().map(Vlapic::running)
+    current().map(|vlapic| vlapic.startup().running())
 }

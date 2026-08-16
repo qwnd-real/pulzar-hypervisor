@@ -67,12 +67,12 @@ impl Vlapic {
         if !self.accepting() {
             return Accepted::Refused;
         }
-        loop {
+        for _ in 0..PUBLISHES {
             let Some(epoch) = self.settled_epoch() else {
                 // A reset that never finishes is a broken invariant rather than
                 // contention, and spinning in a delivery path would take the
                 // sender down with it.
-                return Accepted::Refused;
+                return Accepted::Resetting;
             };
             match trigger {
                 Trigger::Level => self.trigger_mode.set(vector),
@@ -87,6 +87,7 @@ impl Vlapic {
                 };
             }
         }
+        Accepted::Resetting
     }
 
     /// The highest-priority interrupt the guest should take now, left where it
@@ -170,13 +171,16 @@ impl Vlapic {
         let task = self.task_priority();
         let processor = self.processor_priority();
         // Everything the report below names, packed into one word so that
-        // "has this changed" is a single comparison rather than a lock.
+        // "has this changed" is a single comparison rather than a lock. Each of
+        // the three vectors gets nine bits, because "nothing" has to be as
+        // distinguishable as any vector is and there are two hundred and
+        // fifty-six of those.
         let bits = u64::from(accepting)
-            | u64::from(number(requested)) << 8
-            | u64::from(number(in_service)) << 24
-            | u64::from(task.get()) << 40
-            | u64::from(processor.get()) << 48
-            | u64::from(number(selected)) << 56;
+            | u64::from(number(requested)) << 1
+            | u64::from(number(in_service)) << 10
+            | u64::from(number(selected)) << 19
+            | u64::from(task.get()) << 32
+            | u64::from(processor.get()) << 40;
         if self.reported.swap(bits, Ordering::Relaxed) == bits {
             return;
         }
@@ -281,7 +285,31 @@ pub(crate) enum Accepted {
     Illegal,
     /// Offered to a controller that is not accepting interrupts.
     Refused,
+    /// The register file was being reset underneath it and it was not
+    /// published.
+    ///
+    /// Kept apart from [`Accepted::Refused`] because that one is the refusal
+    /// the architecture defines — a controller its guest switched off,
+    /// saying no to something it is entitled to say no to — and this one is
+    /// this hypervisor failing to record an interrupt it was given. A
+    /// caller that treated them alike would issue the real acknowledgement
+    /// a level-triggered interrupt is withholding, on the grounds that the
+    /// guest will never acknowledge it, while the line that raised it is
+    /// still asserted.
+    Resetting,
 }
+
+/// How many times an interrupt is published into a register file that is being
+/// reset underneath it before it is given up on.
+///
+/// Two, and the second cannot be raced by the reset that raced the first: a
+/// reset is a bounded run of stores by the processor the controller belongs to,
+/// with interrupts held off, so by the time the second publish begins the reset
+/// the first one lost to has finished. Only a *new* reset can move the count
+/// again, and a caller retrying past that would be waiting on a guest that
+/// resets its own processor in a loop — which is bounded work that never ends,
+/// on a path entered from an interrupt handler.
+const PUBLISHES: u32 = 2;
 
 /// What [`Vlapic::reported`] holds before any selection has been reported.
 ///
@@ -289,14 +317,19 @@ pub(crate) enum Accepted {
 /// however trivial it is.
 pub(super) const NOTHING_REPORTED: u64 = u64::MAX;
 
-/// A vector's number, or a value outside the eight bits one occupies when there
-/// is no vector.
+/// A vector's number, widened to leave room for a value no vector has.
 ///
 /// Used to pack an optional vector into the reported selection state, where
-/// "nothing" has to be as distinguishable as any vector is.
+/// "nothing" has to be as distinguishable as any vector is — so it is the
+/// ninth bit rather than a value inside the eight a vector occupies, which
+/// would be one vector that could not be told from nothing at all.
 const fn number(vector: Option<Vector>) -> u16 {
     match vector {
         Some(vector) => vector.number() as u16,
-        None => u16::MAX,
+        None => NO_VECTOR,
     }
 }
+
+/// What [`number`] answers when there is no vector, which is the one value
+/// outside a vector's range that nine bits hold.
+const NO_VECTOR: u16 = 1 << 8;

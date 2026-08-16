@@ -17,6 +17,12 @@
 //! model-specific registers, must not find a second way to reach the same
 //! registers.
 //!
+//! What it finds instead is what an address nothing decodes answers with, which
+//! is all-ones: outside that mode the page is not claimed by anything, so the
+//! guest's load reaches a bus where nothing answers. Zero would be a device
+//! standing where none is, and it inverts every test software makes to find out
+//! whether a controller is there.
+//!
 //! # What this face does that the other does not
 //!
 //! Nothing here can fault. Reaching a reserved address through the page is not
@@ -40,6 +46,10 @@
 //! deliberately *not* answered as a reserved address, because the guest named a
 //! perfectly good one and the error the architecture defines for a reserved
 //! address would be an error about something that did not happen.
+//!
+//! The width is judged after the mode, because a width is a question about a
+//! register and outside that mode there are none: every width reads all-ones
+//! there, as every width would from an address nothing claims.
 //!
 //! Two shapes never reach this module at all, because the emulator cannot make
 //! the transaction they would need: an access straddling the end of the page,
@@ -142,8 +152,14 @@ impl Device for Page {
 
     fn read(&self, access: Read<'_>) -> Data {
         let width = access.width();
-        let Some((vlapic, register)) = self.decode(access.offset(), width) else {
-            return Data::from_u64(0, width);
+        let (vlapic, register) = match self.decode(access.offset(), width) {
+            Decoded::Register(vlapic, register) => (vlapic, register),
+            // The page is there and the guest named nothing in it.
+            Decoded::NoRegister => return Data::from_u64(0, width),
+            // There is no page. Answered as an address nothing claims answers,
+            // because that is what this one is when the controller is not in the
+            // mode that has it.
+            Decoded::NoPage => return unclaimed(width),
         };
         // A write-only register answers zero rather than recording an error:
         // the architecture defines no error for reading one through this face,
@@ -163,7 +179,8 @@ impl Device for Page {
     }
 
     fn write(&self, access: Write<'_>) -> Commit {
-        let Some((vlapic, register)) = self.decode(access.offset(), access.width()) else {
+        let Decoded::Register(vlapic, register) = self.decode(access.offset(), access.width())
+        else {
             return Commit::Discard;
         };
         if !matches!(
@@ -194,8 +211,8 @@ impl Device for Page {
 }
 
 impl Page {
-    /// Whose controller an access is for and which register it names, or `None`
-    /// if this face does not answer for it at all.
+    /// Whose controller an access is for and which register it names, or why it
+    /// names none.
     ///
     /// The face itself is gated before any register is decoded, and that comes
     /// first for a reason. This aperture is trapped once, before any guest
@@ -215,35 +232,81 @@ impl Page {
     /// page has not been given a bad offset, and inventing the error would
     /// tell the guest about a fault in a face it is not using.
     ///
-    /// The two ways of being malformed within the face are kept apart, because
-    /// the architecture describes only one of them. An offset no register sits
-    /// at — including one for a register this controller does not have in this
-    /// mode — *is* an illegal register address, and is recorded as one. A width
-    /// the architecture leaves undefined is not: the address was legal, so a
-    /// guest told its address was reserved would be told about something that
-    /// did not happen.
-    fn decode(&self, offset: u64, width: Width) -> Option<(&Vlapic, Register)> {
-        let vlapic = self.current()?;
-        if vlapic.mode() != Mode::XApic {
-            return None;
+    /// A controller that cannot be found at all is answered the same way, and
+    /// for the same reason: the roster this array was built from is where the
+    /// index came from, so a miss is a broken invariant rather than anything a
+    /// guest did — and either way there is no controller behind this page for
+    /// the processor asking, which is exactly what having no page means.
+    ///
+    /// The two ways of being malformed *within* the face are kept apart,
+    /// because the architecture describes only one of them. An offset no
+    /// register sits at — including one for a register this controller does
+    /// not have in this mode — *is* an illegal register address, and is
+    /// recorded as one. A width the architecture leaves undefined is not:
+    /// the address was legal, so a guest told its address was reserved
+    /// would be told about something that did not happen.
+    fn decode(&self, offset: u64, width: Width) -> Decoded<'_> {
+        let Some(vlapic) = self.current() else {
+            return Decoded::NoPage;
+        };
+        let mode = vlapic.mode();
+        if mode != Mode::XApic {
+            return Decoded::NoPage;
         }
         match named(offset, width) {
             Named::Register(register)
-                if Access::of(register, vlapic.mode(), vlapic.model()) != Access::Absent =>
+                if Access::of(register, mode, vlapic.model()) != Access::Absent =>
             {
-                Some((vlapic, register))
+                Decoded::Register(vlapic, register)
             }
-            Named::Undefined => None,
+            Named::Undefined => Decoded::NoRegister,
             // An offset no register sits at, and one whose register this
             // controller does not have in the mode it is in, are the same
             // reserved address as far as a guest is concerned.
             Named::Register(_) | Named::Reserved => {
                 dispatch::illegal_register(vlapic, offset);
-                None
+                Decoded::NoRegister
             }
         }
     }
 }
+
+/// What an access to this page reaches.
+///
+/// Three answers rather than two, because a guest that named nothing inside a
+/// page that is there and one whose controller has no page at all are owed
+/// different values: the first is a register file that holds nothing at that
+/// address, and the second is an address on a bus that nothing claims.
+#[derive(Debug)]
+enum Decoded<'a> {
+    /// The controller the access is for, and the register it names.
+    Register(&'a Vlapic, Register),
+    /// The page is there and no register in it was named — a reserved address,
+    /// which has been recorded, or a width the architecture leaves undefined,
+    /// which has not.
+    NoRegister,
+    /// There is no memory-mapped face at all, because the controller is not in
+    /// the mode that has one.
+    NoPage,
+}
+
+/// What an address nothing claims answers a read with.
+///
+/// All-ones, at whatever width the guest read it. That is what a load from an
+/// unclaimed physical address gives on the machines this runs on, and what the
+/// reference implementation of this controller answers for its own page once
+/// the mode that decodes it is gone.
+fn unclaimed(width: Width) -> Data {
+    match width {
+        // Sixteen bytes is wider than one value and every byte of the answer has
+        // to be filled, because a device asked at a width must answer at it.
+        Width::Vector => Data::vector_from([u8::MAX; VECTOR_BYTES]),
+        width => Data::from_u64(u64::MAX, width),
+    }
+}
+
+/// How many bytes the widest access the emulator makes carries.
+const VECTOR_BYTES: usize = Width::Vector.bytes();
 
 /// What the shape of an access to this page names.
 ///
@@ -298,7 +361,7 @@ mod tests {
 
     use emulate::{Device, Hardware, Width};
 
-    use super::{Named, Page, named};
+    use super::{Named, Page, named, unclaimed};
     use crate::face::table::Register;
 
     /// The device, with no controllers behind it: every declaration it makes is
@@ -379,5 +442,22 @@ mod tests {
         // is decided first, so this stays `Undefined` however bad the offset is.
         assert_eq!(named(0x1000, Width::Byte), Named::Undefined);
         assert_eq!(named(0x34, Width::Vector), Named::Undefined);
+    }
+
+    #[test]
+    fn an_address_nothing_claims_reads_as_all_ones() {
+        // What a controller not in the older mode answers with, at every width
+        // the emulator can ask about. Zero would be a device standing where none
+        // is, and it is the answer software tests for when it wants to know
+        // whether this page is decoded at all.
+        for width in WIDTHS {
+            let answer = unclaimed(width);
+            assert_eq!(answer.width(), width);
+            assert!(
+                answer.bytes().iter().all(|byte| *byte == u8::MAX),
+                "{width:?} answered {:?}",
+                answer.bytes()
+            );
+        }
     }
 }

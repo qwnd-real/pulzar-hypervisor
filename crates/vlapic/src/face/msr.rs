@@ -18,7 +18,6 @@
 //! [`read_msr`] and [`write_msr`] directly.
 
 use apic::{IA32_TSC_DEADLINE, X2APIC_BASE_MSR};
-use descriptors::Vector;
 use log::{trace, warn};
 
 use crate::{
@@ -27,10 +26,10 @@ use crate::{
         dispatch::{self, Written, acted},
         table::{Access, Register, X2APIC_LAST_MSR},
     },
-    hardware::timer,
+    hardware::{model::Model, timer},
     machine::current,
     registers::{
-        Vlapic,
+        SPURIOUS_WRITABLE, TASK_PRIORITY_MASK, TIMER_DIVIDE_MASK, Vlapic,
         base::{ApicBase, BaseFault, Mode},
         icr::Command,
         lvt::{Entry, TimerMode},
@@ -98,6 +97,11 @@ pub fn intercepted() -> impl Iterator<Item = u32> {
 /// The whole of the controller's reserved range counts, not merely the indices
 /// that name a register: reaching an unassigned one is a fault the guest has to
 /// be given, and it cannot be given one by code that never sees the access.
+///
+/// The same set as [`intercepted`], and the two answers have to be the same
+/// set: an index intercepted and not claimed stops the guest, because no
+/// handler owns it, and one claimed and not intercepted is executed against the
+/// machine's own registers.
 #[must_use]
 pub const fn claims(index: u32) -> bool {
     matches!(index, X2APIC_BASE_MSR..=X2APIC_LAST_MSR)
@@ -125,17 +129,19 @@ pub(crate) fn read(vlapic: &Vlapic, index: u32, tsc_offset: u64) -> Result<u64, 
         }
         return Ok(guest_deadline(timer::deadline(vlapic), tsc_offset));
     }
-    let register = addressable(vlapic, index)?;
-    if !matches!(
-        Access::of(register, vlapic.mode(), vlapic.model()),
-        Access::ReadOnly | Access::ReadWrite
-    ) {
+    let (register, access) = addressable(vlapic.mode(), vlapic.model(), index)?;
+    if !matches!(access, Access::ReadOnly | Access::ReadWrite) {
         return Err(Fault::WriteOnly);
     }
-    // The one register that is really 64 bits wide. Every other read has a zero
-    // upper half, which is what `RsvdZ` requires.
+    // The one register that is really 64 bits wide, and the one whose stored
+    // value is not narrowed to what a guest may write before it gets there: a
+    // controller is seeded with the value firmware left in the real register,
+    // whole. So the read is masked with the same set the write is judged
+    // against. Every other read has a zero upper half, which is what `RsvdZ`
+    // requires — and this is the rest of that rule: a guest handed a bit the
+    // register does not have would be faulted for writing back what it read.
     if register == Register::COMMAND_LOW {
-        return Ok(vlapic.command().bits());
+        return Ok(vlapic.command().bits() & Command::WRITABLE_X2APIC);
     }
     Ok(u64::from(dispatch::read(vlapic, register)))
 }
@@ -173,11 +179,9 @@ pub(crate) fn write(
         }
         return Ok(Written::TimerDeadline(physical_deadline(value, tsc_offset)));
     }
-    let register = addressable(vlapic, index)?;
-    if !matches!(
-        Access::of(register, vlapic.mode(), vlapic.model()),
-        Access::ReadWrite | Access::WriteOnly
-    ) {
+    let model = vlapic.model();
+    let (register, access) = addressable(vlapic.mode(), model, index)?;
+    if !matches!(access, Access::ReadWrite | Access::WriteOnly) {
         return Err(Fault::ReadOnly);
     }
     // The one register that is genuinely 64 bits wide, and the one whose
@@ -204,11 +208,8 @@ pub(crate) fn write(
     // stray bit is quietly discarded, and through a model-specific register it
     // is a general protection fault. Judged before the write, for the same
     // reason the command register is.
-    if narrow & !writable(vlapic, register) != 0 {
+    if narrow & reserved(model, register) != 0 {
         return Err(Fault::Reserved);
-    }
-    if register == Register::SELF_IPI {
-        return Ok(Written::SelfIpi(Vector::new(vector_of(narrow))));
     }
     Ok(dispatch::write(vlapic, register, narrow))
 }
@@ -236,71 +237,82 @@ const fn physical_deadline(guest: u64, offset: u64) -> u64 {
     }
 }
 
-/// Which bits of a register's low half a guest in x2APIC may set.
+/// Which bits of a register's low half a guest in x2APIC may not put a one in.
 ///
-/// Every one of these is `RsvdZ`, so this is the mask a write is judged against
-/// rather than masked with. Where the older face silently drops what software
-/// may not set, this face has to fault — and faulting requires knowing exactly
-/// which bits those are, per register, rather than only checking the upper
-/// half.
-fn writable(vlapic: &Vlapic, register: Register) -> u32 {
+/// `RsvdZ`: a non-zero write to one of these is a general protection fault
+/// rather than something quietly dropped, which is the whole of what this face
+/// does that the page does not. So naming the reserved set per register is this
+/// face's own work, and every mask here is the complement of the one the
+/// register file stores through — a bit has to fault exactly when it would
+/// otherwise be discarded, or a guest either reads back a bit it was allowed to
+/// write or is refused one it was entitled to.
+///
+/// The local vector table entries are the one place the two are not
+/// complements, and [`Entry::reserved`] is where that is stated: two of their
+/// bits are the controller's own reports, which are dropped from a write and
+/// not faulted on.
+///
+/// Pure in the model rather than taking a controller, so that the whole table
+/// can be asserted without one.
+fn reserved(model: Model, register: Register) -> u32 {
     match register {
         // Acknowledging is not a value and neither is re-arming the error
         // register. The architecture spells both as a write of zero, so every
         // bit of them is reserved.
-        Register::END_OF_INTERRUPT | Register::ERROR_STATUS => 0,
+        Register::END_OF_INTERRUPT | Register::ERROR_STATUS => u32::MAX,
         // Only the priority byte; the rest of the register is reserved.
-        Register::TASK_PRIORITY => TASK_PRIORITY,
+        Register::TASK_PRIORITY => !TASK_PRIORITY_MASK,
         // The vector and the bit that software-enables the controller.
-        Register::SPURIOUS => SPURIOUS,
+        Register::SPURIOUS => !SPURIOUS_WRITABLE,
         // A vector, and nothing else: the delivery mode is fixed, the
         // destination is this processor, and there is no shorthand to name.
-        Register::SELF_IPI => VECTOR,
+        Register::SELF_IPI => !VECTOR,
         // Three bits that are not adjacent — the middle one is reserved.
-        Register::TIMER_DIVIDE => TIMER_DIVIDE,
-        Register::TIMER_INITIAL_COUNT => u32::MAX,
-        other => Entry::of(other).map_or(u32::MAX, |entry| entry.writable(vlapic.model())),
+        Register::TIMER_DIVIDE => !TIMER_DIVIDE_MASK,
+        // The one register every bit of which is the guest's.
+        Register::TIMER_INITIAL_COUNT => 0,
+        // Every register this face can write and has not named above is a local
+        // vector table entry, so anything else reaching here is a mis-decode.
+        // Reserving all of it is the only safe answer to a register whose
+        // reserved bits are unknown: the alternative direction lets a guest put
+        // arbitrary bits into a register in the one function whose whole job is
+        // to enumerate the bits it may not.
+        other => Entry::of(other).map_or(u32::MAX, |entry| entry.reserved(model)),
     }
 }
 
-/// The register an index names, if the guest may name it at all.
-fn addressable(vlapic: &Vlapic, index: u32) -> Result<Register, Fault> {
+/// The register an index names and what may be done with it, if the guest may
+/// name it at all.
+///
+/// Takes the mode and the model rather than reading them from the controller,
+/// so that authorising an access and performing it are one decision made from
+/// one value. Only the processor a controller belongs to writes its mode, and
+/// it is the processor executing this, so the two loads could not disagree
+/// today — but a guest authorised as an x2APIC controller and then answered as
+/// the older one is the failure that would follow if one ever could, and one
+/// load cannot have it.
+///
+/// # Errors
+///
+/// [`Fault::NotX2Apic`] outside x2APIC, or [`Fault::NoSuchRegister`] if the
+/// index names nothing or names a register this controller does not have.
+fn addressable(mode: Mode, model: Model, index: u32) -> Result<(Register, Access), Fault> {
     // Reaching the controller's registers at all is a fault outside x2APIC:
     // the indices are reserved until the guest has enabled the mode that
     // assigns them.
-    if vlapic.mode() != Mode::X2Apic {
+    if mode != Mode::X2Apic {
         return Err(Fault::NotX2Apic);
     }
     let register = Register::from_msr(index).ok_or(Fault::NoSuchRegister)?;
-    match Access::of(register, vlapic.mode(), vlapic.model()) {
+    match Access::of(register, mode, model) {
         Access::Absent => Err(Fault::NoSuchRegister),
-        _ => Ok(register),
+        access => Ok((register, access)),
     }
 }
 
-/// Only the priority byte of the task priority register holds anything.
-const TASK_PRIORITY: u32 = 0xFF;
-
-/// The spurious vector register's vector and its software-enable bit. Focus
-/// checking and end-of-interrupt broadcast suppression are both refused, and
-/// the version register reports the second unsupported.
-const SPURIOUS: u32 = 0x1FF;
-
-/// A vector is the low eight bits of whatever register carries one.
+/// A vector is the low eight bits of whatever register carries one, and in the
+/// self-interrupt register it is the only field there is.
 const VECTOR: u32 = 0xFF;
-
-/// The timer's divide configuration: three bits with a reserved one between
-/// them.
-const TIMER_DIVIDE: u32 = 0b1011;
-
-/// The vector an eight-bit field of a wider value names.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "a vector is the low eight bits of the register it is written in"
-)]
-const fn vector_of(value: u32) -> u8 {
-    value as u8
-}
 
 /// Why an access through this face is a general protection fault.
 ///
@@ -326,7 +338,234 @@ pub(crate) enum Fault {
 
 #[cfg(test)]
 mod tests {
-    use super::{guest_deadline, physical_deadline};
+    //! A controller cannot be built on a host — one is made from a roster
+    //! entry, and a roster comes from firmware's tables — so what is
+    //! asserted here is the whole of what this face decides without one:
+    //! which index names which register, which accesses are a general
+    //! protection fault, and which bits of each register a write may put a
+    //! one in.
+    //!
+    //! The negative cases are the ones that matter. A fault this face raises
+    //! where hardware does not is a guest killed for doing something correct,
+    //! and both of the defects this suite was written for were of that
+    //! shape.
+
+    use apic::{IA32_TSC_DEADLINE, X2APIC_BASE_MSR};
+
+    use super::{
+        Access, ApicBase, Command, Fault, addressable, claims, guest_deadline, intercepted,
+        physical_deadline, reserved,
+    };
+    use crate::{
+        hardware::model,
+        registers::{base::Mode, lvt::Entry},
+    };
+
+    /// Bit 12 of a local vector table entry: the controller's own report that a
+    /// delivery from the source has not yet reached the processor.
+    const DELIVERY_STATUS: u32 = 1 << 12;
+
+    /// Bit 14 of one: the controller's own report of an accepted,
+    /// unacknowledged level-triggered interrupt from the pin.
+    const REMOTE_IRR: u32 = 1 << 14;
+
+    #[test]
+    fn every_index_the_permission_map_traps_is_one_this_crate_answers_for() {
+        // Both directions of a disagreement are fatal, and in different ways: an
+        // index trapped and unclaimed reaches an exit handler that owns nothing
+        // and stops the guest for good, and one claimed and untrapped is executed
+        // by the guest against the machine's own controller.
+        for index in intercepted() {
+            assert!(claims(index), "{index:#x} is trapped and unclaimed");
+        }
+    }
+
+    #[test]
+    fn the_claimed_set_is_the_whole_of_what_the_architecture_dedicates() {
+        // Interception is default-allow, so an index outside this set is one a
+        // guest executes with no exit at all. The range is four times as long as
+        // the registers reach, and every index in it belongs to the controller.
+        assert!(claims(0x800) && claims(0x8FF) && claims(0x900) && claims(0xBFF));
+        assert!(!claims(0x7FF) && !claims(0xC00));
+        assert!(claims(ApicBase::MSR) && claims(IA32_TSC_DEADLINE));
+        for index in [ApicBase::MSR - 1, ApicBase::MSR + 1, IA32_TSC_DEADLINE - 1] {
+            assert!(!claims(index), "{index:#x}");
+        }
+    }
+
+    #[test]
+    fn the_controllers_registers_have_no_indices_outside_x2apic() {
+        // Every one of them, including the base register's own block: until the
+        // guest has enabled the mode that assigns these indices, they are
+        // reserved and reaching one is a fault.
+        for mode in [Mode::XApic, Mode::Disabled] {
+            for index in [X2APIC_BASE_MSR, 0x802, 0x830, 0x83F, 0xBFF] {
+                assert_eq!(
+                    addressable(mode, model::tests::AMD, index),
+                    Err(Fault::NotX2Apic),
+                    "{index:#x} in {mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_index_that_names_no_register_is_a_fault() {
+        for index in [
+            // Reserved inside the block the registers sit in.
+            0x800, 0x801, 0x804, 0x805, 0x806, 0x807, 0x829, 0x82E, 0x83A, 0x83D,
+            // Past the registers but inside the range the architecture dedicates
+            // to the controller, which is where three quarters of it lies.
+            0x840, 0x8FF, 0x900, 0xBFF,
+        ] {
+            assert_eq!(
+                addressable(Mode::X2Apic, model::tests::AMD, index),
+                Err(Fault::NoSuchRegister),
+                "{index:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_registers_the_wide_face_removed_are_a_fault_to_name() {
+        // Arbitration priority, remote read, the destination format register and
+        // the high half of the interrupt command. Their indices are reserved
+        // here, so naming one is the same fault as naming an unassigned index —
+        // and in particular not an illegal-register error, which this face never
+        // records.
+        for index in [0x809, 0x80C, 0x80E, 0x831] {
+            assert_eq!(
+                addressable(Mode::X2Apic, model::tests::AMD, index),
+                Err(Fault::NoSuchRegister),
+                "{index:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_the_controller_does_not_have_is_a_fault_to_name() {
+        // The three optional local vector table entries, on a controller
+        // reporting the fewest the architecture describes.
+        for index in [0x833, 0x834, 0x82F] {
+            assert_eq!(
+                addressable(Mode::X2Apic, model::tests::SPARSE, index),
+                Err(Fault::NoSuchRegister),
+                "{index:#x}"
+            );
+            assert!(addressable(Mode::X2Apic, model::tests::AMD, index).is_ok());
+        }
+    }
+
+    #[test]
+    fn which_registers_may_be_read_and_which_written() {
+        // The direction of every register this face has. What is not here is
+        // absent, and is covered above.
+        for (index, access) in [
+            (0x802, Access::ReadOnly),
+            (0x803, Access::ReadOnly),
+            (0x808, Access::ReadWrite),
+            (0x80A, Access::ReadOnly),
+            (0x80B, Access::WriteOnly),
+            (0x80D, Access::ReadOnly),
+            (0x80F, Access::ReadWrite),
+            (0x810, Access::ReadOnly),
+            (0x818, Access::ReadOnly),
+            (0x820, Access::ReadOnly),
+            (0x828, Access::ReadWrite),
+            (0x830, Access::ReadWrite),
+            (0x832, Access::ReadWrite),
+            (0x838, Access::ReadWrite),
+            (0x839, Access::ReadOnly),
+            (0x83E, Access::ReadWrite),
+            (0x83F, Access::WriteOnly),
+        ] {
+            let (_, answered) = addressable(Mode::X2Apic, model::tests::AMD, index)
+                .expect("every index here names a register this controller has");
+            assert_eq!(answered, access, "{index:#x}");
+        }
+    }
+
+    #[test]
+    fn the_reserved_bits_of_every_register_this_face_may_write() {
+        // Written out as literals so that a mask moving fails a test rather than
+        // moving with it, and stated as what may *not* be written because that is
+        // what the architecture spells `RsvdZ` and what a fault is raised for.
+        for (index, reserved_bits) in [
+            // Acknowledging and re-arming the error register are both a write of
+            // zero and nothing else.
+            (0x80B, u32::MAX),
+            (0x828, u32::MAX),
+            // The priority byte, the spurious vector with its enable bit, and
+            // the divide's three non-adjacent bits.
+            (0x808, 0xFFFF_FF00),
+            (0x80F, 0xFFFF_FE00),
+            (0x83E, 0xFFFF_FFF4),
+            // The count, every bit of which is the guest's.
+            (0x838, 0),
+            // A vector, and nothing else.
+            (0x83F, 0xFFFF_FF00),
+            // The entries, whose per-entry shape is the local vector table's own
+            // and is asserted there.
+            (0x832, 0xFFF8_EF00),
+            (0x835, 0xFFFE_0800),
+            (0x837, 0xFFFE_E800),
+        ] {
+            let (register, _) = addressable(Mode::X2Apic, model::tests::AMD, index)
+                .expect("every index here names a register this controller has");
+            assert_eq!(
+                reserved(model::tests::AMD, register),
+                reserved_bits,
+                "{index:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_guest_may_write_back_the_entry_it_read() {
+        // Reading an entry, changing one field and writing the whole of it back
+        // is how software touches these registers — every operating system's
+        // controller shutdown does exactly that to mask them. What it read has
+        // whatever the controller had put in its two status bits, so faulting on
+        // those would be a general protection fault for writing back a value the
+        // controller itself supplied.
+        for entry in Entry::ALL {
+            let register = entry.register();
+            assert_eq!(
+                reserved(model::tests::AMD, register) & DELIVERY_STATUS,
+                0,
+                "{entry:?}"
+            );
+            // Remote IRR exists in the two entries that describe a wire, so
+            // unlike delivery status it is genuinely reserved in the rest.
+            assert_eq!(
+                reserved(model::tests::AMD, register) & REMOTE_IRR == 0,
+                entry.is_pin(),
+                "{entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wide_interrupt_command_accepts_what_brings_a_processor_up() {
+        // The reserved-bit test a write of the interrupt command is judged
+        // against, over the quadwords an operating system and this machine's
+        // firmware actually write: INIT asserted, INIT de-asserted, and a
+        // start-up with and without the level bit firmware sets. A fault on any
+        // of these is a guest whose second processor never starts.
+        for low in [0xC500_u64, 0x8500, 0x0608, 0x4608, 0x000C_4500] {
+            let bits = (5 << 32) | low;
+            assert_eq!(bits & !Command::WRITABLE_X2APIC, 0, "{bits:#018x}");
+        }
+        // And what it still refuses: the delivery-status bit this vendor requires
+        // to be written as zero, bit 13, bits 17:16 and bits 31:20.
+        for reserved_bit in [12, 13, 16, 17, 20, 31] {
+            assert_ne!(
+                (1_u64 << reserved_bit) & !Command::WRITABLE_X2APIC,
+                0,
+                "bit {reserved_bit}"
+            );
+        }
+    }
 
     #[test]
     fn deadline_translation_preserves_disarmed_timers() {

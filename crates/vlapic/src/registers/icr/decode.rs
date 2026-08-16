@@ -107,10 +107,11 @@ impl Command {
     /// Whether the level bit is set, which on the bus this outlived meant
     /// assert rather than de-assert.
     ///
-    /// Nothing reads it any more except the one command that is recognised by
-    /// it being clear, which is why [`Command::is_init_deassert`] rather than
-    /// this is what a caller normally wants.
-    pub(crate) const fn level(self) -> bool {
+    /// Private, because nothing reads it any more except the one command that
+    /// is recognised by it being clear: [`Command::is_init_deassert`] is what a
+    /// caller wants, and a caller given the raw bit would be given a field
+    /// hardware reads past.
+    const fn level(self) -> bool {
         LEVEL.test(self.low())
     }
 
@@ -133,8 +134,12 @@ impl Command {
     ///
     /// It resets the arbitration identifiers of everything it reaches and does
     /// nothing else — no processor is initialised by it and no vector is
-    /// delivered. Only the memory-mapped face can express it, since x2APIC
-    /// reserves both bits and faults a guest that sets them.
+    /// delivered. Expressible through both faces, because both keep the two
+    /// bits that name it, and this is what tells it apart from the INIT that
+    /// starts a processor: an operating system's start-up sequence writes the
+    /// same delivery mode twice, once with the level bit set and once without,
+    /// and a controller that could not tell them apart would reset every target
+    /// a second time.
     pub(crate) const fn is_init_deassert(self) -> bool {
         DELIVERY.get(self.low()) == INIT && !self.level() && TRIGGER.test(self.low())
     }
@@ -360,5 +365,54 @@ mod tests {
         assert_eq!(others.shorthand(), Shorthand::Others);
         assert_eq!(others.destination_mode(), DestinationMode::Physical);
         assert_eq!(others.delivery(Mode::XApic), Some(Delivery::Fixed));
+    }
+
+    #[test]
+    fn the_sequence_a_processor_is_started_with_survives_the_wide_face() {
+        // The four quadwords an operating system and this machine's firmware
+        // actually write to bring up an application processor, addressed to
+        // identifier five: INIT asserted, INIT de-asserted, and a start-up at
+        // page 0x08 — the last of them twice, once as firmware forms it with
+        // the level bit set and once as an operating system forms it without.
+        //
+        // Written out as raw bits because that is what a guest writes. Every
+        // one of them has to be accepted: a bit outside the writable mask is a
+        // general protection fault at the `WRMSR`, and a fault here is a
+        // machine whose second processor never starts.
+        const DESTINATION: u64 = 5 << 32;
+        let init = Command::from_bits(DESTINATION | 0xC500);
+        let deassert = Command::from_bits(DESTINATION | 0x8500);
+        let startup = Command::from_bits(DESTINATION | 0x0608);
+        let firmware_startup = Command::from_bits(DESTINATION | 0x4608);
+
+        for command in [init, deassert, startup, firmware_startup] {
+            assert_eq!(
+                command.bits() & !Command::WRITABLE_X2APIC,
+                0,
+                "{:#018x} sets a bit the wide face refuses",
+                command.bits()
+            );
+            assert!(command.legal(Mode::X2Apic), "{:#018x}", command.bits());
+            assert_eq!(command.destination(Mode::X2Apic), 5);
+            assert_eq!(command.shorthand(), Shorthand::None);
+            assert_eq!(command.destination_mode(), DestinationMode::Physical);
+        }
+
+        // The INIT that resets the target, and the message that follows it and
+        // must not: the level bit is the whole of the difference between them.
+        assert_eq!(init.delivery(Mode::X2Apic), Some(Delivery::Init));
+        assert!(!init.is_init_deassert());
+        assert_eq!(init.trigger(), Trigger::Edge);
+        assert_eq!(deassert.delivery(Mode::X2Apic), Some(Delivery::Init));
+        assert!(deassert.is_init_deassert());
+        assert_eq!(deassert.trigger(), Trigger::Level);
+
+        // Both spellings of the start-up name the same page, and the level bit
+        // firmware sets changes nothing about it.
+        for command in [startup, firmware_startup] {
+            assert_eq!(command.delivery(Mode::X2Apic), Some(Delivery::Startup));
+            assert_eq!(command.vector(), Vector::new(0x08));
+            assert_eq!(command.trigger(), Trigger::Edge);
+        }
     }
 }

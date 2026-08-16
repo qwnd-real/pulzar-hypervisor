@@ -20,6 +20,12 @@
 //! that bit dropped instead of stored and a later read never reports state the
 //! architecture says cannot exist there.
 //!
+//! What software may *set* and what it may *put a one in* are two masks and not
+//! one, because two of the bits belong to neither category. Delivery status and
+//! remote IRR are the controller's own reports: software cannot set them, and
+//! writing them is ignored rather than refused, so [`Entry::writable`] drops
+//! them and [`Entry::reserved`] does not fault on them.
+//!
 //! [`Entry::ALL`] is in the order the architecture counts these in, which is
 //! what the version register reports the highest index of. It is deliberately
 //! not the order the registers sit at — the corrected-machine-check entry is
@@ -68,10 +74,12 @@ impl Entry {
 
     /// How few a controller may have.
     ///
-    /// The version register reports one less than the count, so a controller
-    /// with none could not describe itself. Every controller has at least the
-    /// timer.
-    pub(crate) const FEWEST: usize = 1;
+    /// The timer, both interrupt pins and the error entry: the smallest table
+    /// any controller has ever reported, and the smallest the version register
+    /// describes. Nothing has fewer, and a model built with fewer would tell a
+    /// guest its non-maskable interrupt pin and its error entry are not there —
+    /// which every operating system's controller bring-up writes.
+    pub(crate) const FEWEST: usize = 4;
 
     /// Every entry, in the order the architecture counts them.
     ///
@@ -130,7 +138,9 @@ impl Entry {
     /// The delivery-status and remote-IRR bits are absent from every answer:
     /// both are the controller's to report, and letting a guest write either
     /// would let it claim a delivery that never happened or retire one that is
-    /// still outstanding.
+    /// still outstanding. That makes this the mask a write is *stored* through
+    /// and not the one it is judged against — [`Entry::reserved`] is that one,
+    /// and the two differ by exactly those bits.
     ///
     /// Two entries have a shape the model decides rather than the entry. The
     /// error entry's message type is writable on AMD and reserved on Intel. And
@@ -153,6 +163,27 @@ impl Entry {
                 Self::Lint0 | Self::Lint1 => WRITABLE_PIN,
                 _ => 0,
             }
+    }
+
+    /// Which bits of this entry no software may put a one in, in this model.
+    ///
+    /// Not the complement of [`Entry::writable`], and the difference is the
+    /// point: *reserved* and *read-only* are two things, and only the first is
+    /// a general protection fault through the model-specific registers. The
+    /// two bits the controller reports through — delivery status in every
+    /// entry, and remote IRR in the two that describe a wire — are
+    /// read-only. Hardware ignores a write to them, and it has to: reading
+    /// an entry, changing one field and writing the whole of it back is how
+    /// software touches these registers, and what it read back holds
+    /// whatever the controller had put in those bits. A controller that
+    /// faulted on them would fault a guest for writing back a value it had
+    /// just been given.
+    ///
+    /// So a write of one of those bits is dropped, by [`Entry::writable`], and
+    /// not refused. Everything outside both masks is reserved and is refused.
+    pub(crate) const fn reserved(self, model: Model) -> u32 {
+        let pin = if self.is_pin() { REMOTE_IRR } else { 0 };
+        !(self.writable(model) | SEND_PENDING | pin)
     }
 
     /// Whether a register names a local vector table entry this model does not
@@ -198,6 +229,15 @@ const WRITABLE_TIMER_MODE: u32 = Lvt::new().with_timer_mode(TIMER_MODE_FIELD).in
 /// select the third.
 const WRITABLE_COUNTING_MODE: u32 = Lvt::new().with_timer_mode(COUNTING_MODE_FIELD).into_bits();
 
+/// The bit the controller reports a delivery from this source still being in
+/// flight through. Present in every entry, and read-only in all of them.
+const SEND_PENDING: u32 = Lvt::new().with_send_pending(true).into_bits();
+
+/// The bit the controller reports an accepted, unacknowledged level-triggered
+/// interrupt through, which is why it exists in the two pin entries alone and
+/// is reserved in the rest.
+const REMOTE_IRR: u32 = Lvt::new().with_remote_irr(true).into_bits();
+
 /// A three-bit delivery-mode field with every bit set, which is what marks
 /// where the field sits rather than a mode any entry accepts.
 const DELIVERY_FIELD: u8 = 0b111;
@@ -213,9 +253,9 @@ const COUNTING_MODE_FIELD: u8 = 0b01;
 pub(super) const MASKED: u32 = 1 << 16;
 
 /// A controller has exactly the first however-many of [`Entry::ALL`], and
-/// [`Model::has`] answers that from an entry's own position — so the list has to
-/// be in the order the discriminants are, or a guest would be handed an entry its
-/// controller does not have and refused one it does.
+/// [`Model::has`] answers that from an entry's own position — so the list has
+/// to be in the order the discriminants are, or a guest would be handed an
+/// entry its controller does not have and refused one it does.
 const _: () = {
     let mut index = 0;
     while index < Entry::COUNT {
@@ -227,15 +267,16 @@ const _: () = {
     }
 };
 
-/// The table the guest programs has to be as long as the one the real controller
-/// has entries in, because a controller is seeded from a capture of those entries
-/// and every one of them is programmed back onto real hardware. A shorter table
-/// here would drop an entry firmware left armed; a longer one would offer the
-/// guest a register with no source behind it.
+/// The table the guest programs has to be as long as the one the real
+/// controller has entries in, because a controller is seeded from a capture of
+/// those entries and every one of them is programmed back onto real hardware. A
+/// shorter table here would drop an entry firmware left armed; a longer one
+/// would offer the guest a register with no source behind it.
 const _: () = assert!(
     Entry::COUNT == apic::LVT_ENTRIES,
     "the guest's table and the real controller's have to have the same entries"
 );
+
 #[cfg(test)]
 mod tests {
     use descriptors::Vector;
@@ -347,5 +388,102 @@ mod tests {
         assert!(model.allows(entry, Delivery::NonMaskable));
         assert!(!model.allows(entry, Delivery::Init));
         assert!(!model.allows(entry, Delivery::External));
+    }
+
+    /// Bit 12: the controller's report that a delivery from the source is still
+    /// in flight.
+    const DELIVERY_STATUS: u32 = 1 << 12;
+
+    /// Bit 14: the controller's report that a level-triggered interrupt from
+    /// the pin has been accepted and not acknowledged.
+    const REMOTE_IRR: u32 = 1 << 14;
+
+    #[test]
+    fn what_software_may_store_in_each_entry() {
+        // Written out as literals rather than composed from the same constants
+        // the masks are, so that a field moving fails a test instead of moving
+        // with it. Vector 7:0 and mask 16 everywhere; delivery mode 10:8 where
+        // the entry has one; polarity 13 and trigger mode 15 in the two pins;
+        // timer mode 18:17 in the timer.
+        for (entry, amd, intel) in [
+            (Entry::Timer, 0x0007_00FF, 0x0007_00FF),
+            (Entry::Lint0, 0x0001_A7FF, 0x0001_A7FF),
+            (Entry::Lint1, 0x0001_A7FF, 0x0001_A7FF),
+            (Entry::Error, 0x0001_07FF, 0x0001_00FF),
+            (Entry::Performance, 0x0001_07FF, 0x0001_07FF),
+            (Entry::Thermal, 0x0001_07FF, 0x0001_07FF),
+            (Entry::CorrectedMachineCheck, 0x0001_07FF, 0x0001_07FF),
+        ] {
+            assert_eq!(entry.writable(model::tests::AMD), amd, "{entry:?}");
+            assert_eq!(entry.writable(model::tests::INTEL), intel, "{entry:?}");
+        }
+        // A processor without the timestamp-counter deadline has one bit of the
+        // timer's mode field rather than two.
+        assert_eq!(Entry::Timer.writable(model::tests::SPARSE), 0x0003_00FF);
+    }
+
+    #[test]
+    fn what_no_software_may_put_a_one_in() {
+        // The complement of the mask above, less the two bits the controller
+        // reports through: those are read-only rather than reserved, so a write
+        // of one is dropped and not refused.
+        for (entry, amd, intel) in [
+            (Entry::Timer, 0xFFF8_EF00, 0xFFF8_EF00),
+            (Entry::Lint0, 0xFFFE_0800, 0xFFFE_0800),
+            (Entry::Lint1, 0xFFFE_0800, 0xFFFE_0800),
+            (Entry::Error, 0xFFFE_E800, 0xFFFE_EF00),
+            (Entry::Performance, 0xFFFE_E800, 0xFFFE_E800),
+            (Entry::Thermal, 0xFFFE_E800, 0xFFFE_E800),
+            (Entry::CorrectedMachineCheck, 0xFFFE_E800, 0xFFFE_E800),
+        ] {
+            assert_eq!(entry.reserved(model::tests::AMD), amd, "{entry:?}");
+            assert_eq!(entry.reserved(model::tests::INTEL), intel, "{entry:?}");
+        }
+        assert_eq!(Entry::Timer.reserved(model::tests::SPARSE), 0xFFFC_EF00);
+    }
+
+    #[test]
+    fn the_bits_the_controller_reports_through_are_read_only_and_not_reserved() {
+        // The distinction one mask serving both purposes would lose, and the
+        // reason it matters: a guest reads an entry, sets the mask bit in what
+        // it read and writes the whole of it back, which is how every operating
+        // system stops one of these sources. If the controller had a delivery in
+        // flight, or held an unacknowledged level-triggered interrupt from a
+        // pin, that value has the bit set — and refusing it would be a general
+        // protection fault for writing back what the guest was just given.
+        for model in [model::tests::AMD, model::tests::INTEL] {
+            for entry in Entry::ALL {
+                assert_eq!(
+                    entry.reserved(model) & DELIVERY_STATUS,
+                    0,
+                    "{entry:?} must not fault on the delivery-status bit"
+                );
+                assert_eq!(
+                    entry.writable(model) & DELIVERY_STATUS,
+                    0,
+                    "{entry:?} must not store the delivery-status bit"
+                );
+                // Remote IRR exists in the two entries that describe a wire and
+                // is reserved in the rest, so unlike delivery status it does
+                // fault where the architecture has no field for it.
+                assert_eq!(
+                    entry.reserved(model) & REMOTE_IRR == 0,
+                    entry.is_pin(),
+                    "{entry:?}"
+                );
+                assert_eq!(entry.writable(model) & REMOTE_IRR, 0, "{entry:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_controller_has_at_least_the_timer_the_two_pins_and_the_error_entry() {
+        // The smallest table the version register describes. A model built with
+        // fewer would answer that a guest's own non-maskable interrupt pin is
+        // not a register.
+        assert_eq!(Entry::FEWEST, 4);
+        for entry in [Entry::Timer, Entry::Lint0, Entry::Lint1, Entry::Error] {
+            assert!(entry.index() < Entry::FEWEST, "{entry:?}");
+        }
     }
 }

@@ -44,7 +44,11 @@ bitflags! {
         const RECEIVE_CHECKSUM = 1 << 1;
         /// No processor accepted a message this controller sent.
         ///
-        /// Three-wire APIC bus only, and so never set here.
+        /// The one bit of the four the three-wire APIC bus defined that this
+        /// controller does set, because it is the only architectural report for
+        /// what happened: a message aimed at a processor this hypervisor does not
+        /// run, or one whose target could not be interrupted to notice it, has
+        /// been accepted by nobody.
         const SEND_ACCEPT = 1 << 2;
         /// No processor accepted a message this controller received.
         ///
