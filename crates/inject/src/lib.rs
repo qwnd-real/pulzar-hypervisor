@@ -72,6 +72,8 @@
 
 #![no_std]
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use descriptors::Vector;
 use log::{trace, warn};
 use processor::SvmFeatures;
@@ -93,11 +95,6 @@ pub struct Pending {
     awaiting_iret: Option<u64>,
     shutdown: bool,
     blocking: Blocking,
-    /// The vector an interrupt window is currently armed for, or `None` when
-    /// none is. The vector and not merely the fact, because the priority armed
-    /// beside it is that vector's own — so a window armed for a different
-    /// vector has to be rewritten rather than left alone.
-    window: Option<Vector>,
 }
 
 impl Pending {
@@ -112,7 +109,6 @@ impl Pending {
             awaiting_iret: None,
             shutdown: false,
             blocking: Blocking::of(processor::svm().map(|svm| svm.features)),
-            window: None,
         }
     }
 
@@ -236,7 +232,6 @@ impl Pending {
         self.nmi_blocked = false;
         self.awaiting_iret = None;
         self.shutdown = false;
-        self.window = None;
         let control = vcpu.control_mut();
         control.event_injection = Event::none();
         control.interrupt_control = control
@@ -298,6 +293,15 @@ impl Pending {
         // for something quite unrelated to it.
         let waiting = blocked.filter(|_| !matches!(injected, Injected::Interrupt(_)));
         self.arm_window(vcpu, waiting);
+        // The one state a guest does not recover from, checked where it would
+        // have to arise: something is waiting for the guest and the block says
+        // nothing is. It cannot arise now that the window is read back rather
+        // than remembered, which is exactly why the count is worth keeping —
+        // it is the evidence, on a machine with no serial port, that this has
+        // not come back.
+        if waiting.is_some() && armed_for(vcpu).is_none() {
+            unarmed();
+        }
         injected
     }
 
@@ -392,17 +396,33 @@ impl Pending {
     /// priority suppresses; anything higher reports one the guest cannot
     /// take the waiting vector through, and that is an exit which arms
     /// itself again.
+    ///
+    /// # What is armed is read back rather than remembered
+    ///
+    /// The pending bit is not this function's to own. The processor clears it
+    /// as it delivers the virtual interrupt, and on a machine where this
+    /// hypervisor is itself a guest the one underneath does the same when
+    /// it hands an exit up. So a record kept here would be a copy of a
+    /// field something else also writes, and one stale copy is fatal rather
+    /// than untidy: this would decide the window was already armed, write
+    /// nothing, and the processor would enter a guest with an interrupt
+    /// waiting and nothing to tell it so. A guest that then halts is never
+    /// woken — the interrupt is in software, delivering it needs an exit,
+    /// and the only thing that would have produced one was that interrupt.
+    ///
+    /// Reading the block instead makes the arming idempotent: whatever cleared
+    /// the bit, the next entry sees it clear and arms again.
     fn arm_window(&mut self, vcpu: &mut Vcpu, waiting: Option<Vector>) {
         let iret =
             self.blocking == Blocking::Iret && self.nmi_blocked && self.awaiting_iret.is_none();
-        if waiting == self.window && !iret {
+        let armed = armed_for(vcpu);
+        if armed == waiting && !iret {
             return;
         }
-        // The window itself only changed if the answer differs from the one
-        // already written; the `iret` case re-asserts the return intercept
+        // The window itself only changed if the answer differs from what the
+        // block already says; the `iret` case re-asserts the return intercept
         // without changing it, so only a real change is worth a line.
-        let changed = waiting != self.window;
-        self.window = waiting;
+        let changed = armed != waiting;
         if changed {
             match waiting {
                 Some(vector) => trace!(
@@ -546,6 +566,52 @@ pub fn window_open(vcpu: &Vcpu) -> bool {
     vcpu.save().rflags & INTERRUPT_FLAG != 0
 }
 
+/// Whether a guest that has halted would take a maskable interrupt.
+///
+/// Its flag and nothing else, which is the difference from [`window_open`]: the
+/// single-instruction shadow that one refuses does not apply to a halt. Waiting
+/// for an interrupt is written `STI; HLT` precisely because the architecture
+/// recognizes one at the halt whatever the shadow says, and a hypervisor that
+/// read the shadow here would leave such a guest asleep for good.
+#[must_use]
+pub fn interrupts_unmasked(vcpu: &Vcpu) -> bool {
+    vcpu.save().rflags & INTERRUPT_FLAG != 0
+}
+
+/// The vector this block's interrupt window is armed for, or `None` if none is.
+///
+/// Asked of the block rather than remembered beside it, because the field is
+/// not only written here: the processor clears the pending bit as it delivers
+/// the virtual interrupt, and a hypervisor this one is running under does the
+/// same when it hands an exit up. The vector comes back out as well as the
+/// fact, because the priority armed beside it is that vector's own — so a
+/// window armed for some other vector is one that has to be rewritten.
+fn armed_for(vcpu: &Vcpu) -> Option<Vector> {
+    let control = vcpu.control().interrupt_control;
+    control
+        .virtual_irq_pending()
+        .then(|| Vector::new(control.virtual_vector()))
+}
+
+/// Records a guest entered with an interrupt waiting for it and no window armed
+/// to say so, and says so the first time.
+///
+/// A processor lost that way is indistinguishable from an idle one — it takes
+/// no exit, logs nothing and answers nothing — so the count is what tells the
+/// two apart afterwards, from a debugger or a memory dump, on a machine that
+/// has no serial port to have said it at the time.
+fn unarmed() {
+    if UNARMED_ENTRIES.fetch_add(1, Ordering::Relaxed) == 0 {
+        warn!(
+            "inject: a guest was entered with an interrupt waiting for it and no window armed to \
+             say so; counting any others"
+        );
+    }
+}
+
+/// How many times that has happened on this machine. Zero.
+static UNARMED_ENTRIES: AtomicU32 = AtomicU32::new(0);
+
 /// Prepares a control block to have interrupts taken away from its guest and
 /// given back on the host's terms.
 ///
@@ -561,10 +627,30 @@ pub fn window_open(vcpu: &Vcpu) -> bool {
 /// distinguish an NMI taken during guest execution from one arriving while the
 /// host is between entries. Hardware vNMI then tracks the guest's NMI-blocking
 /// state without the software IRET fallback.
+///
+/// # Why the halt is intercepted
+///
+/// A guest that halts is asking to be woken by an interrupt, and the interrupts
+/// it is owed are in software: an armed interrupt window is a *field* the
+/// processor reads when it enters a guest, so it is only ever evaluated at an
+/// entry. On real hardware the halt itself is an evaluation point and an armed
+/// window wakes the guest there. Where this hypervisor is itself a guest, the
+/// one underneath halts the whole virtual processor at that instruction and
+/// decides for itself when there is anything to re-enter for — and a window one
+/// of *its* guests armed for one of *its* guests is not something it knows how
+/// to count as a reason. The entry never happens, so the field is never read,
+/// and a guest with an interrupt waiting for it sleeps until something
+/// unrelated happens to wake the processor.
+///
+/// Intercepting the halt removes the dependency. The guest's halt becomes an
+/// exit, whoever answers it re-decides delivery from the controller, and a
+/// guest with nothing to do is parked by *halting the host processor* instead —
+/// where every wake-up the machine has reaches it. The cost is one exit per
+/// idle transition, which is what every hypervisor pays for the same reason.
 pub fn arm(vcpu: &mut Vcpu) {
     let features = processor::svm().map(|svm| svm.features);
     let control = vcpu.control_mut();
-    control.intercept_1 |= Intercepts1::INTR | Intercepts1::NMI;
+    control.intercept_1 |= Intercepts1::INTR | Intercepts1::NMI | Intercepts1::HLT;
     control.interrupt_control = control
         .interrupt_control
         .with_intercept_interrupt_masking(true);

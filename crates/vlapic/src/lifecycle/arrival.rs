@@ -8,18 +8,23 @@
 //! vector.
 //!
 //! Whether real hardware may be acknowledged now is the whole of what is
-//! decided here, and the controller itself is asked — it recorded, as it
-//! accepted the interrupt, whether the interrupt arrived level triggered.
+//! decided here, and two things decide it: the controller itself, which
+//! recorded as it accepted the interrupt whether the interrupt arrived level
+//! triggered, and the vector, because an acknowledgement withheld in the
+//! priority class the host keeps for itself would hold the host's own
+//! interrupts off with it.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use apic::LocalApic;
 use descriptors::Vector;
 use log::{trace, warn};
 
 use crate::{
     VlapicError,
     machine::current,
-    registers::{Accepted, icr::Trigger},
+    priority::Priority,
+    registers::{Accepted, Vlapic, icr::Trigger},
 };
 
 /// Gives this processor's guest an interrupt that arrived on real hardware.
@@ -38,6 +43,12 @@ use crate::{
 /// acknowledging now would deliver it again at once — the acknowledgement is
 /// withheld and becomes owed, and is issued when the guest acknowledges its
 /// own.
+///
+/// With one exception, which is the priority class the host keeps for its own
+/// interprocessor interrupts. A withheld acknowledgement there would hold every
+/// one of those off as well, for as long as the guest took to give its own, so
+/// such an arrival is acknowledged at once and handed over as the
+/// edge-triggered interrupt it then is.
 ///
 /// # Errors
 ///
@@ -67,37 +78,84 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
         vlapic.requested(),
         vlapic.in_service_count(),
         vlapic.task_priority(),
-        if vlapic.ledger().is_empty() {
-            "owed nothing"
-        } else {
-            "still owed an acknowledgement"
-        }
+        vlapic.ledger().debts()
     );
-    if !level {
-        let accepted = vlapic.accept(vector, Trigger::Edge);
-        local.end_of_interrupt();
-        // Acknowledged whatever became of it, and the two outcomes are worth
-        // different lines. An edge-triggered interrupt is finished with once
-        // taken, so the acknowledgement is owed to hardware however the guest's
-        // controller answered — but a controller that was mid-reset has dropped
-        // an interrupt that reached this machine, which is this hypervisor
-        // losing one rather than a guest declining it.
-        match accepted {
-            Accepted::Resetting => warn!(
-                "vlapic: {} dropped real {vector}, which arrived while its register file was \
-                 being reset",
-                vlapic.index()
-            ),
-            Accepted::Requested | Accepted::Coalesced | Accepted::Illegal | Accepted::Refused => {
-                trace!(
-                    "vlapic: {} acknowledged real {vector} at once, leaving real in service {:?}",
-                    vlapic.index(),
-                    local.in_service_top()
-                );
-            }
-        }
-        return Ok(());
+    if withholdable(vector, level) {
+        withhold(vlapic, local, vector);
+    } else {
+        acknowledge(vlapic, local, vector, level);
     }
+    Ok(())
+}
+
+/// Whether real hardware's acknowledgement for an arrival on `vector` may be
+/// withheld until the guest gives its own.
+///
+/// Only for a level-triggered arrival — an edge-triggered one is finished with
+/// the moment it is taken, and there is nothing to withhold — and not even then
+/// in the priority class the host keeps for itself.
+///
+/// That exception is the whole of what this answers, and it is about what a
+/// withheld acknowledgement costs. It leaves the vector in service on the real
+/// controller, which then refuses everything of the vector's own
+/// interrupt-priority class or lower — and the top class is the host's: its
+/// interprocessor interrupts, the doorbell that fetches a processor out of the
+/// guest, and the translation shootdowns another processor blocks waiting for.
+/// A debt anywhere in that class holds all of them off for as long as the guest
+/// takes to acknowledge, which for a guest that never does is the life of the
+/// machine.
+///
+/// So an arrival there is acknowledged at once and given to the guest as the
+/// edge-triggered interrupt it now is: nothing is owed for it. The cost is that
+/// a level line the guest points at one of those vectors is delivered again
+/// until its driver quiets it, and one the guest is not accepting at all is
+/// delivered again until it is. That still leaves the processor answering the
+/// host between arrivals, which is exactly what withholding would not.
+fn withholdable(vector: Vector, level: bool) -> bool {
+    level && Priority::of(vector).class() < Priority::of(ipi::FIRST).class()
+}
+
+/// Gives the guest an interrupt and acknowledges real hardware at once.
+///
+/// For everything nothing is owed for: an edge-triggered arrival, which is
+/// finished with the moment it is taken, and a level-triggered one on a vector
+/// whose acknowledgement may not be withheld.
+///
+/// The acknowledgement is owed to hardware however the guest's controller
+/// answered, so it is issued before the answer is looked at.
+fn acknowledge(vlapic: &Vlapic, local: LocalApic, vector: Vector, level: bool) {
+    let accepted = vlapic.accept(vector, Trigger::Edge);
+    local.end_of_interrupt();
+    match accepted {
+        // A controller that was mid-reset has dropped an interrupt that reached
+        // this machine, which is this hypervisor losing one rather than a guest
+        // declining it.
+        Accepted::Resetting => warn!(
+            "vlapic: {} dropped real {vector}, which arrived while its register file was being \
+             reset",
+            vlapic.index()
+        ),
+        // Level, and so retired before the guest has done anything with it. Worth
+        // its own line: it is the one arrival handed over already acknowledged,
+        // and the reason is nothing about the interrupt itself.
+        _ if level => trace!(
+            "vlapic: {} acknowledged level {vector} at once and gave it to its guest as an edge, \
+             because withholding it would hold the host's own interrupts off with it",
+            vlapic.index()
+        ),
+        Accepted::Requested | Accepted::Coalesced | Accepted::Illegal | Accepted::Refused => {
+            trace!(
+                "vlapic: {} acknowledged real {vector} at once, leaving real in service {:?}",
+                vlapic.index(),
+                local.in_service_top()
+            );
+        }
+    }
+}
+
+/// Gives the guest a level-triggered interrupt and keeps real hardware's
+/// acknowledgement until the guest gives its own.
+fn withhold(vlapic: &Vlapic, local: LocalApic, vector: Vector) {
     // The debt is recorded before the guest is given the interrupt, so that a
     // guest which acknowledges immediately finds the debt already there.
     vlapic.ledger().owe(vector);
@@ -111,9 +169,8 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
         // Not a refusal the guest made, so the debt is not one nothing will ever
         // discharge: the register file is between one guest and the next, and
         // whichever guest comes out of the reset may still acknowledge this
-        // vector. Paying it here on the grounds that nobody will is what would
-        // issue the real acknowledgement while the line is still asserted, and
-        // the source would re-fire into a controller that has just dropped it.
+        // vector. Writing it off here is what would leave a debt the guest that
+        // comes out of the reset could have paid.
         Accepted::Resetting => warn!(
             "vlapic: {} kept real {vector}'s acknowledgement owed: it arrived while the register \
              file was being reset",
@@ -122,19 +179,19 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
         refused => {
             // The guest was not given it and will therefore never acknowledge
             // it, so the only thing that could ever have discharged the debt
-            // does not exist. Settling here is what stops a refused interrupt
-            // occupying a real in-service slot for the life of the machine,
-            // blocking everything of its priority or lower on this processor.
-            vlapic.ledger().release(vector, &local);
+            // does not exist. The debt is kept rather than paid: acknowledging a
+            // level line nobody has quieted clears the remote in-service state of
+            // the I/O controller that sent it, and the still-asserted line
+            // arrives again at once, into a controller that has just refused it.
+            vlapic.ledger().abandon(vector);
             warn!(
-                "vlapic: {} received level {vector} but is not accepting it: {refused:?}, real in \
-                 service {:?}",
+                "vlapic: {} received level {vector} but is not accepting it: {refused:?}, so real \
+                 hardware goes on holding it — {}",
                 vlapic.index(),
-                local.in_service_top()
+                vlapic.ledger().debts()
             );
         }
     }
-    Ok(())
 }
 
 /// How many interrupts have reached [`arrived`] on this machine.
@@ -144,3 +201,49 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
 /// taking it", and a single number answers that whichever processor the
 /// arrivals landed on.
 static ARRIVALS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+mod tests {
+    //! Which arrivals may have their acknowledgement withheld is the one
+    //! decision here that needs no controller, and it is the one that costs
+    //! the *machine* rather than the guest if it is wrong.
+
+    use descriptors::Vector;
+
+    use super::withholdable;
+
+    #[test]
+    fn an_edge_arrival_owes_nothing_whatever_its_vector() {
+        for number in 0x10..=u8::MAX {
+            assert!(!withholdable(Vector::new(number), false));
+        }
+    }
+
+    #[test]
+    fn a_level_arrival_below_the_hosts_own_class_is_withheld() {
+        for number in 0x10..ipi::FIRST.number() {
+            assert!(
+                withholdable(Vector::new(number), true),
+                "vector {number:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_arrival_in_the_hosts_own_class_is_not() {
+        // Every vector of the top class, not merely the ones a handler has taken:
+        // a debt at any of them holds the whole class in service, and the host's
+        // interprocessor interrupts, its error vector and its spurious vector are
+        // all in it.
+        for number in ipi::FIRST.number()..=u8::MAX {
+            assert!(
+                !withholdable(Vector::new(number), true),
+                "vector {number:#x}"
+            );
+        }
+        assert!(
+            !withholdable(apic::ERROR, true) && !withholdable(apic::SPURIOUS, true),
+            "the controller's own two vectors are in that class as well"
+        );
+    }
+}

@@ -12,9 +12,11 @@
 use core::sync::atomic::Ordering;
 
 use thiserror::Error;
+use x86_64::instructions::interrupts;
 
 use crate::{
     hardware::{model::Model, sources, timer},
+    lifecycle::ledger::Debts,
     registers::{
         Vlapic,
         base::{ApicBase, BOOTSTRAP, GLOBAL_ENABLE, Mode, RESERVED_LOW, X2APIC_ENABLE},
@@ -58,11 +60,11 @@ impl Vlapic {
     /// enable is entitled to discard.
     ///
     /// Switching one off is the other thing entirely, and leaves the register
-    /// file as reset leaves it. There the physical hardware has to be brought
-    /// across first: an entry left armed goes on delivering into a controller
-    /// the guest believes is switched off, and every acknowledgement owed
-    /// has to be settled before the tokens that would have discharged it
-    /// are deleted.
+    /// file as reset leaves it. There the physical hardware has to be dealt
+    /// with: an entry left armed goes on delivering into a controller the guest
+    /// believes is switched off, and every acknowledgement real hardware is
+    /// owed has to be accounted for, because what the guest would have
+    /// discharged it through is exactly what the reset deletes.
     ///
     /// # Errors
     ///
@@ -98,22 +100,30 @@ impl Vlapic {
     /// Switches the controller off, which is the one transition that throws the
     /// register file away.
     ///
-    /// The physical hardware is brought across before anything virtual moves,
-    /// and in this order: a source that is still armed can deliver into
-    /// whatever comes next, and a debt that is still outstanding needs the
-    /// register file that records it.
+    /// The sources are quieted before anything virtual moves, because one left
+    /// armed can deliver into whatever comes next.
     ///
-    /// The controller the debts are paid through is this processor's, and it is
-    /// this processor's because the write being taken came out of the guest
+    /// The write, the reset and the settlement are one step, with this
+    /// processor's interrupts held off for all three, and the settlement is
+    /// last. An arrival taken between a settlement and a reset is accepted into
+    /// a register file that is about to be wiped: its debt is recorded, the
+    /// request bit that would have led the guest to acknowledge it is deleted,
+    /// and the real controller is left holding a vector with nothing that names
+    /// it. Settling last makes such an arrival one the settlement accounts for,
+    /// and holding interrupts off leaves no interval for it to land in.
+    ///
+    /// The controller the debts are settled against is this processor's, and it
+    /// is this processor's because the write being taken came out of the guest
     /// running here — the same thing that makes quieting the sources and
     /// stopping the timer legitimate.
     fn switched_off(&self, next: ApicBase) -> Transition {
         let quiet = sources::quiesce(self) & timer::disarm(self);
-        let settled = self.ledger.settle(&apic::local().ok());
-
-        self.base.store(next.bits(), Ordering::Release);
-        self.reset_registers();
-        Transition::Changed { quiet, settled }
+        let debts = interrupts::without_interrupts(|| {
+            self.base.store(next.bits(), Ordering::Release);
+            self.reset_registers();
+            self.ledger.settle(&apic::local().ok())
+        });
+        Transition::Changed { quiet, debts }
     }
 }
 
@@ -154,9 +164,9 @@ pub(crate) enum Transition {
     Changed {
         /// Whether every source really was quieted first.
         quiet: bool,
-        /// Whether every acknowledgement real hardware was owed really was
-        /// settled first.
-        settled: bool,
+        /// What real hardware was left holding for the guest whose controller
+        /// this was.
+        debts: Debts,
     },
 }
 

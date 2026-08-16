@@ -43,12 +43,10 @@ pub(crate) fn entered(vlapic: &Vlapic, transition: Transition) {
         // Worth a line rather than a trace: real hardware was left holding
         // something across a boundary the guest believes cleared it, and that is
         // a state nothing later in the guest's life will explain.
-        Transition::Changed { quiet, settled } if !quiet || !settled => warn!(
-            "vlapic: {} changed face without fully settling hardware: sources {}, \
-             acknowledgements {}",
+        Transition::Changed { quiet, debts } if !quiet || !debts.is_empty() => warn!(
+            "vlapic: {} changed face without fully settling hardware: sources {}, hardware {debts}",
             vlapic.index(),
             if quiet { "quiet" } else { "still armed" },
-            if settled { "settled" } else { "still owed" },
         ),
         Transition::Preserved | Transition::Changed { .. } => {}
     }

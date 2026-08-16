@@ -105,13 +105,15 @@ impl Bitmap {
     /// the highest at any single instant, because a higher bit set during
     /// the scan may be missed.
     ///
-    /// That weaker guarantee is enough for the two callers this has, and both
-    /// rely on the same precondition: exactly one processor consumes from a
-    /// given bitmap, and nothing resets it concurrently. The in-service
-    /// register is consumed only by the processor the controller belongs
-    /// to, and the ledger only by the processor whose hardware owes the
-    /// debt. A second consumer, or a reset racing a take, would need a
-    /// different structure.
+    /// That weaker guarantee is enough for the one caller this has, and it
+    /// rests on a precondition: exactly one thing consumes from a given
+    /// bitmap, and nothing resets it concurrently. The in-service register
+    /// is consumed only by the processor the controller belongs to,
+    /// acknowledging one interrupt at a time out of its own guest. A second
+    /// consumer, or a reset racing a take, would need a different structure
+    /// — which is why the one other place in this crate that walks a bitmap
+    /// down to nothing does it with [`Bitmap::highest`] and a clear of its
+    /// own, inside a window where this processor's interrupts are held off.
     pub(crate) fn take_highest(&self) -> Option<Vector> {
         loop {
             let vector = self.highest()?;

@@ -94,7 +94,7 @@ use x86_64::{
 };
 
 pub use crate::{
-    dispatch::{Disposition, Handler, Interrupt, Unclaimed, adopt, claim, register},
+    dispatch::{Disposition, Handler, Interrupt, Unclaimed, adopt, claim, is_claimed, register},
     gdt::Selectors,
     vector::{InterruptStack, Resumption, Vector},
 };

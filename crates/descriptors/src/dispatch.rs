@@ -317,6 +317,24 @@ pub fn claim(first: Vector, last: Vector, handler: Handler) -> Result<Vector, De
     Err(DescriptorError::NoVectorFree { first, last })
 }
 
+/// Whether a handler has claimed `vector`.
+///
+/// What the hypervisor has taken for itself, asked rather than assumed. Only
+/// two of those vectors are constants — the interrupt controller's own error
+/// and spurious vectors — and the rest are allocated at run time by [`claim`],
+/// so anything that has to keep away from them cannot do it by naming numbers.
+///
+/// A claimed vector is not one nothing else may arrive on: this hypervisor
+/// shares the machine's vectors with whatever else is using it, and a claimed
+/// vector's handler exists precisely to tell an arrival that is the
+/// hypervisor's own from one that is not. What the answer says is that an
+/// arrival here is decided by a handler *before* anything else sees it, which
+/// makes such a vector a poor thing to point a source at deliberately.
+#[must_use]
+pub fn is_claimed(vector: Vector) -> bool {
+    claimed(vector).is_some()
+}
+
 /// Records what becomes of an unclaimed interrupt.
 ///
 /// One answer for the whole machine, given once and before any processor loads

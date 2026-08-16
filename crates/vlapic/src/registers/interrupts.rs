@@ -53,6 +53,7 @@ impl Vlapic {
     /// Answers what became of it. A vector already requested and not yet
     /// accepted collapses into the one bit, exactly as hardware does, and is
     /// not a second interrupt.
+    #[must_use]
     pub(crate) fn accept(&self, vector: Vector, trigger: Trigger) -> Accepted {
         // The controller never sets a request bit in the illegal range, and
         // records that it was asked to.
@@ -253,12 +254,23 @@ impl Vlapic {
     /// acknowledgement is exactly the event that makes an acknowledgement to
     /// real hardware permissible, and nothing else ever will be.
     ///
+    /// The trigger-mode bit is deliberately left where it is. Hardware writes
+    /// that register when it accepts an interrupt and reads it when one is
+    /// acknowledged; it does not clear it, and a guest reading the bank back
+    /// after an acknowledgement has to find what hardware would have left. That
+    /// is a readback and nothing more today — the level or edge decision this
+    /// crate acts on comes from the *real* controller's own record, which is
+    /// the one authority on how an interrupt actually arrived. Anything
+    /// that made this register the oracle instead would make the order the
+    /// bank is published in load-bearing, which is the reason
+    /// [`crate::registers::bitmap`] gives for its orderings.
+    ///
     /// `controller` is the real controller of the processor whose guest is
     /// acknowledging, which is this processor: a guest's acknowledgement comes
     /// out of the guest, and the guest runs nowhere else.
+    #[must_use]
     pub(crate) fn end_of_interrupt(&self, controller: &impl InService) -> Option<Vector> {
         let vector = self.in_service.take_highest()?;
-        self.trigger_mode.clear(vector);
         self.ledger.release(vector, controller);
         Some(vector)
     }

@@ -37,10 +37,11 @@ use crate::{
         mirror::{entered, mirror_logical_destination},
         sources, timer,
     },
+    lifecycle::settle,
     machine::registry::lapics,
     priority,
     registers::{
-        Vlapic,
+        Accepted, Vlapic,
         base::Transition,
         error::Errors,
         icr::{Command, Trigger},
@@ -327,11 +328,7 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
                 vlapic.requested_count(),
                 vlapic.task_priority(),
                 local.and_then(LocalApic::in_service_top),
-                if vlapic.ledger().is_empty() {
-                    "owed nothing"
-                } else {
-                    "still owed an acknowledgement"
-                }
+                vlapic.ledger().debts()
             );
         }
         Written::Timer => {
@@ -359,9 +356,14 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // masked entry would have achieved — but an interrupt already on its way
         // when the bit cleared is refused where hardware would have latched it
         // in the request register and held it.
+        //
+        // And it is a lifecycle boundary, which is the third of them: a
+        // controller that has stopped delivering is one whose guest cannot
+        // acknowledge what real hardware is holding for it.
         Written::Disabled => {
             sources::reprogram(vlapic);
             timer::reprogram(vlapic);
+            settle::disabled(vlapic);
         }
         Written::LogicalDestination => mirror_logical_destination(vlapic),
         Written::ModeChanged(transition) => entered(vlapic, transition),
@@ -372,12 +374,28 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // A guest sending itself an interrupt is the sender, so a vector no
         // controller may deliver is its error to be told about rather than the
         // receiver's — even though the two are the same controller here.
-        Written::SelfIpi(vector) => {
-            if priority::legal(vector) {
-                vlapic.accept(vector, Trigger::Edge);
-            } else {
-                vlapic.errors().record(Errors::SEND_ILLEGAL_VECTOR);
-            }
-        }
+        Written::SelfIpi(vector) => self_ipi(vlapic, vector),
+    }
+}
+
+/// Gives the guest the interrupt it sent itself.
+///
+/// Nothing is owed for one of these whatever becomes of it: it came from the
+/// guest rather than from a real source, so there is no real in-service bit
+/// behind it and nothing to acknowledge. What the acceptance answers is
+/// therefore only worth saying — and it is worth saying, because a controller
+/// that refused its own guest's interrupt to itself has dropped something the
+/// guest has no other way to notice.
+fn self_ipi(vlapic: &Vlapic, vector: Vector) {
+    if !priority::legal(vector) {
+        vlapic.errors().record(Errors::SEND_ILLEGAL_VECTOR);
+        return;
+    }
+    match vlapic.accept(vector, Trigger::Edge) {
+        Accepted::Requested | Accepted::Coalesced => {}
+        declined => trace!(
+            "vlapic: {} sent itself {vector}, which its own controller did not take: {declined:?}",
+            vlapic.index()
+        ),
     }
 }

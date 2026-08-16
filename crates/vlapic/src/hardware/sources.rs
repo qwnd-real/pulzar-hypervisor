@@ -55,20 +55,33 @@
 //!
 //! # Vectors that cannot be armed
 //!
-//! Three ranges, and one of them is a hazard rather than a rule. The controller
+//! Three kinds, and two of them are hazards rather than rules. The controller
 //! itself refuses vectors 0 through 15. Above those, 16 through 31 are the
 //! architecture's remaining exception vectors: a controller *will* deliver on
 //! them, and delivering one here would enter a host exception handler with no
-//! exception having occurred, which the host answers by stopping. And the
-//! host's own error and spurious vectors would be consumed by the handlers that
-//! own them before anything could pass them on, because for those two the
-//! pass-through test is about the arrival rather than about the vector.
+//! exception having occurred, which the host answers by stopping.
+//!
+//! And every vector the host has claimed a handler on is refused, because such
+//! a vector's arrivals are adjudicated by that handler before anything else
+//! sees them. For the controller's own error and spurious vectors the handler
+//! *consumes* an arrival it decides is the host's, so a guest source on one of
+//! those loses every interrupt that coincides with the condition the handler
+//! looks for — and no read of any register can tell the two apart. For the
+//! interprocessor interrupts the same coincidence holds, and one more thing
+//! does: those vectors are the top priority class, where an acknowledgement
+//! cannot be withheld at all, so a level-triggered source there would be one
+//! this crate could not defer.
+//!
+//! Which vectors those are is asked rather than named. Two of them are
+//! constants and the rest are handed out at run time, so a rule written as
+//! numbers would be wrong the moment one more interprocessor interrupt existed.
 //!
 //! A source whose guest vector falls in any of them is programmed masked and
-//! the attempt is recorded in the guest's error status register. For the first
-//! range that is exactly what hardware does. For the other two it is a
-//! deliberate departure — hardware would deliver — taken because the
-//! alternative is a guest halting the host by writing a register.
+//! the attempt is recorded in the guest's error status register. For the
+//! exceptions the controller refuses below 16 exactly as hardware does. For the
+//! rest it is a deliberate departure — hardware would deliver — taken because
+//! the alternative is a guest halting the host, or silently losing interrupts,
+//! by writing a register.
 
 use apic::{Entry as HardwareEntry, LvtDelivery, Polarity, Source, Trigger as HardwareTrigger};
 use descriptors::Vector;
@@ -251,8 +264,13 @@ pub(crate) fn armable(vlapic: &Vlapic, vector: Vector) -> Option<Vector> {
 }
 
 /// Whether real hardware may be told to deliver a source on this vector.
+///
+/// The exceptions, and whatever the host has claimed. Both are asked of the
+/// authority that owns the answer rather than restated here: the architecture
+/// fixes which vectors are exceptions, and the descriptor tables know which
+/// vectors have a handler, including the ones handed out at run time.
 fn arms(vector: Vector) -> bool {
-    !vector.is_exception() && vector != apic::ERROR && vector != apic::SPURIOUS
+    !vector.is_exception() && !descriptors::is_claimed(vector)
 }
 
 /// Which of the guest's entries a source corresponds to.
@@ -306,5 +324,45 @@ const fn polarity(active_low: bool) -> Polarity {
         Polarity::ActiveLow
     } else {
         Polarity::ActiveHigh
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Which vectors a source may be armed with is the one decision here that
+    //! needs no controller, and the host's own claims are what it turns on.
+
+    use descriptors::{Disposition, Interrupt, Vector};
+
+    use super::arms;
+
+    /// A vector nothing else in this crate's tests uses, standing in for one
+    /// the host has taken.
+    const CLAIMED: Vector = Vector::new(0x47);
+
+    /// What a claimed vector's handler would answer, which nothing here runs.
+    fn handler(_: &Interrupt) -> Disposition {
+        Disposition::Passed
+    }
+
+    #[test]
+    fn no_source_is_armed_on_a_vector_the_host_has_claimed() {
+        // Whatever the host claimed, and not a range: two of its vectors are
+        // constants and the rest are handed out at run time, so the test claims
+        // one the same way the host does.
+        assert!(arms(CLAIMED), "nothing has claimed it yet");
+        descriptors::register(CLAIMED, handler).expect("the vector is free");
+        assert!(!arms(CLAIMED));
+    }
+
+    #[test]
+    fn no_source_is_armed_on_an_exception_vector() {
+        // The architecture's own, and the reason is not the host's claim: a
+        // controller delivering one of these enters a host exception handler with
+        // no exception having occurred.
+        for number in 0..Vector::FIRST_EXTERNAL.number() {
+            assert!(!arms(Vector::new(number)), "vector {number:#x}");
+        }
+        assert!(arms(Vector::FIRST_EXTERNAL));
     }
 }

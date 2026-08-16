@@ -22,7 +22,7 @@ pub fn describe(who: &str) {
     };
     for vlapic in page.all() {
         info!(
-            "{who}: {} {} {} in {}{}, task priority {}, {} requested, {} in service{}",
+            "{who}: {} {} {} in {}{}, task priority {}, {} requested, {} in service, hardware {}",
             vlapic.index(),
             vlapic.apic_id(),
             if vlapic.startup().running() {
@@ -39,11 +39,7 @@ pub fn describe(who: &str) {
             vlapic.task_priority(),
             vlapic.requested_count(),
             vlapic.in_service_count(),
-            if vlapic.ledger().is_empty() {
-                ""
-            } else {
-                ", owing hardware an acknowledgement"
-            },
+            vlapic.ledger().debts(),
         );
         if let Some(vector) = vlapic.requested() {
             info!(

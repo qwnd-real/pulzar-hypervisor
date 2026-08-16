@@ -279,6 +279,10 @@ impl<'a> Exits<'a> {
             // whichever controller it was for, and the exit itself carries
             // nothing further.
             Some(Reason::VirtualInterrupt | Reason::Interrupt | Reason::Nmi) => Flow::Resume,
+            // The guest asked to be woken by an interrupt. What it is owed is in
+            // software, so this is where the processor is parked rather than
+            // inside a guest nothing would re-enter.
+            Some(Reason::Hlt) => self.halted(vcpu),
             // The guest left an interrupt handler, which ends the window during
             // which it takes no further non-maskable interrupt.
             Some(Reason::Iret) => {
@@ -384,6 +388,57 @@ impl<'a> Exits<'a> {
         Flow::Resume
     }
 
+    /// Parks this processor while its guest has nothing to take.
+    ///
+    /// The guest halted, which is a request to be woken by an interrupt, and
+    /// what it is owed is in software: an interrupt window is a field read at
+    /// an entry, so leaving the guest halted with one armed makes the
+    /// wake-up depend on something re-entering it. Here the wait is the
+    /// *host's* instead — the processor halts with its own interrupts
+    /// enabled, where a physical arrival, a doorbell from another processor
+    /// and a startup message all reach it — and the guest is re-entered
+    /// with whatever that produced.
+    ///
+    /// The halt is stepped over first, because the wait below is what it asked
+    /// for: coming back to it would halt twice for one request, and every wake
+    /// would find the same instruction and do it again.
+    ///
+    /// Said to be away for the whole of the wait, and that is not decoration:
+    /// a processor delivering into this controller only rings the doorbell for
+    /// one that has stopped watching, and without the flag it would leave a
+    /// request bit in a controller whose processor is asleep and set nothing to
+    /// wake it.
+    fn halted(&mut self, vcpu: &mut Vcpu) -> Flow {
+        advance(vcpu, HLT_LENGTH);
+        let vcpu = &*vcpu;
+        if self.wakeable(vcpu) {
+            return Flow::Resume;
+        }
+        let _ = vlapic::set_away(true);
+        trace!("exits: the guest halted with nothing to take; waiting for something to give it");
+        while !self.wakeable(vcpu) {
+            descriptors::wait_until(|| self.wakeable(vcpu));
+        }
+        let _ = vlapic::set_away(false);
+        Flow::Resume
+    }
+
+    /// Whether there is anything for this processor's guest to be re-entered
+    /// for.
+    ///
+    /// The exact question a halted processor asks, and it is the architecture's
+    /// rather than a convenience: an interrupt the guest's own priority is
+    /// holding back does not wake a halted processor on real hardware either,
+    /// and a guest cannot lower that priority while it is halted. So a vector
+    /// that is merely pending is not a reason, and the two things that reach a
+    /// guest whatever it has masked are — a non-maskable interrupt, and a
+    /// startup message from another processor.
+    fn wakeable(&self, vcpu: &Vcpu) -> bool {
+        self.interrupts.owed()
+            || !vlapic::running().unwrap_or(true)
+            || (inject::interrupts_unmasked(vcpu) && vlapic::select().unwrap_or(None).is_some())
+    }
+
     /// Brings the control block's virtual task priority into agreement with the
     /// emulated register.
     ///
@@ -449,6 +504,10 @@ pub enum ExitError {
 /// class, which is the half of it the control block's virtual task priority
 /// holds.
 const TPR_CLASS_SHIFT: u8 = 4;
+
+/// How long the halt instruction is, for a processor that does not report the
+/// address of the one after it.
+const HLT_LENGTH: u64 = 1;
 
 /// Moves the guest past an intercepted instruction the host has completed.
 ///
