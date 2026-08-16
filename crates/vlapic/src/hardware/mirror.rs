@@ -84,7 +84,7 @@ pub(crate) fn mirror_logical_destination(vlapic: &Vlapic) {
         );
         return;
     };
-    let wanted = vlapic.logical_destination();
+    let wanted = vlapic.logical_destination(vlapic.mode());
     if local.set_logical_routing(vlapic.destination_format(), wanted) {
         return;
     }

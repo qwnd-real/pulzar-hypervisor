@@ -39,7 +39,7 @@ use log::{trace, warn};
 
 use crate::{
     delivery::{
-        arbitration::least_busy,
+        arbitration::candidates,
         destination::targets,
         doorbell::nudge,
         startup::{initialize, start},
@@ -109,15 +109,26 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
     }
 
     match delivery {
-        // The chipset picks, and it picks by priority. Which priority, and how a
-        // tie is broken, is the guest's own processor's rule rather than a
-        // universal one.
+        // One of the named processors takes it, and which one is the chipset's
+        // choice on real hardware rather than the architecture's. The set is
+        // walked in the order arbitration puts it in until a processor takes it,
+        // because a processor that refuses has not consumed the interrupt — it is
+        // meant for one of the set, and the next one is entitled to it.
         Delivery::LowestPriority => {
-            if let Some(target) = least_busy(from, targets(from, lapics, command)) {
-                accept(from, target, delivery, command);
+            let named = targets(from, lapics, command);
+            if !candidates(named, command.vector())
+                .any(|target| accept(from, target, delivery, command))
+            {
+                // Every processor the command named refused it, or it named none
+                // that was accepting. Nothing has it, and the architecture's
+                // nearest report is the one for a message nobody accepted.
+                refused_by_all(from, delivery, command);
             }
         }
         Delivery::Fixed => {
+            // Each target answers for itself, so what any one of them made of it
+            // is nothing the others or the sender depend on: a fixed interrupt
+            // names the processors it names, and one that refuses has refused.
             for target in targets(from, lapics, command) {
                 accept(from, target, delivery, command);
             }
@@ -163,35 +174,50 @@ pub(crate) fn send(from: &Vlapic, lapics: &[Vlapic], command: Command) {
 
 /// Gives one processor an interrupt, and makes sure it notices.
 ///
-/// A controller that is switched off or software-disabled refuses it, which is
-/// what a real one does — and it is refused at the target rather than filtered
-/// here, because whether a controller is accepting is the target's own state
-/// and may change between the two.
-fn accept(from: &Vlapic, target: &Vlapic, delivery: Delivery, command: Command) {
+/// Answers whether the interrupt is now recorded somewhere that will deliver
+/// it. A refusal is not a failure — a controller that is switched off or
+/// software-disabled refuses interrupts, which is what a real one does — but it
+/// is the difference between a fixed interrupt, where each target answers for
+/// itself, and a redirectable one, where a refusal means the next processor in
+/// the set has to be offered it.
+///
+/// Whether a controller is accepting is checked at the target rather than
+/// filtered here, because it is the target's own state and may change between
+/// the two.
+fn accept(from: &Vlapic, target: &Vlapic, delivery: Delivery, command: Command) -> bool {
     if !ownership::owns(target) {
         refused(from, target, delivery);
-        return;
+        return false;
     }
     let vector = command.vector();
     match target.accept(vector, command.trigger()) {
         // It is in the target's register file now, and the target may not be
         // looking at it.
-        Accepted::Requested | Accepted::Coalesced => nudge(from, target),
+        Accepted::Requested | Accepted::Coalesced => {
+            nudge(from, target);
+            true
+        }
         // The refusals the architecture defines, and both are the target's own
         // state to answer with rather than anything that went wrong.
-        Accepted::Illegal | Accepted::Refused => trace!(
-            "vlapic: {} offered {vector} to {}, which did not take it",
-            from.index(),
-            target.index()
-        ),
+        Accepted::Illegal | Accepted::Refused => {
+            trace!(
+                "vlapic: {} offered {vector} to {}, which did not take it",
+                from.index(),
+                target.index()
+            );
+            false
+        }
         // Not one of those: the interrupt was not recorded anywhere, so nothing
         // will deliver it and nothing will report it but this.
-        Accepted::Resetting => warn!(
-            "vlapic: {} offered {vector} to {}, whose register file was being reset, and it was \
-             not delivered",
-            from.index(),
-            target.index()
-        ),
+        Accepted::Resetting => {
+            warn!(
+                "vlapic: {} offered {vector} to {}, whose register file was being reset, and it \
+                 was not delivered",
+                from.index(),
+                target.index()
+            );
+            false
+        }
     }
 }
 
@@ -226,6 +252,30 @@ fn refused(from: &Vlapic, target: &Vlapic, delivery: Delivery) {
             "vlapic: {} sent {delivery:?} to {}, which this hypervisor does not run",
             from.index(),
             target.index()
+        );
+    }
+}
+
+/// Records that a redirectable interrupt was offered to every processor the
+/// command named and taken by none of them.
+///
+/// Which is not nothing having happened: the guest asked for the interrupt to
+/// be delivered to one of a set, and it has been delivered to none. The set can
+/// be empty — a command naming processors whose controllers are all
+/// software-disabled — or every one of them can refuse it in the window between
+/// being found accepting and being offered it, which is the target's own
+/// guest's state changing and cannot be closed from here.
+///
+/// Recorded as a message no processor accepted, which is what happened, and
+/// said once per re-armed error status rather than once per message: a guest
+/// that offlines a processor with a redirectable interrupt in flight can
+/// produce these as fast as it can write a register.
+fn refused_by_all(from: &Vlapic, delivery: Delivery, command: Command) {
+    if from.errors().record(Errors::SEND_ACCEPT) {
+        warn!(
+            "vlapic: {} sent {delivery:?} {} to processors none of which took it",
+            from.index(),
+            command.vector()
         );
     }
 }

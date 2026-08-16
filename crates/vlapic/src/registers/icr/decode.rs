@@ -13,7 +13,8 @@ use crate::registers::{
     icr::{
         Command,
         command::{
-            DELIVERY, DESTINATION_MODE, DESTINATION_XAPIC, LEVEL, SHORTHAND, TRIGGER, VECTOR,
+            BROADCAST_XAPIC, DELIVERY, DESTINATION_MODE, DESTINATION_XAPIC, LEVEL, SHORTHAND,
+            TRIGGER, VECTOR,
         },
     },
 };
@@ -102,6 +103,28 @@ impl Command {
         } else {
             DESTINATION_XAPIC.get(self.high())
         }
+    }
+
+    /// Whether the destination names every processor there is.
+    ///
+    /// Answered in the width the *sending* face gives the field, which is the
+    /// only face that can answer it: all-ones is thirty-two bits through x2APIC
+    /// and eight through the page, and the same command reaches controllers
+    /// that disagree about which face they are in. Judging it in the
+    /// target's width instead breaks in both directions during any
+    /// mixed-mode window — and there is always one, because an application
+    /// processor is in the older face from reset until it enables x2APIC
+    /// for itself. An x2APIC broadcast of `0xFFFF_FFFF` would name nobody
+    /// in the older face, and an x2APIC destination of `0x0000_00FF` —
+    /// identifier 255, an ordinary processor — would be a broadcast to
+    /// every controller still in it.
+    pub(crate) const fn is_broadcast(self, mode: Mode) -> bool {
+        self.destination(mode)
+            == if matches!(mode, Mode::X2Apic) {
+                Self::BROADCAST
+            } else {
+                BROADCAST_XAPIC
+            }
     }
 
     /// Whether the level bit is set, which on the bus this outlived meant
@@ -343,6 +366,32 @@ mod tests {
         // reserved and no part of the destination.
         let mapped = Command::from_halves(0x0000_0030, 0x0500_00FF);
         assert_eq!(mapped.destination(Mode::XApic), TARGET);
+    }
+
+    #[test]
+    fn a_broadcast_is_all_ones_of_the_sending_face_and_nothing_else() {
+        // Each spelling is a broadcast in its own face. What breaks when the
+        // question is asked in the *target's* width is not so much the first of
+        // these — all ones of the wide field has all ones in its top byte too —
+        // as the second: identifier 255 written through the wide face would be a
+        // broadcast to every controller still in the older one, while being one
+        // ordinary processor to everything else.
+        let wide = Command::from_bits(0xFFFF_FFFF_0000_0030);
+        let narrow = Command::from_halves(0x0000_0030, 0xFF00_0000);
+        let addressed = Command::from_bits(0x0000_00FF_0000_0030);
+
+        assert!(wide.is_broadcast(Mode::X2Apic));
+        assert!(narrow.is_broadcast(Mode::XApic));
+        // The older face's spelling is not the wide one's: its high half is the
+        // destination in the top byte and zero below, which is a destination.
+        assert!(!narrow.is_broadcast(Mode::X2Apic));
+        assert!(!addressed.is_broadcast(Mode::X2Apic));
+        assert_eq!(addressed.destination(Mode::X2Apic), 0xFF);
+        // And the answer is total over the three faces: the one no sender is ever
+        // in is answered in the narrower width, which is the one the register has
+        // until something enables the wider one.
+        assert!(narrow.is_broadcast(Mode::Disabled));
+        assert!(!addressed.is_broadcast(Mode::Disabled));
     }
 
     #[test]

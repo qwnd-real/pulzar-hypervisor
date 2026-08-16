@@ -46,9 +46,16 @@ bitflags! {
         ///
         /// The one bit of the four the three-wire APIC bus defined that this
         /// controller does set, because it is the only architectural report for
-        /// what happened: a message aimed at a processor this hypervisor does not
-        /// run, or one whose target could not be interrupted to notice it, has
-        /// been accepted by nobody.
+        /// what happened. Two things reach it, and both really are a message
+        /// nobody took: one aimed at a processor this hypervisor does not run,
+        /// and a redirectable one offered to every processor it named and
+        /// refused by all of them.
+        ///
+        /// A doorbell that could not be sent is deliberately *not* one of them.
+        /// The message was accepted — the request bit is set in a controller that
+        /// has it — and what failed is this hypervisor's own way of making the
+        /// target look at it sooner, which is not a condition the architecture
+        /// has a bit for.
         const SEND_ACCEPT = 1 << 2;
         /// No processor accepted a message this controller received.
         ///

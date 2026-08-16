@@ -13,7 +13,10 @@ impl Command {
     /// destination mode as much as the physical one.
     ///
     /// The memory-mapped face spells the same thing with all eight bits of its
-    /// narrower field set, which is what this value truncates to.
+    /// narrower field set, which is [`BROADCAST_XAPIC`] and is a different
+    /// number. Which of the two a command means is decided by the face the
+    /// *sender* wrote it through, because that is the face whose width the
+    /// field has — see [`Command::is_broadcast`].
     pub(crate) const BROADCAST: u32 = u32::MAX;
 
     /// Which bits of the low half software may set.
@@ -169,6 +172,13 @@ pub(super) const TRIGGER: Field = Field::new(15, 1);
 
 /// Which shorthand, if any, names the targets in place of the destination.
 pub(super) const SHORTHAND: Field = Field::new(18, 2);
+
+/// The destination the memory-mapped face names every processor with: all eight
+/// bits of its narrower field.
+///
+/// Derived from the field rather than written out, so that it cannot drift away
+/// from the width the field actually has.
+pub(super) const BROADCAST_XAPIC: u32 = DESTINATION_XAPIC.get(u32::MAX);
 
 /// The destination within the high half of the memory-mapped register, where it
 /// is a byte at the top rather than the whole word.

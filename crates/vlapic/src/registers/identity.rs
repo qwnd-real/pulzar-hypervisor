@@ -7,21 +7,55 @@
 //! derived by the architecture in x2APIC, which is why it is computed here in
 //! that face rather than stored: hardware computes the same thing from the same
 //! number, and a guest cannot get the two out of step.
+//!
+//! # Both answers are asked in a face, and the face is the caller's to fix
+//!
+//! Which face the controller is in decides both of them, and the caller passes
+//! it in rather than each of these reading it again. A remote processor working
+//! out whether a command names this controller is reading a word the target's
+//! own guest may be changing under it, and one decision made from two loads of
+//! that word is a decision made about a controller in neither state — an
+//! xAPIC-format logical identifier matched by the x2APIC cluster rule, which
+//! matches nothing and drops the interrupt with no error anywhere. So the mode
+//! is taken once, as a [`Mode`], and threaded down.
 
 use core::sync::atomic::Ordering;
 
 use crate::registers::{Vlapic, base::Mode};
 
 impl Vlapic {
-    /// The identifier register, in whichever shape the face in use gives it.
+    /// The identifier register, in whichever shape `mode` gives it.
     ///
     /// The older interface keeps it in the top eight bits; x2APIC uses the
     /// whole register.
-    pub(crate) fn id_register(&self) -> u32 {
-        match self.mode() {
+    ///
+    /// Only eight bits of it survive in the older face, and the mask is not
+    /// decoration: an identifier of `0x100` shifted into the top byte loses
+    /// every bit it has, so a guest would read the same zero from that
+    /// processor as from the one whose identifier really is zero. Masking
+    /// reports the identifier the older face can hold, which is the
+    /// aliasing real hardware performs — and is the same eight bits a
+    /// physical destination is matched against in this face, so what a
+    /// guest reads here is what it can address. [`crate::install`] says
+    /// once, on a machine with such a processor, that the aliasing is
+    /// happening.
+    pub(crate) fn id_register(&self, mode: Mode) -> u32 {
+        match mode {
             Mode::X2Apic => self.apic_id.get(),
-            _ => self.apic_id.get() << XAPIC_ID_SHIFT,
+            _ => self.xapic_id() << XAPIC_ID_SHIFT,
         }
+    }
+
+    /// The identifier the older face can hold, which is the low eight bits of
+    /// the real one.
+    ///
+    /// One statement of that narrowing, because two would be a guest reading an
+    /// identifier out of its register that a physical destination then does not
+    /// match: what [`Vlapic::id_register`] answers with in that face and what
+    /// [`crate::delivery`] compares a destination against have to be the same
+    /// eight bits.
+    pub(crate) const fn xapic_id(&self) -> u32 {
+        self.apic_id.get() & XAPIC_ID_MASK
     }
 
     /// The version register.
@@ -42,14 +76,14 @@ impl Vlapic {
         self.model.max_lvt() << MAX_LVT_SHIFT | VERSION_NUMBER
     }
 
-    /// Which logical destinations this controller answers to.
+    /// Which logical destinations this controller answers to, in `mode`.
     ///
     /// In x2APIC this is not stored at all: the architecture derives it from
     /// the identifier and makes it read-only, so it is computed here for the
     /// same reason hardware computes it, and a guest cannot get the two out of
     /// step.
-    pub(crate) fn logical_destination(&self) -> u32 {
-        match self.mode() {
+    pub(crate) fn logical_destination(&self, mode: Mode) -> u32 {
+        match mode {
             Mode::X2Apic => {
                 let id = self.apic_id.get();
                 ((id >> X2APIC_CLUSTER_SHIFT) << CLUSTER_SHIFT) | (1 << (id & X2APIC_LOGICAL_MASK))
@@ -82,6 +116,9 @@ impl Vlapic {
 
 /// Bits the older interface's identifier is shifted by.
 const XAPIC_ID_SHIFT: u32 = 24;
+
+/// The part of an identifier the older interface's field can hold.
+const XAPIC_ID_MASK: u32 = 0xFF;
 
 /// The version this controller reports: an integrated one, which is what every
 /// processor since the discrete controller reports.

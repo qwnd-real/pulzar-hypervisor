@@ -10,58 +10,43 @@
 use descriptors::Vector;
 use log::trace;
 
-use crate::{VlapicError, machine::current, registers::Vlapic};
+use crate::{
+    VlapicError,
+    machine::current,
+    priority::Priority,
+    registers::{Nomination, Vlapic},
+};
 
-/// The highest-priority interrupt this processor's guest should take now, left
-/// where it is.
+/// What this processor's controller has for its guest, left where it is.
 ///
-/// Answers `None` when nothing is requested, when what is requested does not
-/// outrank what the guest is already servicing, or when the controller is not
-/// in a state that delivers anything.
+/// Both answers at once, out of one look at the register file, because the
+/// caller needs both and they are two comparisons against the same state: the
+/// highest interrupt the guest should take now, and the highest one only the
+/// guest's own task priority may be holding back. Asking twice would let a
+/// vector be admitted by one question and refused by the other on state that
+/// moved in between, and would scan both bitmaps twice on a path every exit
+/// takes.
 ///
-/// Nothing is consumed. Whether the guest can actually be given this is not the
-/// controller's to know — the processor may already have an event part-way
-/// through delivery, or a non-maskable interrupt that goes first, or an
-/// interrupt window that is shut — so the caller decides, and reports back
-/// through [`committed`]. A controller that moved a vector out of the request
-/// register for an injection that then did not happen would have thrown the
-/// interrupt away, and for a level-triggered one would have stranded the real
-/// acknowledgement owed for it as well.
+/// Nothing is consumed. Whether the guest can actually be given the first of
+/// them is not the controller's to know — the processor may already have an
+/// event part-way through delivery, or a non-maskable interrupt that goes
+/// first, or an interrupt window that is shut — so the caller decides, and
+/// reports back through [`committed`]. A controller that moved a vector out of
+/// the request register for an injection that then did not happen would have
+/// thrown the interrupt away, and for a level-triggered one would have stranded
+/// the real acknowledgement owed for it as well.
 ///
 /// # Errors
 ///
 /// As [`crate::read_msr`].
-pub fn select() -> Result<Option<Vector>, VlapicError> {
-    current().map(Vlapic::select)
-}
-
-/// The highest-priority interrupt this processor's guest is owed, whatever its
-/// task priority currently says.
-///
-/// What an interrupt window has to be armed for, and it is deliberately not
-/// [`select`]. A guest changes its task priority through its control register
-/// without exiting — with interrupt masking virtualized the processor keeps the
-/// value in the control block — so a vector [`select`] refused on a priority
-/// read at the last exit would stay refused however far the guest lowered that
-/// priority afterwards, and nothing would ever ask again. Arming the window for
-/// this instead hands the comparison to the hardware that owns the register,
-/// and the guest lowering its priority is what produces the exit.
-///
-/// Everything else a controller filters on is applied: a controller that is
-/// switched off or software-disabled offers nothing, and neither does one whose
-/// only requests are outranked by what it already has in service.
-///
-/// # Errors
-///
-/// As [`crate::read_msr`].
-pub fn pending() -> Result<Option<Vector>, VlapicError> {
-    current().map(Vlapic::pending)
+pub fn nominate() -> Result<Nomination, VlapicError> {
+    current().map(Vlapic::nominate)
 }
 
 /// Records that the guest really has been given `vector`, moving it from
 /// requested to in service.
 ///
-/// The other half of [`select`], and the only thing that consumes a request.
+/// The other half of [`nominate`], and the only thing that consumes a request.
 /// Called once an injection is known to have happened.
 ///
 /// # Errors
@@ -128,24 +113,25 @@ pub fn observe_task_priority(class: u8) {
 /// The value the exit loop pushes into the control block's virtual task
 /// priority, so that a guest which wrote the emulated register through the
 /// page or a model-specific register finds its `CR8` answering the same
-/// number — the two are one register on real hardware and must stay one.
+/// number — the two are one register on real hardware and must stay one. Only
+/// the class of it goes in the control block, and [`Priority::class`] is where
+/// that narrowing is written.
 ///
 /// # Errors
 ///
 /// As [`crate::read_msr`].
-pub fn task_priority() -> Result<u8, VlapicError> {
-    current().map(|vlapic| vlapic.task_priority().get())
+pub fn task_priority() -> Result<Priority, VlapicError> {
+    current().map(Vlapic::task_priority)
 }
 
 /// Records whether this processor has stopped looking at its controller.
 ///
 /// The second half of the protocol that stops an interrupt being lost to a
 /// processor that was entering the guest as it arrived. A caller must store
-/// `true` and then consult [`select`] and [`pending`] once more before it
-/// actually enters, abandoning the entry if something appeared in between — and
-/// store
-/// `false` on the way out, because a processor answering an exit will consult
-/// its controller again on its own and needs nothing to remind it.
+/// `true` and then consult [`nominate`] once more before it actually enters,
+/// abandoning the entry if something appeared in between — and store `false` on
+/// the way out, because a processor answering an exit will consult its
+/// controller again on its own and needs nothing to remind it.
 ///
 /// # Errors
 ///

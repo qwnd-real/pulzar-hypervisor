@@ -357,13 +357,13 @@ impl<'a> Exits<'a> {
         // guest's interrupt window may be shut — and a controller that had
         // already consumed the request would have thrown the interrupt away.
         //
-        // The second answer is the wider one, and is what an interrupt window
-        // is armed for. A guest changes its task priority without exiting, so
-        // the vector that priority is holding back has to be armed as well as
-        // the one it admits — otherwise the guest lowering it is a change
-        // nothing on this machine hears about.
-        let candidate = vlapic::select().unwrap_or(None);
-        let blocked = vlapic::pending().unwrap_or(None);
+        // Both answers come out of one look at the controller, and the second is
+        // the wider one: what an interrupt window is armed for. A guest changes
+        // its task priority without exiting, so the vector that priority is
+        // holding back has to be armed as well as the one it admits — otherwise
+        // the guest lowering it is a change nothing on this machine hears about.
+        let nomination = vlapic::nominate().unwrap_or_default();
+        let (candidate, blocked) = (nomination.deliverable, nomination.blocked);
         let injected = self.interrupts.commit(vcpu, candidate, blocked);
         // Only when there was something to decide about. Every exit reaches
         // here, and a guest with nothing owed would otherwise describe that
@@ -436,7 +436,8 @@ impl<'a> Exits<'a> {
     fn wakeable(&self, vcpu: &Vcpu) -> bool {
         self.interrupts.owed()
             || !vlapic::running().unwrap_or(true)
-            || (inject::interrupts_unmasked(vcpu) && vlapic::select().unwrap_or(None).is_some())
+            || (inject::interrupts_unmasked(vcpu)
+                && vlapic::nominate().unwrap_or_default().deliverable.is_some())
     }
 
     /// Brings the control block's virtual task priority into agreement with the
@@ -458,12 +459,15 @@ impl<'a> Exits<'a> {
     /// register has just been reset and the copy has not.
     ///
     /// Only the class is held in the control block, which is the upper nibble
-    /// of the emulated byte.
+    /// of the emulated byte — and [`vlapic::Priority::class`] is where that
+    /// narrowing is written, because the processor compares this field against
+    /// the class the interrupt window is armed with and the two have to be the
+    /// same nibble of the same rule.
     fn mirror_task_priority(vcpu: &mut Vcpu) {
         let Ok(priority) = vlapic::task_priority() else {
             return;
         };
-        let class = priority >> TPR_CLASS_SHIFT;
+        let class = priority.class();
         if vcpu.control().interrupt_control.virtual_tpr() == class {
             return;
         }
@@ -499,11 +503,6 @@ pub enum ExitError {
     #[error(transparent)]
     Vlapic(#[from] VlapicError),
 }
-
-/// How far a task-priority byte is shifted to leave its interrupt-priority
-/// class, which is the half of it the control block's virtual task priority
-/// holds.
-const TPR_CLASS_SHIFT: u8 = 4;
 
 /// How long the halt instruction is, for a processor that does not report the
 /// address of the one after it.

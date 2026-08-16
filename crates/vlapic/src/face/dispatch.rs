@@ -54,14 +54,19 @@ use crate::{
 /// Every register that is not simply stored is computed here rather than kept
 /// up to date as things change, because the architecture defines most of them
 /// as functions of other state and a stored copy is a copy that can be wrong.
+///
+/// Two of them are shaped by the face the controller is in, and it is taken
+/// once for the whole read: which face a controller answers through is not a
+/// question a single access should be able to get two answers to.
 pub(crate) fn read(vlapic: &Vlapic, register: Register) -> u32 {
+    let mode = vlapic.mode();
     match register {
-        Register::ID => vlapic.id_register(),
+        Register::ID => vlapic.id_register(mode),
         Register::VERSION => vlapic.version(),
         Register::TASK_PRIORITY => u32::from(vlapic.task_priority().get()),
         Register::ARBITRATION_PRIORITY => u32::from(vlapic.arbitration_priority().get()),
         Register::PROCESSOR_PRIORITY => u32::from(vlapic.processor_priority().get()),
-        Register::LOGICAL_DESTINATION => vlapic.logical_destination(),
+        Register::LOGICAL_DESTINATION => vlapic.logical_destination(mode),
         Register::DESTINATION_FORMAT => vlapic.destination_format(),
         Register::SPURIOUS => vlapic.spurious(),
         Register::ERROR_STATUS => vlapic.errors().read(),

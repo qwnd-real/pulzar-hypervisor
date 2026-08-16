@@ -88,9 +88,21 @@ impl Vlapic {
     }
 
     /// Takes the outstanding non-maskable interrupt, if there is one.
+    ///
+    /// Sequentially consistent on both halves of the update, for the same
+    /// reason [`Startup::signalled`] is: the load half is the target's side
+    /// of the pairing with [`Vlapic::away`], and under the memory model an
+    /// acquire load takes no part in the total order that argument is made
+    /// in — it may be ordered before the sequentially consistent store of
+    /// `away` that precedes it, which is precisely the interleaving in
+    /// which both sides miss. On x86-64 it cannot be: the store of `away`
+    /// compiles to `xchg` and this compare-exchange to `lock cmpxchg`, both
+    /// full barriers. The ordering is stated in the model's terms anyway,
+    /// because the model is what the argument is written against, and it
+    /// costs nothing here.
     pub(crate) fn take_nmi(&self) -> bool {
         self.nmi
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 (count != 0).then(|| count - 1)
             })
             .is_ok()

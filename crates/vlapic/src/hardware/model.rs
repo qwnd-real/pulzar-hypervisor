@@ -40,6 +40,11 @@
 //! its delivery is fixed by the architecture. A guest that programs one on a
 //! machine reporting an AMD processor and reads back a fixed delivery has been
 //! told its write did not happen.
+//!
+//! What they do *not* disagree about, as far as anything here is concerned, is
+//! which processor a redirectable interrupt goes to. That was the chipset's
+//! choice rather than the processor's, neither vendor specifies it, and
+//! [`crate::delivery`] makes it without asking the model.
 
 use apic::LocalApic;
 use descriptors::Vector;
@@ -172,30 +177,6 @@ impl Model {
             Vendor::Intel => priority::intel_arbitration(task, in_service, requested),
         }
     }
-
-    /// How this model picks the target of a lowest-priority interrupt.
-    pub(crate) const fn arbitration(self) -> Arbitration {
-        match self.vendor {
-            Vendor::Amd => Arbitration::AmdArbitrationPriority,
-            Vendor::Intel => Arbitration::ProcessorPriority,
-        }
-    }
-}
-
-/// How the least busy of several named processors is picked.
-///
-/// The choice is the chipset's on real hardware and is not the same chipset
-/// everywhere, which is exactly why it belongs to the model rather than to the
-/// delivery path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Arbitration {
-    /// AMD compares arbitration priorities — which count what a processor has
-    /// merely been sent as well as what it is servicing — and gives a tie to
-    /// the highest identifier.
-    AmdArbitrationPriority,
-    /// Intel's chipsets compared processor priorities, which count only what is
-    /// in service, and left a tie to whichever processor answered first.
-    ProcessorPriority,
 }
 
 /// Whose architecture the guest's controller follows.
@@ -239,7 +220,7 @@ pub(crate) mod tests {
     //! runs on, which is not the guest's machine and is not necessarily either
     //! vendor.
 
-    use super::{Arbitration, Model, Vendor};
+    use super::{Model, Vendor};
     use crate::registers::lvt::Entry;
 
     /// A controller with every entry, on a processor implementing both optional
@@ -296,11 +277,5 @@ pub(crate) mod tests {
     fn the_optional_interfaces_follow_the_processor() {
         assert!(AMD.x2apic() && AMD.deadline());
         assert!(!SPARSE.x2apic() && !SPARSE.deadline());
-    }
-
-    #[test]
-    fn the_vendors_arbitrate_differently() {
-        assert_eq!(AMD.arbitration(), Arbitration::AmdArbitrationPriority);
-        assert_eq!(INTEL.arbitration(), Arbitration::ProcessorPriority);
     }
 }

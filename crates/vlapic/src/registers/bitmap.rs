@@ -11,14 +11,49 @@
 //!
 //! # Which orderings, and why
 //!
-//! Setting a bit releases and reading one acquires. That is not
-//! belt-and-braces: a processor delivering a level-triggered interrupt sets the
-//! trigger-mode bit *before* the request bit, and the processor that observes
-//! the request bit must not then read a trigger-mode bit from before it was
-//! set. Release on the store and acquire on the load is what makes the pair
-//! ordered; relaxed would let the second read be hoisted above the first and
-//! deliver a level-triggered interrupt as an edge-triggered one, which is a
-//! missing end-of-interrupt and a line that never fires again.
+//! [`Bitmap::set`] and [`Bitmap::highest`] are sequentially consistent, and the
+//! reason is not that a stronger ordering is safer. They are two of the four
+//! accesses that make up the handshake which stops a wakeup being lost, and
+//! that argument needs a single total order over all four:
+//!
+//! - A processor delivering an interrupt sets the request bit, then reads
+//!   whether the target has stopped watching its controller
+//!   ([`crate::registers::Vlapic::away`]).
+//! - The target stores that it has stopped watching, then scans the request
+//!   register one last time before entering the guest.
+//!
+//! Under the Rust and C++ memory model, sequentially consistent operations —
+//! and only those — take part in one total order `S` consistent with
+//! happens-before and with each object's modification order. With all four in
+//! it, the deliverer reading "not away" forces its read after the target's
+//! store in `S`; program order puts its own set before that read and the
+//! target's store before its scan; so the set precedes the scan in `S`, and two
+//! sequentially consistent accesses to the same word must agree with that
+//! word's modification order — the scan sees the bit. Either the deliverer
+//! sends a doorbell or the target finds the interrupt itself, and there is no
+//! interleaving in which both miss.
+//!
+//! A release read-modify-write and an acquire load do not give that. A release
+//! RMW's load half is relaxed and neither operation orders a store against a
+//! later load, so the both-miss interleaving is permitted by the model even
+//! though it cannot be produced on x86 — where `lock or` drains the store
+//! buffer and a sequentially consistent store compiles to `xchg`, so both sides
+//! are already full barriers. That is what makes this free here: on x86-64 a
+//! sequentially consistent load is a plain `mov` and the read-modify-write is
+//! the same `lock or` it was, so the argument is bought with no instructions
+//! at all. It is stated in terms of the model because the model is what a
+//! future reader — or a future target — is entitled to rely on.
+//!
+//! The trigger-mode register is written before the request bit by
+//! [`crate::registers::Vlapic::accept`], and nothing in this crate reads a
+//! trigger-mode bit back: the level-or-edge decision this hypervisor acts on
+//! comes from the *real* controller's own record, and the virtual register is
+//! there for the guest's own readback of a whole word. So that pair is not an
+//! ordering anything depends on today. It is kept in that order because it is
+//! the order hardware writes them in, and because anything that ever did make
+//! the virtual register the oracle would depend on it — at which point the
+//! release on the trigger-mode store and the acquire on its load become
+//! load-bearing rather than merely true.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -61,9 +96,12 @@ impl Bitmap {
     /// and not yet accepted is one the architecture folds into the single bit,
     /// so a second arrival is not a second interrupt and nothing should be
     /// counted twice for it.
+    ///
+    /// Sequentially consistent because this is the store half of the handshake
+    /// the module doc states, not merely a bit being published.
     pub(crate) fn set(&self, vector: Vector) -> bool {
         let (slot, bit) = place(vector);
-        self.slots[slot].fetch_or(bit, Ordering::Release) & bit != 0
+        self.slots[slot].fetch_or(bit, Ordering::SeqCst) & bit != 0
     }
 
     /// Clears a vector's bit, and says whether it had been set.
@@ -83,9 +121,24 @@ impl Bitmap {
     /// Highest-numbered is highest-priority: the upper nibble of a vector is
     /// its priority class and the lower nibble ranks within the class, so one
     /// descending scan answers both.
+    ///
+    /// Sequentially consistent because this is the load half of the handshake
+    /// the module doc states: every scan of a request register goes through
+    /// here, including the last one a processor makes before it enters the
+    /// guest.
+    ///
+    /// # A snapshot, not an instant
+    ///
+    /// The scan spans eight independent words and no single atomic operation
+    /// covers them, so what comes back was not necessarily the highest set
+    /// vector at any one moment: a bit set in a word this has already passed is
+    /// missed. That is not a lost interrupt — the bit stays set, and the
+    /// processor that set it either finds this one still watching and rings its
+    /// doorbell or is the reason it looks again — but it does mean this is not
+    /// a linearisation point and nothing may treat it as one.
     pub(crate) fn highest(&self) -> Option<Vector> {
         (0..SLOTS).rev().find_map(|slot| {
-            let word = self.slots[slot].load(Ordering::Acquire);
+            let word = self.slots[slot].load(Ordering::SeqCst);
             // The highest set bit of a non-zero word, and nothing at all for an
             // empty one — which is the whole of what makes this total. An
             // arithmetic "thirty-one less the leading zeros" answers `-1` for an
@@ -97,13 +150,11 @@ impl Bitmap {
     /// Takes the highest-priority vector with its bit set, clearing it.
     ///
     /// A scan followed by a separate clear, retried until the clear is the one
-    /// that took the bit. The two are not one read-modify-write and cannot be:
-    /// finding the highest set bit spans eight independent words, and no single
-    /// atomic operation covers them. What the retry establishes is only that
-    /// the vector answered was really taken by this call and not by a
-    /// concurrent one; it does not establish that the vector answered was
-    /// the highest at any single instant, because a higher bit set during
-    /// the scan may be missed.
+    /// that took the bit. The two are not one read-modify-write and cannot be,
+    /// for the reason [`Bitmap::highest`] gives. What the retry establishes is
+    /// only that the vector answered was really taken by this call and not by a
+    /// concurrent one; it does not establish that the vector answered was the
+    /// highest at any single instant.
     ///
     /// That weaker guarantee is enough for the one caller this has, and it
     /// rests on a precondition: exactly one thing consumes from a given
@@ -127,6 +178,12 @@ impl Bitmap {
     }
 
     /// Whether no vector's bit is set.
+    ///
+    /// Eight loads and not one operation, so this can answer `true` for a
+    /// bitmap that was never empty — a bit set in a word already passed, in
+    /// a word not yet reached — exactly as [`Bitmap::highest`] can miss
+    /// one. Its callers ask it of a bitmap only they write, or of one where
+    /// a wrong answer costs a misleading line of diagnostics.
     pub(crate) fn is_empty(&self) -> bool {
         self.slots
             .iter()
@@ -134,6 +191,10 @@ impl Bitmap {
     }
 
     /// How many bits are set, which is how many interrupts this describes.
+    ///
+    /// A snapshot in the same sense [`Bitmap::is_empty`] is: the count can
+    /// include a bit that was cleared before the scan ended and miss one that
+    /// was set. Diagnostic only, and that is why.
     pub(crate) fn count(&self) -> u32 {
         self.slots
             .iter()

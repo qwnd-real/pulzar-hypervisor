@@ -37,25 +37,25 @@ impl Vlapic {
     /// is all the control register carries. Every write clears the subclass,
     /// including a write of the class already present, so the exit path stores
     /// the hardware-maintained value unconditionally.
+    ///
+    /// `class` is those four bits, and turning them back into a priority is
+    /// [`Priority::of_class`]'s so that the workspace has one statement of
+    /// where a class sits in the byte — the same one the crates that write
+    /// `V_INTR_PRIO` and `V_TPR` use.
     pub(crate) fn observe_task_priority(&self, class: u8) {
         self.task_priority
-            .store(u32::from(class) << PRIORITY_CLASS_SHIFT, Ordering::Release);
+            .store(Priority::of_class(class).get().into(), Ordering::Release);
     }
 
     /// The priority this controller is actually servicing at.
+    ///
+    /// Both halves of it: what the guest has asked for through its task
+    /// priority and what it is already handling. The delivery path does not
+    /// go through this — it takes one look at the register file and
+    /// computes both halves from it — so what is left here is the guest's
+    /// own read of the register.
     pub(crate) fn processor_priority(&self) -> Priority {
         priority::processor_priority(self.task_priority(), self.in_service.highest())
-    }
-
-    /// The priority the interrupts this controller has already accepted impose,
-    /// with the guest's task priority left out of it.
-    ///
-    /// Half of [`Vlapic::processor_priority`], and the half this hypervisor can
-    /// see change. The other half moves without any exit at all — the guest's
-    /// control register writes land in the control block — which is why the two
-    /// are separable at all and why [`Vlapic::pending`] needs this one alone.
-    pub(super) fn servicing(&self) -> Priority {
-        priority::processor_priority(Priority::NONE, self.in_service.highest())
     }
 
     /// The arbitration priority, which exists only in the older face.
@@ -70,9 +70,6 @@ impl Vlapic {
         )
     }
 }
-
-/// Bits a priority class is shifted by within the byte that holds it.
-const PRIORITY_CLASS_SHIFT: u32 = 4;
 
 /// The task priority register's reserved bits are everything above the low
 /// byte.

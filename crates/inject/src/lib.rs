@@ -7,6 +7,14 @@
 //! architecture's priority rules, the second is what AMD's virtualization
 //! extension will accept in a control block.
 //!
+//! One thing crosses that line, and it has to. The interrupt window armed below
+//! carries an interrupt-priority class, and the processor compares it against
+//! the class of the guest's own task priority — so half of the controller's
+//! deliverability rule is evaluated by hardware against a field written here.
+//! [`Priority`] is where that class is computed, in the crate that owns the
+//! rule, rather than being a second shift of a byte that would have to be kept
+//! in step with it.
+//!
 //! # Two mechanisms, and why both
 //!
 //! The extension offers two ways to give a guest an interrupt, and a hypervisor
@@ -79,6 +87,7 @@ use log::{trace, warn};
 use processor::SvmFeatures;
 use svm::{CleanBits, Event, EventKind, intercept::Intercepts1};
 use vcpu::Vcpu;
+use vlapic::Priority;
 
 /// What a guest is owed and what has been done about it, for one processor.
 ///
@@ -397,7 +406,7 @@ impl Pending {
     /// take the waiting vector through, and that is an exit which arms
     /// itself again.
     ///
-    /// # What is armed is read back rather than remembered
+    /// # What is armed is read back, and rewritten whenever anything waits
     ///
     /// The pending bit is not this function's to own. The processor clears it
     /// as it delivers the virtual interrupt, and on a machine where this
@@ -410,24 +419,36 @@ impl Pending {
     /// woken — the interrupt is in software, delivering it needs an exit,
     /// and the only thing that would have produced one was that interrupt.
     ///
-    /// Reading the block instead makes the arming idempotent: whatever cleared
-    /// the bit, the next entry sees it clear and arms again.
+    /// The same argument decides what the read-back may be *used* for, and it
+    /// is not "nothing needs writing". Only the withdrawal is skipped on
+    /// it: with nothing waiting and nothing armed there is no field to
+    /// clear and no intercept to remove. Whenever something is waiting the
+    /// fields are written afresh, because what is in them is not this
+    /// function's record of what it armed — it is whatever the processor,
+    /// or a hypervisor underneath, last left there, and taking a pending
+    /// bit somebody else set as proof that the vector, its priority and the
+    /// intercept beside it are the ones this entry decided on is trusting a
+    /// field this crate does not own. It is also what turned a disagreement
+    /// between the two halves of the delivery rule into an unbounded exit
+    /// loop rather than a bounded one: the window exit fired, the interrupt
+    /// was refused, and the entry that followed changed nothing at all.
     fn arm_window(&mut self, vcpu: &mut Vcpu, waiting: Option<Vector>) {
         let iret =
             self.blocking == Blocking::Iret && self.nmi_blocked && self.awaiting_iret.is_none();
         let armed = armed_for(vcpu);
-        if armed == waiting && !iret {
+        if waiting.is_none() && armed.is_none() && !iret {
             return;
         }
         // The window itself only changed if the answer differs from what the
         // block already says; the `iret` case re-asserts the return intercept
-        // without changing it, so only a real change is worth a line.
+        // without changing it, and a rewrite of what is already there is not
+        // worth a line either.
         let changed = armed != waiting;
         if changed {
             match waiting {
                 Some(vector) => trace!(
                     "inject: arming the interrupt window for {vector} at priority {:#x}",
-                    priority_class(vector)
+                    Priority::of(vector).class()
                 ),
                 None => trace!("inject: withdrawing the interrupt window"),
             }
@@ -438,7 +459,7 @@ impl Pending {
                 .interrupt_control
                 .with_virtual_irq_pending(true)
                 .with_virtual_vector(vector.number())
-                .with_virtual_priority(priority_class(vector)),
+                .with_virtual_priority(Priority::of(vector).class()),
             None => control
                 .interrupt_control
                 .with_virtual_irq_pending(false)
@@ -694,14 +715,6 @@ impl Blocking {
         }
     }
 }
-
-/// A vector's interrupt-priority class, which is the upper nibble.
-const fn priority_class(vector: Vector) -> u8 {
-    vector.number() >> PRIORITY_SHIFT
-}
-
-/// How far a vector is shifted to leave its priority class.
-const PRIORITY_SHIFT: u8 = 4;
 
 /// The bit of the guest's flags that says it is willing to take a maskable
 /// interrupt.

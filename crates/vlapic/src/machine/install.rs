@@ -116,6 +116,20 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
         page.all().len(),
         page.all().first().map_or(0, Vlapic::version)
     );
+    // Said once, on the machine where it matters. The older face's identifier
+    // field is eight bits, so on a machine with a processor whose identifier
+    // needs more than that, a guest in that face reads two processors' registers
+    // answering with the same number and can address only one of them — and the
+    // one it reaches is whichever the roster happens to name first. Nothing here
+    // can widen a field the architecture defines, and the guest is entitled to
+    // use the face; what it is not entitled to is silence about it.
+    if roster.needs_x2apic() {
+        warn!(
+            "vlapic: this machine has a processor whose identifier does not fit the older \
+             interface's destination field, so a guest that uses that interface will find \
+             identifiers aliased to their low eight bits"
+        );
+    }
 
     // Last, because it programs real hardware from what it seeds and so needs
     // everything that reaches hardware to be in place — and because a controller

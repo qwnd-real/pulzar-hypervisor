@@ -66,6 +66,29 @@ impl Vlapic {
     /// owed has to be accounted for, because what the guest would have
     /// discharged it through is exactly what the reset deletes.
     ///
+    /// # What another processor sees part-way through
+    ///
+    /// Every store below is this processor's, and a processor delivering into
+    /// this controller reads them without any lock. The one that matters is the
+    /// base register, because the face it names decides how a remote processor
+    /// reads everything else — so the interval between publishing it and
+    /// clearing the logical destination beside it is an interval in which
+    /// the two do not describe the same controller.
+    ///
+    /// It is harmless in the order below, and the order is the reason. A remote
+    /// decision takes one snapshot of this register and reads the logical
+    /// destination in the face that snapshot names, so a reader that saw the
+    /// new face computes the identifier x2APIC derives and never looks at
+    /// the stored word being cleared, while one that saw the old face reads
+    /// the stored word — either firmware's or a zero, both of which are
+    /// values the older face legitimately holds. Clearing first would only
+    /// move that interval, not close it: what closes it is the snapshot,
+    /// which is [`crate::delivery`]'s. A logically addressed interrupt sent
+    /// to a controller in the middle of the transition can still be
+    /// dropped, and that is the architecture's window rather than this
+    /// one's — the register it was matched against is being replaced by one
+    /// the guest has not written yet.
+    ///
     /// # Errors
     ///
     /// Whatever the transition refused: a reserved bit, or a state that cannot

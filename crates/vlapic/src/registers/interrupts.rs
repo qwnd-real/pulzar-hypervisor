@@ -9,11 +9,11 @@
 use core::sync::atomic::Ordering;
 
 use descriptors::Vector;
-use log::trace;
+use log::{Level, log_enabled, trace};
 
 use crate::{
     lifecycle::ledger::InService,
-    priority,
+    priority::{self, Priority},
     registers::{Vlapic, error::Errors, icr::Trigger},
 };
 
@@ -91,8 +91,7 @@ impl Vlapic {
         Accepted::Resetting
     }
 
-    /// The highest-priority interrupt the guest should take now, left where it
-    /// is.
+    /// What this controller has for its guest, left where it is.
     ///
     /// Deliberately does not consume anything. Whether the guest can actually
     /// be given an interrupt is not this controller's to know — the
@@ -103,89 +102,74 @@ impl Vlapic {
     /// it. So this only nominates, and [`Vlapic::committed`] is what
     /// accounts for one that went in.
     ///
-    /// Answers `None` when nothing is requested, or when what is requested does
-    /// not outrank what the guest is already servicing — in which case the
-    /// request stays pending, which is what makes a task priority a filter
-    /// rather than a discard.
-    pub(crate) fn select(&self) -> Option<Vector> {
-        let selected = self.select_inner();
-        self.report_selection(selected);
-        selected
+    /// Both answers come out of one [`Look`] at the register file, and that is
+    /// not only a saving. They are two comparisons against the same requested
+    /// vector, the same in-service bank and the same task priority, so reading
+    /// the file twice would let a vector be admitted by one and refused by the
+    /// other on state that moved in between — and the caller puts the two in
+    /// the control block together.
+    pub(crate) fn nominate(&self) -> Nomination {
+        let look = self.look();
+        let nomination = look.nomination();
+        self.report(&look, nomination);
+        nomination
     }
 
-    /// The highest-priority interrupt nothing but the guest's task priority may
-    /// be holding back.
+    /// Everything a nomination is decided from, read once.
     ///
-    /// A superset of [`Vlapic::select`], and the difference between them is the
-    /// one comparison this hypervisor must not be the one to make. A guest
-    /// changes its task priority through its control register without exiting —
-    /// the processor keeps the value in the control block — so a vector this
-    /// crate ruled out on a task priority it read at the last exit would stay
-    /// ruled out however far the guest lowered that priority afterwards, and
-    /// nothing would ever ask again.
-    ///
-    /// So the two halves of the processor priority are split. What is already
-    /// in service is applied here, because it moves only when the guest
-    /// acknowledges an interrupt and that always exits. The task priority is
-    /// left to the hardware that owns it: this is what an interrupt window is
-    /// armed for, and the processor raises one exactly when the guest's own
-    /// priority admits the vector.
-    ///
-    /// Applying the in-service half here rather than leaving both to hardware
-    /// is what keeps that arrangement from spinning. The control block
-    /// carries only the task priority, so a vector armed while an interrupt
-    /// of its own class or higher is still in service would have the
-    /// processor report a window the guest cannot actually take anything
-    /// through, and every exit would arm it again.
-    pub(crate) fn pending(&self) -> Option<Vector> {
-        if !self.accepting() {
-            return None;
+    /// One scan of each bitmap and one load of each register. Every scan spans
+    /// eight independent words and no single atomic operation covers them, so
+    /// this is a snapshot rather than a linearisation point — see
+    /// [`crate::registers::bitmap::Bitmap::highest`] for what that does and
+    /// does not promise.
+    fn look(&self) -> Look {
+        Look {
+            accepting: self.accepting(),
+            requested: self.request.highest(),
+            in_service: self.in_service.highest(),
+            task: self.task_priority(),
         }
-        let vector = self.request.highest()?;
-        priority::deliverable(vector, self.servicing()).then_some(vector)
-    }
-
-    /// [`Vlapic::select`] proper, with nothing said about what it decided.
-    fn select_inner(&self) -> Option<Vector> {
-        if !self.accepting() {
-            return None;
-        }
-        let vector = self.request.highest()?;
-        priority::deliverable(vector, self.processor_priority()).then_some(vector)
     }
 
     /// Says why this controller is nominating what it is, the first time it
     /// reaches any given answer.
     ///
     /// A controller that has stopped delivering says so once and then goes
-    /// quiet, so this costs nothing on the path it sits on: what makes an
-    /// interrupt undeliverable is state that has to change before it becomes
-    /// deliverable again, and the change is what gets reported. The three ways
-    /// a nomination comes to nothing are indistinguishable to the caller, and
-    /// they are three different faults — a controller its guest switched off,
-    /// a controller with nothing to give, and a controller holding something
-    /// back behind a priority that never falls.
-    fn report_selection(&self, selected: Option<Vector>) {
-        let accepting = self.accepting();
-        let requested = self.request.highest();
-        let in_service = self.in_service.highest();
-        let task = self.task_priority();
-        let processor = self.processor_priority();
+    /// quiet: what makes an interrupt undeliverable is state that has to change
+    /// before it becomes deliverable again, and the change is what gets
+    /// reported. The three ways a nomination comes to nothing are
+    /// indistinguishable to the caller, and they are three different faults — a
+    /// controller its guest switched off, a controller with nothing to give,
+    /// and a controller holding something back behind a priority that never
+    /// falls.
+    ///
+    /// Nothing here runs unless the level it logs at is enabled, and the
+    /// comparison that suppresses a repeat is inside that guard rather than
+    /// outside it. It is a read-modify-write on a line every processor
+    /// delivering into this controller loads, and this is called on every entry
+    /// — so at a level that discards the line it would be a cache line stolen
+    /// from every interrupt sender on the machine to produce nothing.
+    fn report(&self, look: &Look, nomination: Nomination) {
+        if !log_enabled!(Level::Trace) {
+            return;
+        }
         // Everything the report below names, packed into one word so that
         // "has this changed" is a single comparison rather than a lock. Each of
         // the three vectors gets nine bits, because "nothing" has to be as
         // distinguishable as any vector is and there are two hundred and
         // fifty-six of those.
-        let bits = u64::from(accepting)
-            | u64::from(number(requested)) << 1
-            | u64::from(number(in_service)) << 10
-            | u64::from(number(selected)) << 19
-            | u64::from(task.get()) << 32
+        let processor = look.processor_priority();
+        let bits = u64::from(look.accepting)
+            | u64::from(number(look.requested)) << 1
+            | u64::from(number(look.in_service)) << 10
+            | u64::from(number(nomination.deliverable)) << 19
+            | u64::from(look.task.get()) << 32
             | u64::from(processor.get()) << 40;
         if self.reported.swap(bits, Ordering::Relaxed) == bits {
             return;
         }
-        match (accepting, requested, selected) {
+        let (task, in_service) = (look.task.get(), look.in_service);
+        match (look.accepting, look.requested, nomination.deliverable) {
             (false, _, _) => trace!(
                 "vlapic: {} is not accepting interrupts: mode {:?}, software {}",
                 self.index(),
@@ -197,16 +181,15 @@ impl Vlapic {
                 }
             ),
             (true, None, _) => trace!(
-                "vlapic: {} has nothing requested; in service {in_service:?}, task priority {:#x}",
-                self.index(),
-                task.get()
+                "vlapic: {} has nothing requested; in service {in_service:?}, task priority \
+                 {task:#x}",
+                self.index()
             ),
             (true, Some(vector), None) => trace!(
-                "vlapic: {} is holding {vector} back: processor priority {:#x} from task {:#x} \
-                 and in service {in_service:?}",
+                "vlapic: {} is holding {vector} back: processor priority {:#x} from task \
+                 {task:#x} and in service {in_service:?}",
                 self.index(),
-                processor.get(),
-                task.get()
+                processor.get()
             ),
             (true, Some(_), Some(vector)) => trace!(
                 "vlapic: {} nominates {vector}, processor priority {:#x}, in service \
@@ -283,6 +266,73 @@ impl Vlapic {
     /// How many the guest has taken and not yet acknowledged.
     pub(crate) fn in_service_count(&self) -> u32 {
         self.in_service.count()
+    }
+}
+
+/// What a controller has for its guest, decided from one look at its register
+/// file.
+///
+/// Two answers to two different questions, and the difference between them is
+/// the one comparison this hypervisor must not be the one to make.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Nomination {
+    /// The highest-priority interrupt the guest should take now, or `None` when
+    /// nothing is requested, when what is requested does not outrank what the
+    /// guest is already servicing, or when the guest's own task priority holds
+    /// it back. The request stays pending either way, which is what makes a
+    /// priority a filter rather than a discard.
+    pub deliverable: Option<Vector>,
+    /// The highest-priority interrupt nothing *but* the guest's own task
+    /// priority may be holding back, which is what an interrupt window is armed
+    /// for.
+    ///
+    /// A superset of [`Nomination::deliverable`], and deliberately so. A guest
+    /// changes its task priority through its control register without exiting —
+    /// the processor keeps the value in the control block — so a vector this
+    /// crate ruled out on a priority it read at the last exit would stay ruled
+    /// out however far the guest lowered that priority afterwards, and nothing
+    /// would ever ask again. Arming the window for this hands the comparison to
+    /// the hardware that owns the register, and the guest lowering its priority
+    /// is what produces the exit.
+    ///
+    /// What is already in service is applied here rather than left to hardware
+    /// too, and that is what keeps the arrangement from spinning: the control
+    /// block carries only the task priority, so a vector armed while an
+    /// interrupt of its own class or higher is still in service would have the
+    /// processor report a window the guest cannot take anything through, and
+    /// every exit would arm it again.
+    pub blocked: Option<Vector>,
+}
+
+/// Everything one [`Nomination`] is decided from, read once.
+struct Look {
+    accepting: bool,
+    requested: Option<Vector>,
+    in_service: Option<Vector>,
+    task: Priority,
+}
+
+impl Look {
+    /// What this look nominates.
+    fn nomination(&self) -> Nomination {
+        let Some(vector) = self.requested.filter(|_| self.accepting) else {
+            return Nomination::default();
+        };
+        Nomination {
+            deliverable: priority::deliverable(vector, self.processor_priority()).then_some(vector),
+            blocked: priority::deliverable(vector, self.servicing()).then_some(vector),
+        }
+    }
+
+    /// The priority the guest is running at, both halves of it.
+    fn processor_priority(&self) -> Priority {
+        priority::processor_priority(self.task, self.in_service)
+    }
+
+    /// The half of that priority the interrupts this controller has already
+    /// accepted impose, with the guest's task priority left out of it.
+    fn servicing(&self) -> Priority {
+        priority::processor_priority(Priority::NONE, self.in_service)
     }
 }
 

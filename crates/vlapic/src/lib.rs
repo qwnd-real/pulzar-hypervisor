@@ -51,7 +51,11 @@
 //! - `hardware` — the surface where the guest's registers become physical ones.
 //!
 //! `priority` is on its own because it is the one rule everything else
-//! compares against, and it holds no state at all.
+//! compares against, and it holds no state at all. It is also the one thing
+//! here that is not only this crate's: the deliverability rule is evaluated in
+//! halves, one of them by the processor against fields another crate writes
+//! into a control block, so [`Priority`] is public and is the workspace's
+//! single statement of what an interrupt-priority class is.
 
 #![no_std]
 
@@ -79,13 +83,14 @@ pub use crate::{
     machine::{
         diagnostics::describe,
         exits::{
-            committed, observe_task_priority, pending, raise_nmi, select, set_away, take_nmi,
+            committed, nominate, observe_task_priority, raise_nmi, set_away, take_nmi,
             task_priority,
         },
         install::install,
         ownership::{Joining, bring_up_finished, claim_processor},
     },
-    registers::StartupPage,
+    priority::Priority,
+    registers::{Nomination, StartupPage},
 };
 
 /// Why the emulated controllers could not be set up or driven.
