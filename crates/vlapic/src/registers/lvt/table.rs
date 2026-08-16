@@ -9,7 +9,7 @@
 use core::sync::atomic::Ordering;
 
 use crate::{
-    hardware::sources,
+    hardware::sources::{self, Refusal},
     registers::{
         Vlapic,
         lvt::{Delivery, Entry, Lvt, MASKED, TimerMode},
@@ -85,18 +85,36 @@ impl Vlapic {
             kept |= MASKED;
         }
         let was = self.lvt[entry.index()].swap(kept, Ordering::AcqRel);
-        if entry == Entry::Timer {
-            let old_mode = timer_mode(was);
-            let new_mode = timer_mode(kept);
-            if old_mode != new_mode {
-                self.set_timer_periodic_running(false);
-            }
-            if waits_for_a_deadline(was) != waits_for_a_deadline(kept) {
-                self.timer_initial.store(0, Ordering::Release);
-                self.clear_timer_clamp();
-            }
+        if entry == Entry::Timer && waits_for_a_deadline(was) != waits_for_a_deadline(kept) {
+            self.timer_initial.store(0, Ordering::Release);
         }
         Lvt::from_bits(kept)
+    }
+
+    /// Whether a write of `value` would stop this entry's source delivering.
+    ///
+    /// Asked before the write, because the answer decides an ordering rather
+    /// than a value: real hardware has to stop delivering before the register
+    /// file says it has, and only this direction needs it. Masking an entry
+    /// that is already masked changes nothing, and unmasking needs no
+    /// ordering at all — a masked source cannot fire, so hardware may catch
+    /// up afterwards.
+    pub(crate) fn masks(&self, entry: Entry, value: u32) -> bool {
+        masking(self.lvt(entry), Lvt::from_bits(value))
+    }
+
+    /// Whether a refusal of an entry's configuration is one this controller has
+    /// not reported yet, and records that it now has.
+    ///
+    /// One bit per entry per kind of refusal, because a guest can rewrite a
+    /// refused entry as fast as it can take an exit and every reprogram derives
+    /// the refusal again — so the alternative is a line of serial output, with
+    /// a machine-wide lock held and interrupts off, per unrelated register
+    /// write. Per kind as well as per entry so that a vector refused in an
+    /// entry cannot silence a delivery mode refused in the same one.
+    pub(crate) fn report_refusal_once(&self, entry: Entry, refusal: Refusal) -> bool {
+        let bit = 1 << (entry.index() * Refusal::COUNT + refusal.kind());
+        self.refusals_reported.fetch_or(bit, Ordering::AcqRel) & bit == 0
     }
 
     /// Whether an entry, as it stands, would actually deliver a vector.
@@ -116,6 +134,23 @@ impl Vlapic {
     }
 }
 
+/// Whether going from one value of an entry to another stops a source that was
+/// delivering.
+///
+/// Written out because it is the whole of the ordering rule above and the only
+/// part of it that can be checked without a controller.
+const fn masking(stored: Lvt, wanted: Lvt) -> bool {
+    !stored.masked() && wanted.masked()
+}
+
+/// The refusal latch is one word, so every kind of refusal of every entry has
+/// to have a bit of its own in it — an entry whose bit fell outside would
+/// silence another entry's report instead of its own.
+const _: () = assert!(
+    Entry::COUNT * Refusal::COUNT <= u32::BITS as usize,
+    "every entry needs a bit per kind of refusal"
+);
+
 /// Whether a timer entry selects the mode that counts nothing, and so the mode
 /// the count registers mean nothing in.
 fn waits_for_a_deadline(entry: u32) -> bool {
@@ -125,4 +160,40 @@ fn waits_for_a_deadline(entry: u32) -> bool {
 /// The timer mode encoded in a raw local-vector-table entry.
 fn timer_mode(entry: u32) -> Option<TimerMode> {
     TimerMode::from_bits(Lvt::from_bits(entry).timer_mode())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one decision here that needs no controller is which writes have to
+    //! reach hardware before they reach the register file, and it is the one a
+    //! mistake in lets an interrupt be accepted on a source the guest has
+    //! already masked.
+
+    use descriptors::Vector;
+
+    use super::masking;
+    use crate::registers::lvt::Lvt;
+
+    #[test]
+    fn only_a_write_that_stops_a_delivering_source_is_ordered_against_hardware() {
+        let armed = Lvt::new().with_vector(Vector::new(0x30));
+        let masked = armed.with_masked(true);
+        assert!(masking(armed, masked), "the one that has to go first");
+        assert!(!masking(masked, masked), "already masked, nothing stops");
+        assert!(!masking(masked, armed), "arming needs no ordering");
+        assert!(!masking(armed, armed), "nothing about masking changed");
+    }
+
+    #[test]
+    fn what_else_the_write_changes_takes_no_part() {
+        // The vector, the delivery mode and the wiring bits all move with a mask
+        // bit that does not, and none of them is a source that stops delivering.
+        let armed = Lvt::new().with_vector(Vector::new(0x30));
+        let elsewhere = Lvt::new()
+            .with_vector(Vector::new(0x40))
+            .with_delivery(0b100)
+            .with_level_triggered(true);
+        assert!(!masking(armed, elsewhere));
+        assert!(masking(armed, elsewhere.with_masked(true)));
+    }
 }

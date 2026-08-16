@@ -1,12 +1,17 @@
 //! What the controller remembers about its timer.
 //!
-//! The registers only: the divide, the initial count, and what this hypervisor
-//! has to keep beside them — the measured rate of the real timer, and the
-//! physical count standing in for a period too short to put on hardware. What
-//! any of it does to the real timer is [`crate::hardware::timer`]'s, and the
-//! division of labour is the architecture's own: writing the configuration and
-//! starting a count are different operations, so storing a value here starts
-//! nothing.
+//! The registers only: the divide, the initial count, and the one thing this
+//! hypervisor has to keep beside them, which is the measured rate of the real
+//! timer — nothing reports it, and the shortest period a periodic timer may run
+//! at is a duration rather than a count. What any of it does to the real timer
+//! is [`crate::hardware::timer`]'s, and the division of labour is the
+//! architecture's own: writing the configuration and starting a count are
+//! different operations, so storing a value here starts nothing.
+//!
+//! What is deliberately *not* kept is anything about what the real timer is
+//! doing. The count it reloads from and the count it has left are readable
+//! registers, and reading them is exact where remembering them is a copy that
+//! goes stale the first time hardware moves underneath it.
 
 use core::sync::atomic::Ordering;
 
@@ -58,37 +63,16 @@ impl Vlapic {
         self.timer_frequency.store(frequency, Ordering::Release);
     }
 
-    /// The physical initial count used to lengthen a pathological period.
-    pub(crate) fn timer_clamp(&self) -> u32 {
-        self.timer_clamp.load(Ordering::Acquire)
-    }
-
-    /// Records the physical initial count backing the guest's periodic timer.
-    pub(crate) fn set_timer_clamp(&self, count: u32) {
-        self.timer_clamp.store(count, Ordering::Release);
-    }
-
-    /// Stops scaling current-count reads for a physically lengthened period.
-    pub(crate) fn clear_timer_clamp(&self) {
-        self.set_timer_clamp(0);
-    }
-
-    /// Whether this controller has already reported period clamping.
+    /// Whether this controller has already said that its guest's periodic timer
+    /// is being given a longer period than it asked for.
+    ///
+    /// Latched rather than counted: the guest can rewrite the count as fast as
+    /// it can take an exit, and what an operator needs is the fact rather than
+    /// one line per write.
     pub(crate) fn report_timer_clamp_once(&self) -> bool {
         self.timer_clamp_reported
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-    }
-
-    /// Whether a nonzero periodic count was successfully loaded on hardware.
-    pub(crate) fn timer_periodic_running(&self) -> bool {
-        self.timer_periodic_running.load(Ordering::Acquire)
-    }
-
-    /// Records whether the physical timer is running periodically.
-    pub(crate) fn set_timer_periodic_running(&self, running: bool) {
-        self.timer_periodic_running
-            .store(running, Ordering::Release);
     }
 
     /// Which mode the timer's entry selects, or `None` for the encoding the

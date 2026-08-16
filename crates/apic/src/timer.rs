@@ -390,6 +390,19 @@ impl Timer {
         self.0.access().read(Register::TIMER_CURRENT_COUNT)
     }
 
+    /// What the timer was last started from, and what a periodic one reloads at
+    /// every zero crossing.
+    ///
+    /// The register that decides how short a periodic period actually is, which
+    /// is why it is readable here rather than remembered by whoever wrote it: a
+    /// count written while the entry was masked, or in another mode, is still
+    /// the count hardware will reload when the entry is unmasked in periodic
+    /// mode, and no software copy of it can be relied on to say so.
+    #[must_use]
+    pub fn initial(self) -> u32 {
+        self.0.access().read(Register::TIMER_INITIAL_COUNT)
+    }
+
     /// Measures how fast the timer counts at `divisor`.
     ///
     /// A one-shot from the top of the count is started, the timebase is used to

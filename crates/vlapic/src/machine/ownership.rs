@@ -10,9 +10,11 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use log::warn;
+
 use crate::{
     VlapicError,
-    hardware::timer,
+    hardware::{sources, timer},
     machine::of,
     registers::{Phase, Vlapic},
 };
@@ -31,13 +33,34 @@ use crate::{
 /// The order inside is the same argument one level down. Where the guest thinks
 /// this processor stands is published before ownership, so that a startup
 /// message arriving the instant ownership is taken finds a controller that
-/// already knows it is waiting for one. Calibrating the timer comes last
-/// because it is the only slow step — it measures a real frequency over
-/// milliseconds — and doing it while the processor was still forwardable is
-/// what left a window wide enough for a guest to reset a host processor in. It
-/// is safe there because the guest has not started this processor, so its
-/// emulated timer is still at reset and there is no appointment for calibration
-/// to destroy.
+/// already knows it is waiting for one. The real sources follow, because they
+/// are five register writes and the window they close is open from here.
+/// Calibrating the timer comes last because it is the only slow step — it
+/// measures a real frequency over milliseconds — and doing it while the
+/// processor was still forwardable is what left a window wide enough for a
+/// guest to reset a host processor in. It is safe there because the guest has
+/// not started this processor, so its emulated timer is still at reset and
+/// there is no appointment for calibration to destroy.
+///
+/// # Why the real sources are programmed here
+///
+/// Because they are the guest's, and until this runs they are firmware's. Every
+/// processor brings its own controller up from the machine's ACPI tables, which
+/// arm both interrupt pins *unmasked* as non-maskable interrupts wherever
+/// firmware described one — while the controller this processor is joining with
+/// is at its reset value, where every entry is masked. A platform
+/// non-maskable interrupt in that window is taken by the host and handed to a
+/// guest that has masked the pin it came in on, which for a processor the guest
+/// has just started is a guest in real mode with no handler for it.
+///
+/// So the pins are the guest's from the moment it owns the processor, and
+/// hardware says what the guest's own table says. The other half of that
+/// decision is the host's: a platform non-maskable interrupt while the guest
+/// has its pin masked is one nothing sees, because hardware is masked and the
+/// host has no use of its own for one. What the host forwards is only ever what
+/// the guest's own configuration asked for — through a pin it unmasked, or
+/// through a passed-through I/O controller or device message it programmed for
+/// the mode, neither of which this table has anything to do with.
 ///
 /// `id` is the identifier this processor's own controller reports.
 ///
@@ -55,6 +78,13 @@ pub fn claim_processor(id: cpu::ApicId, joining: Joining) -> Result<(), VlapicEr
     let vlapic = of(id)?;
     vlapic.startup().join(joining.phase());
     vlapic.take_ownership();
+    if !sources::reprogram(vlapic) {
+        warn!(
+            "vlapic: {} joined the guest with a source of its own that hardware would not take, so \
+             something may deliver into a guest that has it masked",
+            vlapic.index()
+        );
+    }
     timer::calibrate(vlapic)?;
     Ok(())
 }

@@ -116,9 +116,7 @@ pub(crate) struct Vlapic {
     timer_divide: AtomicU32,
     timer_initial: AtomicU32,
     timer_frequency: AtomicU64,
-    timer_clamp: AtomicU32,
     timer_clamp_reported: AtomicBool,
-    timer_periodic_running: AtomicBool,
     command: AtomicU64,
     errors: ErrorStatus,
     ledger: Ledger,
@@ -127,6 +125,10 @@ pub(crate) struct Vlapic {
     away: AtomicBool,
     nmi: AtomicU8,
     owned: AtomicBool,
+    /// Which refusals of a local-vector-table entry's configuration have
+    /// already been reported, one bit per entry per kind of refusal.
+    /// Diagnostic only: nothing reads it back but the report that sets it.
+    refusals_reported: AtomicU32,
     /// The last selection state `Vlapic::report_selection` logged, packed into
     /// one word by that function, so a controller whose answer has not changed
     /// stays quiet. Diagnostic only: nothing reads it back but the report.

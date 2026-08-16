@@ -62,9 +62,7 @@ impl Vlapic {
             timer_divide: AtomicU32::new(0),
             timer_initial: AtomicU32::new(0),
             timer_frequency: AtomicU64::new(0),
-            timer_clamp: AtomicU32::new(0),
             timer_clamp_reported: AtomicBool::new(false),
-            timer_periodic_running: AtomicBool::new(false),
             command: AtomicU64::new(0),
             errors: ErrorStatus::new(),
             ledger: Ledger::new(),
@@ -73,6 +71,7 @@ impl Vlapic {
             away: AtomicBool::new(false),
             nmi: AtomicU8::new(0),
             owned: AtomicBool::new(false),
+            refusals_reported: AtomicU32::new(0),
             reported: AtomicU64::new(NOTHING_REPORTED),
         };
         this.reset_registers();
@@ -232,8 +231,6 @@ impl Vlapic {
         }
         self.timer_divide.store(0, Ordering::Release);
         self.timer_initial.store(0, Ordering::Release);
-        self.clear_timer_clamp();
-        self.set_timer_periodic_running(false);
         self.command.store(0, Ordering::Release);
         self.errors.reset();
     }

@@ -380,12 +380,15 @@ mod tests {
     }
 
     #[test]
-    fn corrected_machine_check_refuses_init_and_external() {
+    fn corrected_machine_check_refuses_everything_but_a_vector_and_a_pin_signal() {
         let model = model::tests::AMD;
         let entry = Entry::CorrectedMachineCheck;
         assert!(model.allows(entry, Delivery::Fixed));
-        assert!(model.allows(entry, Delivery::SystemManagement));
         assert!(model.allows(entry, Delivery::NonMaskable));
+        // Not the architecture's rule for this entry: a system-management
+        // interrupt would take the host into system-management mode, which is
+        // refused in every entry rather than in this one.
+        assert!(!model.allows(entry, Delivery::SystemManagement));
         assert!(!model.allows(entry, Delivery::Init));
         assert!(!model.allows(entry, Delivery::External));
     }

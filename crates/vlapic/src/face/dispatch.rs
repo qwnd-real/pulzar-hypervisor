@@ -25,8 +25,16 @@
 //! what real hardware is doing. What the register file itself cannot finish is
 //! answered as a [`Written`] and performed by [`acted`], which is where the two
 //! faces stop being two code paths.
+//!
+//! One thing happens on the way *in* rather than afterwards, and it is the one
+//! whose ordering the guest can observe: a write that stops a source delivering
+//! reaches real hardware before the register file records it. Hardware does
+//! both in one register write, so an arrival cannot land on a source it has
+//! masked; here they are separate accesses with host interrupts deliverable
+//! between them, and the other order leaves a window in which a source the
+//! guest has masked can still set a request bit.
 
-use apic::LocalApic;
+use apic::{LocalApic, Source};
 use descriptors::Vector;
 use log::{trace, warn};
 
@@ -112,7 +120,16 @@ pub(crate) fn write(vlapic: &Vlapic, register: Register, value: u32) -> Written 
             // Software-disabling a controller is a transition rather than a
             // flag: it masks every stored entry, and those entries are what
             // real hardware is programmed from, so the sources and the timer
-            // both have to be brought back into agreement with them.
+            // both have to stop delivering.
+            //
+            // They stop *before* the register file records it, which is the
+            // ordering hardware has: there the mask bits and the enable bit are
+            // one register write, so no source can deliver after the write. Here
+            // they are separate accesses with host interrupts deliverable
+            // between them, and reaching hardware afterwards leaves a window in
+            // which a real source still fires while the guest's controller has
+            // already stopped accepting — an interrupt hardware would have
+            // latched in the request register, refused instead.
             //
             // Every other write to this register changes nothing hardware is
             // programmed from. The spurious vector itself never reaches the real
@@ -120,6 +137,9 @@ pub(crate) fn write(vlapic: &Vlapic, register: Register, value: u32) -> Written 
             // machine's own controller and is the host's — and re-enabling
             // leaves every entry masked, so there is nothing to reprogram until
             // the guest unmasks one.
+            if vlapic.disabling(value) {
+                quiet_controller(vlapic);
+            }
             if vlapic.set_spurious(value) {
                 Written::Disabled
             } else {
@@ -204,6 +224,13 @@ fn write_indexed(vlapic: &Vlapic, register: Register, value: u32) -> Written {
     let Some(entry) = Entry::of(register).filter(|entry| vlapic.model().has(*entry)) else {
         return Written::Nothing;
     };
+    // The one thing a write does before the value is stored rather than after,
+    // for the ordering reason this module's own documentation gives. Only this
+    // direction needs it: arming in the other order is harmless, because a masked
+    // source cannot fire.
+    if vlapic.masks(entry, value) {
+        quiet_source(vlapic, entry);
+    }
     let written = vlapic.write_lvt(entry, value);
     // An illegal vector is an error the architecture reports whether or not the
     // entry is masked — but only for an entry that would actually deliver one.
@@ -230,6 +257,47 @@ fn write_indexed(vlapic: &Vlapic, register: Register, value: u32) -> Written {
         // is nothing to bring into agreement.
         Entry::Error => Written::Nothing,
         _ => Written::LocalVectorTable,
+    }
+}
+
+/// Stops whatever one local-vector-table entry drives from delivering on real
+/// hardware.
+///
+/// Which module owns the entry decides how: masking the timer has to leave its
+/// mode, its count and any armed deadline where they are, and masking any other
+/// source has nothing to keep — the entry is rebuilt from the guest's table the
+/// moment it is armed again.
+///
+/// A failure is not reported here. Both of these say what went wrong
+/// themselves, naming the entry and what the controller refused, and the caller
+/// has nothing to add: the guest's write succeeds either way.
+fn quiet_source(vlapic: &Vlapic, entry: Entry) {
+    match sources::source_of(entry) {
+        Some(Source::Timer) => {
+            let _masked = timer::mask(vlapic);
+        }
+        Some(source) => {
+            let _masked = sources::mask(vlapic, source);
+        }
+        // The error entry, which is the one with no source behind it: the guest's
+        // error reporting is delivered from its own error status register and
+        // nothing of that entry reaches hardware.
+        None => {}
+    }
+}
+
+/// Stops every source and the timer delivering, for a guest that has just
+/// software-disabled its controller.
+///
+/// Nothing is disarmed: masking suppresses delivery and does not stop a count
+/// the guest may still be reading, which is what the architecture has a
+/// software-disabled controller do to the entries it masks.
+fn quiet_controller(vlapic: &Vlapic) {
+    if !(sources::quiesce(vlapic) & timer::mask(vlapic)) {
+        warn!(
+            "vlapic: {} software-disabled its controller and something behind it is still armed",
+            vlapic.index()
+        );
     }
 }
 
@@ -264,7 +332,9 @@ pub(crate) enum Written {
     /// into agreement with it.
     LocalVectorTable,
     /// The guest software-disabled its controller, which masked every entry it
-    /// has and must now stop every source and the timer.
+    /// has and stopped every source and the timer delivering before the
+    /// register file said so. What is left is what real hardware is owed
+    /// for a controller that has stopped accepting.
     Disabled,
     /// The timer's configuration has changed — what it delivers, in which mode,
     /// at what rate. Not a request to start it.
@@ -337,39 +407,36 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
             );
         }
         Written::Timer => {
-            timer::reprogram(vlapic);
+            // Whether hardware ended up agreeing with the guest's entry is
+            // reported where it is discovered, naming the entry and what the
+            // controller refused. There is nothing to add here and nothing to
+            // undo: the guest's write has succeeded either way.
+            let _agreed = timer::reprogram(vlapic);
         }
         // The one write that starts a counting timer. What it delivers and in
         // which mode was settled when those registers were written, so this
         // does not reconfigure anything — reconfiguring here is what would move
         // the phase of a periodic tick on every unrelated write.
-        Written::TimerStarted => timer::reload(vlapic),
-        Written::TimerDeadline(deadline) => timer::arm_deadline(vlapic, deadline),
+        //
+        // As above, the answer is not consulted: a count the controller would not
+        // take is said once by the timer itself, naming what was refused, and the
+        // guest's write has architecturally succeeded — there is no bit in any
+        // register the architecture defines for a timer that did not start.
+        Written::TimerStarted => {
+            let _started = timer::reload(vlapic);
+        }
+        Written::TimerDeadline(deadline) => {
+            let _armed = timer::arm_deadline(vlapic, deadline);
+        }
         Written::LocalVectorTable => {
-            sources::reprogram(vlapic);
+            let _agreed = sources::reprogram(vlapic);
         }
-        // Software-disabling masked every stored entry, and the timer is
-        // programmed from its own entry rather than with the rest, so both have
-        // to follow. Neither is disarmed: masking suppresses delivery and does
-        // not stop a count the guest may still be reading.
-        //
-        // Hardware masks the entries in the same instant it clears the bit.
-        // Here they are separate accesses with host interrupts deliverable
-        // between them, so a physical source can still fire after the guest's
-        // controller has stopped accepting. Nothing is delivered to the guest
-        // either way — its controller refuses it, which is what hardware's
-        // masked entry would have achieved — but an interrupt already on its way
-        // when the bit cleared is refused where hardware would have latched it
-        // in the request register and held it.
-        //
-        // And it is a lifecycle boundary, which is the third of them: a
-        // controller that has stopped delivering is one whose guest cannot
-        // acknowledge what real hardware is holding for it.
-        Written::Disabled => {
-            sources::reprogram(vlapic);
-            timer::reprogram(vlapic);
-            settle::disabled(vlapic);
-        }
+        // Software-disabling stopped every source and the timer delivering
+        // before the register file recorded it, which is where that ordering has
+        // to be; what is left is the third lifecycle boundary — a controller
+        // that has stopped delivering is one whose guest cannot acknowledge what
+        // real hardware is holding for it.
+        Written::Disabled => settle::disabled(vlapic),
         Written::LogicalDestination => mirror_logical_destination(vlapic),
         Written::ModeChanged(transition) => entered(vlapic, transition),
         Written::Command(command) => match lapics() {

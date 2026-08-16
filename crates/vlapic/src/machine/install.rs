@@ -169,7 +169,13 @@ fn inherit(vlapic: &Vlapic, firmware: &FirmwareContext) {
     }
     vlapic.seed(&interrupts.local, interrupts.base);
     mirror_logical_destination(vlapic);
-    sources::reprogram(vlapic);
+    if !sources::reprogram(vlapic) {
+        warn!(
+            "vlapic: {} could not put firmware's own sources back on real hardware, so a source \
+             firmware was using may be left masked or armed with the wrong vector",
+            vlapic.index()
+        );
+    }
     timer::inherit(vlapic, &interrupts.local, firmware.tsc);
     info!(
         "vlapic: {} inherited firmware's controller in {}, spurious {:#x}, task priority {}",

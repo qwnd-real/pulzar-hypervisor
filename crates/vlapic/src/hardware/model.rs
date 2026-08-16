@@ -21,9 +21,10 @@
 //! it.
 //!
 //! So the model is built from the machine — the vendor out of `CPUID`, the
-//! entry count out of the real controller's version register, the optional
-//! interfaces out of the reported features — and every processor's controller
-//! carries a copy of it.
+//! entry count out of the real controller's version register reconciled with
+//! the machine-check capability the same guest reads, the optional interfaces
+//! out of the reported features — and every processor's controller carries a
+//! copy of it.
 //!
 //! # What the two vendors actually disagree about
 //!
@@ -48,6 +49,7 @@
 
 use apic::LocalApic;
 use descriptors::Vector;
+use log::warn;
 use processor::Features;
 
 use crate::{
@@ -81,16 +83,21 @@ impl Model {
     /// minimum rather than assumed to have everything, since advertising an
     /// absent entry is the failure that silently misleads a guest and
     /// advertising too few merely offers it less.
+    ///
+    /// The count is then reconciled with the machine's machine-check
+    /// capability, which is the other half of the same fact; see
+    /// [`corrected_machine_check_entries`].
     pub(crate) fn of_machine() -> Self {
         let features = processor::features();
         let entries = apic::local()
             .map(LocalApic::entries)
             .map_or(Entry::FEWEST, |entries| {
                 usize::try_from(entries).unwrap_or(Entry::FEWEST)
-            });
+            })
+            .clamp(Entry::FEWEST, Entry::COUNT);
         Self {
             vendor: Vendor::of_machine(),
-            entries: entries.clamp(Entry::FEWEST, Entry::COUNT),
+            entries: corrected_machine_check_entries(entries),
             x2apic: features.contains(Features::X2APIC),
             deadline: features.contains(Features::TSC_DEADLINE),
         }
@@ -135,15 +142,32 @@ impl Model {
 
     /// Whether an entry accepts a delivery mode in this model.
     ///
-    /// The two pins take everything, because both describe a wire an external
-    /// controller signals over. The rest take the modes a source the controller
-    /// raises itself can meaningfully ask for, which excludes INIT and an
-    /// external interrupt. The error entry is where the vendors part: it has no
-    /// delivery field at all on Intel and a message type on AMD.
+    /// The two pins accept the modes the architecture defines for a wire an
+    /// external controller signals over, which is all of them. The rest accept
+    /// the modes a source the controller raises itself can meaningfully ask
+    /// for, which excludes INIT and an external interrupt. The error entry
+    /// is where the vendors part: it has no delivery field at all on Intel
+    /// and a message type on AMD.
+    ///
+    /// The one exception to all of that is a system-management interrupt, which
+    /// no entry accepts, and that is this hypervisor's own departure rather
+    /// than either vendor's rule. These entries are programmed onto the
+    /// machine's own controller, so a guest that chose that mode would take
+    /// the *host* into system-management mode over host state, running
+    /// firmware's handler against a context it was not written for — and
+    /// the guest would see nothing of it either way. The interrupt command
+    /// register refuses to send one for exactly the same reason, and the
+    /// decision belongs in one place rather than in both.
+    ///
+    /// INIT and an external interrupt reach a pin's entry from here and are
+    /// refused where the entry is turned into a physical one, because what is
+    /// wrong with them is not the shape of the entry;
+    /// [`crate::hardware::sources`] is where that is stated.
     pub(crate) const fn allows(self, entry: Entry, delivery: Delivery) -> bool {
         match delivery {
             Delivery::Fixed => true,
-            Delivery::SystemManagement | Delivery::NonMaskable => self.has_delivery(entry),
+            Delivery::NonMaskable => self.has_delivery(entry),
+            Delivery::SystemManagement => false,
             Delivery::Init | Delivery::External => matches!(entry, Entry::Lint0 | Entry::Lint1),
         }
     }
@@ -208,6 +232,76 @@ impl Vendor {
     }
 }
 
+/// The entry count this controller and the machine's machine-check reporting
+/// both stand behind.
+///
+/// The corrected-machine-check entry is the last of the seven the architecture
+/// counts, so it is the only one two independent capabilities describe: the
+/// controller's version register says whether the register is there, and
+/// `IA32_MCG_CAP` says whether corrected errors are reported by an interrupt at
+/// all. A guest reads both — the version register through its emulated
+/// controller, the capability straight off the machine, since that register is
+/// not intercepted — and a hypervisor that let the two disagree would hand it a
+/// machine that does not exist.
+///
+/// So the entry is offered only when both say so, and the count is the whole of
+/// what has to change for that: a controller has exactly the first
+/// however-many of [`Entry::ALL`] and this one is last in the list.
+///
+/// The other direction cannot be reconciled from here and is reported instead.
+/// A machine whose capability names the interrupt while its controller has no
+/// entry for it is one where the register genuinely is not there, and a guest
+/// that consults the capability and writes the entry finds no such register —
+/// through the model-specific registers, a general protection fault. Nothing
+/// here can invent the entry, because the source behind it is the real one.
+fn corrected_machine_check_entries(entries: usize) -> usize {
+    let last = Entry::CorrectedMachineCheck.index();
+    match (last < entries, corrected_machine_check()) {
+        (true, false) => {
+            warn!(
+                "vlapic: this controller has a {:?} entry and the machine does not report the \
+                 interrupt it would deliver, so a guest is told it has {last} entries rather than \
+                 {entries}",
+                Entry::CorrectedMachineCheck
+            );
+            last
+        }
+        (false, true) => {
+            warn!(
+                "vlapic: the machine reports corrected machine-check interrupts and this \
+                 controller has no {:?} entry, so a guest that programs one finds no such register",
+                Entry::CorrectedMachineCheck
+            );
+            entries
+        }
+        _ => entries,
+    }
+}
+
+/// Whether the machine reports corrected machine-check errors by an interrupt,
+/// which is what the entry named after it exists to deliver.
+///
+/// Asked of the same register the guest asks, and asked through [`probe`]
+/// because a machine without machine-check reporting has no such register and
+/// faulting is the only way a processor answers whether an index is one. A
+/// refused read is therefore the same answer as a clear bit: nothing to
+/// interrupt about.
+///
+/// Requires the general protection vector to have been claimed, which
+/// [`probe::install`] does during bring-up and before any controller is built.
+fn corrected_machine_check() -> bool {
+    probe::read(MACHINE_CHECK_CAPABILITY)
+        .is_ok_and(|capability| capability & CORRECTED_INTERRUPT != 0)
+}
+
+/// `IA32_MCG_CAP`, which describes what the machine's machine-check reporting
+/// can do.
+const MACHINE_CHECK_CAPABILITY: u32 = 0x179;
+
+/// The bit of it that says corrected errors raise an interrupt through the
+/// local controller rather than only accumulating to be polled.
+const CORRECTED_INTERRUPT: u64 = 1 << 10;
+
 /// The `CPUID` leaf whose three registers spell the vendor.
 const VENDOR_LEAF: u32 = 0;
 
@@ -221,7 +315,7 @@ pub(crate) mod tests {
     //! vendor.
 
     use super::{Model, Vendor};
-    use crate::registers::lvt::Entry;
+    use crate::registers::lvt::{Delivery, Entry};
 
     /// A controller with every entry, on a processor implementing both optional
     /// interfaces, following AMD's rules.
@@ -277,5 +371,46 @@ pub(crate) mod tests {
     fn the_optional_interfaces_follow_the_processor() {
         assert!(AMD.x2apic() && AMD.deadline());
         assert!(!SPARSE.x2apic() && !SPARSE.deadline());
+    }
+
+    #[test]
+    fn no_entry_delivers_a_system_management_interrupt() {
+        // The one delivery mode refused everywhere, including in the two entries
+        // whose architectural shape accepts it: taking it would put the host into
+        // system-management mode over host state, and the interrupt command
+        // register refuses to send one for the same reason.
+        for model in [AMD, INTEL, SPARSE] {
+            for entry in Entry::ALL {
+                assert!(
+                    !model.allows(entry, Delivery::SystemManagement),
+                    "{entry:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_corrected_machine_check_entry_needs_the_machine_to_report_the_interrupt() {
+        // Both halves of one fact: the count is what carries the entry, so the
+        // reconciliation is a count and the entry is the last of them.
+        assert_eq!(Entry::CorrectedMachineCheck.index(), Entry::COUNT - 1);
+        let with = Model {
+            entries: Entry::COUNT,
+            ..AMD
+        };
+        let without = Model {
+            entries: Entry::COUNT - 1,
+            ..AMD
+        };
+        assert!(with.has(Entry::CorrectedMachineCheck));
+        assert!(!without.has(Entry::CorrectedMachineCheck));
+        // And nothing else moves with it: the six entries below are the ones the
+        // version register alone answers for.
+        for entry in Entry::ALL
+            .into_iter()
+            .filter(|entry| *entry != Entry::CorrectedMachineCheck)
+        {
+            assert!(without.has(entry), "{entry:?}");
+        }
     }
 }

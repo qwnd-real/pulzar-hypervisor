@@ -11,6 +11,12 @@
 //! handing it over wholesale possible — and what makes the hardware registers
 //! the honest place to read the guest's timer state back from.
 //!
+//! Every function here is about the timer of the processor that calls it: each
+//! pairs the [`Vlapic`] it is handed with [`apic::local`], which answers for
+//! the processor doing the reaching and not for the one whose row it was given.
+//! A caller holding another processor's row would stop its own timer while
+//! reporting that it had stopped that one's, and nothing local could notice.
+//!
 //! # Configuring a timer is not starting one
 //!
 //! The distinction runs through this whole module and it is the architecture's,
@@ -43,6 +49,15 @@
 //! cleared the deadline register instead would lose an appointment the guest
 //! cannot re-derive.
 //!
+//! # The one thing the guest asks for and does not get
+//!
+//! An unmasked periodic period shorter than the floor in [`clamp`] is
+//! lengthened to it, which is the only place the real timer deliberately
+//! differs from what the guest programmed. Nothing about it is concealed: the
+//! count a guest reads out of its current-count register is hardware's own, so
+//! a guest measuring its timer's rate measures the rate it is being given
+//! rather than the one it asked for.
+//!
 //! # Deadline mode reads and writes through hardware
 //!
 //! The deadline is not mirrored in this crate. Hardware clears the register
@@ -64,8 +79,9 @@ mod clamp;
 mod deadline;
 mod inherit;
 
-use apic::{Divisor, LocalApic, Source, TimerMode as HardwareMode};
-use log::{trace, warn};
+use apic::{ApicError, Divisor, LocalApic, Source, TimerMode as HardwareMode};
+use descriptors::Vector;
+use log::{Level, log_enabled, trace, warn};
 
 pub use crate::hardware::timer::deadline::adjust_deadline;
 pub(crate) use crate::hardware::timer::{
@@ -74,8 +90,8 @@ pub(crate) use crate::hardware::timer::{
 };
 use crate::{
     hardware::{
-        sources,
-        timer::clamp::{clamped_count, reconfigure, scale_remaining},
+        sources::{self, Refusal},
+        timer::clamp::{Reconfigured, floor, reconfigure},
     },
     registers::{
         Vlapic,
@@ -85,14 +101,22 @@ use crate::{
 
 /// What the guest's timer has left to count.
 ///
-/// Read from the hardware, because the hardware is what is counting. In
-/// deadline mode the architecture defines this as reading zero.
+/// Read from the hardware, because the hardware is what is counting — including
+/// where hardware is counting a longer period than the guest asked for, which
+/// is the whole of how a guest can tell that it is.
+///
+/// Zero in the two modes that count nothing: deadline mode, where the
+/// architecture defines this as reading zero, and the encoding the architecture
+/// reserves, where the timer is stopped and a physical count would be one for a
+/// timer the guest never started.
 pub(crate) fn remaining(vlapic: &Vlapic) -> u32 {
-    if vlapic.timer_mode() == Some(TimerMode::Deadline) {
+    if !matches!(
+        vlapic.timer_mode(),
+        Some(TimerMode::OneShot | TimerMode::Periodic)
+    ) {
         return 0;
     }
-    let remaining = apic::local().map_or(0, |local| local.timer().remaining());
-    scale_remaining(remaining, vlapic.timer_initial(), vlapic.timer_clamp())
+    apic::local().map_or(0, |local| local.timer().remaining())
 }
 
 /// The deadline the guest's timer is counting towards.
@@ -121,40 +145,238 @@ pub(crate) fn deadline(vlapic: &Vlapic) -> u64 {
 /// change are known.
 ///
 /// Answers whether the hardware agrees with the guest's entry afterwards.
+#[must_use]
 pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
     let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        warn!(
+            "vlapic: {} could not reach its controller to program its timer",
+            vlapic.index()
+        );
         return false;
     };
-    let entry = vlapic.lvt(Entry::Timer);
-    let mode = match vlapic.timer_mode() {
-        Some(TimerMode::OneShot) => HardwareMode::OneShot,
-        Some(TimerMode::Periodic) => HardwareMode::Periodic,
-        Some(TimerMode::Deadline) => HardwareMode::Deadline,
+    let Some(mode) = hardware_mode(vlapic) else {
         // The encoding the architecture reserves. A controller given it does
         // nothing defined, so the timer is stopped and left delivering nothing.
-        None => return disarm(vlapic),
+        return disarm(vlapic);
     };
-    let delivery = (!entry.masked())
-        .then(|| entry.vector())
-        .and_then(|vector| sources::armable(vlapic, vector));
     let divisor = divisor(vlapic);
-    match reconfigure(vlapic, &timer, delivery, mode, divisor) {
-        Ok(()) => {
+    let delivery = armed(vlapic);
+    match reconfigure(
+        &timer,
+        delivery,
+        mode,
+        divisor,
+        floor(vlapic.timer_frequency(), divisor),
+    ) {
+        Ok(Reconfigured::Applied) => {
             report(vlapic, "configured");
             true
         }
-        Err(error) => {
-            warn!(
-                "vlapic: {} could not program its timer, so it is stopped: {error}",
-                vlapic.index()
+        Ok(Reconfigured::Raised { from, to }) => {
+            report_floor(vlapic, from, to);
+            report(vlapic, "configured");
+            true
+        }
+        // Stopped rather than armed, and so not in agreement with the guest's
+        // entry: the guest's timer has stopped and its own registers say it
+        // should be running.
+        Ok(Reconfigured::Stopped) => {
+            sources::refused(
+                vlapic,
+                Entry::Timer,
+                Refusal::Rate(vlapic.timer_frequency()),
             );
+            report(vlapic, "stopped");
+            false
+        }
+        Err(error) => {
+            sources::refused(vlapic, Entry::Timer, Refusal::Hardware(error));
             // A configuration hardware refused is one it never took, so the
             // entry still holds whatever it held before — quite possibly a
             // vector the guest has stopped asking for, unmasked. Stopping the
-            // timer is what keeps a refusal from leaving a source delivering.
-            disarm(vlapic);
+            // timer is what keeps a refusal from leaving a source delivering,
+            // and whether the stop itself succeeded is [`disarm`]'s to say: the
+            // answer here is that hardware does not hold what the guest asked
+            // for.
+            let _stopped = disarm(vlapic);
             false
         }
+    }
+}
+
+/// Starts the guest's timer counting from what it last wrote.
+///
+/// The one operation that starts a counting timer, and it is reached only from
+/// a write to the initial count — which is the write the architecture defines
+/// as starting one. A count of zero stops the timer rather than firing it,
+/// which is the architecture's own spelling and needs no special case here.
+///
+/// A refusal is reported here, once per controller, because the guest's own
+/// write has already succeeded and no register the architecture defines has a
+/// bit for "your controller did not start the timer". The answer is returned as
+/// well, for the one caller that has something of its own to say about it.
+///
+/// # Errors
+///
+/// [`ApicError::Calibration`] where the timer's own rate is not known well
+/// enough to say whether the guest's period is one the machine can answer, in
+/// which case the timer is stopped rather than started; otherwise whatever the
+/// controller refused.
+pub(crate) fn reload(vlapic: &Vlapic) -> Result<(), ApicError> {
+    let timer = apic::local()?.timer();
+    if hardware_mode(vlapic).is_none() {
+        // The encoding the architecture reserves defines nothing for a count
+        // either, so nothing is started and nothing has gone wrong. `reprogram`
+        // stopped the timer when the mode was selected, and `remaining` reports
+        // zero for it, so the guest sees a timer that is doing nothing — which
+        // is all the architecture promises about this encoding.
+        return Ok(());
+    }
+    let guest_count = vlapic.timer_initial();
+    let Some(count) = physical_count(vlapic, guest_count) else {
+        // Fail closed: a count that cannot be shown to be long enough is not put
+        // on hardware at all.
+        let _stopped = disarm(vlapic);
+        sources::refused(
+            vlapic,
+            Entry::Timer,
+            Refusal::Rate(vlapic.timer_frequency()),
+        );
+        return Err(ApicError::Calibration);
+    };
+    if let Err(error) = timer.reload(count) {
+        sources::refused(vlapic, Entry::Timer, Refusal::Hardware(error));
+        return Err(error);
+    }
+    if count != guest_count {
+        report_floor(vlapic, guest_count, count);
+    }
+    report(vlapic, "started");
+    Ok(())
+}
+
+/// Stops the guest's timer delivering, leaving what it is counting alone.
+///
+/// The masking half of a configuration, on its own, for the two moments the
+/// ordering matters — a write that masks the entry, and a controller the guest
+/// has software-disabled. Both reach hardware before the register file records
+/// them, and the argument for that is in `face::dispatch`, where the
+/// decision is made.
+///
+/// Masking is not cancelling: the mode, the count and any armed deadline are
+/// left exactly where they were, so a guest that unmasks the entry again finds
+/// the timer where it left it. That is what this has that [`disarm`] does not,
+/// and it is the whole reason the timer cannot be masked the way the other
+/// sources are — writing a masked entry over it would put its mode down with
+/// it, and a mode change disarms the timer.
+///
+/// Answers whether it really was masked.
+pub(crate) fn mask(vlapic: &Vlapic) -> bool {
+    let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        warn!(
+            "vlapic: {} could not reach its controller to mask its timer",
+            vlapic.index()
+        );
+        return false;
+    };
+    let Some(mode) = hardware_mode(vlapic) else {
+        // The reserved encoding, for which `reprogram` has already stopped the
+        // timer: there is nothing to mask and nothing that can deliver.
+        return true;
+    };
+    match timer.configure(None, mode, divisor(vlapic)) {
+        Ok(()) => true,
+        Err(error) => {
+            sources::refused(vlapic, Entry::Timer, Refusal::Hardware(error));
+            false
+        }
+    }
+}
+
+/// Stops the guest's timer and stops it delivering.
+///
+/// What a controller transition needs: an old timer left running would deliver
+/// into a guest that has been reset, or after the controller it belonged to was
+/// switched off.
+#[must_use]
+pub(crate) fn disarm(vlapic: &Vlapic) -> bool {
+    let Ok(timer) = apic::local().map(LocalApic::timer) else {
+        warn!(
+            "vlapic: {} could not reach its controller to disarm its timer",
+            vlapic.index()
+        );
+        return false;
+    };
+    timer.disarm();
+    trace!("vlapic: {} disarmed its timer", vlapic.index());
+    true
+}
+
+/// What the timer is to deliver, or `None` for an entry that delivers nothing.
+///
+/// A masked entry is one, and so is one naming a vector no source may be armed
+/// with here — which is refused for the timer by the same rule and reported the
+/// same way as for every other source, because it is the same restriction.
+fn armed(vlapic: &Vlapic) -> Option<Vector> {
+    let entry = vlapic.lvt(Entry::Timer);
+    if entry.masked() {
+        return None;
+    }
+    let vector = entry.vector();
+    if !sources::arms(vector) {
+        sources::refused(vlapic, Entry::Timer, Refusal::Vector(vector));
+        return None;
+    }
+    Some(vector)
+}
+
+/// The physical count the guest's own count has to be started at, or `None`
+/// where that cannot be said.
+///
+/// The floor applies to an unmasked periodic timer and to nothing else: a
+/// masked entry delivers nothing however fast it counts — which is exactly what
+/// an operating system measuring its timer's rate programs — a one-shot fires
+/// once, and a count of zero is how the architecture spells a stopped timer.
+fn physical_count(vlapic: &Vlapic, guest_count: u32) -> Option<u32> {
+    let periodic = vlapic.timer_mode() == Some(TimerMode::Periodic)
+        && !vlapic.lvt(Entry::Timer).masked()
+        && guest_count != 0;
+    if !periodic {
+        return Some(guest_count);
+    }
+    floor(vlapic.timer_frequency(), divisor(vlapic)).map(|floor| guest_count.max(floor))
+}
+
+/// The mode the real timer counts in for the mode the guest selected, or `None`
+/// for the encoding the architecture reserves.
+fn hardware_mode(vlapic: &Vlapic) -> Option<HardwareMode> {
+    match vlapic.timer_mode()? {
+        TimerMode::OneShot => Some(HardwareMode::OneShot),
+        TimerMode::Periodic => Some(HardwareMode::Periodic),
+        TimerMode::Deadline => Some(HardwareMode::Deadline),
+    }
+}
+
+/// Says once that this guest's periodic timer is being given a longer period
+/// than it asked for.
+///
+/// `programmed` is the count that was going to be reloaded and `given` is what
+/// is reloaded instead.
+///
+/// Once per controller, because the guest can rewrite the count as fast as it
+/// can take an exit and each of those would otherwise be a line of serial
+/// output with a machine-wide lock held. The guest is not relying on the log to
+/// find out: its current-count reads are hardware's, so the period it is being
+/// given is one it can measure.
+fn report_floor(vlapic: &Vlapic, programmed: u32, given: u32) {
+    if vlapic.report_timer_clamp_once() {
+        warn!(
+            "vlapic: {} is running its guest's periodic timer from a count of {given:#x} where \
+             {programmed:#x} was programmed, that being the shortest period this hypervisor puts \
+             on real hardware; the guest's current-count reads report the count hardware is really \
+             counting",
+            vlapic.index()
+        );
     }
 }
 
@@ -166,7 +388,15 @@ pub(crate) fn reprogram(vlapic: &Vlapic) -> bool {
 /// the hardware did not take, a vector masked on one side and not the other, or
 /// a count the hardware refused to start are each invisible from the guest's
 /// own reads and each stop its ticks.
+///
+/// Behind the log level rather than inside the record, because reaching the
+/// controller at all is an uncached register read and reading the entry back is
+/// another — two of them on every guest write to the entry, the divide or the
+/// count, for a record the configured level throws away.
 fn report(vlapic: &Vlapic, what: &str) {
+    if !log_enabled!(Level::Trace) {
+        return;
+    }
     let Ok(local) = apic::local() else {
         return;
     };
@@ -189,66 +419,6 @@ fn report(vlapic: &Vlapic, what: &str) {
         },
         local.timer().remaining(),
     );
-}
-
-/// Starts the guest's timer counting from what it last wrote.
-///
-/// The one operation that starts a counting timer, and it is reached only from
-/// a write to the initial count — which is the write the architecture defines
-/// as starting one. A count of zero stops the timer rather than firing it,
-/// which is the architecture's own spelling and needs no special case here.
-pub(crate) fn reload(vlapic: &Vlapic) {
-    let Ok(timer) = apic::local().map(LocalApic::timer) else {
-        return;
-    };
-    let guest_count = vlapic.timer_initial();
-    let physical_count = clamped_count(vlapic, guest_count).unwrap_or(guest_count);
-    if let Err(error) = timer.reload(physical_count) {
-        warn!(
-            "vlapic: {} could not start its timer counting: {error}",
-            vlapic.index()
-        );
-        vlapic.clear_timer_clamp();
-        vlapic.set_timer_periodic_running(false);
-        timer.disarm();
-        return;
-    }
-    vlapic.set_timer_periodic_running(
-        physical_count != 0 && vlapic.timer_mode() == Some(TimerMode::Periodic),
-    );
-    let clamp = if physical_count == guest_count {
-        0
-    } else {
-        physical_count
-    };
-    vlapic.set_timer_clamp(clamp);
-    if physical_count != guest_count && vlapic.report_timer_clamp_once() {
-        warn!(
-            "vlapic: {} limited a periodic timer count from {guest_count:#x} to {physical_count:#x}",
-            vlapic.index()
-        );
-    }
-    report(vlapic, "started");
-}
-
-/// Stops the guest's timer and stops it delivering.
-///
-/// What a controller transition needs: an old timer left running would deliver
-/// into a guest that has been reset, or after the controller it belonged to was
-/// switched off.
-pub(crate) fn disarm(vlapic: &Vlapic) -> bool {
-    let Ok(timer) = apic::local().map(LocalApic::timer) else {
-        warn!(
-            "vlapic: {} could not reach its controller to disarm its timer",
-            vlapic.index()
-        );
-        return false;
-    };
-    timer.disarm();
-    vlapic.clear_timer_clamp();
-    vlapic.set_timer_periodic_running(false);
-    trace!("vlapic: {} disarmed its timer", vlapic.index());
-    true
 }
 
 /// How far the guest asked for the clock to be divided.

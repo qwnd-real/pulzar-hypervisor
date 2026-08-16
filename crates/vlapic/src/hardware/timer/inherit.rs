@@ -7,7 +7,7 @@
 //! appointment it had already made — and pulzar does not boot a fresh guest, so
 //! there is very often such an appointment to keep.
 
-use apic::{Divisor, LocalApic, LocalState};
+use apic::{Divisor, LocalState};
 use clock::{Frequency, Kind};
 use log::{trace, warn};
 
@@ -31,8 +31,6 @@ pub(crate) fn calibrate(vlapic: &Vlapic) -> Result<(), apic::ApicError> {
     }
     let frequency = apic::local()?.timer().calibrate(Divisor::By1)?;
     vlapic.set_timer_frequency(frequency.hz());
-    vlapic.clear_timer_clamp();
-    vlapic.set_timer_periodic_running(false);
     trace!(
         "vlapic: {} calibrated its undivided timer at {} Hz",
         vlapic.index(),
@@ -63,20 +61,34 @@ pub(crate) fn calibrate(vlapic: &Vlapic) -> Result<(), apic::ApicError> {
 ///   so however long the capture has been sitting in the chunk has to come off
 ///   it, or firmware's appointment lands late by the whole of bring-up.
 pub(crate) fn inherit(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
-    reprogram(vlapic);
-    match vlapic.timer_mode() {
+    if !reprogram(vlapic) {
+        warn!(
+            "vlapic: {} could not put firmware's timer configuration on real hardware, so \
+             firmware's own appointment is not restarted",
+            vlapic.index()
+        );
+        return;
+    }
+    let restarted = match vlapic.timer_mode() {
         Some(TimerMode::Deadline) if firmware.tsc_deadline != 0 => {
-            arm_deadline(vlapic, firmware.tsc_deadline);
+            arm_deadline(vlapic, firmware.tsc_deadline)
         }
         Some(TimerMode::Periodic) => reload(vlapic),
         Some(TimerMode::OneShot) if firmware.timer_current_count != 0 => {
-            oneshot(vlapic, firmware, since);
+            oneshot(vlapic, firmware, since)
         }
         // Three ways to have nothing to start, and `reprogram` has left the
         // timer stopped for all of them: a deadline mode firmware had not armed,
         // a one-shot that had already run out, and the encoding the architecture
         // reserves, which a controller given it does nothing defined with.
-        _ => {}
+        _ => Ok(()),
+    };
+    if let Err(error) = restarted {
+        warn!(
+            "vlapic: {} could not restart the timer firmware left running, so firmware's next \
+             appointment is one nobody is keeping: {error}",
+            vlapic.index()
+        );
     }
 }
 
@@ -95,27 +107,22 @@ pub(crate) fn inherit(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
 /// armed as it stands and the reason is logged. That fires late by the length
 /// of bring-up, which is a worse answer than the aged one and a far better
 /// answer than never.
-fn oneshot(vlapic: &Vlapic, firmware: &LocalState, since: u64) {
+///
+/// # Errors
+///
+/// Whatever the controller refused the count for.
+fn oneshot(vlapic: &Vlapic, firmware: &LocalState, since: u64) -> Result<(), apic::ApicError> {
     let left = firmware.timer_current_count;
     let count = match elapsed_ticks(vlapic, since) {
         Some(elapsed) => left.saturating_sub(elapsed).max(SOONEST),
         None => left,
     };
-    let Ok(timer) = apic::local().map(LocalApic::timer) else {
-        return;
-    };
-    if let Err(error) = timer.reload(count) {
-        warn!(
-            "vlapic: {} could not restart firmware's one-shot timer: {error}",
-            vlapic.index()
-        );
-        return;
-    }
-    vlapic.set_timer_periodic_running(false);
+    apic::local()?.timer().reload(count)?;
     trace!(
         "vlapic: {} restarted firmware's one-shot timer at {count} of the {left} it had left",
         vlapic.index(),
     );
+    Ok(())
 }
 
 /// How many of this timer's ticks have passed since the capture was taken, or
@@ -132,15 +139,19 @@ fn elapsed_ticks(vlapic: &Vlapic, since: u64) -> Option<u32> {
         return None;
     }
     let rate = Frequency::from_hz(vlapic.timer_frequency())?;
-    // SAFETY: `RDTSC` is always permitted at privilege level zero, whatever
-    // `CR4.TSD` says, and reading the counter does not disturb it.
-    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    // Read through the same wrapper every other reading of this counter in the
+    // workspace goes through, including the one the capture took and the one
+    // being subtracted here.
+    let now = processor::timestamp();
     // Through nanoseconds rather than by a ratio of the two rates, because that
     // is the one conversion both clocks already offer and it needs no arithmetic
     // of its own to be right about.
     let nanos = source.frequency().nanos(now.saturating_sub(since));
     let elapsed = rate.ticks(nanos) / u64::from(divisor(vlapic).ratio());
-    u32::try_from(elapsed).ok().or(Some(u32::MAX))
+    // Saturating rather than fallible: a span longer than the timer can count is
+    // one whose appointment is due at once, which is what the largest count the
+    // register holds becomes after the subtraction above.
+    Some(u32::try_from(elapsed).unwrap_or(u32::MAX))
 }
 
 /// The fewest ticks a restarted timer is armed at.

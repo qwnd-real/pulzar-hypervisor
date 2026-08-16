@@ -45,6 +45,19 @@ impl Vlapic {
         disabled
     }
 
+    /// Whether a write of `value` would software-disable this controller.
+    ///
+    /// Asked before the write, because what it decides is an ordering rather
+    /// than a value: the sources and the timer have to stop delivering on real
+    /// hardware before the register file records that they have stopped. Only
+    /// the processor this controller belongs to writes this register, and that
+    /// is the processor asking, so the answer cannot have changed by the
+    /// time [`Vlapic::set_spurious`] answers the same question of the same
+    /// value.
+    pub(crate) fn disabling(&self, value: u32) -> bool {
+        self.software_enabled() && value & SOFTWARE_ENABLE == 0
+    }
+
     /// Whether the guest has software-enabled its controller.
     ///
     /// A software-disabled controller holds every local-vector-table entry

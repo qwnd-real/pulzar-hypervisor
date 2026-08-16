@@ -52,8 +52,17 @@ pub(crate) fn entered(vlapic: &Vlapic, transition: Transition) {
     }
     promote(vlapic);
     mirror_logical_destination(vlapic);
-    sources::reprogram(vlapic);
-    timer::reprogram(vlapic);
+    // Both answers together, because they are the same question about two halves
+    // of one table and a caller that has just changed face needs the whole of it:
+    // a source left as it was is one that can still deliver on a vector the
+    // guest's new face may not even be able to name.
+    if !(sources::reprogram(vlapic) & timer::reprogram(vlapic)) {
+        warn!(
+            "vlapic: {} changed face and something behind its controller does not agree with the \
+             table it was left holding",
+            vlapic.index()
+        );
+    }
     info!("vlapic: {} entered {}", vlapic.index(), vlapic.mode());
 }
 
