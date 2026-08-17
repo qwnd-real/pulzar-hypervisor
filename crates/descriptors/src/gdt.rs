@@ -70,7 +70,7 @@ use x86_64::{
 };
 
 use crate::{
-    DescriptorError, InterruptStack,
+    DescriptorError, InterruptStack, fatal,
     nesting::{self, Cpu},
 };
 
@@ -325,18 +325,43 @@ pub(crate) fn release_stacks(space: &mut AddressSpace, stacks: impl IntoIterator
 /// processor's own block — and the table register is per processor, which is
 /// what makes this answer the running processor's rather than anyone else's.
 ///
+/// # A table that is not ours is a terminal state, not an answer
+///
+/// Everything below is an unchecked read through whatever the end of the live
+/// table happens to say, so the table is judged before it is read. Two facts
+/// settle it, and neither needs any per-processor state — which is the point,
+/// because this runs on the interrupt entry path before anything else does:
+///
+/// - a table this crate built is allocated out of this image's own memory,
+///   which is in the higher half, and the ones the machine came up on —
+///   firmware's, and the one the trampoline hands an application processor —
+///   are not;
+/// - a table too short to hold the descriptor this reads is not one of ours
+///   either, and the arithmetic below would step off the front of it.
+///
+/// Reading such a table is what turns one unrecoverable event into an endless
+/// fault: the address it answers with faults, the fault arrives here, and it
+/// answers the same way forever, on a stack whose fixed top overwrites the
+/// frame that would have said what started it. So the answer is [`fatal`]
+/// instead. There is no per-processor state to report from and none to carry on
+/// with, and the one interval where this can happen is inside
+/// [`Tables::activate`](crate::Tables::activate) — between the table this crate
+/// builds becoming live and this processor's own descriptors becoming live with
+/// it.
+///
 /// # Panics
 ///
-/// Never. It is used on the interrupt entry path, so it reads a possible answer
-/// out of the descriptor rather than checking one: a table that is not one of
-/// ours would give an address that is not one either, and there is no state
-/// left to report that from.
+/// Never. The two refusals above are reported and stop this processor rather
+/// than unwinding, which nothing on this path could do.
 pub(crate) fn block() -> *mut Cpu {
     let live = tables::sgdt();
     let entries = (usize::from(live.limit) + 1) / size_of::<u64>();
+    if live.base.as_u64() < HIGHER_HALF || entries < TASK_DESCRIPTOR_ENTRIES {
+        fatal::foreign_gdt(live.base, live.limit);
+    }
     // SAFETY: the processor is running with this table loaded, so `limit + 1`
-    // bytes at `base` are the table itself: readable, and holding at least the
-    // two entries a task descriptor takes.
+    // bytes at `base` are the table itself: readable, and — by the refusal above
+    // — long enough for the two entries a task descriptor takes to be inside it.
     let (low, high) = unsafe {
         let base = live.base.as_ptr::<u64>();
         (base.add(entries - 2).read(), base.add(entries - 1).read())
@@ -344,6 +369,17 @@ pub(crate) fn block() -> *mut Cpu {
     let base = (low >> 16) & 0x00FF_FFFF | (low >> 56) << 24 | (high & 0xFFFF_FFFF) << 32;
     (VirtAddr::new_truncate(base) - TSS_OFFSET).as_mut_ptr()
 }
+
+/// Where the higher half of the address space begins.
+///
+/// Every table this crate builds is above it, because every one of them is
+/// allocated from this image's own memory; everything the machine came up on is
+/// below it.
+const HIGHER_HALF: u64 = 0xFFFF_8000_0000_0000;
+
+/// How many descriptors a table must hold for the last two to be the task
+/// descriptor [`block`] reads.
+const TASK_DESCRIPTOR_ENTRIES: usize = 2;
 
 /// Where the task state segment sits inside the block the table describes.
 const TSS_OFFSET: u64 = offset_of!(Cpu, tss) as u64;

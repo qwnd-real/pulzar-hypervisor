@@ -12,7 +12,7 @@ use descriptors::Vector;
 use log::{Level, log_enabled, trace};
 
 use crate::{
-    lifecycle::ledger::InService,
+    lifecycle::ledger::Controller,
     priority::{self, Priority},
     registers::{Vlapic, icr::Trigger},
 };
@@ -260,7 +260,7 @@ impl Vlapic {
     /// acknowledging, which is this processor: a guest's acknowledgement comes
     /// out of the guest, and the guest runs nowhere else.
     #[must_use]
-    pub(crate) fn end_of_interrupt(&self, controller: &impl InService) -> Option<Vector> {
+    pub(crate) fn end_of_interrupt(&self, controller: &impl Controller) -> Option<Vector> {
         let vector = self.in_service.take_highest()?;
         self.ledger.release(vector, controller);
         Some(vector)

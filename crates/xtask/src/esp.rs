@@ -20,7 +20,14 @@ const IMAGES: [(&str, &str, &str); 2] = [
 
 /// Compiles the UEFI crates and repopulates `dist/esp/` from scratch,
 /// returning its path.
-pub fn stage(release: bool) -> Result<PathBuf> {
+///
+/// `silent` builds both images with their `quiet` feature, which takes `log`'s
+/// static maximum level to `Off` and so compiles every record out of the whole
+/// image. It is asked of both packages rather than one, even though `log` is
+/// compiled once for the build and either would do it: a flag whose effect
+/// depends on feature unification is one that stops working the moment the
+/// dependency graph changes.
+pub fn stage(release: bool, silent: bool) -> Result<PathBuf> {
     let root = paths::workspace_root();
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut build = Command::new(cargo);
@@ -30,6 +37,13 @@ pub fn stage(release: bool) -> Result<PathBuf> {
     }
     if release {
         build.arg("--release");
+    }
+    if silent {
+        let features: Vec<String> = IMAGES
+            .iter()
+            .map(|(package, _, _)| format!("{package}/quiet"))
+            .collect();
+        build.args(["--features", &features.join(",")]);
     }
     proc::run(&mut build, "it ships with the Rust toolchain")?;
 

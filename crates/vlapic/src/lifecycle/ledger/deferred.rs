@@ -1,14 +1,5 @@
-//! What real hardware is still holding on the guest's behalf.
-//!
-//! A level-triggered interrupt is asserted until whatever raised it is dealt
-//! with, so the real controller's acknowledgement cannot be issued when the
-//! interrupt arrives: doing so would deliver it again immediately, forever. It
-//! is withheld until the guest's own driver has finished, which the guest
-//! announces by acknowledging its emulated controller. Between those two
-//! moments the real controller is holding a vector in service for a guest that
-//! has not finished with it, and that is a debt this module keeps.
-//!
-//! # The acknowledgement register carries no vector
+//! Settling debts on a controller whose acknowledgement register takes no
+//! vector.
 //!
 //! Which is the whole difficulty. Writing it retires whichever vector the real
 //! controller currently holds highest, not one named by the writer — so a debt
@@ -35,7 +26,7 @@
 //! merely requested acknowledges the low one first; its debt is then released
 //! but not payable, because the higher vector is what the real controller holds
 //! at the top. It becomes payable when the higher one is retired, and the next
-//! [`Ledger::release`] is what notices.
+//! [`Deferred::release`] is what notices.
 //!
 //! The third state is what the other two cannot express: *abandoned*, for a
 //! debt whose acknowledgement is not coming. A guest that is reset stops
@@ -58,7 +49,7 @@
 //! only when this processor accepts an interrupt, and it cannot accept one
 //! while this processor's interrupts are masked. No other processor can write
 //! that register, and a non-maskable interrupt sets nothing in it. So
-//! everything here that pays runs inside [`InService::exclusively`], where the
+//! everything here that pays runs inside [`Controller::exclusively`], where the
 //! register is frozen for as long as the payment takes.
 //!
 //! The same window is what makes the bookkeeping safe. Each transition below
@@ -110,111 +101,24 @@
 //! reset. That is a processor making no progress at all, rather than one that
 //! runs with a priority missing.
 //!
-//! Removing the limitation needs awareness of the passed-through I/O
-//! controller: with the redirection entry a vector came from in reach, an
-//! abandoned debt could be paid safely by masking that entry first and leaving
-//! it masked until the guest programs it again.
+//! None of it applies to [`super::immediate`], which is the same hypervisor on
+//! a machine whose controllers can retire a vector by name: there the
+//! acknowledgement is issued and the vector is stopped from arriving again, so
+//! nothing is left in service and no class is lost.
 
 use core::{
     fmt::{self, Display, Formatter},
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use apic::LocalApic;
 use descriptors::Vector;
-use x86_64::instructions::interrupts;
 
-use crate::registers::bitmap::Bitmap;
+use crate::{lifecycle::ledger::Controller, registers::bitmap::Bitmap};
 
-/// What the ledger needs of the controller holding its debts.
-///
-/// Taken as a parameter rather than reached for through [`apic::local`],
-/// because *which* controller a debt is paid through is the one thing that must
-/// not be assumed — the acknowledgement register carries no vector, so paying
-/// through the wrong controller retires an interrupt belonging to somebody else
-/// and strands the one that should have been retired for the life of the
-/// machine.
-///
-/// Passing it in is also what makes every interleaving in this module a test:
-/// nothing here has to be on a processor that has a controller at all.
-pub(crate) trait InService {
-    /// The highest-priority vector the controller is holding in service, or
-    /// `None` if it is holding nothing.
-    fn in_service_top(&self) -> Option<Vector>;
-
-    /// Whether the controller can be reached to be asked at all.
-    ///
-    /// Told apart from a controller holding nothing because the two mean
-    /// opposite things to a debt. A controller that answers "nothing" is one
-    /// that is demonstrably not holding this debt either, which is a
-    /// bookkeeping error to correct; a controller that cannot be asked has said
-    /// nothing at all, and every debt must be left exactly where it was.
-    fn reachable(&self) -> bool;
-
-    /// Retires whichever vector is highest, which is the only thing the
-    /// acknowledgement register can be told to do.
-    fn end_of_interrupt(&self);
-
-    /// Runs `paying` with nothing else on this processor able to reach the
-    /// controller, and answers what it answered.
-    ///
-    /// Part of the seam rather than of the bookkeeping, because it is a
-    /// property of the *controller* and not of the debts: every payment is
-    /// a read of a real register followed by a write that depends on what
-    /// it said, and a handler interposing between the two would be answered
-    /// about one vector and paid for another.
-    fn exclusively<T>(&self, paying: impl FnOnce() -> T) -> T;
-}
-
-impl InService for LocalApic {
-    fn in_service_top(&self) -> Option<Vector> {
-        LocalApic::in_service_top(*self)
-    }
-
-    fn reachable(&self) -> bool {
-        true
-    }
-
-    fn end_of_interrupt(&self) {
-        LocalApic::end_of_interrupt(*self);
-    }
-
-    fn exclusively<T>(&self, paying: impl FnOnce() -> T) -> T {
-        interrupts::without_interrupts(paying)
-    }
-}
-
-/// A controller that may not have been reachable when it was asked for.
-///
-/// Answering as though it were holding nothing is what leaves every debt where
-/// it was: a debt that could not be paid is a real in-service entry with
-/// nothing left that would retire it, and inventing an acknowledgement would
-/// retire whatever the controller does hold instead. Which is why the absence
-/// is reported as such rather than as an empty controller — the two answers
-/// lead to opposite conclusions about a debt hardware is not holding.
-impl InService for Option<LocalApic> {
-    fn in_service_top(&self) -> Option<Vector> {
-        self.as_ref().and_then(InService::in_service_top)
-    }
-
-    fn reachable(&self) -> bool {
-        self.is_some()
-    }
-
-    fn end_of_interrupt(&self) {
-        if let Some(local) = self {
-            InService::end_of_interrupt(local);
-        }
-    }
-
-    fn exclusively<T>(&self, paying: impl FnOnce() -> T) -> T {
-        interrupts::without_interrupts(paying)
-    }
-}
-
-/// The debts one processor's real controller is holding for its guest.
+/// The debts one processor's real controller is holding, on a machine where an
+/// acknowledgement cannot name its vector.
 #[derive(Debug)]
-pub(crate) struct Ledger {
+pub(crate) struct Deferred {
     /// What real hardware holds and the guest may still acknowledge.
     owed: Bitmap,
     /// What the guest has acknowledged, waiting for its turn at the top.
@@ -240,7 +144,7 @@ pub(crate) struct Ledger {
     phantoms: AtomicU32,
 }
 
-impl Ledger {
+impl Deferred {
     /// Nothing owed, which is what a controller is built with.
     pub(crate) const fn new() -> Self {
         Self {
@@ -254,14 +158,6 @@ impl Ledger {
 
     /// Records that real hardware holds `vector` in service for this guest.
     ///
-    /// Recorded before the guest is given the interrupt, so that a guest which
-    /// acknowledges immediately finds the debt already there.
-    ///
-    /// At most one debt per vector can exist, because the real controller has
-    /// one in-service bit per vector and cannot accept a second interrupt
-    /// on a vector it is already holding. A repeat is therefore not a
-    /// second debt and is not counted as one.
-    ///
     /// One store, so there is nothing for an exclusion to protect: no vector is
     /// being moved between two maps, and the caller is an interrupt handler on
     /// the processor whose hardware is owed.
@@ -272,18 +168,13 @@ impl Ledger {
     /// Records that the guest has finished with `vector`, and pays whatever
     /// that makes payable.
     ///
-    /// Any debt on the vector is discharged by this, abandoned ones included:
-    /// the guest acknowledging a vector is the licence to retire it, and a debt
-    /// written off because no acknowledgement was expected is still owed the
-    /// payment if one arrives.
-    ///
     /// Every acknowledgement retries what an earlier one had to defer, which is
     /// what keeps a debt waiting on a vector that has since come to the top
     /// from waiting forever. The retry costs the eight loads below on a
     /// path with nothing to pay, which is the overwhelmingly common one: a
     /// guest acknowledging an edge-triggered interrupt that owed nothing at
     /// all.
-    pub(crate) fn release(&self, vector: Vector, controller: &impl InService) {
+    pub(crate) fn release(&self, vector: Vector, controller: &impl Controller) {
         if !self.holds(vector) && self.released.is_empty() {
             return;
         }
@@ -299,11 +190,8 @@ impl Ledger {
 
     /// Records that nothing is expected to acknowledge `vector`.
     ///
-    /// Reached from two places: an arrival the guest refused, which is the one
-    /// exit a single interrupt makes on its own, and the sweep in
-    /// [`Ledger::settle`]. The debt is kept rather than paid — see this
-    /// module's limitations — and the real controller goes on holding the
-    /// vector.
+    /// The debt is kept rather than paid — see this module's limitations — and
+    /// the real controller goes on holding the vector.
     ///
     /// Needs no exclusion of its own. The two operations that move a vector out
     /// of the owed map hold this processor's interrupts off for as long as they
@@ -315,22 +203,19 @@ impl Ledger {
         self.strandings.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Settles everything real hardware is owed for a guest that will not be
-    /// acknowledging any of it, and says what is left.
+    /// Abandons everything still owed, pays whatever the guest had already
+    /// acknowledged, and says what is left.
     ///
-    /// The two lifecycle boundaries: a guest that has been reset, and one that
-    /// has switched its controller off. Neither will announce that it has
-    /// finished with what it was given, so every debt it still owed is
-    /// abandoned. What it had already acknowledged is *not* — that payment is
-    /// licensed and still due, and is made here if its vector has come to the
-    /// top.
+    /// What the guest had already acknowledged is *not* abandoned — that
+    /// payment is licensed and still due, and is made here if its vector
+    /// has come to the top.
     ///
     /// The whole of it runs with this processor's interrupts held off, which is
     /// what makes the answer exact: a debt recorded by an arrival landing
     /// underneath the sweep would otherwise be one this reports as settled and
     /// nothing ever pays.
     #[must_use]
-    pub(crate) fn settle(&self, controller: &impl InService) -> Debts {
+    pub(crate) fn settle(&self, controller: &impl Controller) -> Owing {
         controller.exclusively(|| {
             // Bounded like the payment below, and for the same reason: each pass
             // that continues clears one bit and nothing inside can set one.
@@ -341,20 +226,15 @@ impl Ledger {
                 self.abandon(vector);
             }
             self.pay(controller);
-            self.debts()
+            self.owing()
         })
     }
 
     /// What real hardware is holding for this guest, and what has become of
     /// what it held before.
-    ///
-    /// Several independent reads and so not one instant's truth, which is all a
-    /// diagnostic needs. The one caller that needs it exact takes it from
-    /// inside [`Ledger::settle`], where this processor's interrupts are
-    /// held off and nothing else can be mutating.
     #[must_use]
-    pub(crate) fn debts(&self) -> Debts {
-        Debts {
+    pub(crate) fn owing(&self) -> Owing {
+        Owing {
             owed: self.owed.count(),
             released: self.released.count(),
             abandoned: self.abandoned.count(),
@@ -387,7 +267,7 @@ impl Ledger {
     ///
     /// Bounded by the number of vectors, because every pass that continues has
     /// cleared one bit of the released map and nothing inside can set one.
-    fn pay(&self, controller: &impl InService) {
+    fn pay(&self, controller: &impl Controller) {
         for _ in 0..Bitmap::CAPACITY {
             let Some(due) = self.released.highest() else {
                 return;
@@ -420,73 +300,62 @@ impl Ledger {
     }
 }
 
-/// What real hardware is holding for one guest, and what has become of what it
-/// held before.
+/// What real hardware is holding for one guest on this kind of controller, and
+/// what has become of what it held before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Debts {
+pub(crate) struct Owing {
     /// How many vectors the guest may still acknowledge.
-    owed: u32,
+    pub(super) owed: u32,
     /// How many it has acknowledged that are waiting for their turn at the top.
-    released: u32,
-    /// How many are held with no acknowledgement expected.
-    abandoned: u32,
+    pub(super) released: u32,
+    /// How many are held with no acknowledgement expected, and so for good.
+    pub(super) abandoned: u32,
     /// How many have been abandoned since the controller was built.
-    strandings: u32,
+    pub(super) strandings: u32,
     /// How many came due against a controller that was not holding them.
-    phantoms: u32,
+    pub(super) phantoms: u32,
 }
 
-impl Debts {
+impl Owing {
     /// Whether real hardware is holding nothing at all for this guest.
-    ///
-    /// About what is outstanding now and not about what has happened: a
-    /// controller that had a debt written off and honoured afterwards is
-    /// holding nothing and says so, while its counts still say what it did.
     #[must_use]
     pub(crate) const fn is_empty(&self) -> bool {
         self.owed == 0 && self.released == 0 && self.abandoned == 0
     }
 }
 
-impl Display for Debts {
-    /// Only what is not zero, because a line reporting five of them says
-    /// nothing.
+impl Display for Owing {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        let mut said = false;
-        for (count, what) in [
-            (self.owed, "owed"),
-            (self.released, "released"),
-            (self.abandoned, "abandoned"),
-            (self.strandings, "abandoned in all"),
-            (self.phantoms, "never held"),
-        ] {
-            if count == 0 {
-                continue;
-            }
-            if said {
-                formatter.write_str(", ")?;
-            }
-            write!(formatter, "{count} {what}")?;
-            said = true;
-        }
-        if !said {
-            formatter.write_str("owed nothing")?;
-        }
-        Ok(())
+        super::describe(
+            formatter,
+            &[
+                (self.owed, "owed"),
+                (self.released, "released"),
+                (self.abandoned, "abandoned"),
+                (self.strandings, "abandoned in all"),
+                (self.phantoms, "never held"),
+            ],
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Every interleaving these assert is one the module's own documentation
+    //! Every interleaving these assert is one this module's own documentation
     //! describes: the controller is a parameter, so a test is a controller.
+    //!
+    //! Each double refuses the two operations this arm must never reach for. A
+    //! controller whose acknowledgement takes no vector has no way to retire
+    //! one by name, so a call to either is a defect this arm would
+    //! otherwise commit silently on every machine but the one it was
+    //! written for.
 
     use alloc::{format, vec::Vec};
     use core::cell::{Cell, RefCell};
 
     use descriptors::Vector;
 
-    use super::{InService, Ledger};
+    use super::{Controller, Deferred};
 
     /// A controller holding a stack of in-service vectors, retiring the top one
     /// when it is acknowledged.
@@ -523,13 +392,9 @@ mod tests {
         }
     }
 
-    impl InService for Holding {
+    impl Controller for Holding {
         fn in_service_top(&self) -> Option<Vector> {
             self.held.borrow().last().copied()
-        }
-
-        fn reachable(&self) -> bool {
-            true
         }
 
         fn end_of_interrupt(&self) {
@@ -538,11 +403,23 @@ mod tests {
             }
         }
 
+        fn retire(&self, _vector: Vector) {
+            unreachable!("this arm exists because the acknowledgement takes no vector");
+        }
+
+        fn set_enabled(&self, _vector: Vector, _enabled: bool) {
+            unreachable!("a controller with no extended space has no interrupt enables");
+        }
+
+        fn reachable(&self) -> bool {
+            true
+        }
+
         /// Nothing else reaches this controller: it is one test's own, and a
         /// test process may not execute the instruction that holds a
         /// real processor's interrupts off.
-        fn exclusively<T>(&self, paying: impl FnOnce() -> T) -> T {
-            paying()
+        fn exclusively<T>(&self, settling: impl FnOnce() -> T) -> T {
+            settling()
         }
     }
 
@@ -550,21 +427,29 @@ mod tests {
     /// this processor's own leaves a caller holding.
     struct Unreachable;
 
-    impl InService for Unreachable {
+    impl Controller for Unreachable {
         fn in_service_top(&self) -> Option<Vector> {
             None
-        }
-
-        fn reachable(&self) -> bool {
-            false
         }
 
         fn end_of_interrupt(&self) {
             unreachable!("a controller that cannot be asked is never acknowledged");
         }
 
-        fn exclusively<T>(&self, paying: impl FnOnce() -> T) -> T {
-            paying()
+        fn retire(&self, _vector: Vector) {
+            unreachable!("this arm exists because the acknowledgement takes no vector");
+        }
+
+        fn set_enabled(&self, _vector: Vector, _enabled: bool) {
+            unreachable!("a controller with no extended space has no interrupt enables");
+        }
+
+        fn reachable(&self) -> bool {
+            false
+        }
+
+        fn exclusively<T>(&self, settling: impl FnOnce() -> T) -> T {
+            settling()
         }
     }
 
@@ -581,18 +466,14 @@ mod tests {
         /// The controller proper.
         controller: Holding,
         /// The ledger the arrival records its debt in.
-        ledger: &'ledger Ledger,
+        ledger: &'ledger Deferred,
         /// What arrives, once.
         arrival: Cell<Option<Vector>>,
     }
 
-    impl InService for Interposing<'_> {
+    impl Controller for Interposing<'_> {
         fn in_service_top(&self) -> Option<Vector> {
             self.controller.in_service_top()
-        }
-
-        fn reachable(&self) -> bool {
-            true
         }
 
         fn end_of_interrupt(&self) {
@@ -603,8 +484,20 @@ mod tests {
             }
         }
 
-        fn exclusively<T>(&self, paying: impl FnOnce() -> T) -> T {
-            paying()
+        fn retire(&self, _vector: Vector) {
+            unreachable!("this arm exists because the acknowledgement takes no vector");
+        }
+
+        fn set_enabled(&self, _vector: Vector, _enabled: bool) {
+            unreachable!("a controller with no extended space has no interrupt enables");
+        }
+
+        fn reachable(&self) -> bool {
+            true
+        }
+
+        fn exclusively<T>(&self, settling: impl FnOnce() -> T) -> T {
+            settling()
         }
     }
 
@@ -615,27 +508,27 @@ mod tests {
 
     #[test]
     fn a_vector_that_was_never_owed_releases_nothing() {
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW]);
 
         ledger.release(LOW, &controller);
-        assert!(ledger.debts().is_empty());
+        assert!(ledger.owing().is_empty());
         assert!(
             controller.paid().is_empty(),
-            "an edge-triggered vector was acknowledged when it arrived, and paying \
-             again would retire somebody else's interrupt"
+            "an edge-triggered vector was acknowledged when it arrived, and paying again would \
+             retire somebody else's interrupt"
         );
     }
 
     #[test]
     fn the_guest_acknowledging_pays_the_debt_it_makes_payable() {
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW]);
         ledger.owe(LOW);
 
         ledger.release(LOW, &controller);
         assert_eq!(controller.paid(), [LOW]);
-        assert!(ledger.debts().is_empty());
+        assert!(ledger.owing().is_empty());
     }
 
     #[test]
@@ -643,7 +536,7 @@ mod tests {
         // A guest may write its acknowledgement register as often as it likes, and
         // every write past the first has no debt to find: a second payment would
         // retire whatever the controller had taken since.
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW, HIGH]);
         ledger.owe(LOW);
 
@@ -655,32 +548,33 @@ mod tests {
         controller.end_of_interrupt();
         ledger.release(HIGH, &controller);
         assert_eq!(controller.paid(), [HIGH, LOW]);
-        assert!(ledger.debts().is_empty());
+        assert!(ledger.owing().is_empty());
     }
 
     #[test]
     fn a_debt_is_not_paid_while_a_higher_vector_is_in_service() {
         // The interleaving the two payable states exist for: the guest services a
-        // low vector while a higher one is still held, and acknowledges the low one
-        // first. Its debt is released and not payable, because the real controller
-        // would retire the higher one instead.
-        let ledger = Ledger::new();
+        // low vector while a higher one is still held, and acknowledges the low
+        // one first. Its debt is released and not payable, because the real
+        // controller would retire the higher one instead.
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW, HIGH]);
         ledger.owe(LOW);
 
         ledger.release(LOW, &controller);
         assert!(controller.paid().is_empty());
-        let debts = ledger.debts();
-        assert_eq!(debts.released, 1, "the debt is kept rather than forgotten");
-        assert_eq!(debts.owed, 0);
+        let owing = ledger.owing();
+        assert_eq!(owing.released, 1, "the debt is kept rather than forgotten");
+        assert_eq!(owing.owed, 0);
     }
 
     #[test]
     fn a_payment_deferred_is_retried_at_the_next_acknowledgement() {
         // Nothing else would ever retry it. The vector blocking the top is retired
-        // by whoever owns it, and the guest's next acknowledgement — of any vector,
-        // debt or no debt — is what notices that the debt below has come up.
-        let ledger = Ledger::new();
+        // by whoever owns it, and the guest's next acknowledgement — of any
+        // vector, debt or no debt — is what notices that the debt below has come
+        // up.
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW, HIGH]);
         ledger.owe(LOW);
         ledger.release(LOW, &controller);
@@ -688,12 +582,12 @@ mod tests {
         controller.end_of_interrupt();
         ledger.release(HIGHER, &controller);
         assert_eq!(controller.paid(), [HIGH, LOW]);
-        assert!(ledger.debts().is_empty());
+        assert!(ledger.owing().is_empty());
     }
 
     #[test]
     fn debts_are_paid_from_the_top_down() {
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW, HIGH]);
         ledger.owe(LOW);
         ledger.owe(HIGH);
@@ -707,22 +601,22 @@ mod tests {
 
         ledger.release(LOW, &controller);
         assert_eq!(controller.paid(), [HIGH, LOW]);
-        assert!(ledger.debts().is_empty());
+        assert!(ledger.owing().is_empty());
     }
 
     #[test]
     fn a_repeated_arrival_is_not_a_second_debt() {
-        // The real controller has one in-service bit per vector and cannot accept a
-        // second interrupt on a vector it is already holding, so a repeat is one
+        // The real controller has one in-service bit per vector and cannot accept
+        // a second interrupt on a vector it is already holding, so a repeat is one
         // debt and one acknowledgement.
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW]);
         ledger.owe(LOW);
         ledger.owe(LOW);
 
         ledger.release(LOW, &controller);
         assert_eq!(controller.paid(), [LOW]);
-        assert!(ledger.debts().is_empty());
+        assert!(ledger.owing().is_empty());
     }
 
     #[test]
@@ -732,31 +626,31 @@ mod tests {
         // in-service state of an I/O controller whose line is still asserted, and
         // the interrupt would arrive again at once, into a guest that has already
         // refused it.
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW]);
         ledger.owe(LOW);
 
         ledger.abandon(LOW);
         assert!(controller.paid().is_empty());
-        let debts = ledger.debts();
-        assert_eq!((debts.owed, debts.abandoned, debts.strandings), (0, 1, 1));
-        assert!(!debts.is_empty());
+        let owing = ledger.owing();
+        assert_eq!((owing.owed, owing.abandoned, owing.strandings), (0, 1, 1));
+        assert!(!owing.is_empty());
     }
 
     #[test]
     fn a_reset_abandons_a_debt_rather_than_acknowledging_a_line_nobody_has_quieted() {
         // A guest that has been reset will never acknowledge anything, and the
         // source it was servicing is still asserting: the acknowledgement is
-        // withheld for good rather than issued into a processor that is being reset
-        // and cannot service the re-arrival.
-        let ledger = Ledger::new();
+        // withheld for good rather than issued into a processor that is being
+        // reset and cannot service the re-arrival.
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW]);
         ledger.owe(LOW);
 
-        let debts = ledger.settle(&controller);
+        let owing = ledger.settle(&controller);
         assert!(controller.paid().is_empty());
-        assert_eq!((debts.owed, debts.abandoned, debts.strandings), (0, 1, 1));
-        assert!(!debts.is_empty(), "the answer says what was left behind");
+        assert_eq!((owing.owed, owing.abandoned, owing.strandings), (0, 1, 1));
+        assert!(!owing.is_empty(), "the answer says what was left behind");
     }
 
     #[test]
@@ -764,16 +658,16 @@ mod tests {
         // Released is not abandoned. The guest said it had finished with this one
         // before it stopped existing, and that acknowledgement is the licence to
         // issue the real one; only the debts it never got to are written off.
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW, HIGH]);
         ledger.owe(LOW);
         ledger.owe(HIGH);
         ledger.release(HIGH, &controller);
         assert_eq!(controller.paid(), [HIGH]);
 
-        let debts = ledger.settle(&controller);
+        let owing = ledger.settle(&controller);
         assert_eq!(controller.paid(), [HIGH], "LOW was never acknowledged");
-        assert_eq!((debts.owed, debts.abandoned), (0, 1));
+        assert_eq!((owing.owed, owing.abandoned), (0, 1));
     }
 
     #[test]
@@ -781,22 +675,22 @@ mod tests {
         // A guest that switches its controller off keeps whatever it had already
         // taken and may switch it on again, so the write-off is not a refusal to
         // honour the acknowledgement — it is the absence of an expectation of one.
-        // If it arrives after all it is paid, because a guest acknowledging a vector
-        // is itself the licence to retire it.
-        let ledger = Ledger::new();
+        // If it arrives after all it is paid, because a guest acknowledging a
+        // vector is itself the licence to retire it.
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW]);
         ledger.owe(LOW);
 
-        let debts = ledger.settle(&controller);
+        let owing = ledger.settle(&controller);
         assert!(controller.paid().is_empty());
-        assert_eq!(debts.abandoned, 1);
+        assert_eq!(owing.abandoned, 1);
 
         ledger.release(LOW, &controller);
         assert_eq!(controller.paid(), [LOW]);
-        let debts = ledger.debts();
-        assert!(debts.is_empty());
+        let owing = ledger.owing();
+        assert!(owing.is_empty());
         assert_eq!(
-            debts.strandings, 1,
+            owing.strandings, 1,
             "the write-off happened, and is counted whether or not it was honoured"
         );
     }
@@ -806,16 +700,16 @@ mod tests {
         // The answer decides whether the reset is reported as clean, and a
         // settlement that looked only at what it could pay would call this one
         // clean while real hardware went on holding two vectors.
-        let ledger = Ledger::new();
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW, HIGH, HIGHER]);
         ledger.owe(LOW);
         ledger.owe(HIGH);
         ledger.release(LOW, &controller);
 
-        let debts = ledger.settle(&controller);
+        let owing = ledger.settle(&controller);
         assert!(controller.paid().is_empty(), "HIGHER is somebody else's");
-        assert_eq!((debts.released, debts.abandoned), (1, 1));
-        assert!(!debts.is_empty());
+        assert_eq!((owing.released, owing.abandoned), (1, 1));
+        assert!(!owing.is_empty());
     }
 
     #[test]
@@ -824,77 +718,79 @@ mod tests {
         // arrival lands in the instant after the settlement's own acknowledgement,
         // when its sweep has already been past. Its debt is unpayable — nothing
         // pays an owed bit — so an answer that did not mention it would be a
-        // settlement reported as complete with a real in-service bit held for good.
-        let ledger = Ledger::new();
+        // settlement reported as complete with a real in-service bit held for
+        // good.
+        let ledger = Deferred::new();
         let controller = Interposing {
             controller: Holding::new(&[LOW, HIGH]),
             ledger: &ledger,
             arrival: Cell::new(Some(HIGHER)),
         };
-        // The guest acknowledges LOW while HIGH is still in service, so the payment
-        // is deferred; HIGH is then retired by whoever owns it, and the debt below
-        // becomes payable.
+        // The guest acknowledges LOW while HIGH is still in service, so the
+        // payment is deferred; HIGH is then retired by whoever owns it, and the
+        // debt below becomes payable.
         ledger.owe(LOW);
         ledger.release(LOW, &controller);
         assert!(controller.controller.paid().is_empty());
-        InService::end_of_interrupt(&controller.controller);
+        Controller::end_of_interrupt(&controller.controller);
 
-        let debts = ledger.settle(&controller);
+        let owing = ledger.settle(&controller);
         assert_eq!(controller.controller.paid(), [HIGH, LOW]);
-        assert_eq!(debts.owed, 1, "the arrival's debt is the answer's");
-        assert!(!debts.is_empty());
+        assert_eq!(owing.owed, 1, "the arrival's debt is the answer's");
+        assert!(!owing.is_empty());
     }
 
     #[test]
     fn a_debt_hardware_is_not_holding_is_dropped_and_counted() {
-        // Something else acknowledged the vector — the one unowed acknowledgement in
-        // this image is the controller's own error handler's — so the bit can never
-        // be what an acknowledgement would retire. Keeping it would report a debt
-        // the machine does not have forever, and would pay for the vector's *next*
-        // arrival while the guest was still servicing it.
-        let ledger = Ledger::new();
+        // Something else acknowledged the vector — the one unowed acknowledgement
+        // in this image is the controller's own error handler's — so the bit can
+        // never be what an acknowledgement would retire. Keeping it would report a
+        // debt the machine does not have forever, and would pay for the vector's
+        // *next* arrival while the guest was still servicing it.
+        let ledger = Deferred::new();
         let controller = Holding::new(&[HIGH]);
         ledger.owe(HIGHER);
 
         ledger.release(HIGHER, &controller);
         assert!(controller.paid().is_empty(), "HIGH is not the debt");
-        let debts = ledger.debts();
-        assert!(debts.is_empty(), "the phantom is gone rather than stuck");
-        assert_eq!(debts.phantoms, 1);
+        let owing = ledger.owing();
+        assert!(owing.is_empty(), "the phantom is gone rather than stuck");
+        assert_eq!(owing.phantoms, 1);
     }
 
     #[test]
     fn a_controller_that_cannot_be_reached_leaves_every_debt_where_it_was() {
-        // It answers nothing about what it holds, and a debt is never dropped on the
-        // strength of an answer nobody gave: an unreachable controller and one
-        // holding nothing would otherwise be the same thing, and they are opposites.
-        let ledger = Ledger::new();
+        // It answers nothing about what it holds, and a debt is never dropped on
+        // the strength of an answer nobody gave: an unreachable controller and one
+        // holding nothing would otherwise be the same thing, and they are
+        // opposites.
+        let ledger = Deferred::new();
         let controller = Holding::new(&[LOW]);
         ledger.owe(LOW);
         ledger.release(LOW, &Unreachable);
 
-        let debts = ledger.debts();
-        assert_eq!((debts.released, debts.phantoms), (1, 0));
+        let owing = ledger.owing();
+        assert_eq!((owing.released, owing.phantoms), (1, 0));
 
         // Reachable again, and the debt is paid rather than lost.
         ledger.release(HIGHER, &controller);
         assert_eq!(controller.paid(), [LOW]);
-        assert!(ledger.debts().is_empty());
+        assert!(ledger.owing().is_empty());
     }
 
     #[test]
     fn debts_report_only_what_is_not_zero() {
         // The record a machine with no serial port is read by, so what it says has
         // to be legible: five counts of which four are usually zero.
-        let ledger = Ledger::new();
-        assert_eq!(format!("{}", ledger.debts()), "owed nothing");
+        let ledger = Deferred::new();
+        assert_eq!(format!("{}", ledger.owing()), "owed nothing");
 
         ledger.owe(LOW);
-        assert_eq!(format!("{}", ledger.debts()), "1 owed");
+        assert_eq!(format!("{}", ledger.owing()), "1 owed");
 
         ledger.abandon(LOW);
         assert_eq!(
-            format!("{}", ledger.debts()),
+            format!("{}", ledger.owing()),
             "1 abandoned, 1 abandoned in all"
         );
     }

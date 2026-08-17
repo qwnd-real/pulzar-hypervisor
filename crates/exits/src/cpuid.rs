@@ -50,13 +50,15 @@ const HYPERVISOR_LEAF_LIMIT: u32 = 0x4000_00FF;
 /// directly should find it as empty as one that trusted the bit would have
 /// expected.
 ///
-/// The extended APIC register space is the same argument about a different
-/// capability. The guest's interrupt controller is emulated and does not model
-/// the registers that space holds, so a guest told the space is there finds
-/// nothing in it — and the one thing worse than a missing capability is a
-/// capability whose registers read as though something else had already claimed
-/// them, which is how an operating system reads a zero out of an extended local
-/// vector table entry.
+/// The extended APIC register space is hidden for a sharper reason than the
+/// other two. Two of its registers are how the hypervisor settles what real
+/// hardware is still holding on the guest's behalf: one retires a named vector,
+/// and one decides which vectors the controller accepts at all. Both are the
+/// host's own bookkeeping, on the real controller rather than the emulated one,
+/// so a guest that could reach them could retire an interrupt the host is
+/// accounting for or silence a vector the host has just given back. The guest's
+/// emulated controller answers the whole range as reserved, and clearing this
+/// bit is what stops software looking there in the first place.
 pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
     let leaf = low(vcpu.save().rax);
     let subleaf = low(vcpu.registers().rcx);

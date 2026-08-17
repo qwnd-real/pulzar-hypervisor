@@ -12,5 +12,20 @@ spin = { workspace = true }
 thiserror = { workspace = true }
 x86_64 = { workspace = true }
 
+[features]
+# Compiles every log record out of the whole image.
+#
+# `log`'s static maximum level becomes `Off`, which the log macros are expanded
+# against at compile time: no record is formatted, no lock is taken, no byte
+# reaches a port, and the arguments are not evaluated either — so the register
+# reads and controller queries that only ever fed a trace line stop happening
+# as well. `log` is compiled once for the build, so enabling this anywhere
+# strips every crate's records and not just this one's.
+#
+# For a real machine, where a byte down a 16550 costs 260 µs with interrupts
+# held off, and the machine has a header whether or not anything is plugged
+# into it.
+quiet = ["log/max_level_off"]
+
 [lints]
 workspace = true

@@ -76,6 +76,24 @@ pub const IA32_TSC: u32 = 0x10;
 /// a write to [`IA32_TSC`] changes this value by the same amount.
 pub const IA32_TSC_ADJUST: u32 = 0x3B;
 
+/// `IA32_PAT`, the page-attribute table: eight memory types, one per encoding
+/// of a page table entry's `PAT`, `PCD` and `PWT` bits.
+///
+/// Named here because under nested paging a guest's copy of this register is
+/// *not* this register. The processor takes the guest's memory types from the
+/// save area's `g_pat` field and leaves the real register as host state, so a
+/// guest write left to reach the machine does exactly the wrong thing twice
+/// over: it reprograms the memory types the *hypervisor's* own mappings are
+/// interpreted through, without the cache-flush transition the architecture
+/// prescribes for changing them, and it leaves the guest's own memory types
+/// untouched. A guest that asks for write-combining and silently does not get
+/// it is a guest whose framebuffer writes go out one partial transaction at a
+/// time.
+///
+/// Reads are intercepted with writes so that the two agree: a guest that could
+/// read the machine's register would be told its own write had not happened.
+pub const IA32_PAT: u32 = 0x277;
+
 /// `VM_CR`, the register deciding whether this extension may be used on this
 /// machine, with three unrelated switches sharing the space.
 pub const VM_CR: u32 = 0xC001_0114;

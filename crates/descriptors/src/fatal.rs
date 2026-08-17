@@ -43,6 +43,21 @@ pub(crate) fn nesting(vector: Vector, stack: VirtAddr) -> ! {
     ))
 }
 
+/// Reports an event that arrived while the live global descriptor table was not
+/// one this crate built, and stops.
+///
+/// The entry path finds this processor's own block through the task descriptor
+/// at the end of that table, so a table that is not ours answers with an
+/// address that is not one either. Judging it rather than reading it is what
+/// keeps one unrecoverable event from becoming an endless fault; what is left
+/// to say is the table it was judged on.
+pub(crate) fn foreign_gdt(base: VirtAddr, limit: u16) -> ! {
+    report(format_args!(
+        "an event arrived on a global descriptor table that is not ours: base {base:#x}, limit \
+         {limit:#x}"
+    ))
+}
+
 /// Writes one line to the port and stops this processor.
 fn report(what: Arguments<'_>) -> ! {
     serial::emergency(format_args!("descriptors: {what}"));

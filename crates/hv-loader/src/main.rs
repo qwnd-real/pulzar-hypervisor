@@ -115,9 +115,11 @@ fn main() -> Status {
     // address, which is exactly what the identity window describes. The
     // descriptor tables read here are the ones the processor is running on.
     let firmware = unsafe { snapshot::capture(DirectMap::identity()) };
-    if serial::init().is_err() {
-        return Status::DEVICE_ERROR;
-    }
+    // Not fatal, and for the reason the hypervisor image gives at its own call:
+    // a machine with no output is one nothing can be reported from rather than
+    // one that must not boot. Every record below is discarded while no logger is
+    // installed, and the loader's work does not depend on any of them.
+    let _ = serial::init();
     info!("loader: pulzar hv-loader starting");
     firmware.describe("loader");
     match boot(&firmware) {

@@ -98,10 +98,7 @@ pub use crate::{
     gdt::Selectors,
     vector::{InterruptStack, Resumption, Vector},
 };
-use crate::{
-    gdt::Segments,
-    idt::{Idt, Stacks},
-};
+use crate::{gdt::Segments, idt::Idt};
 
 /// Everything one processor needs to run on tables of its own, built and not
 /// yet loaded.
@@ -119,14 +116,10 @@ pub struct Tables {
     segments: Segments,
     /// The table this processor ends up on.
     table: Box<Idt>,
-    /// The table it is on while the segments are being replaced, whose gates
-    /// switch no stacks because the task register does not yet name a task
-    /// state segment that has any.
-    transition: Box<Idt>,
 }
 
 impl Tables {
-    /// Allocates this processor's interrupt stacks and writes its three tables.
+    /// Allocates this processor's interrupt stacks and writes its tables.
     ///
     /// Nothing is loaded and no register is touched. A failure leaves the
     /// processor exactly as it was, with every frame and every window run the
@@ -152,11 +145,10 @@ impl Tables {
         }
         let stacks = gdt::allocate_stacks(space)?;
         match Self::assemble(&stacks) {
-            Ok((segments, table, transition)) => Ok(Self {
+            Ok((segments, table)) => Ok(Self {
                 stacks,
                 segments,
                 table,
-                transition,
             }),
             Err(error) => {
                 gdt::release_stacks(space, stacks.into_iter().rev());
@@ -173,12 +165,10 @@ impl Tables {
     /// returned alongside the error that consumed it.
     fn assemble(
         stacks: &[Stack; InterruptStack::COUNT],
-    ) -> Result<(Segments, Box<Idt>, Box<Idt>), DescriptorError> {
+    ) -> Result<(Segments, Box<Idt>), DescriptorError> {
         let segments = Segments::build(stacks)?;
-        let code = segments.selectors().code;
-        let table = Idt::build(code, Stacks::Own)?;
-        let transition = Idt::build(code, Stacks::Interrupted)?;
-        Ok((segments, table, transition))
+        let table = Idt::build(segments.selectors().code)?;
+        Ok((segments, table))
     }
 
     /// Gives everything back without loading any of it.
@@ -198,23 +188,42 @@ impl Tables {
     ///
     /// 1. Interrupts are masked and stay masked until the end. That holds off
     ///    the maskable arrivals; it does not hold off a fault, a machine check
-    ///    or a non-maskable interrupt, which is why the steps below leave no
-    ///    interval where one of those would be delivered through something
-    ///    inconsistent.
+    ///    or a non-maskable interrupt, which is why the steps below leave as
+    ///    little as possible between them.
     /// 2. The debug registers are disarmed, so that nothing firmware left armed
     ///    can raise `#DB` inside the path that handles `#DB`.
-    /// 3. The transition table is loaded. Its gates name the code selector that
-    ///    is live *now*, and switch no stacks, so it is valid before the
-    ///    segments change and valid after — and from this instant every vector
-    ///    reaches this image rather than firmware's handlers.
-    /// 4. The segments are replaced and the task register is loaded. The code
+    /// 3. The segments are replaced and the task register is loaded. The code
     ///    segment lands at the index the live code selector already used and
-    ///    the live stack descriptor is carried over unchanged, so the table
-    ///    loaded in step 3 keeps meaning what it meant, and so does an `IRET`
+    ///    the live stack descriptor is carried over unchanged, so the gates
+    ///    that are live at this instant — firmware's, or whatever the
+    ///    trampoline left — keep meaning what they meant, and so does an `IRET`
     ///    that reloads either register.
-    /// 5. The real table is loaded, and its gates may name interrupt stacks
-    ///    because the task register now names the segment holding them.
-    /// 6. The interrupt flag goes back to whatever it was on entry.
+    /// 4. The table is loaded, and its gates may name interrupt stacks because
+    ///    the task register already names the segment holding them.
+    /// 5. The interrupt flag goes back to whatever it was on entry.
+    ///
+    /// # Why the segments go first
+    ///
+    /// Because the entry path needs them. Every gate in the table switches to a
+    /// stack out of this processor's own task state segment, and the first
+    /// thing a handler does is find this processor's block through the task
+    /// descriptor at the end of the live global descriptor table. A table
+    /// of ours loaded while the machine's own descriptors were still live
+    /// would be a table whose handlers cannot run: the block they look for
+    /// is not described there, and an event arriving in that interval would
+    /// fault inside the entry path, arrive again through the same gate, and
+    /// never get as far as saying so.
+    ///
+    /// So the interval that exists is the other one — this processor's
+    /// descriptors live with the machine's gates still installed — and it is
+    /// the harmless direction. What step 3 keeps meaning what it meant is what
+    /// an event delivered through those gates needs: the code selector, because
+    /// a gate names one, and the stack selector, because `IRET` reloads it.
+    /// What firmware's own handler makes of the event is firmware's
+    /// business, and the only thing that reaches it is an event masking
+    /// does not hold off, in an interval of a dozen instructions.
+    /// [`gdt::block`] refuses the other direction outright rather than
+    /// trusting that it cannot happen.
     ///
     /// # Errors
     ///
@@ -227,7 +236,6 @@ impl Tables {
         let Self {
             segments,
             table,
-            transition,
             stacks: _,
         } = self;
         let mut installed = INSTALLED.lock();
@@ -243,20 +251,16 @@ impl Tables {
         let table: &'static Idt = Box::leak(table);
         let selectors = interrupts::without_interrupts(|| {
             gdt::disarm_debug();
-            // SAFETY: `transition` lives until the end of this function, which is
-            // past the load of `table` that replaces it. Its gates name the code
-            // selector that is live at this instant and switch no stacks, so they
-            // need nothing of the task register. `segments` was built on this
-            // processor, which the record above proves is not already running on
-            // tables of ours, so its task descriptor is not busy; it preserves
-            // the live code and stack descriptors, so the gates just loaded stay
-            // valid across it; and nothing in this image depends on the
-            // segmentation or on an `FS`/`GS` base at this point in bring-up.
-            // `table` is `'static` and its gates name the code selector the
-            // segments just made ours and the stacks the task register now
-            // reaches.
+            // SAFETY: `segments` was built on this processor, which the record
+            // above proves is not already running on tables of ours, so its task
+            // descriptor is not busy; it preserves the live code and stack
+            // descriptors, so the gates installed at this instant stay valid
+            // across it; and nothing in this image depends on the segmentation or
+            // on an `FS`/`GS` base at this point in bring-up. `table` is
+            // `'static`, its gates name the code selector the segments just made
+            // ours, and the stacks they switch to are in the task state segment
+            // the task register now names.
             unsafe {
-                idt::load(&transition);
                 let selectors = segments.activate();
                 idt::load(table);
                 selectors

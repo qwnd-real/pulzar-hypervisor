@@ -88,6 +88,7 @@ extern crate alloc;
 
 mod base;
 mod capture;
+mod extended;
 mod icr;
 mod lvt;
 mod pic;
@@ -115,6 +116,7 @@ use x86_64::PhysAddr;
 
 pub use crate::{
     capture::{Controller, FirmwareState, LVT_ENTRIES, LocalState, VECTOR_WORDS, capture},
+    extended::{Extended, Specific},
     icr::{Command, Delivery, Target},
     lvt::{Delivery as LvtDelivery, Entry, Polarity, Trigger},
     register::{REGISTER_STRIDE, X2APIC_BASE_MSR, lvt_entries, version_number},
@@ -333,11 +335,12 @@ impl Apic {
             pic::mask();
         }
 
-        bring_up(access, wiring);
+        let extended = bring_up(access, wiring);
         INSTALLED.call_once(|| Installation {
             page,
             mode: entered,
             local_nmis,
+            extended,
         });
         Ok(Self {
             entered,
@@ -368,6 +371,12 @@ impl Apic {
         if self.masked_8259 {
             info!("{who}: apic masked both legacy 8259 controllers");
         }
+        info!(
+            "{who}: apic {}",
+            INSTALLED
+                .get()
+                .map_or(Extended::empty(), |installed| installed.extended)
+        );
         info!(
             "{who}: apic spurious interrupts on {SPURIOUS} ({} so far), controller errors on {ERROR} ({} so far)",
             SPURIOUS_ARRIVALS.load(Ordering::Relaxed),
@@ -469,7 +478,20 @@ impl LocalApic {
             .find(id)
             .ok_or(CpuError::Unknown { apic_id: id })?
             .uid();
-        bring_up(access, wiring(&installed.local_nmis, uid));
+        let extended = bring_up(access, wiring(&installed.local_nmis, uid));
+        if extended != installed.extended {
+            // Said rather than refused, because the processor is worth running
+            // either way and there is nothing here that could change what was
+            // decided from the boot processor's controller. What it costs is
+            // stated where the decision is used: a controller that cannot retire
+            // a named vector, asked to, retires nothing, and the withheld
+            // acknowledgement stays withheld.
+            warn!(
+                "apic: {id} reports {extended} and the machine was installed with {}, so whichever \
+                 of the two this processor does not have will not behave as the rest do",
+                installed.extended
+            );
+        }
         Ok(Self::of(installed))
     }
 
@@ -765,8 +787,35 @@ impl LocalApic {
     /// Owed for everything the controller delivered, and for nothing else: a
     /// spurious interrupt was never accepted, so acknowledging one would retire
     /// whatever really is in service instead.
+    ///
+    /// Retires whichever vector in service has the highest priority, because
+    /// that is the only thing the register can be told to do. Anything that
+    /// withheld an acknowledgement and means to issue it later has to establish
+    /// that the vector it owes is still that one — or use
+    /// [`LocalApic::specific`], where the question does not arise.
     pub fn end_of_interrupt(self) {
         self.access().acknowledge();
+    }
+
+    /// What the extended register space offers on this machine's controllers.
+    ///
+    /// Read once from the boot processor's own controller, for the reason
+    /// [`Installation::extended`] gives.
+    #[must_use]
+    pub fn extended(self) -> Extended {
+        self.installed.extended
+    }
+
+    /// Retiring one named vector and stopping one being accepted, on this
+    /// processor's controller, or `None` where its controller cannot do both.
+    ///
+    /// The absence is the ordinary answer rather than a failure: it is every
+    /// machine whose controllers have no extended register space, which is
+    /// every Intel part and every emulator this hypervisor is developed
+    /// against. Whoever asks has to have something to do without it.
+    #[must_use]
+    pub fn specific(self) -> Option<Specific> {
+        self.extended().usable().then(|| Specific::new(self))
     }
 
     /// Sends `command`.
@@ -852,11 +901,17 @@ fn identifier(access: Access, mode: Mode) -> ApicId {
 /// deliver something written, because a software-disabled controller holds
 /// every entry masked and ignores an attempt to clear the bit.
 ///
+/// Answers what the extended register space turned out to offer on this
+/// processor, having switched on the parts of it this crate uses. It is done
+/// here because it is per processor and belongs with everything else each
+/// processor does to its own controller once, and it is done after the enable
+/// bit for the same reason the sources are.
+///
 /// Nothing here can fail. Every register it writes is one the controller has
 /// said it has, and every value is one the register accepts — which is what
 /// lets installation put its last refusal before this and treat the rest as
 /// done.
-fn bring_up(access: Access, wiring: [Entry; 2]) {
+fn bring_up(access: Access, wiring: [Entry; 2]) -> Extended {
     let entries = register::lvt_entries(access.read(Register::VERSION));
 
     // SAFETY: a masked entry with a valid vector delivers nothing, which is
@@ -906,9 +961,11 @@ fn bring_up(access: Access, wiring: [Entry; 2]) {
     }
 
     retire_inherited(access);
+    let extended = extended::install(access);
     // Last: the register latches whatever the controller noticed while it was
     // being set up, and none of that describes a running machine.
     let _ = take_errors(access);
+    extended
 }
 
 /// Acknowledges whatever the controller was already holding in service, and
@@ -1078,6 +1135,17 @@ struct Installation {
     mode: Mode,
     /// What firmware said about the two interrupt pins of each processor.
     local_nmis: Vec<LocalNmi>,
+    /// What the extended register space offers, as the boot processor's own
+    /// controller reported it.
+    ///
+    /// Machine-wide because it is read once, and that is an assumption about
+    /// the machine rather than about the architecture: the space and its
+    /// parts are fixed at reset and uniform across a package, exactly as
+    /// the features [`processor::features`] caches from one processor are.
+    /// Every processor joining afterwards checks its own against this and
+    /// says so if they differ, because what would follow otherwise is a
+    /// vector-named acknowledgement issued to a controller that ignores it.
+    extended: Extended,
 }
 
 /// Decided by the boot processor, read by every processor bringing its own

@@ -278,8 +278,10 @@ fn injection(control: &ControlArea) -> Option<Invalid> {
 /// Whether every field of a page-attribute table holds a memory type.
 ///
 /// Only read when nested paging is on, which is the only time the processor
-/// loads this register from the control block at all.
-fn pat(g_pat: u64) -> Option<Invalid> {
+/// loads this register from the control block at all — and asked of a guest's
+/// write of the register before it is stored, so that a value the entry check
+/// would refuse becomes the fault the guest is owed instead.
+pub(crate) fn pat(g_pat: u64) -> Option<Invalid> {
     for field in 0..PAT_FIELDS {
         #[expect(
             clippy::cast_possible_truncation,

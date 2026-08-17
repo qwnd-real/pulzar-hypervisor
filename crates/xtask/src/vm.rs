@@ -37,15 +37,41 @@ pub struct Spec {
     pub tpm: bool,
     /// Expose QEMU's guest GDB stub on the local machine.
     pub gdb: bool,
-    /// Log outputs to capture: the first entry takes the debug console, which
-    /// is where the guest writes, and any further ones become COM1 upwards.
-    /// Empty means the debug console on stdio.
-    pub serial_logs: Vec<PathBuf>,
+    /// Where the guest's own log output goes, and whether it has anywhere to go
+    /// at all.
+    pub console: Console,
+}
+
+/// What output devices the guest is given.
+///
+/// A choice rather than a list, because "no device" and "the default device"
+/// are not points on the same scale: one of them is a machine the guest can
+/// describe itself on and the other is a machine where every record it produces
+/// is discarded at the source.
+pub enum Console {
+    /// The debug console, to this terminal. What a run says when nothing asked
+    /// otherwise.
+    Stdio,
+    /// The debug console to the first file, and COM1 upwards to any others.
+    Files(Vec<PathBuf>),
+    /// Neither a debug console nor a serial port.
+    ///
+    /// What a machine with no serial header presents, which is the machine this
+    /// hypervisor has to run on: the log records are still in the image and
+    /// still decide whether they have anything to say, and there is nowhere for
+    /// the answer to go. Worth being able to ask for under QEMU, because it is
+    /// the one configuration where logging cannot be what changed the timing.
+    None,
 }
 
 /// Builds the boot media and runs it in QEMU, optionally with a guest disk.
-pub fn run(os: Guest, release: bool, gdb: bool, serial_logs: Vec<PathBuf>) -> Result<()> {
-    let staged = esp::stage(release)?;
+///
+/// `silent` compiles every log record out of both images, which is a strange
+/// thing to ask of a QEMU run — the debug console there costs one port write a
+/// byte — and is offered anyway, because a bare-metal image is worth being able
+/// to try under QEMU before it is written to a stick.
+pub fn run(os: Guest, release: bool, gdb: bool, silent: bool, console: Console) -> Result<()> {
+    let staged = esp::stage(release, silent)?;
     let disk = match os {
         Guest::None => None,
         Guest::Linux => Some(existing_image(os, "cargo xtask disk linux")?),
@@ -61,7 +87,7 @@ pub fn run(os: Guest, release: bool, gdb: bool, serial_logs: Vec<PathBuf>) -> Re
         installer: None,
         tpm: matches!(os, Guest::Windows),
         gdb,
-        serial_logs,
+        console,
     })
 }
 
@@ -70,12 +96,13 @@ pub fn launch(spec: &Spec) -> Result<()> {
     let (code, vars) = firmware(spec.label)?;
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.args(["-machine", "q35,accel=kvm", "-cpu", "host,invtsc=on"]);
-    qemu.args(["-smp", "4", "-m", "4G"]);
+    qemu.args(["-smp", "16", "-m", "8G"]);
     qemu.args(["-no-shutdown", "-no-reboot"]);
+    qemu.args(["-overcommit", "cpu-pm=on"]);
     if spec.gdb {
         qemu.args(["-gdb", "tcp:127.0.0.1:1234"]);
     }
-    output_args(&mut qemu, &spec.serial_logs)?;
+    output_args(&mut qemu, &spec.console)?;
     qemu.arg("-drive").arg(format!(
         "if=pflash,format=raw,readonly=on,file={}",
         drive_path(&code)
@@ -124,8 +151,20 @@ pub fn launch(spec: &Spec) -> Result<()> {
 /// both. Files are created empty up front — appending to a previous run's log,
 /// or silently keeping one around when QEMU fails to start, would be a
 /// debugging hazard.
-fn output_args(qemu: &mut Command, logs: &[PathBuf]) -> Result<()> {
-    let Some((console, ports)) = logs.split_first() else {
+///
+/// [`Console::None`] passes neither, and the debug console's absence is its
+/// absence from the command line: a port nothing is attached to is a port the
+/// guest's probe does not find, which is the whole point of asking for it.
+fn output_args(qemu: &mut Command, console: &Console) -> Result<()> {
+    let files = match console {
+        Console::None => {
+            qemu.args(["-serial", "none"]);
+            return Ok(());
+        }
+        Console::Stdio => &[][..],
+        Console::Files(files) => files,
+    };
+    let Some((first, ports)) = files.split_first() else {
         qemu.args(["-debugcon", "stdio", "-serial", "none"]);
         return Ok(());
     };
@@ -134,7 +173,7 @@ fn output_args(qemu: &mut Command, logs: &[PathBuf]) -> Result<()> {
         "QEMU's PC machines expose at most four serial ports (COM1–COM4) beyond the debug console"
     );
     qemu.arg("-chardev")
-        .arg(format!("file,id=debugcon,path={}", chardev_path(console)?));
+        .arg(format!("file,id=debugcon,path={}", chardev_path(first)?));
     qemu.args(["-debugcon", "chardev:debugcon"]);
     for (index, path) in ports.iter().enumerate() {
         qemu.arg("-chardev")

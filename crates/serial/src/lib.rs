@@ -19,6 +19,29 @@
 //! long enough to be useful takes longer to send than the guest gets to run
 //! between two exits.
 //!
+//! # Machines with no output, and machines that must not spend time on it
+//!
+//! Both are ordinary and neither is a failure.
+//!
+//! A machine with no port at all is one nothing can be reported from, which is
+//! a reason to run it silently rather than a reason not to run it: [`init`]
+//! answers [`InitError::NoUartFound`] and callers carry on, after which [`log`]
+//! discards every record because no logger was installed and [`emergency`]
+//! writes nowhere because no backend was chosen.
+//!
+//! A machine with a port is the harder case, because *having* one is not the
+//! same as anybody listening to it. Every desktop board with a serial header
+//! has a working 16550 behind it whether or not a cable is plugged in, and the
+//! transmitter clocks its bytes out at the line rate regardless — so on such a
+//! machine the log costs exactly as much as it would if somebody were reading
+//! it, and buys nothing. The `quiet` feature is for that machine: it takes
+//! [`MAX_LEVEL`] to `Off` and, because that is `log`'s *static* maximum, every
+//! record in every crate of the build is compiled out rather than filtered.
+//! Nothing is formatted, no lock is taken, and the arguments are never
+//! evaluated — which matters here beyond the bytes, because several of this
+//! workspace's trace lines read a real controller register or query a
+//! controller to build their arguments.
+//!
 //! The crate is safe to use from any number of cores. The chosen backend sits
 //! behind a spinlock that is held for one whole log line at a time, so
 //! concurrent records come out intact instead of interleaved byte-by-byte.
@@ -53,13 +76,37 @@ use crate::{debugcon::Debugcon, uart::Uart};
 
 /// Most verbose level that gets logged.
 ///
-/// `Info` and up regardless of profile. What that costs depends entirely on
-/// which backend answered: through the debug console a record is a run of port
-/// writes and per-exit logging is affordable, while through a UART every byte
-/// is clocked out at the line rate and on a virtualized machine each access is
-/// itself a world switch — so the host spends longer reporting an exit than the
-/// guest gets to run between two of them.
-pub const MAX_LEVEL: LevelFilter = LevelFilter::Info;
+/// `Info` and up, unless the `quiet` feature is on, in which case nothing is
+/// logged at all and every record is compiled out rather than filtered at run
+/// time.
+///
+/// What logging costs depends entirely on which backend answered: through the
+/// debug console a record is a run of port writes and per-exit logging is
+/// affordable, while through a UART every byte is clocked out at the line rate
+/// and on a virtualized machine each access is itself a world switch — so the
+/// host spends longer reporting an exit than the guest gets to run between two
+/// of them. A real machine almost always has a UART and almost never has a
+/// debug console, which is what `quiet` is for.
+pub const MAX_LEVEL: LevelFilter = if cfg!(feature = "quiet") {
+    LevelFilter::Off
+} else {
+    LevelFilter::Info
+};
+
+/// The `quiet` feature has to reach [`log`]'s *static* maximum level and not
+/// merely this crate's, because that is the one the macros are expanded
+/// against. A run-time filter would still format the record, still take the
+/// lock, and — the part that matters most here — still evaluate the arguments,
+/// which on several paths in this workspace means reading a real controller
+/// register or querying a controller to build a line nothing will print.
+///
+/// So if the feature ever stops forwarding to `log`, this is what says so,
+/// rather than a machine that is mysteriously slow again.
+#[cfg(feature = "quiet")]
+const _: () = assert!(
+    log::STATIC_MAX_LEVEL as usize == LevelFilter::Off as usize,
+    "the quiet feature must switch log's static maximum level off, not this crate's"
+);
 
 /// The output all log records funnel through, behind the lock that keeps each
 /// core's lines whole. `None` until [`init`] chooses one.

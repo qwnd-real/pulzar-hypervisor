@@ -27,6 +27,14 @@ enum Cli {
         /// Build with the release profile.
         #[arg(long)]
         release: bool,
+        /// Compile every log record out of both images.
+        ///
+        /// For a real machine, where a byte down a 16550 costs 260 µs with
+        /// interrupts held off and a board with a serial header has a working
+        /// one behind it whether or not a cable is plugged in. Counters kept in
+        /// memory are unaffected and still readable from a debugger.
+        #[arg(long)]
+        silent: bool,
     },
     /// Provision a guest OS disk image (a one-time setup step per machine).
     #[command(subcommand)]
@@ -42,6 +50,19 @@ enum Cli {
         /// Expose QEMU's guest GDB stub on 127.0.0.1:1234.
         #[arg(long)]
         gdb: bool,
+        /// Compile every log record out of both images, as `build --silent`.
+        #[arg(long)]
+        silent: bool,
+        /// Give the guest no debug console and no serial port at all.
+        ///
+        /// What a machine with no serial header presents, which is the machine
+        /// this hypervisor has to run on: every log record is still in the
+        /// image and still decides whether it has anything to say, and
+        /// the answer has nowhere to go. The one configuration in which
+        /// logging cannot be what changed the timing — `--silent`
+        /// removes the records instead, which is a different question.
+        #[arg(long, conflicts_with = "serial_log")]
+        no_console: bool,
         /// Capture a guest log output to a file, created fresh each run.
         /// Repeatable: the first use maps to the debug console, which is where
         /// the guest logs, and further uses to COM1 upwards. Without it, the
@@ -96,14 +117,26 @@ impl Guest {
 
 fn main() -> Result<()> {
     match Cli::parse() {
-        Cli::Build { release } => esp::stage(release).map(|_| ()),
+        Cli::Build { release, silent } => esp::stage(release, silent).map(|_| ()),
         Cli::Disk(DiskCommand::Linux { force }) => disk::linux(force),
         Cli::Disk(DiskCommand::Windows { iso, force }) => disk::windows(&iso, force),
         Cli::Run {
             os,
             release,
             gdb,
+            silent,
+            no_console,
             serial_log,
-        } => vm::run(os, release, gdb, serial_log),
+        } => {
+            // Three ways of asking, and they collapse to one answer here so that
+            // nothing downstream has to hold both a flag and a list and decide
+            // which of them means what.
+            let console = match (no_console, serial_log) {
+                (true, _) => vm::Console::None,
+                (false, files) if files.is_empty() => vm::Console::Stdio,
+                (false, files) => vm::Console::Files(files),
+            };
+            vm::run(os, release, gdb, silent, console)
+        }
     }
 }

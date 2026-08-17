@@ -86,6 +86,16 @@ bitflags! {
         /// The timestamp-counter adjustment register exists, so software can
         /// observe and update the cumulative changes made to the counter.
         const TSC_ADJUST = 1 << 8;
+        /// The local interrupt controller has the extended register space AMD
+        /// adds above the architectural registers, which is where a vector can
+        /// be retired by name rather than by priority and where a single vector
+        /// can be stopped from being accepted at all.
+        ///
+        /// A capability of the space as a whole. Which parts of it a particular
+        /// controller implements is in the space's own feature register, so a
+        /// processor reporting this is one whose controller may be asked and not
+        /// one that necessarily has any given part.
+        const EXTENDED_APIC_SPACE = 1 << 9;
     }
 }
 
@@ -155,6 +165,12 @@ impl Features {
                 .get_extended_feature_info()
                 .as_ref()
                 .is_some_and(ExtendedFeatures::has_tsc_adjust_msr),
+        );
+        features.set(
+            Self::EXTENDED_APIC_SPACE,
+            extended
+                .as_ref()
+                .is_some_and(ExtendedProcessorFeatureIdentifiers::has_ext_apic_space),
         );
         features
     }

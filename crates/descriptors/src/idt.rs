@@ -55,16 +55,17 @@
 //!   are replaced until every such source is silenced, which is what
 //!   [`crate::Descriptors::unmask`] exists to make a caller state.
 //!
-//! # Two tables, briefly
+//! # One table, loaded last
 //!
 //! A gate that names an interrupt stack table slot is only meaningful once the
-//! task register names the task state segment holding it. But the table has to
-//! be live *before* the global descriptor table is replaced, or there is an
-//! interval where the gates that are live name selectors that have changed
-//! meaning underneath them. Both cannot be true of one table, so there are two:
-//! one whose gates switch no stacks, live across the change, and the real one,
-//! loaded the instant the task register is valid. See
-//! [`crate::Tables::activate`].
+//! task register names the task state segment holding it, so this table is
+//! loaded after the segments are replaced rather than before. That order is not
+//! only about the stacks: the first thing an entry point does is find this
+//! processor's own block through the task descriptor at the end of the live
+//! global descriptor table, so a table of ours loaded while the machine's own
+//! descriptors were still live would be a table whose handlers cannot run. See
+//! [`crate::Tables::activate`], which states what the remaining interval is and
+//! why it is the harmless one.
 
 use alloc::boxed::Box;
 
@@ -177,31 +178,28 @@ const _: () = assert!(
 /// that could produce one entry point per vector, and writing out 256 calls to
 /// achieve it would be 256 chances to transpose a number.
 macro_rules! gates {
-    ($table:expr, $selector:expr, $stacks:expr) => {
-        gates!(@high $table, $selector, $stacks, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    ($table:expr, $selector:expr) => {
+        gates!(@high $table, $selector, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
     };
-    (@high $table:expr, $selector:expr, $stacks:expr, $($high:literal),+) => {
-        $( gates!(@low $table, $selector, $stacks, $high, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); )+
+    (@high $table:expr, $selector:expr, $($high:literal),+) => {
+        $( gates!(@low $table, $selector, $high, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); )+
     };
-    (@low $table:expr, $selector:expr, $stacks:expr, $high:literal, $($low:literal),+) => {
-        $( gate::<{ $high * 16 + $low }>($table, $selector, $stacks); )+
+    (@low $table:expr, $selector:expr, $high:literal, $($low:literal),+) => {
+        $( gate::<{ $high * 16 + $low }>($table, $selector); )+
     };
 }
 
 impl Idt {
-    /// Builds a table whose gates enter this image on `selector` and switch
-    /// stacks as `stacks` says.
+    /// Builds a table whose gates enter this image on `selector` and switch to
+    /// the stack each vector asks for.
     ///
     /// # Errors
     ///
     /// [`DescriptorError::OutOfMemory`] if the table cannot be allocated.
-    pub(crate) fn build(
-        selector: SegmentSelector,
-        stacks: Stacks,
-    ) -> Result<Box<Self>, DescriptorError> {
+    pub(crate) fn build(selector: SegmentSelector) -> Result<Box<Self>, DescriptorError> {
         let mut table = Box::try_new(Self([Gate::MISSING; Vector::COUNT]))
             .map_err(|_| DescriptorError::OutOfMemory)?;
-        gates!(&mut table, selector, stacks);
+        gates!(&mut table, selector);
         Ok(table)
     }
 
@@ -214,29 +212,16 @@ impl Idt {
     }
 }
 
-/// Which stack the gates of a table switch to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Stacks {
-    /// The one the interrupted code was already on.
-    ///
-    /// What a table loaded before the task register can say and nothing more:
-    /// the stacks it would otherwise name are in a task state segment the
-    /// processor is not looking at yet.
-    Interrupted,
-    /// The one each vector asks for, out of this processor's own task state
-    /// segment.
-    Own,
-}
-
 /// Points this processor at `table`.
 ///
 /// # Safety
 ///
 /// `table` must outlive every moment the processor is running with it loaded,
 /// which for the table a processor ends up on means forever. Its gates must
-/// name a code selector the live global descriptor table describes, and if any
-/// of them switches stacks, the task register must already name a task state
-/// segment whose slots are filled.
+/// name a code selector the live global descriptor table describes, and —
+/// because every table this crate builds switches stacks for the conditions
+/// that cannot trust the one they interrupted — the task register must already
+/// name a task state segment whose slots are filled.
 pub(crate) unsafe fn load(table: &Idt) {
     // SAFETY: the pointer describes `table` itself, with the limit its own size
     // fixes; the caller vouches for its lifetime and for the state its gates
@@ -250,14 +235,11 @@ pub(crate) unsafe fn load(table: &Idt) {
 /// through the shape the processor enters it with and whether it may return,
 /// and which stack, through the conditions that cannot trust the one they
 /// interrupted.
-fn gate<const NUMBER: u8>(table: &mut Idt, selector: SegmentSelector, stacks: Stacks) {
+fn gate<const NUMBER: u8>(table: &mut Idt, selector: SegmentSelector) {
     let vector = Vector::new(NUMBER);
-    let stack = match stacks {
-        Stacks::Own => vector
-            .stack()
-            .map_or(0, |stack| hardware_slot(stack.slot())),
-        Stacks::Interrupted => 0,
-    };
+    let stack = vector
+        .stack()
+        .map_or(0, |stack| hardware_slot(stack.slot()));
     table.0[usize::from(NUMBER)] = Gate::new(entry_point::<NUMBER>(), selector, stack);
 }
 

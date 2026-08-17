@@ -9,7 +9,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use apic::LocalState;
+use apic::{Extended, LocalState};
 use cpu::{ApicId, CpuIndex};
 use x86_64::instructions::interrupts;
 
@@ -40,12 +40,20 @@ impl Vlapic {
     /// something any guest can change: a processor firmware described as
     /// unstartable is one no startup message may ever be put on real hardware
     /// for.
+    ///
+    /// `extended` is what the machine's real controllers offer above their
+    /// architectural registers, and it decides one thing only: which of the two
+    /// ledgers this controller settles its debts through. It is not part of
+    /// [`Model`] because it is not part of the controller the guest is given —
+    /// the guest is told the space is absent, and that is what keeps the
+    /// registers this hypervisor uses out of its reach.
     pub(crate) fn new(
         index: CpuIndex,
         apic_id: ApicId,
         bootstrap: bool,
         startable: bool,
         model: Model,
+        extended: Extended,
     ) -> Self {
         let this = Self {
             index,
@@ -66,7 +74,7 @@ impl Vlapic {
             timer_frequency: AtomicU64::new(0),
             command: AtomicU64::new(0),
             errors: ErrorStatus::new(),
-            ledger: Ledger::new(),
+            ledger: Ledger::new(extended),
             epoch: AtomicU64::new(0),
             startup: Startup::new(Phase::Running),
             away: AtomicBool::new(false),

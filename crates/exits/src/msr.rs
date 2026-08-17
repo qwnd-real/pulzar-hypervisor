@@ -1,7 +1,7 @@
 //! The model-specific registers the guest is answered for rather than allowed
 //! to reach.
 //!
-//! Four kinds are answered here, and they fail differently. The timestamp
+//! Five kinds are answered here, and they fail differently. The timestamp
 //! counter and its adjustment register are backed by the control block's
 //! offset, keeping native `RDTSC` and `RDTSCP` reads on the zero-exit path. The
 //! two registers that decide whether the virtualization extension may be used
@@ -9,17 +9,32 @@
 //! allowed at the machine's own copies could turn the extension off underneath
 //! the hypervisor running it. The extended feature register is the guest's own,
 //! and is answered by hiding one bit of it and forcing that same bit back on
-//! whatever the guest writes. The interrupt controller's registers are
-//! answered by the guest's own emulated controller, and an access the
-//! architecture does not allow is a general protection fault the guest is
-//! given rather than an error the host reports.
+//! whatever the guest writes. The page-attribute table is the guest's own too,
+//! and is answered out of the save area, because that is where the processor
+//! reads the guest's memory types from while nested paging is on. The interrupt
+//! controller's registers are answered by the guest's own emulated controller,
+//! and an access the architecture does not allow is a general protection fault
+//! the guest is given rather than an error the host reports.
 //!
-//! A fifth kind is not answered at all so much as forwarded. The permission
+//! A sixth kind is not answered at all so much as forwarded. The permission
 //! map covers three ranges of the index space and an access outside all three
 //! is intercepted whatever the map holds, so those arrive here whether this
 //! crate wants them or not; they reach the machine's own register, and a
 //! register the machine has none of refuses the access and the guest takes the
 //! fault for it.
+//!
+//! # The page-attribute table is two registers with one name
+//!
+//! With nested paging on, the memory type of a guest access is decided by the
+//! guest's page tables against the guest's table of types — which the processor
+//! takes from the save area — and the register called `IA32_PAT` holds the
+//! *host's*. There is no sense in which a guest can be allowed at it. Left
+//! unintercepted, one guest `WRMSR` reprograms the memory types every mapping
+//! the hypervisor itself is using is interpreted through, with none of the
+//! cache-flush transition the architecture prescribes for that, while the
+//! guest's own types stay exactly as they were. Both halves of that are silent:
+//! the guest reads back what it wrote, believes it has write-combining, and
+//! gets whatever it had before.
 //!
 //! # The extension is presented as firmware-disabled, consistently
 //!
@@ -42,7 +57,9 @@ use inject::Pending;
 use log::{error, trace};
 use svm::{
     CleanBits, Event,
-    msr::{EFER, EFER_RESERVED, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR, VmCr},
+    msr::{
+        EFER, EFER_RESERVED, IA32_PAT, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR, VmCr,
+    },
     permissions::{MsrAccess, msrpm_position},
 };
 use vcpu::{Flow, Vcpu};
@@ -124,9 +141,10 @@ impl Virtualization {
 
     /// What the guest reads from one of them.
     ///
-    /// None of the three can fault a read. Two are the emulated answer and
-    /// nothing else; the third is the guest's own register with the one bit
-    /// removed that would contradict what it has been told.
+    /// None of the four can fault a read. Two are the emulated answer and
+    /// nothing else; the other two are the guest's own registers out of its
+    /// save area, one of them with the single bit removed that would
+    /// contradict what it has been told.
     fn read(self, vcpu: &Vcpu, register: Hidden) -> u64 {
         match register {
             Hidden::VmCr => self.vm_cr.into_bits(),
@@ -136,6 +154,11 @@ impl Virtualization {
             // nothing can lift.
             Hidden::Key => NO_KEY,
             Hidden::Efer => vcpu.save().efer & !SVME,
+            // The guest's own table of memory types, which is a field of the save
+            // area and not the register of that name. Answering from the register
+            // would hand the guest the host's types and contradict its own last
+            // write.
+            Hidden::Pat => vcpu.guest_pat(),
         }
     }
 
@@ -153,6 +176,7 @@ impl Virtualization {
                 Ok(())
             }
             Hidden::Efer => write_efer(vcpu, value),
+            Hidden::Pat => write_pat(vcpu, value),
         }
     }
 
@@ -295,6 +319,9 @@ enum Hidden {
     Key,
     /// The extended feature register, which holds the enable bit itself.
     Efer,
+    /// The page-attribute table, whose guest copy the processor takes from the
+    /// save area while nested paging is on.
+    Pat,
 }
 
 impl Hidden {
@@ -305,6 +332,7 @@ impl Hidden {
             VM_CR => Some(Self::VmCr),
             SVM_KEY => Some(Self::Key),
             EFER => Some(Self::Efer),
+            IA32_PAT => Some(Self::Pat),
             _ => None,
         }
     }
@@ -383,6 +411,38 @@ fn write_efer(vcpu: &mut Vcpu, value: u64) -> Result<(), Fault> {
     vcpu.soil(CleanBits::CONTROL_REGISTERS);
     trace!("exits: the guest's EFER is now {efer:#x}");
     Ok(())
+}
+
+/// Stores the table of memory types the guest's own mappings are interpreted
+/// through.
+///
+/// Straight into the save area, which is where the processor reads it from —
+/// and, just as importantly, nowhere near the register of the same name, which
+/// is the host's and whose meaning every mapping this hypervisor uses depends
+/// on.
+///
+/// A value with a byte that names no memory type is refused rather than stored,
+/// for the reason a reserved bit of the extended feature register is: the
+/// processor's own entry check reads this field whenever nested paging is on,
+/// so storing one would stop the guest with a control block that cannot be
+/// entered instead of giving it the fault its architecture promised.
+///
+/// Nothing is flushed. The transition the architecture prescribes for changing
+/// memory types under live mappings is the *guest's* to perform — it is the one
+/// whose mappings are being reinterpreted, and `MtrrLib`, Windows and Linux all
+/// perform it around their own write — and this hypervisor's own mappings are
+/// not affected at all, which is the whole point of the interception.
+fn write_pat(vcpu: &mut Vcpu, value: u64) -> Result<(), Fault> {
+    match vcpu.set_guest_pat(value) {
+        Ok(()) => {
+            trace!("exits: the guest's page-attribute table is now {value:#x}");
+            Ok(())
+        }
+        Err(invalid) => {
+            trace!("exits: refusing the guest's page-attribute table {value:#x}: {invalid}");
+            Err(Fault)
+        }
+    }
 }
 
 /// Answers an access to a register the permission map does not reach.

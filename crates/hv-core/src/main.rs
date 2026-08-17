@@ -92,11 +92,13 @@ static PARTITION: Once<Partition> = Once::new();
 /// called, and its stack is gone.
 #[unsafe(no_mangle)]
 extern "efiapi" fn efi_main(argument: *const c_void) -> Status {
-    if serial::init().is_err() {
-        // Nothing that happened after this could be reported, so there is no
-        // point in continuing.
-        return Status::DEVICE_ERROR;
-    }
+    // A machine with no output is one nothing can be reported from, not one that
+    // must not boot: `log` discards every record while no logger is installed
+    // and `emergency` writes nowhere, so what follows runs silently and
+    // correctly. Refusing to start instead meant the machines pulzar would not
+    // run on were exactly the ones with no serial header — which is most of
+    // them.
+    let _ = serial::init();
     // SAFETY: `argument` is the first integer argument register, holding either
     // the handoff pointer the loader put there or the image handle firmware
     // passes to an application. Both are readable, and distinguishing them is

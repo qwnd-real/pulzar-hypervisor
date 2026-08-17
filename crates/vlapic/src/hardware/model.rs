@@ -138,7 +138,10 @@ impl Model {
     ///
     /// The bit that says the extended register space is present is deliberately
     /// not reported: the low byte is taken out of the machine's word on its
-    /// own, and this crate does not model that space.
+    /// own, so the machine's own answer to that question cannot leak through
+    /// here. The space is the host's — it is where a withheld acknowledgement
+    /// is settled by name — and a guest that found it announced would be a
+    /// guest that could reach those registers.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the entry count is clamped to the seven the architecture defines, so one less than it fits the byte the field occupies"

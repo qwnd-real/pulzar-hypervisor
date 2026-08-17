@@ -55,7 +55,7 @@ use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
     control::NestedPagingControl,
     intercept::{Intercepts1, Intercepts2, Intercepts2Flags, TlbControl},
-    msr::{EFER, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR},
+    msr::{EFER, IA32_PAT, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR},
     permissions::{MSRPM_BYTES, msrpm_position},
 };
 use x86_64::{
@@ -74,10 +74,20 @@ use crate::{
 /// The permission bits for the registers this layer always intercepts.
 ///
 /// Three protect the machine's virtualization extension, two define the
-/// guest's offset timestamp domain, and the ratio register is hidden because
-/// the extension itself is hidden. Keeping them here makes their permission
-/// bits part of every VCPU rather than policy a caller could forget to install.
-const INTERCEPTED_MSRS: [u32; 6] = [VM_CR, SVM_KEY, EFER, IA32_TSC, IA32_TSC_ADJUST, TSC_RATIO];
+/// guest's offset timestamp domain, the ratio register is hidden because the
+/// extension itself is hidden, and the page-attribute table is virtualized
+/// because under nested paging the guest's copy of it is a field of this block
+/// rather than the register. Keeping them here makes their permission bits part
+/// of every VCPU rather than policy a caller could forget to install.
+const INTERCEPTED_MSRS: [u32; 7] = [
+    VM_CR,
+    SVM_KEY,
+    EFER,
+    IA32_TSC,
+    IA32_TSC_ADJUST,
+    TSC_RATIO,
+    IA32_PAT,
+];
 
 /// What a guest's control block has to be told about the guest before it can
 /// run at all.
@@ -373,6 +383,46 @@ impl Vcpu {
     #[must_use]
     pub fn tsc_offset(&self) -> u64 {
         self.control().tsc_offset
+    }
+
+    /// The page-attribute table this guest's own mappings are interpreted
+    /// through.
+    ///
+    /// Under nested paging this field is the guest's `IA32_PAT` and the
+    /// register of that name is the host's, so this is what an intercepted
+    /// read of it has to answer with. Reaching for the machine's register
+    /// instead would tell the guest about memory types that are not the
+    /// ones its mappings get.
+    #[must_use]
+    pub fn guest_pat(&self) -> u64 {
+        self.save().g_pat
+    }
+
+    /// Sets it, or reports the rule that makes the value one the processor
+    /// would refuse the guest for.
+    ///
+    /// Refused rather than stored, for the reason a reserved bit of the
+    /// extended feature register is: the entry check examines this field
+    /// whenever nested paging is on, so a save area holding an encoding the
+    /// architecture does not define stops the guest with a control block
+    /// the hypervisor cannot enter — where what the guest is owed is the
+    /// general protection fault its own architecture promised it for the
+    /// `WRMSR`.
+    ///
+    /// # Errors
+    ///
+    /// [`Invalid::PatEncoding`] naming the field and the encoding, for a value
+    /// with a byte that is not a memory type.
+    pub fn set_guest_pat(&mut self, value: u64) -> Result<(), Invalid> {
+        if let Some(invalid) = invalid::pat(value) {
+            return Err(invalid);
+        }
+        if value == self.save().g_pat {
+            return Ok(());
+        }
+        self.save_mut().g_pat = value;
+        self.soil(CleanBits::NESTED_PAGING);
+        Ok(())
     }
 
     /// Changes the offset hardware adds to this guest's timestamp counter.

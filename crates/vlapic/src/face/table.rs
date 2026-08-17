@@ -35,12 +35,24 @@
 //!
 //! # Limitations
 //!
-//! The extended APIC register space AMD defines at 0x400–0x530 is not modelled.
-//! `CPUID Fn8000_0001_ECX[3]` is therefore cleared for the guest, so software
-//! that honours the capability bit never reaches those registers. Software that
-//! probes the space regardless reads zero and records an illegal-register
-//! error. Modelling it would require the extended interrupt-enable and extended
-//! local vector table registers, and the machine-check and
+//! The extended APIC register space AMD defines at 0x400–0x530 is not offered
+//! to the guest, and that is a requirement rather than an omission: two of its
+//! registers are how this hypervisor settles what real hardware is holding on
+//! the guest's behalf — see [`crate::lifecycle::ledger::immediate`] — so a
+//! guest able to reach them could retire an interrupt the host is accounting
+//! for, or stop a vector the host has just unblocked from arriving.
+//!
+//! Three things keep it out, and each would do on its own.
+//! `CPUID Fn8000_0001_ECX[3]` is cleared, so software that honours the
+//! capability bit never looks. The bit the version register sets to announce
+//! the space is dropped from what the emulated one reports, so software that
+//! checks there does not look either. And every offset of the range is answered
+//! here as reserved: a guest that probes regardless reads zero and records an
+//! illegal-register error, exactly as it would on a controller that has no such
+//! space.
+//!
+//! Modelling it instead would mean emulating the extended interrupt-enable and
+//! extended local vector table registers, and the machine-check and
 //! instruction-based-sampling sources that use them.
 
 use apic::{REGISTER_STRIDE, X2APIC_BASE_MSR};

@@ -43,18 +43,27 @@
 //!
 //! # What a [`Register`] is allowed to be
 //!
-//! Every one of them is a register software both reads and writes. The two that
-//! are not are kept out of the list rather than trusted to a comment: the
-//! acknowledgement register, which x2APIC faults a read of, is reachable only
-//! as [`Access::acknowledge`], and the eight-register banks are reachable only
-//! through [`bank`] and [`word`], so the offset arithmetic that could leave the
-//! page cannot be written anywhere else.
+//! Every one of them is a register software both reads and writes. The ones
+//! that are not are kept out of the list rather than trusted to a comment: the
+//! two acknowledgement registers, one of which x2APIC faults a read of and
+//! neither of which answers with anything, are reachable only as
+//! [`Access::acknowledge`] and [`Access::retire`], and the eight-register banks
+//! are reachable only through [`bank`] and [`word`], so the offset arithmetic
+//! that could leave the page cannot be written anywhere else.
+//!
+//! Presence is a separate question from readability, and three registers here
+//! answer it differently: the extended space AMD puts above the architectural
+//! registers exists only where the version register says so, exactly as the
+//! optional local vector table entries exist only as far as that register
+//! counts. [`crate::extended`] is the one thing that names them, and it asks
+//! first.
 
 use core::{
     ptr,
     sync::atomic::{Ordering, fence},
 };
 
+use descriptors::Vector;
 use x86_64::{VirtAddr, instructions::interrupts, registers::model_specific::Msr};
 
 use crate::ApicError;
@@ -128,12 +137,37 @@ impl Register {
     /// How far the bus clock is divided before the timer counts it.
     pub(crate) const TIMER_DIVIDE: Self = Self(0x3E0);
 
+    /// What the extended register space offers, and how much of it this
+    /// controller implements.
+    ///
+    /// One of the three registers below that exist only where the version
+    /// register says the extended space is there. Naming one on a controller
+    /// without it reads zero and latches an illegal-register-address error, so
+    /// nothing reaches for these without asking first — see
+    /// [`crate::extended`], which is the only thing that does.
+    pub(crate) const EXTENDED_FEATURE: Self = Self(0x400);
+    /// Which parts of the extended space are switched on. Every one of them is
+    /// off at reset, so this is written before any of them answers.
+    pub(crate) const EXTENDED_CONTROL: Self = Self(0x410);
+    /// First of the eight registers saying which vectors this controller will
+    /// accept an interrupt on at all.
+    pub(crate) const INTERRUPT_ENABLE: Self = Self(0x480);
+
     /// Written to acknowledge the interrupt currently being serviced.
     ///
     /// Private, and the reason is that it is the one register software may not
     /// read: x2APIC faults the attempt. [`Access::acknowledge`] is the whole of
     /// what anything needs of it.
     const END_OF_INTERRUPT: Self = Self(0xB0);
+
+    /// Written with a vector number to retire that vector, whatever else the
+    /// controller is holding.
+    ///
+    /// Private for the reason [`Register::END_OF_INTERRUPT`] is: the
+    /// architecture defines no value it answers with, and a read of it is a
+    /// zero rather than the vector last written. [`Access::retire`] is the
+    /// whole of it.
+    const SPECIFIC_END_OF_INTERRUPT: Self = Self(0x420);
 
     /// The register `slots` slots past this one.
     ///
@@ -408,6 +442,38 @@ impl Access {
         unsafe { self.write(Register::END_OF_INTERRUPT, 0) };
     }
 
+    /// Retires `vector`, whatever else the controller is holding in service.
+    ///
+    /// The whole of what the extended space adds to acknowledging, and the
+    /// difference from [`Access::acknowledge`] is the entire point: that one
+    /// retires whichever vector in service has the highest priority, so
+    /// anything withholding an acknowledgement has to establish that the one it
+    /// owes is still that one. This names its vector, so there is nothing to
+    /// establish and nothing to read first.
+    ///
+    /// A vector the controller is not holding is not an error and retires
+    /// nothing: the write is ignored, the in-service bank is untouched, and no
+    /// error is latched. So is every write here on a controller whose extended
+    /// control register has not switched the register on, which is why
+    /// [`crate::extended`] is the only thing that reaches this.
+    ///
+    /// For a vector that arrived level triggered the controller also broadcasts
+    /// an end-of-interrupt to the I/O controllers, which is what clears the
+    /// remote request bit of whichever one sent it — the same broadcast the
+    /// non-specific acknowledgement makes, for the vector this one names.
+    pub(crate) fn retire(self, vector: Vector) {
+        // SAFETY: the register takes a vector number in its low byte and
+        // requires the rest to be zero, which is exactly what this writes. A
+        // vector the controller is not holding retires nothing rather than
+        // retiring something else.
+        unsafe {
+            self.write(
+                Register::SPECIFIC_END_OF_INTERRUPT,
+                u32::from(vector.number()),
+            );
+        }
+    }
+
     /// The interrupt command as one value, whichever interface holds it and in
     /// however many pieces.
     ///
@@ -528,6 +594,8 @@ const fn truncate(value: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::{
         DEFINED_LVT_ENTRIES, LVT_ENTRIES, MappedRegister, Register, VECTOR_SLOTS, bank, has_lvt,
         lvt_entries, lvt_present, version_number, word,
@@ -535,7 +603,7 @@ mod tests {
 
     /// Every register both interfaces have, with the model-specific index the
     /// architecture puts it in.
-    const DERIVED: [(Register, u32); 22] = [
+    const DERIVED: [(Register, u32); 26] = [
         (Register::ID, 0x802),
         (Register::VERSION, 0x803),
         (Register::TASK_PRIORITY, 0x808),
@@ -558,6 +626,10 @@ mod tests {
         (Register::TIMER_INITIAL_COUNT, 0x838),
         (Register::TIMER_CURRENT_COUNT, 0x839),
         (Register::TIMER_DIVIDE, 0x83E),
+        (Register::EXTENDED_FEATURE, 0x840),
+        (Register::EXTENDED_CONTROL, 0x841),
+        (Register::SPECIFIC_END_OF_INTERRUPT, 0x842),
+        (Register::INTERRUPT_ENABLE, 0x848),
     ];
 
     #[test]
@@ -610,6 +682,22 @@ mod tests {
             word(Register::TRIGGER_MODE, 255),
             (Register(0x1F0), 1 << 31)
         );
+    }
+
+    #[test]
+    fn the_extended_space_banks_and_registers_stay_inside_it() {
+        // The space AMD defines runs from 0x400 to 0x530, and the
+        // interrupt-enable bank is the one thing here that is derived rather
+        // than written down: eight registers from 0x480, which has to stop at
+        // 0x4F0 and not run into the extended local vector table at 0x500.
+        let bank: Vec<Register> = bank(Register::INTERRUPT_ENABLE).collect();
+        assert_eq!(bank.first(), Some(&Register(0x480)));
+        assert_eq!(bank.last(), Some(&Register(0x4F0)));
+        assert_eq!(
+            word(Register::INTERRUPT_ENABLE, u8::MAX),
+            (Register(0x4F0), 1 << 31)
+        );
+        assert_eq!(word(Register::INTERRUPT_ENABLE, 0), (Register(0x480), 1));
     }
 
     #[test]

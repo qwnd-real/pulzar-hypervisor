@@ -86,6 +86,14 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     let roster = cpu::roster()?;
     let model = Model::of_machine(local);
     model::describe("vlapic", model);
+    // What the real controllers offer above their architectural registers, which
+    // decides how a withheld acknowledgement is settled and nothing else. Read
+    // from this processor's controller for the reason the model is, and given to
+    // every controller rather than reached for later: it cannot change while the
+    // machine runs, and a controller that answered the question differently at
+    // two moments would be one that had settled some of its debts one way and
+    // the rest the other.
+    let extended = local.extended();
     let lapics: Box<[_]> = roster
         .entries()
         .iter()
@@ -101,6 +109,7 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
                 entry.apic_id() == here,
                 entry.startable(),
                 model,
+                extended,
             )
         })
         .collect();

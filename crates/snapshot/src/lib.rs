@@ -63,7 +63,7 @@ mod segments;
 use apic::{Controller, FirmwareState};
 use log::info;
 use paging::DirectMap;
-use svm::SaveArea;
+use svm::{SaveArea, msr::IA32_PAT};
 use x86_64::registers::{
     control::{Cr0, Cr2, Cr3, Cr4, Cr4Flags},
     debug::{Dr6, Dr7},
@@ -269,7 +269,9 @@ fn model_specific(cpu: &mut SaveArea) {
     // The guest's page-attribute table, which the processor loads under nested
     // paging — and the one register here the loader is about to overwrite, since
     // the address-space subsystem programs the architectural default so that
-    // cache selection needs no `PAT` bit of its own.
+    // cache selection needs no `PAT` bit of its own. From here on the two are
+    // separate registers: this value is the guest's, and every guest write of it
+    // is intercepted so that the machine's own copy stays the host's.
     cpu.g_pat = read(IA32_PAT);
 }
 
@@ -338,6 +340,3 @@ const IA32_SYSENTER_ESP: u32 = 0x175;
 
 /// The instruction pointer that mechanism enters at.
 const IA32_SYSENTER_EIP: u32 = 0x176;
-
-/// What each `PAT:PCD:PWT` combination in a page-table entry means.
-const IA32_PAT: u32 = 0x277;

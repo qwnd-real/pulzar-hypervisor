@@ -191,16 +191,19 @@ fn withhold(vlapic: &Vlapic, local: LocalApic, vector: Vector) {
         refused => {
             // The guest was not given it and will therefore never acknowledge
             // it, so the only thing that could ever have discharged the debt
-            // does not exist. The debt is kept rather than paid: acknowledging a
-            // level line nobody has quieted clears the remote in-service state of
-            // the I/O controller that sent it, and the still-asserted line
+            // does not exist. What becomes of it is the machine's answer rather
+            // than this crate's: a controller that can retire a named vector
+            // retires it and stops the vector arriving again until the guest is
+            // reset, and one that cannot keeps the debt — because acknowledging
+            // a level line nobody has quieted clears the remote in-service state
+            // of the I/O controller that sent it, and the still-asserted line
             // arrives again at once, into a controller that has just refused it.
-            vlapic.ledger().abandon(vector);
+            vlapic.ledger().abandon(vector, &local);
             vlapic.diagnostics().declined();
-            // Not latched, and bounded without one: the abandoned debt leaves the
-            // vector in service on the real controller, which then refuses
-            // everything of its class or lower — so the line that produced this
-            // cannot produce another.
+            // Not latched, and bounded without one on either machine: the debt
+            // leaves the vector either in service on the real controller, which
+            // then refuses everything of its class or lower, or blocked there —
+            // so the line that produced this cannot produce another.
             warn!(
                 "vlapic: {} received level {vector} but is not accepting it: {refused:?}, so real \
                  hardware goes on holding it — {}",
