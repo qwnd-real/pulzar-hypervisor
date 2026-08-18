@@ -127,8 +127,7 @@ pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
     }
     if leaf == STRUCTURED_EXTENDED_FEATURES && subleaf == 0 {
         result.ecx &= !OSPKE;
-        if Cr4Flags::from_bits_retain(vcpu.save().cr4)
-            .contains(Cr4Flags::PROTECTION_KEY_USER)
+        if Cr4Flags::from_bits_retain(vcpu.save().cr4).contains(Cr4Flags::PROTECTION_KEY_USER)
             && result.ecx & PKU != 0
         {
             result.ecx |= OSPKE;
