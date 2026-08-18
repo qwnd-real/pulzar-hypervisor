@@ -201,7 +201,6 @@ impl Display for Mode {
 #[derive(Clone, Copy, Debug)]
 pub struct Apic {
     entered: Mode,
-    masked_8259: bool,
 }
 
 impl Apic {
@@ -330,8 +329,8 @@ impl Apic {
         // Also before anything is unmasked. The legacy controllers deliver onto
         // vectors 8 to 15 at reset, which are exceptions, and vector 8 is the
         // one nothing may claim.
-        let masked_8259 = madt.pic_8259();
-        if masked_8259 {
+        let legacy = madt.pic_8259();
+        if legacy {
             pic::mask();
         }
 
@@ -341,11 +340,9 @@ impl Apic {
             mode: entered,
             local_nmis,
             extended,
+            legacy,
         });
-        Ok(Self {
-            entered,
-            masked_8259,
-        })
+        Ok(Self { entered })
     }
 
     /// Which interface the boot processor's controller was brought up in.
@@ -368,7 +365,7 @@ impl Apic {
             ),
             Err(error) => info!("{who}: apic {mode}, controller not readable: {error}"),
         }
-        if self.masked_8259 {
+        if INSTALLED.get().is_some_and(|installed| installed.legacy) {
             info!("{who}: apic masked both legacy 8259 controllers");
         }
         info!(
@@ -1121,6 +1118,68 @@ pub fn end_of_interrupt() -> Result<(), ApicError> {
     local().map(LocalApic::end_of_interrupt)
 }
 
+/// Puts the legacy controllers' interrupt masks back to what firmware left
+/// them, and says whether there were any to put back.
+///
+/// The one part of the host's own bring-up that is undone, and it is undone
+/// because of what it costs to leave done. A guest that *is* firmware drives
+/// its own periodic timer through these controllers and through the local
+/// controller's first pin; it programmed both before this hypervisor existed
+/// and never programs either again, so a mask laid over an input firmware had
+/// left open is a firmware environment with no clock — no timer events, and
+/// therefore no countdowns and no polled peripherals.
+///
+/// What the mask bought up to this point is kept, because this belongs at the
+/// last moment before a guest is entered and nowhere earlier: an input firmware
+/// had left open cannot assert into a host that is the only thing running and
+/// has nowhere to hand an interrupt to, since it is still masked for the whole
+/// of that. The interrupt that arrives afterwards arrives with somewhere to go.
+///
+/// `masks` is what [`capture`] read before anything had written them. Answers
+/// `false` on a machine firmware said has no such controllers, where nothing
+/// was masked and there is nothing to put back — writing to ports nothing
+/// decodes is how such a machine gets a configuration it never had.
+///
+/// # Errors
+///
+/// [`ApicError::NotInstalled`] before [`Apic::install`], which is what decides
+/// whether the machine has these controllers at all.
+pub fn restore_legacy(masks: [u8; 2]) -> Result<bool, ApicError> {
+    let installed = INSTALLED.get().ok_or(ApicError::NotInstalled)?;
+    if installed.legacy {
+        pic::restore(masks);
+    }
+    Ok(installed.legacy)
+}
+
+/// Masks every input of both legacy controllers again, and says whether there
+/// were any to mask.
+///
+/// The counterpart of [`restore_legacy`], for the moment firmware's services
+/// stop existing. Up to that point the guest is firmware and the legacy path is
+/// firmware's own; past it, whatever the guest starts next programs both
+/// controllers for itself before it uses either — every operating system
+/// reinitializes them from scratch — so what firmware left behind is state
+/// nothing is coming back for.
+///
+/// Leaving it behind is what costs. Those controllers deliver on vectors
+/// firmware chose and only firmware had handlers for, and nothing can read back
+/// where firmware put them: the vector base is write-only. So an input left
+/// open past this point is an interrupt arriving on a number no guest has
+/// claimed and this hypervisor cannot name, and masking is what makes that
+/// impossible again.
+///
+/// # Errors
+///
+/// As [`restore_legacy`].
+pub fn mask_legacy() -> Result<bool, ApicError> {
+    let installed = INSTALLED.get().ok_or(ApicError::NotInstalled)?;
+    if installed.legacy {
+        pic::mask();
+    }
+    Ok(installed.legacy)
+}
+
 /// What is true of every processor's controller, decided once.
 #[derive(Debug)]
 struct Installation {
@@ -1146,6 +1205,15 @@ struct Installation {
     /// says so if they differ, because what would follow otherwise is a
     /// vector-named acknowledgement issued to a controller that ignores it.
     extended: Extended,
+    /// Whether firmware said the machine has the two legacy interrupt
+    /// controllers, and so whether anything answers at the ports that mask
+    /// them.
+    ///
+    /// Held here rather than beside the mode because it outlives the value
+    /// [`Apic::install`] returns: the masks are put back for the firmware guest
+    /// and taken away again once firmware's services stop existing, and neither
+    /// of those moments has that value in reach.
+    legacy: bool,
 }
 
 /// Decided by the boot processor, read by every processor bringing its own

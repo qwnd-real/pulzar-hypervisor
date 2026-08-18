@@ -8,11 +8,12 @@
 //! vector.
 //!
 //! Whether real hardware may be acknowledged now is the whole of what is
-//! decided here, and two things decide it: the controller itself, which
-//! recorded as it accepted the interrupt whether the interrupt arrived level
-//! triggered, and the vector, because an acknowledgement withheld in the
-//! priority class the host keeps for itself would hold the host's own
-//! interrupts off with it.
+//! decided here, and three things decide it: whether the real controller is
+//! holding the vector in service at all, which is what tells an interrupt it
+//! delivered from one that came in through the pin that bypasses it; the
+//! controller's own record of whether the interrupt arrived level triggered;
+//! and the vector, because an acknowledgement withheld in the priority class
+//! the host keeps for itself would hold the host's own interrupts off with it.
 
 use apic::LocalApic;
 use descriptors::Vector;
@@ -86,12 +87,62 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
         vlapic.task_priority(),
         vlapic.ledger().debts()
     );
-    if withholdable(vector, level) {
+    if !local.in_service(vector) {
+        external(vlapic, vector);
+    } else if withholdable(vector, level) {
         withhold(vlapic, local, vector);
     } else {
         acknowledge(vlapic, local, vector, level);
     }
     Ok(())
+}
+
+/// Gives the guest an interrupt its own controller never accepted, and
+/// acknowledges nothing.
+///
+/// The real controller is not holding this vector in service, and for a vector
+/// it delivered it would be: it sets that bit as it accepts the interrupt and
+/// clears it only when acknowledged. So what arrived came in through the pin
+/// that bypasses the controller — an external interrupt, answered by an
+/// acknowledge cycle to a legacy controller — and two things follow that are
+/// the opposite of the ordinary path.
+///
+/// Nothing is acknowledged. There is no in-service bit to retire, and an
+/// acknowledgement would retire whatever else the controller happened to be
+/// holding. Nothing is owed either, for the same reason: the vector is not
+/// held, so no line is waiting on this hypervisor to release it. What has to
+/// acknowledge the legacy controller is the guest's own handler, which reaches
+/// it through ports nothing here intercepts.
+///
+/// And the guest's controller is told not to hold it in service when it hands
+/// it over, because the guest will acknowledge the legacy controller and not
+/// this one — see [`Vlapic::arrived_externally`].
+fn external(vlapic: &Vlapic, vector: Vector) {
+    vlapic.arrived_externally(vector);
+    match vlapic.accept(vector, Trigger::Edge) {
+        Accepted::Resetting => {
+            vlapic.diagnostics().dropped();
+            warn!(
+                "vlapic: {} dropped external {vector}, which arrived while its register file was \
+                 being reset",
+                vlapic.index()
+            );
+        }
+        Accepted::Requested | Accepted::Coalesced => trace!(
+            "vlapic: {} took external {vector}, which its own controller never accepted and owes \
+             no acknowledgement for",
+            vlapic.index()
+        ),
+        refused => {
+            vlapic.diagnostics().declined();
+            trace!(
+                "vlapic: {} received external {vector} but is not accepting it: {refused:?}, and \
+                 whatever raised it is still asserting into a legacy controller only its guest can \
+                 quiet",
+                vlapic.index()
+            );
+        }
+    }
 }
 
 /// Whether real hardware's acknowledgement for an arrival on `vector` may be

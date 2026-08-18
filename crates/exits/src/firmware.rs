@@ -7,7 +7,7 @@
 //! the other two arrive here, and each of them is the moment something the host
 //! was waiting to do becomes possible.
 
-use log::{error, info};
+use log::{error, info, warn};
 use partition::Partition;
 use portal::{Notification, Portal};
 use vcpu::{Flow, Vcpu};
@@ -136,10 +136,32 @@ impl Firmware {
         }
     }
 
-    /// Starts the other processors, now that firmware no longer owns the
-    /// machine.
+    /// Takes the legacy interrupt controllers back and starts the other
+    /// processors, now that firmware no longer owns the machine.
+    ///
+    /// The controllers go first, and before anything else here, because they
+    /// are the one piece of the machine that was handed *to* the guest
+    /// rather than kept from it. Firmware needed them: its own periodic
+    /// timer arrives through them, on vectors it chose and only it had
+    /// handlers for, and it programmed them long before this hypervisor
+    /// existed. Past this point nothing is coming back for that
+    /// configuration — every operating system reinitializes
+    /// both controllers from scratch before it uses either — while an input
+    /// left open is an interrupt arriving on a number no guest has claimed
+    /// and nothing here can name, because the vector base is write-only and
+    /// cannot be read back.
     fn handed(&mut self, vcpu: &mut Vcpu) -> Flow {
         if self.stage == Stage::Portal {
+            match apic::mask_legacy() {
+                Ok(true) => {
+                    info!("exits: legacy controllers masked again, firmware is done with them");
+                }
+                Ok(false) => {}
+                // Not fatal to the guest, and not a reason to stop a boot that
+                // will otherwise finish: what is left is firmware's own masks,
+                // which is the state the machine was in a moment ago.
+                Err(error) => warn!("exits: the legacy controllers could not be masked: {error}"),
+            }
             info!("exits: About to boot APICs");
             let started = apic::start(self.boot.trampoline, self.boot.attach);
             // Whatever came of it, and before the guest is let go: every

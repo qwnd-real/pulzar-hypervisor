@@ -220,12 +220,30 @@ impl Vlapic {
     /// which is a consistency check rather than a race: only this processor
     /// clears a request bit, and it does not do so between a nomination and the
     /// commitment.
+    ///
+    /// One kind of arrival is given to the guest and *not* held in service, and
+    /// it is the one no controller holds: an external interrupt, answered by an
+    /// acknowledge cycle to a legacy controller that the guest acknowledges
+    /// directly. Holding one would leave a bit the guest has no reason to
+    /// clear, blocking its whole interrupt-priority class for as long as
+    /// the guest lives.
     pub(crate) fn committed(&self, vector: Vector) -> bool {
         if !self.request.clear(vector) {
             return false;
         }
-        self.in_service.set(vector);
+        if !self.external.clear(vector) {
+            self.in_service.set(vector);
+        }
         true
+    }
+
+    /// Records that the next delivery of `vector` reached this guest through
+    /// the pin that bypasses its controller.
+    ///
+    /// Set before the vector is requested, so that the commitment which follows
+    /// cannot find the request without also finding this.
+    pub(crate) fn arrived_externally(&self, vector: Vector) {
+        self.external.set(vector);
     }
 
     /// Whether anything is requested at all, whatever its priority.

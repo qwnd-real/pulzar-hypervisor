@@ -55,6 +55,29 @@ pub(crate) fn mask() {
     }
 }
 
+/// Puts both controllers' interrupt masks back to `masks`, the primary's first.
+///
+/// The other half of [`mask`], for a hypervisor whose guest is the firmware
+/// that programmed these: what [`mask`] takes away is the path firmware's own
+/// periodic timer arrives on, and firmware configured that path before this
+/// hypervisor existed and will never configure it again.
+///
+/// The order is the opposite of [`mask`]'s and for the same reason. The primary
+/// goes first so that the cascade input is open before anything of the
+/// secondary's can assert through it, which is the order that cannot leave an
+/// interrupt asserting into a controller whose path to the processor is still
+/// shut.
+pub(crate) fn restore(masks: [u8; 2]) {
+    let [primary, secondary] = masks;
+    // SAFETY: as `mask`, and each value came from reading the same port it is
+    // written back to — so this can only return a controller to a mask it was
+    // observed to hold.
+    unsafe {
+        Port::<u8>::new(PRIMARY_DATA).write(primary);
+        Port::<u8>::new(SECONDARY_DATA).write(secondary);
+    }
+}
+
 /// Both controllers' interrupt masks, the primary's first.
 ///
 /// Reading the data port is how a mask is read back, and it needs no command

@@ -112,21 +112,23 @@
 //!
 //! # Limitations
 //!
-//! External-interrupt delivery through LINT0 is not available: no legacy
-//! interrupt controller is presented to the guest, and both of the machine's
-//! own are masked before the guest runs, so no interrupt-acknowledge cycle can
-//! be answered. A guest that configures virtual-wire mode sees the entry
-//! refused rather than armed. Supporting it would require presenting an
-//! interrupt controller the guest can drive and answering the acknowledge cycle
-//! from it.
+//! External-interrupt delivery through a pin is programmed onto real hardware
+//! but not mediated. The pin asserts when a legacy controller has something,
+//! the processor answers an acknowledge cycle to that controller and takes
+//! whatever vector it returns, and none of it passes through either interrupt
+//! controller's in-service register — so an arrival on such a vector is one the
+//! emulated controller was never told about and one nothing here can withhold
+//! an acknowledgement for.
 //!
-//! What such a guest reads back is what it wrote, unmasked and external,
-//! because the mask bit is the only field a readback could say a refusal
-//! through and it is a bit the guest stores again on its next read-modify-write
-//! — after which the entry is masked with the guest's own register saying it
-//! asked for that. So the refusal is in the log and not in the register file,
-//! and a guest calibrating on the legacy timer's line waits for an interrupt
-//! that cannot arrive.
+//! What that leaves is a guest whose legacy controller is the real one: it
+//! programmed the mask and the vector base before this hypervisor existed, it
+//! acknowledges the controller directly through ports nothing intercepts, and
+//! the emulated controller is not part of the path. It works because both ends
+//! of it are the guest's own, and it stops working the moment a second guest
+//! wants the same controller.
+//!
+//! Mediating it would mean presenting an interrupt controller the guest can
+//! drive and answering the acknowledge cycle from it.
 
 use core::fmt::{self, Display, Formatter};
 
@@ -305,20 +307,19 @@ fn describe(entry: Entry, guest: Lvt) -> Result<HardwareEntry, Refusal> {
         // This one carries no vector, so there is nothing to admit and the
         // guest's chosen delivery is programmed as it stands.
         Delivery::NonMaskable => LvtDelivery::NonMaskable,
+        // An external interrupt carries no vector either: the processor runs an
+        // acknowledge cycle to a legacy controller and takes whatever vector
+        // that returns, bypassing the local controller's in-service register
+        // entirely. It is programmed as the guest asked because a guest that is
+        // firmware drives its own periodic timer through exactly this pin, and
+        // firmware configured it before this hypervisor existed and will never
+        // configure it again.
+        Delivery::External => LvtDelivery::External,
         // A system-management interrupt and an INIT are refused for every entry
         // before they get here, and the arm is written out rather than answered
         // by a wildcard so that a mode the entries start allowing has to be
         // decided here as well.
-        //
-        // An external interrupt is refused for a subtler reason. It means the
-        // processor runs an acknowledge cycle to a legacy controller and takes
-        // whatever vector that returns, bypassing the local controller's
-        // in-service register entirely — so nothing is accepted, nothing is
-        // owed, and an arrival taking the ordinary path here would issue an
-        // acknowledgement that retires an unrelated interrupt. There is nothing
-        // to mediate in any case: this hypervisor masks every input of both
-        // legacy controllers during bring-up, so the pin can never assert.
-        Delivery::SystemManagement | Delivery::Init | Delivery::External => {
+        Delivery::SystemManagement | Delivery::Init => {
             return Err(Refusal::Delivery(guest.delivery()));
         }
     };
@@ -329,16 +330,18 @@ fn describe(entry: Entry, guest: Lvt) -> Result<HardwareEntry, Refusal> {
     if !entry.is_pin() {
         return Ok(HardwareEntry::new(delivery));
     }
-    // A pin's trigger mode is the wire's, and only a fixed delivery reads it.
-    // Every other mode is an event with its own signalling — a non-maskable
-    // interrupt is edge triggered by definition, and programming one level
-    // triggered is a configuration the architecture does not define and hardware
-    // need not honour.
-    let trigger = if matches!(asked, Delivery::Fixed) && guest.level_triggered() {
-        HardwareTrigger::Level
-    } else {
-        HardwareTrigger::Edge
-    };
+    // A pin's trigger mode is the wire's, and the two modes that read it are the
+    // two whose source is a wire: a fixed vector, and the acknowledge cycle an
+    // external interrupt runs. Every other mode is an event with its own
+    // signalling — a non-maskable interrupt is edge triggered by definition, and
+    // programming one level triggered is a configuration the architecture does
+    // not define and hardware need not honour.
+    let trigger =
+        if matches!(asked, Delivery::Fixed | Delivery::External) && guest.level_triggered() {
+            HardwareTrigger::Level
+        } else {
+            HardwareTrigger::Edge
+        };
     Ok(HardwareEntry::new(delivery).wired(polarity(guest.active_low()), trigger))
 }
 
@@ -636,19 +639,14 @@ mod tests {
     }
 
     #[test]
-    fn the_three_modes_no_entry_delivers_are_refused_in_all_of_them() {
+    fn the_two_modes_no_entry_delivers_are_refused_in_all_of_them() {
         // A system-management interrupt would take the *host* into
-        // system-management mode; an INIT would reset the host processor; and an
-        // external interrupt would run an acknowledge cycle to a legacy
-        // controller this hypervisor has masked, taking whatever vector it
-        // returned. The two pins are the interesting rows: the architecture
-        // defines all three for them.
+        // system-management mode, and an INIT would reset the host processor.
+        // Neither is a thing a guest's entry may be put on real hardware for,
+        // and the two pins are the interesting rows because the architecture
+        // defines both modes for them.
         for entry in Entry::ALL {
-            for delivery in [
-                Delivery::SystemManagement,
-                Delivery::Init,
-                Delivery::External,
-            ] {
+            for delivery in [Delivery::SystemManagement, Delivery::Init] {
                 let bits = delivery as u8;
                 let guest = Lvt::new().with_delivery(bits).with_vector(GUEST);
                 assert_eq!(
@@ -657,6 +655,30 @@ mod tests {
                     "{entry:?} with {delivery:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn an_external_source_is_programmed_on_a_pin_and_refused_everywhere_else() {
+        // It carries no vector: the processor answers an acknowledge cycle to a
+        // legacy controller and takes whatever that returns. The two pins are
+        // the only entries the architecture defines the mode for, and it is
+        // programmed there because a guest that is firmware drives its own
+        // periodic timer through one of them.
+        let bits = Delivery::External as u8;
+        let guest = Lvt::new()
+            .with_delivery(bits)
+            .with_vector(GUEST)
+            .with_level_triggered(true);
+        let armed = HardwareEntry::new(LvtDelivery::External)
+            .wired(polarity(false), HardwareTrigger::Level);
+        for entry in Entry::ALL {
+            let expected = if matches!(entry, Entry::Lint0 | Entry::Lint1) {
+                Ok(armed)
+            } else {
+                Err(Refusal::Delivery(bits))
+            };
+            assert_eq!(describe(entry, guest), expected, "{entry:?}");
         }
     }
 
@@ -759,11 +781,17 @@ mod tests {
     /// Every entry a guest's write may legitimately become: one that delivers
     /// nothing, or one that delivers what the guest asked on the vector the
     /// guest named, wired the way the guest wired it.
-    fn permitted(entry: Entry, guest: Lvt) -> [HardwareEntry; 3] {
+    fn permitted(entry: Entry, guest: Lvt) -> [HardwareEntry; 4] {
         let fixed = HardwareEntry::new(LvtDelivery::Fixed(guest.vector()));
         let non_maskable = HardwareEntry::new(LvtDelivery::NonMaskable);
+        let external = HardwareEntry::new(LvtDelivery::External);
         if !entry.is_pin() {
-            return [HardwareEntry::masked(), fixed, non_maskable];
+            return [
+                HardwareEntry::masked(),
+                fixed,
+                non_maskable,
+                HardwareEntry::masked(),
+            ];
         }
         let polarity = polarity(guest.active_low());
         let trigger = if guest.level_triggered() {
@@ -775,6 +803,7 @@ mod tests {
             HardwareEntry::masked(),
             fixed.wired(polarity, trigger),
             non_maskable.wired(polarity, HardwareTrigger::Edge),
+            external.wired(polarity, trigger),
         ]
     }
 }

@@ -258,6 +258,16 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     ipi::describe("core");
     vlapic::describe("core");
     paging::with(|space| self_check(space, handoff))??;
+    // The last thing before the guest, and the only part of the host's own
+    // bring-up that is undone: the legacy controllers go back to the masks
+    // firmware had left them, because a guest that is firmware drives its own
+    // periodic timer through them and cannot program them again. Held masked
+    // until here, so that nothing they carry can assert while the host is the
+    // only thing running and has nowhere to hand an interrupt to — and taken
+    // away again the moment firmware's services stop existing.
+    if apic::restore_legacy(inherited(handoff)?.interrupts.legacy_masks)? {
+        info!("core: legacy controllers put back as firmware had masked them");
+    }
     info!("core: host bring-up complete, entering the firmware guest");
     run_guest(&mut vcpu, partition, portal, handoff)
 }

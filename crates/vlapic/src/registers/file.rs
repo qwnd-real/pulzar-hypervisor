@@ -64,6 +64,7 @@ impl Vlapic {
             request: Bitmap::new(),
             in_service: Bitmap::new(),
             trigger_mode: Bitmap::new(),
+            external: Bitmap::new(),
             task_priority: AtomicU32::new(0),
             logical_destination: AtomicU32::new(0),
             destination_format: AtomicU32::new(FLAT_DESTINATION_FORMAT),
@@ -255,6 +256,7 @@ impl Vlapic {
         self.request.reset();
         self.in_service.reset();
         self.trigger_mode.reset();
+        self.external.reset();
         self.task_priority.store(0, Ordering::Release);
         self.logical_destination.store(0, Ordering::Release);
         self.destination_format

@@ -110,6 +110,17 @@ pub(crate) struct Vlapic {
     request: Bitmap,
     in_service: Bitmap,
     trigger_mode: Bitmap,
+    /// Which requested vectors reached this guest through the pin that bypasses
+    /// its controller, and so must not be held in service when they are given
+    /// to it.
+    ///
+    /// An external interrupt is answered by an acknowledge cycle to a legacy
+    /// controller, and neither controller's in-service register takes any part
+    /// in it — so the guest acknowledges the legacy controller and nothing
+    /// else. An in-service bit set for one of these would be a bit the
+    /// guest has no reason to clear, holding its whole interrupt-priority
+    /// class for good.
+    external: Bitmap,
     task_priority: AtomicU32,
     logical_destination: AtomicU32,
     destination_format: AtomicU32,
