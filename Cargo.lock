@@ -527,6 +527,7 @@ dependencies = [
  "processor",
  "svm",
  "vcpu",
+ "vlapic",
 ]
 
 [[package]]
@@ -1170,6 +1171,7 @@ dependencies = [
  "emulate",
  "ipi",
  "log",
+ "probe",
  "processor",
  "snapshot",
  "spin 0.12.2",

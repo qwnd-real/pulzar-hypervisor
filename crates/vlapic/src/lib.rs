@@ -101,15 +101,14 @@ use thiserror::Error;
 pub use crate::{
     face::{
         mmio::region,
-        msr::{claims, intercepted, read_msr, write_msr},
+        msr::{apic_enabled, claims, intercepted, read_msr, write_msr},
     },
     hardware::timer::adjust_deadline,
     lifecycle::{arrival::arrived, hold, running, settle, settle::Resumption},
     machine::{
         diagnostics::describe,
         exits::{
-            committed, nominate, observe_task_priority, raise_nmi, set_away, take_nmi,
-            task_priority,
+            committed, nominate, observe_task_priority, raise_nmi, set_away, take_nmi, task_priority,
         },
         install::install,
         ownership::{Joining, bring_up_finished, claim_processor},

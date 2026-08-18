@@ -69,6 +69,14 @@ enum Cli {
         /// debug console goes to stdio.
         #[arg(long, value_name = "FILE")]
         serial_log: Vec<PathBuf>,
+        /// Boot the guest disk directly, with no hypervisor in front of it.
+        ///
+        /// The same machine, the same disk and the same processor topology,
+        /// with pulzar taken out — which is the only way to tell a fault of the
+        /// hypervisor's from one the guest has on this hardware anyway. Nothing
+        /// is built, because nothing of pulzar's is used.
+        #[arg(long)]
+        no_hypervisor: bool,
     },
 }
 
@@ -78,6 +86,12 @@ enum DiskCommand {
     /// Fetch a pre-installed Debian image (no installer, no interaction).
     Linux {
         /// Recreate the disk even if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Fetch the `CachyOS` ISO and run its installer (interactive, once).
+    Cachyos {
+        /// Recreate the disk (and its firmware state) even if it exists.
         #[arg(long)]
         force: bool,
     },
@@ -94,10 +108,13 @@ enum DiskCommand {
 }
 
 /// Guest OS selection for `run`.
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Guest {
     /// Attach the Debian disk created by `disk linux`.
     Linux,
+    /// Attach the `CachyOS` disk created by `disk cachyos`.
+    #[value(name = "cachyos")]
+    Cachyos,
     /// Attach the Windows disk created by `disk windows`.
     Windows,
     /// Boot the hypervisor media alone, with no guest OS disk.
@@ -109,6 +126,7 @@ impl Guest {
     fn label(self) -> &'static str {
         match self {
             Self::Linux => "linux",
+            Self::Cachyos => "cachyos",
             Self::Windows => "windows",
             Self::None => "none",
         }
@@ -119,6 +137,7 @@ fn main() -> Result<()> {
     match Cli::parse() {
         Cli::Build { release, silent } => esp::stage(release, silent).map(|_| ()),
         Cli::Disk(DiskCommand::Linux { force }) => disk::linux(force),
+        Cli::Disk(DiskCommand::Cachyos { force }) => disk::cachyos(force),
         Cli::Disk(DiskCommand::Windows { iso, force }) => disk::windows(&iso, force),
         Cli::Run {
             os,
@@ -127,6 +146,7 @@ fn main() -> Result<()> {
             silent,
             no_console,
             serial_log,
+            no_hypervisor,
         } => {
             // Three ways of asking, and they collapse to one answer here so that
             // nothing downstream has to hold both a flag and a list and decide
@@ -136,7 +156,12 @@ fn main() -> Result<()> {
                 (false, files) if files.is_empty() => vm::Console::Stdio,
                 (false, files) => vm::Console::Files(files),
             };
-            vm::run(os, release, gdb, silent, console)
+            let layering = if no_hypervisor {
+                vm::Layering::Bare
+            } else {
+                vm::Layering::Hypervisor
+            };
+            vm::run(os, release, gdb, silent, console, layering)
         }
     }
 }

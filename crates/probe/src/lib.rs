@@ -185,7 +185,6 @@ unsafe extern "sysv64" {
 unsafe extern "sysv64" fn attempt_read(msr: u32, value: *mut u64) -> bool {
     naked_asm!(
         "mov ecx, edi",
-
         // The read, at the address the handler recognises. `RDMSR` answers in
         // `EDX:EAX` with the upper half of each register cleared, so the value
         // is assembled out of the two halves rather than merely moved.
@@ -197,7 +196,6 @@ unsafe extern "sysv64" fn attempt_read(msr: u32, value: *mut u64) -> bool {
         "mov [rsi], rax",
         "mov eax, 1",
         "ret",
-
         // Where the handler sends this routine when the read faulted. Nothing of
         // this routine's own is on the stack, so the top of it is still the
         // caller's return address: answering is a zero and a return, and what

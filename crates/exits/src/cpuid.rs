@@ -1,6 +1,8 @@
 //! What the guest is told about the processor it runs on.
 
+use log::error;
 use vcpu::{Flow, Vcpu};
+use x86_64::registers::control::Cr4Flags;
 
 use crate::advance;
 
@@ -12,8 +14,40 @@ const BYTES: u64 = 2;
 /// to software that checks before it goes looking for the hypervisor leaves.
 const STANDARD_FEATURES: u32 = 0x1;
 
+/// The structured extended feature leaf, whose ECX word reports protection-key
+/// support and whether the operating system enabled it.
+const STRUCTURED_EXTENDED_FEATURES: u32 = 0x7;
+
+/// The extended state enumeration leaf. Its size fields are evaluated against
+/// the processor's current `XCR0`, which remains the guest's value across an
+/// SVM exit in this hypervisor.
+const EXTENDED_STATE: u32 = 0xD;
+
+/// The subleaf that advertises which user state components exist and the size
+/// required by the components currently enabled in `XCR0`.
+const EXTENDED_STATE_INFO: u32 = 0;
+
+/// The subleaf that advertises XSAVE instruction support and the size of the
+/// state enabled in `XCR0` and `IA32_XSS`.
+const EXTENDED_STATE_INSTRUCTIONS: u32 = 1;
+
 /// The hypervisor-present bit in that word.
 const HYPERVISOR_PRESENT: u32 = 1 << 31;
+
+/// `CPUID.01H:ECX[26]`: the static XSAVE capability required by OSXSAVE.
+const XSAVE: u32 = 1 << 26;
+
+/// `CPUID.01H:ECX[27]`: the current `CR4.OSXSAVE` state.
+const OSXSAVE: u32 = 1 << 27;
+
+/// `CPUID.01H:EDX[9]`: the local APIC's current enablement state.
+const APIC: u32 = 1 << 9;
+
+/// `CPUID.07H:ECX[3]`: static protection-key support.
+const PKU: u32 = 1 << 3;
+
+/// `CPUID.07H:ECX[4]`: the current `CR4.PKE` state.
+const OSPKE: u32 = 1 << 4;
 
 /// The extended feature leaf, whose ECX word advertises the virtualization
 /// extension.
@@ -76,6 +110,39 @@ pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
     let leaf = low(vcpu.save().rax);
     let subleaf = low(vcpu.registers().rcx);
     let mut result = processor::cpuid(leaf, subleaf);
+    if leaf == STANDARD_FEATURES {
+        result.ecx &= !OSXSAVE;
+        if Cr4Flags::from_bits_retain(vcpu.save().cr4).contains(Cr4Flags::OSXSAVE)
+            && result.ecx & XSAVE != 0
+        {
+            result.ecx |= OSXSAVE;
+        }
+        result.edx &= !APIC;
+        if vlapic::apic_enabled().unwrap_or_else(|error| {
+            error!("exits: could not read the guest APIC enable state: {error}");
+            false
+        }) {
+            result.edx |= APIC;
+        }
+    }
+    if leaf == STRUCTURED_EXTENDED_FEATURES && subleaf == 0 {
+        result.ecx &= !OSPKE;
+        if Cr4Flags::from_bits_retain(vcpu.save().cr4)
+            .contains(Cr4Flags::PROTECTION_KEY_USER)
+            && result.ecx & PKU != 0
+        {
+            result.ecx |= OSPKE;
+        }
+    }
+    // Leaf 0DH is deliberately passed through unchanged. SVM does not save
+    // `XCR0` in the VMCB, so this processor is still running with the guest's
+    // `XCR0` when the intercepted `CPUID` executes; the hardware therefore
+    // supplies the enabled-state sizes in EBX and the related fields directly.
+    if leaf == EXTENDED_STATE
+        && matches!(subleaf, EXTENDED_STATE_INFO | EXTENDED_STATE_INSTRUCTIONS)
+    {
+        result = processor::cpuid(leaf, subleaf);
+    }
     if leaf == EXTENDED_FEATURES {
         result.ecx &= !(SVM | EXTENDED_APIC_SPACE);
     }

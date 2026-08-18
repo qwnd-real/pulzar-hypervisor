@@ -82,6 +82,20 @@ pub fn write_msr(index: u32, value: u64, tsc_offset: u64) -> Result<(), VlapicEr
     Ok(())
 }
 
+/// Whether the guest's local interrupt controller is globally enabled.
+///
+/// This is the virtual `IA32_APIC_BASE.EN` state, not the host processor's
+/// model-specific register. It is exposed separately because `CPUID.01H:EDX[9]`
+/// reports the guest's current controller state.
+///
+/// # Errors
+///
+/// [`VlapicError::NotInstalled`] before [`crate::install`], or
+/// [`VlapicError::NoLapic`] on a processor with no emulated controller.
+pub fn apic_enabled() -> Result<bool, VlapicError> {
+    Ok(current()?.base().mode() != Mode::Disabled)
+}
+
 /// Says once that this face refused an access, and traces the rest.
 ///
 /// The guest is told about every one of these already, and told by the

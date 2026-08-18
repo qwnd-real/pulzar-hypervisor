@@ -20,6 +20,31 @@ use crate::{Guest, disk, esp, paths, proc};
 /// Hint attached to errors when a QEMU binary is missing from the host.
 pub const QEMU_INSTALL_HINT: &str = "install QEMU (it provides qemu-system-x86_64 and qemu-img)";
 
+/// The processors the guest is given, and how they are arranged: one socket of
+/// eight cores with two threads each.
+///
+/// The arrangement is the point rather than the total. Two logical processors
+/// sharing one physical core is a case nothing in this hypervisor's emulation
+/// distinguishes — it has no notion of a core — and everything about the
+/// hardware shares, so it is the one topology a guest has to be run on before
+/// the emulation is believed. A flat `-smp 16` gives sixteen single-threaded
+/// cores and never exercises it.
+const TOPOLOGY: &str = "16,sockets=1,cores=8,threads=2";
+
+/// The processor the guest is shown.
+///
+/// `topoext` is what makes the topology above mean anything: it is the bit that
+/// says AMD's own topology leaf is there, and without it a guest cannot tell
+/// which logical processors share a core. Linux then treats all sixteen as
+/// separate cores and never brings a sibling up as one.
+///
+/// `invtsc` says the timestamp counter runs at a constant rate, which is what
+/// lets a guest use it as a timebase rather than as a cycle counter.
+const PROCESSOR: &str = "host,invtsc=on,topoext=on";
+
+/// Memory the guest is given. Enough for a desktop installer to run in.
+const MEMORY: &str = "8G";
+
 /// Everything needed to assemble one QEMU invocation.
 ///
 /// `esp` and `installer` are mutually exclusive: whichever is present claims
@@ -64,25 +89,60 @@ pub enum Console {
     None,
 }
 
+/// Whether pulzar stands in front of the guest.
+///
+/// A choice rather than a flag, because the two are not settings of one thing.
+/// One boots the media this workspace builds, with the guest disk behind it;
+/// the other boots that disk on bare firmware, on the same machine with the
+/// same processor topology. The second exists so that a fault of the
+/// hypervisor's can be told from one the guest has on this hardware anyway,
+/// which is not a question any amount of looking at the first can answer.
+#[derive(Clone, Copy)]
+pub enum Layering {
+    /// Boot the staged hypervisor media, with the guest disk behind it.
+    Hypervisor,
+    /// Boot the guest disk directly. Nothing is built, because nothing of
+    /// pulzar's is used.
+    Bare,
+}
+
 /// Builds the boot media and runs it in QEMU, optionally with a guest disk.
 ///
 /// `silent` compiles every log record out of both images, which is a strange
 /// thing to ask of a QEMU run — the debug console there costs one port write a
 /// byte — and is offered anyway, because a bare-metal image is worth being able
 /// to try under QEMU before it is written to a stick.
-pub fn run(os: Guest, release: bool, gdb: bool, silent: bool, console: Console) -> Result<()> {
-    let staged = esp::stage(release, silent)?;
+pub fn run(
+    os: Guest,
+    release: bool,
+    gdb: bool,
+    silent: bool,
+    console: Console,
+    layering: Layering,
+) -> Result<()> {
+    ensure!(
+        matches!(layering, Layering::Hypervisor) || os != Guest::None,
+        "nothing to boot: --no-hypervisor leaves only the guest disk, and --os none leaves no disk"
+    );
     let disk = match os {
         Guest::None => None,
         Guest::Linux => Some(existing_image(os, "cargo xtask disk linux")?),
+        Guest::Cachyos => Some(existing_image(os, "cargo xtask disk cachyos")?),
         Guest::Windows => Some(existing_image(
             os,
             "cargo xtask disk windows --iso <windows.iso>",
         )?),
     };
+    let esp = match layering {
+        Layering::Hypervisor => Some(esp::stage(release, silent)?),
+        Layering::Bare => {
+            println!("booting {} with no hypervisor in front of it", os.label());
+            None
+        }
+    };
     launch(&Spec {
         label: os.label(),
-        esp: Some(staged),
+        esp,
         disk,
         installer: None,
         tpm: matches!(os, Guest::Windows),
@@ -95,8 +155,8 @@ pub fn run(os: Guest, release: bool, gdb: bool, silent: bool, console: Console) 
 pub fn launch(spec: &Spec) -> Result<()> {
     let (code, vars) = firmware(spec.label)?;
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu.args(["-machine", "q35,accel=kvm", "-cpu", "host,invtsc=on"]);
-    qemu.args(["-smp", "16", "-m", "8G"]);
+    qemu.args(["-machine", "q35,accel=kvm", "-cpu", PROCESSOR]);
+    qemu.args(["-smp", TOPOLOGY, "-m", MEMORY]);
     qemu.args(["-no-shutdown", "-no-reboot"]);
     qemu.args(["-overcommit", "cpu-pm=on"]);
     if spec.gdb {
