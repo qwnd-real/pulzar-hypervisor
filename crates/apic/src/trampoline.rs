@@ -382,11 +382,11 @@ impl Trampoline {
     /// Points the next start at `stack_top` and puts the stage back to nothing.
     ///
     /// Only safe to call once the processor started before it is accounted for:
-    /// either it never began, which [`Trampoline::began`] answers, or it has
-    /// arrived somewhere its caller can see — publishing itself as one of the
-    /// machine's processors is a long way past its last read of this block. A
-    /// processor anywhere between those two still has both of these fields to
-    /// read, and there is no way to ask it.
+    /// it has arrived somewhere its caller can see — publishing itself as one
+    /// of the machine's processors is a long way past its last read of this
+    /// block. A processor that did not publish progress after a startup command
+    /// is not safe to reuse either, because the command may still be pending
+    /// and there is no way to cancel or query it.
     pub(crate) fn prepare(&self, stack_top: u64) {
         // SAFETY: the block was written by `place` into a page nothing else uses,
         // and the caller establishes that the processor started before this one

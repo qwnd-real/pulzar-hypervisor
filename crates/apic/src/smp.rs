@@ -28,10 +28,11 @@
 //! read them, and two processors running on one stack is a worse machine than
 //! one with fewer processors.
 //!
-//! A processor that never began at all is a different case and is only logged:
-//! the architecture's own startup sequence defines the two commands and the
-//! delays after them, and a processor that has not executed its first
-//! instruction by the end of that is one the sequence has finished with.
+//! A processor that has not published progress by the end of the wait is not a
+//! different case: a startup command has no completion or cancellation
+//! acknowledgement, so the processor may still execute it later. The sequence
+//! stops and leaves the shared page intact rather than guessing that it is safe
+//! to reuse.
 //!
 //! # Stacks are never handed on
 //!
@@ -136,11 +137,11 @@ pub struct Started {
 /// installing descriptor tables is the first thing it should do, because until
 /// it does the processor has no way to report anything that goes wrong.
 ///
-/// A processor that never answered a startup command is logged and skipped: one
-/// processor failing to start is not a reason to refuse to run a machine, and
-/// the count returned is what actually happened rather than what was attempted.
-/// A processor that answered and then stopped part-way is not skipped, because
-/// starting anything else would mean overwriting parameters it may still read.
+/// A processor that never answered a startup command cannot be safely skipped:
+/// once a startup command has been sent, it may still be pending in the
+/// controller or the processor may only be waiting to run it. A processor that
+/// answered and then stopped part-way is likewise not skipped, because starting
+/// anything else would mean overwriting parameters it may still read.
 ///
 /// # Errors
 ///
@@ -151,10 +152,9 @@ pub struct Started {
 /// [`ApicError::Cpu`] if the processor roster cannot be read;
 /// [`ApicError::Paging`] if the page cannot be mapped or unmapped, which
 /// includes some processor failing to acknowledge dropping the mapping;
-/// [`ApicError::StartupUnresolved`] if a processor began starting and stopped
-/// before it had read its parameters, which leaves the trampoline page mapped
-/// because that processor may still be executing from it; or whatever placing
-/// the trampoline reported.
+/// [`ApicError::StartupUnresolved`] if a processor may still be executing from
+/// the trampoline, which leaves the page mapped and untouched; or whatever
+/// placing the trampoline reported.
 pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError> {
     let base = trampoline.as_u64();
     if base >= ONE_MIB || !base.is_multiple_of(PAGE) {
@@ -203,21 +203,21 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
     // low half behind would outlast the reason it existed. This is also what
     // makes every processor that just ran from it forget the translation.
     //
-    // Unless a processor is unaccounted for. One that began and never finished
-    // reading its parameters may yet execute the instruction that turns paging
-    // on, and that instruction is fetched from this page — so removing the
+    // Unless a processor is unaccounted for. A sent startup command may execute
+    // after the deadline even if the stage word did not change, and a processor
+    // that did change it may still be reading the parameters. Either may yet
+    // fetch the instruction that turns paging on from this page, so removing the
     // mapping is the one thing that could still make its situation worse.
     let unmapped = if let Err(ApicError::StartupUnresolved { apic_id }) = &started {
         warn!(
-            "apic: leaving the trampoline mapped at {base:#x}; {apic_id} began starting and \
-             may still be executing from it"
+            "apic: leaving the trampoline mapped at {base:#x}; {apic_id} may still execute from \
+             it"
         );
         Ok(())
     } else {
-        // SAFETY: every processor is either past the point of using this
-        // page — each is waited for before the next is started, and one
-        // that began and did not finish stops the sequence above — or never
-        // reached it. The direct-map alias is the page's sole writable host
+        // SAFETY: every processor sent a startup command has attached and is
+        // past the point of using this page; any unresolved command stops the
+        // sequence above. The direct-map alias is the page's sole writable host
         // reference, so clearing it cannot race a trampoline instruction.
         unsafe { at.as_ptr().write_bytes(0, paging::as_usize(PAGE)) };
         info!("apic: zeroed the trampoline page at {base:#x}");
@@ -275,9 +275,9 @@ fn startable() -> Result<Vec<ApicId>, ApicError> {
 ///
 /// # Errors
 ///
-/// [`ApicError::StartupUnresolved`] if a processor began and stopped before it
-/// had taken its parameters out of the trampoline, which is the one failure
-/// that stops the rest: the next processor's parameters go in the same place.
+/// [`ApicError::StartupUnresolved`] if a processor may still be executing from
+/// the trampoline, which is the one failure that stops the rest: the next
+/// processor's parameters go in the same place.
 fn start_each(
     local: LocalApic,
     trampoline: &Trampoline,
@@ -304,11 +304,22 @@ fn start_each(
         // such proof.
         match bring_up(local, trampoline, target, &stack) {
             Ok(()) => info!("apic: {target} started"),
+            Err(ApicError::StartupUnresolved { apic_id }) => {
+                warn!("apic: {target} startup is unresolved for {apic_id}");
+                return Err(ApicError::StartupUnresolved { apic_id });
+            }
             // It began and did not arrive, so where it is now is unknown and it
             // may still have the parameter block to read. Nothing else can be
             // started, because the next processor's parameters go in the same
             // place. A success is not this case: it ends in the target
             // publishing itself, which is a long way past its last read.
+            Err(error @ ApicError::NoStartupResponse { apic_id }) => {
+                warn!(
+                    "apic: {target} did not publish trampoline progress; treating startup as \
+                     unresolved: {error}"
+                );
+                return Err(ApicError::StartupUnresolved { apic_id });
+            }
             Err(error) if trampoline.began() => {
                 warn!(
                     "apic: {target} stopped after stage {} of starting: {error}",
@@ -332,9 +343,10 @@ fn allocate_stack() -> Result<Stack, ApicError> {
 /// # Errors
 ///
 /// Whatever sending it a command reported, [`ApicError::Clock`] if there is no
-/// timebase to wait on, [`ApicError::NoStartupResponse`] if it never executed
-/// the first instruction of the trampoline, or [`ApicError::AttachTimeout`] if
-/// it began and never became one of the machine's.
+/// timebase to wait on, [`ApicError::NoStartupResponse`] if it did not execute
+/// the first instruction of the trampoline within the startup deadline, or
+/// [`ApicError::AttachTimeout`] if it began and never became one of the
+/// machine's.
 fn bring_up(
     local: LocalApic,
     trampoline: &Trampoline,
@@ -352,19 +364,41 @@ fn bring_up(
     sleep(INIT_MICROS)?;
 
     for _ in 0..STARTUP_COMMANDS {
-        local.send(Command::new(
-            Delivery::Startup(trampoline.vector()),
-            Target::One(target),
-        ))?;
-        sleep(STARTUP_MICROS)?;
+        local
+            .send(Command::new(
+                Delivery::Startup(trampoline.vector()),
+                Target::One(target),
+            ))
+            .map_err(|_| ApicError::StartupUnresolved { apic_id: target })?;
+        sleep(STARTUP_MICROS).map_err(|_| ApicError::StartupUnresolved { apic_id: target })?;
         if trampoline.began() {
             break;
         }
     }
-    if !trampoline.began() {
+    if !trampoline.began()
+        && !wait_for_begin(trampoline)
+            .map_err(|_| ApicError::StartupUnresolved { apic_id: target })?
+    {
         return Err(ApicError::NoStartupResponse { apic_id: target });
     }
     wait_for(target)
+}
+
+/// Waits long enough for a delivered startup command to reach the trampoline.
+///
+/// A SIPI has no cancellation or completion acknowledgement. Returning from
+/// this wait without observing the stage would therefore not prove that the
+/// page is unused: a delayed processor could still execute the command after
+/// the caller rewrites the shared parameters. The caller treats a timeout as
+/// unresolved and keeps the page intact.
+fn wait_for_begin(trampoline: &Trampoline) -> Result<bool, ApicError> {
+    for _ in 0..ATTACH_MICROS.div_ceil(POLL_MICROS) {
+        if trampoline.began() {
+            return Ok(true);
+        }
+        sleep(POLL_MICROS)?;
+    }
+    Ok(trampoline.began())
 }
 
 /// Where a function the trampoline jumps to lives.

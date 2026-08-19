@@ -370,6 +370,7 @@ name = "exits"
 version = "0.1.0"
 dependencies = [
  "apic",
+ "bitflags",
  "descriptors",
  "emulate",
  "inject",

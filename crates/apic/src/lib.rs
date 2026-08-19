@@ -1487,8 +1487,9 @@ pub enum ApicError {
         /// Where the tables are.
         phys: u64,
     },
-    /// A processor was sent every startup command the architecture prescribes
-    /// and never executed the first instruction of the trampoline.
+    /// A processor did not execute the first instruction of the trampoline
+    /// within the startup deadline. Because a startup command has no
+    /// cancellation acknowledgement, the caller must treat this as unresolved.
     #[error("{apic_id} did not answer a startup command")]
     NoStartupResponse {
         /// The processor that was asked.
