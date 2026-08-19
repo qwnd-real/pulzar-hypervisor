@@ -493,6 +493,12 @@ fn virtualize(space: &mut AddressSpace) -> Result<Vcpu, CoreError> {
     // The guest's own controller answers for every one of these, so none of
     // them may reach the real one underneath.
     vcpu.intercept_msrs(window, vlapic::intercepted())?;
+    // And the guest's own copy of the memory-type ranges and their MTRR control
+    // fields in SYSCFG answers for these. They decide nothing about a guest's
+    // memory while nested paging is on, and everything about the host's — one
+    // set per core, shared with the sibling thread — so guest writes must not
+    // reach the host's copies.
+    vcpu.intercept_msrs(window, exits::mtrr::intercepted())?;
     Ok(vcpu)
 }
 

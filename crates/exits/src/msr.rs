@@ -1,7 +1,7 @@
 //! The model-specific registers the guest is answered for rather than allowed
 //! to reach.
 //!
-//! Five kinds are answered here, and they fail differently. The timestamp
+//! Six kinds are answered here, and they fail differently. The timestamp
 //! counter and its adjustment register are backed by the control block's
 //! offset, keeping native `RDTSC` and `RDTSCP` reads on the zero-exit path. The
 //! two registers that decide whether the virtualization extension may be used
@@ -11,12 +11,16 @@
 //! and is answered by hiding one bit of it and forcing that same bit back on
 //! whatever the guest writes. The page-attribute table is the guest's own too,
 //! and is answered out of the save area, because that is where the processor
-//! reads the guest's memory types from while nested paging is on. The interrupt
-//! controller's registers are answered by the guest's own emulated controller,
-//! and an access the architecture does not allow is a general protection fault
-//! the guest is given rather than an error the host reports.
+//! reads the guest's memory types from while nested paging is on. The
+//! memory-type range registers are answered out of [`crate::mtrr`], for the
+//! same reason the page-attribute table is not answered from the register of
+//! that name: they are the host's, and shared with the other thread of this
+//! core. The interrupt controller's registers are answered by the guest's own
+//! emulated controller, and an access the architecture does not allow is a
+//! general protection fault the guest is given rather than an error the host
+//! reports.
 //!
-//! A sixth kind is not answered at all so much as forwarded. The permission
+//! A seventh kind is not answered at all so much as forwarded. The permission
 //! map covers three ranges of the index space and an access outside all three
 //! is intercepted whatever the map holds, so those arrive here whether this
 //! crate wants them or not; they reach the machine's own register, and a
@@ -65,7 +69,10 @@ use svm::{
 use vcpu::{Flow, Vcpu};
 use x86_64::registers::{control::Cr0Flags, model_specific::EferFlags};
 
-use crate::advance;
+use crate::{
+    advance,
+    mtrr::{self, Mtrrs},
+};
 
 /// What one processor's guest has been told about this machine's virtualization
 /// extension.
@@ -99,7 +106,18 @@ impl Virtualization {
     }
 
     /// Answers one intercepted register access.
-    pub(crate) fn exit(&mut self, vcpu: &mut Vcpu, interrupts: &mut Pending) -> Flow {
+    ///
+    /// The routing rather than the answering: the four registers this type is
+    /// about are answered below, and everything else is handed to whichever
+    /// handler owns it. `mtrrs` is this processor's memory-type ranges, which
+    /// are its own state rather than this type's — the two kinds of
+    /// register have nothing in common but arriving through the same exit.
+    pub(crate) fn exit(
+        &mut self,
+        vcpu: &mut Vcpu,
+        mtrrs: &mut Mtrrs,
+        interrupts: &mut Pending,
+    ) -> Flow {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "a model-specific register index is the low half of RCX; the architecture ignores the rest"
@@ -110,6 +128,9 @@ impl Virtualization {
         }
         if vlapic::claims(msr) {
             return controller(vcpu, msr, interrupts);
+        }
+        if mtrr::claims(msr) {
+            return ranges(vcpu, mtrrs, msr, interrupts);
         }
         let Some(register) = Hidden::of(msr) else {
             if msrpm_position(msr).is_some() {
@@ -374,7 +395,7 @@ const LMA: u64 = EferFlags::LONG_MODE_ACTIVE.bits();
 /// Carries nothing: every one of them is the same exception with the same error
 /// code, and the guest is told no rather than told why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Fault;
+pub(crate) struct Fault;
 
 /// Stores what a write of the extended feature register leaves the guest
 /// running with.
@@ -500,6 +521,30 @@ fn controller(vcpu: &mut Vcpu, msr: u32, interrupts: &mut Pending) -> Flow {
             Flow::Leave
         }
     }
+}
+
+/// Answers an access to the guest's own memory-type ranges.
+///
+/// The guest is given a general protection fault for anything real hardware
+/// refuses — a range this machine does not have, a write of the read-only
+/// capability register, a reserved bit set, a memory type the architecture does
+/// not define — because a guest programming its ranges probes them, and one
+/// that silently accepted a range it cannot have would go on to trust it.
+///
+/// The virtual `SYSCFG` switch for the routing bits is read here, once per
+/// access, because a guest may change it between one access and the next.
+fn ranges(vcpu: &mut Vcpu, mtrrs: &mut Mtrrs, msr: u32, interrupts: &mut Pending) -> Flow {
+    let routing = mtrrs.routing();
+    let answered = match MsrAccess::from_exit_info(vcpu.control().exit_info_1) {
+        MsrAccess::Read => mtrrs.read(msr, routing).map(|value| answer(vcpu, value)),
+        MsrAccess::Write => mtrrs.write(msr, written(vcpu), routing),
+    };
+    let Ok(()) = answered else {
+        trace!("exits: refusing the guest's access to memory-type register {msr:#x}");
+        return refuse(vcpu, interrupts);
+    };
+    advance(vcpu, BYTES);
+    Flow::Resume
 }
 
 /// Gives the guest the exception its access earned.

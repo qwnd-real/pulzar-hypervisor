@@ -6,6 +6,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+bitflags = { workspace = true }
 inject = { workspace = true }
 descriptors = { workspace = true }
 apic = { workspace = true }

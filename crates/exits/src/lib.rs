@@ -11,6 +11,10 @@
 //! - The model-specific registers that decide whether that extension may be
 //!   used, answered consistently with that — and the extended feature register
 //!   whose enable bit would otherwise contradict it.
+//! - The memory-type range registers, answered out of a copy of this
+//!   processor's own. They decide nothing about a guest's memory under nested
+//!   paging and everything about the host's, so a guest write must reach the
+//!   copy and never the register.
 //! - Every other model-specific register the permission map cannot cover, which
 //!   the processor intercepts whatever that map says. Those reach the machine's
 //!   own register, and one the machine does not have is a fault the guest
@@ -57,6 +61,7 @@ mod cpuid;
 mod firmware;
 mod hidden_svm;
 mod msr;
+pub mod mtrr;
 mod nested;
 
 use core::convert::Infallible;
@@ -72,22 +77,23 @@ use vlapic::{Resumption, VlapicError};
 use x86_64::instructions::interrupts;
 
 pub use crate::firmware::Boot;
-use crate::{census::Census, firmware::Firmware, msr::Virtualization};
+use crate::{census::Census, firmware::Firmware, msr::Virtualization, mtrr::Mtrrs};
 
 /// The guest's exits, and everything the host needs to answer one.
 ///
 /// One of these per processor, holding the things that are one processor's:
 /// what its guest is owed, how far it has got out of firmware — which for every
-/// processor but one is "there was no firmware" — and what it has been told
-/// about this machine's virtualization extension. The guest's memory is
-/// borrowed rather than held, because that part really is shared by all of
-/// them.
+/// processor but one is "there was no firmware" — what it has been told about
+/// this machine's virtualization extension, and the memory-type ranges it was
+/// given in place of this core's own. The guest's memory is borrowed rather
+/// than held, because that part really is shared by all of them.
 #[derive(Debug)]
 pub struct Exits<'a> {
     partition: &'a Partition,
     firmware: Option<Firmware>,
     interrupts: Pending,
     virtualization: Virtualization,
+    mtrrs: Mtrrs,
     left: Left,
     census: Census,
 }
@@ -101,6 +107,7 @@ impl<'a> Exits<'a> {
             firmware: Some(Firmware::new(portal, boot)),
             interrupts: Pending::new(),
             virtualization: Virtualization::new(),
+            mtrrs: Mtrrs::seed(),
             left: Left::Stopped,
             census: Census::new(),
         }
@@ -112,6 +119,12 @@ impl<'a> Exits<'a> {
     /// *into* the guest and only one processor goes that way. This one
     /// reaches the same guest by being started by it, which cannot happen
     /// until firmware is long finished.
+    ///
+    /// The memory-type ranges are read here as they are on the processor that
+    /// does go that way, and from this processor's own registers: what makes
+    /// the guest's rendezvous over them find every processor agreeing is
+    /// each one answering what firmware really left on the core it is
+    /// running on.
     #[must_use]
     pub fn joining(partition: &'a Partition) -> Self {
         Self {
@@ -119,6 +132,7 @@ impl<'a> Exits<'a> {
             firmware: None,
             interrupts: Pending::new(),
             virtualization: Virtualization::new(),
+            mtrrs: Mtrrs::seed(),
             left: Left::Stopped,
             census: Census::new(),
         }
@@ -255,7 +269,10 @@ impl<'a> Exits<'a> {
         }
         let flow = match reason {
             Some(Reason::Cpuid) => cpuid::exit(vcpu),
-            Some(Reason::MsrAccess) => self.virtualization.exit(vcpu, &mut self.interrupts),
+            Some(Reason::MsrAccess) => {
+                self.virtualization
+                    .exit(vcpu, &mut self.mtrrs, &mut self.interrupts)
+            }
             Some(Reason::NestedPageFault) => {
                 nested::exit(vcpu, self.partition, &mut self.interrupts)
             }
