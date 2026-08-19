@@ -2,6 +2,8 @@
 # freestanding hv-core image built with a custom target JSON) lands here.
 /target/
 **/target/
+.agents/
+.jspace/
 
 # Temp
 /tmp/
