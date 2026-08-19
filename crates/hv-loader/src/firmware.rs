@@ -162,9 +162,13 @@ fn load_from(volume: Handle) -> Result<Handle, LoaderError> {
 /// which would mean firmware did not give us the handle it started us with.
 pub fn loaded_self() -> Result<Loader, LoaderError> {
     let handle = boot::image_handle();
-    let image = boot::open_protocol_exclusive::<LoadedImage>(handle)
+    let mut image = boot::open_protocol_exclusive::<LoadedImage>(handle)
         .context("open the loader's own loaded-image protocol")?;
     let (base, size) = image.info();
+    // SAFETY: the callback is linked into this image and firmware invokes it
+    // before releasing the image's pages, which satisfies `set_unload`'s
+    // lifetime contract.
+    unsafe { image.set_unload(unload_self) };
     Ok(Loader {
         handle,
         base: wide(base.addr()),
@@ -172,11 +176,17 @@ pub fn loaded_self() -> Result<Loader, LoaderError> {
     })
 }
 
-/// The physical memory the loader takes out of firmware's hands for good.
+/// Accepts firmware's request to unload this image.
+extern "efiapi" fn unload_self(_image: Handle) -> Status {
+    Status::SUCCESS
+}
+
+/// The physical memory the loader acquires for the hypervisor handoff.
 ///
-/// Two regions, reserved together because they are the same kind of thing: both
-/// outlive the loader, both are [`MemoryType::RESERVED`] so that nothing after
-/// pulzar reuses them, and neither can be asked for once firmware is gone.
+/// The chunk remains reserved for the hypervisor. The trampoline is held as
+/// boot-services data until EBS succeeds; while the boot processor is stopped
+/// at the success notification, the hypervisor starts the other processors and
+/// clears the page before the guest can reclaim it.
 #[derive(Clone, Copy, Debug)]
 pub struct Reserved {
     /// Base of the hypervisor's 64 MiB chunk, [`paging::chunk::CHUNK_ALIGN`]
@@ -186,7 +196,7 @@ pub struct Reserved {
     pub trampoline: PhysAddr,
 }
 
-/// Reserves both regions.
+/// Acquires both regions.
 ///
 /// # Errors
 ///
@@ -237,12 +247,10 @@ fn allocate_chunk() -> Result<PhysAddr, LoaderError> {
 /// One past the highest physical address a 32-bit `CR3` can name.
 const FOUR_GIB: u64 = 1 << 32;
 
-/// One past the highest physical address a startup interprocessor interrupt can
-/// send a processor to: the vector is eight bits and the processor reads it as
-/// `vector << 12`.
-const ONE_MIB: u64 = 1 << 20;
+/// Highest byte an eight-bit startup vector can address.
+const LAST_SIPI_BYTE: u64 = (1 << 20) - 1;
 
-/// Reserves the page the other processors will start executing on.
+/// Acquires the page the other processors will start executing on.
 ///
 /// It has to be in the first megabyte because that is the only place a startup
 /// interprocessor interrupt can point a processor at, and the first megabyte is
@@ -250,17 +258,20 @@ const ONE_MIB: u64 = 1 << 20;
 /// page is asked for rather than picked out of the memory map, and firmware
 /// answers with one nothing else is using.
 ///
-/// [`MemoryType::RESERVED`] for the same reason the chunk uses it: the page
-/// outlives the loader, and the other processors may be started at any point
-/// after boot, not only during it.
+/// [`MemoryType::BOOT_SERVICES_DATA`] keeps the page exclusively owned through
+/// EBS without leaving a permanent reserved-memory hole in the final map.
 ///
 /// # Errors
 ///
 /// [`LoaderError::Firmware`] if firmware has no free page below 1 MiB, which
 /// leaves no way to start another processor.
 fn allocate_trampoline() -> Result<PhysAddr, LoaderError> {
-    let base = boot::allocate_pages(AllocateType::MaxAddress(ONE_MIB), MemoryType::RESERVED, 1)
-        .context("reserve the application processors' trampoline page below 1 MiB")?;
+    let base = boot::allocate_pages(
+        AllocateType::MaxAddress(LAST_SIPI_BYTE),
+        MemoryType::BOOT_SERVICES_DATA,
+        1,
+    )
+    .context("allocate the application processors' trampoline page below 1 MiB")?;
     Ok(PhysAddr::new(wide(base.addr().get())))
 }
 

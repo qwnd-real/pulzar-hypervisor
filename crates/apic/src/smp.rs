@@ -130,11 +130,11 @@ pub struct Started {
 /// Starts every processor firmware described as startable, and waits for each
 /// to reach `main`.
 ///
-/// `trampoline` is a reserved page below one megabyte, which the loader asked
-/// firmware for. `main` is what each processor runs once it is executing 64-bit
-/// code on a stack of its own: it never returns, and installing descriptor
-/// tables is the first thing it should do, because until it does the processor
-/// has no way to report anything that goes wrong.
+/// `trampoline` is a boot-services-data page below one megabyte, which the
+/// loader holds through EBS. `main` is what each processor runs once it is
+/// executing 64-bit code on a stack of its own: it never returns, and
+/// installing descriptor tables is the first thing it should do, because until
+/// it does the processor has no way to report anything that goes wrong.
 ///
 /// A processor that never answered a startup command is logged and skipped: one
 /// processor failing to start is not a reason to refuse to run a machine, and
@@ -177,8 +177,8 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
     // Mapped at its own address, because the instruction after the one that
     // turns paging on is fetched from here.
     paging::with(|space| {
-        // SAFETY: the page is firmware-reserved for exactly this and nothing
-        // else maps it; the direct map's alias of it is read-write and
+        // SAFETY: the page is held as boot-services data for exactly this and
+        // nothing else maps it; the direct map's alias of it is read-write and
         // no-execute, so this adds an executable path to a page whose contents
         // are about to be written and nothing else.
         unsafe {
@@ -192,35 +192,41 @@ pub fn start(trampoline: PhysAddr, main: fn() -> !) -> Result<Started, ApicError
         }
     })??;
 
-    // SAFETY: `at` is the direct map's address of the whole reserved page, which
-    // is writable there and used by nothing else, and `trampoline` is its
-    // physical address — checked above to be frame-aligned and below one
+    // SAFETY: `at` is the direct map's address of the whole boot-services-data
+    // page, which is writable there and used by nothing else, and `trampoline`
+    // is its physical address — checked above to be frame-aligned and below one
     // megabyte.
     let placed = unsafe { Trampoline::place(at.as_ptr(), trampoline, root, entry_address(main)) };
     let started = placed.and_then(|trampoline| start_each(local, &trampoline, &startable, here));
 
-    // Unmapped whatever happened above: leaving one executable page of the low
-    // half behind would outlast the reason it existed. This is also what makes
-    // every processor that just ran from it forget the translation.
+    // Zero and unmap whatever happened above: leaving one executable page of the
+    // low half behind would outlast the reason it existed. This is also what
+    // makes every processor that just ran from it forget the translation.
     //
     // Unless a processor is unaccounted for. One that began and never finished
     // reading its parameters may yet execute the instruction that turns paging
     // on, and that instruction is fetched from this page — so removing the
     // mapping is the one thing that could still make its situation worse.
-    let unmapped = match &started {
-        Err(ApicError::StartupUnresolved { apic_id }) => {
-            warn!(
-                "apic: leaving the trampoline mapped at {base:#x}; {apic_id} began starting and \
-                 may still be executing from it"
-            );
-            Ok(())
-        }
-        _ => paging::with(|space| {
-            // SAFETY: every processor is either past the point of using this page
-            // — each is waited for before the next is started, and one that began
-            // and did not finish stops the sequence above — or never reached it.
+    let unmapped = if let Err(ApicError::StartupUnresolved { apic_id }) = &started {
+        warn!(
+            "apic: leaving the trampoline mapped at {base:#x}; {apic_id} began starting and \
+             may still be executing from it"
+        );
+        Ok(())
+    } else {
+        // SAFETY: every processor is either past the point of using this
+        // page — each is waited for before the next is started, and one
+        // that began and did not finish stops the sequence above — or never
+        // reached it. The direct-map alias is the page's sole writable host
+        // reference, so clearing it cannot race a trampoline instruction.
+        unsafe { at.as_ptr().write_bytes(0, paging::as_usize(PAGE)) };
+        info!("apic: zeroed the trampoline page at {base:#x}");
+        paging::with(|space| {
+            // SAFETY: every processor is past the point of using this page,
+            // so removing its identity mapping cannot strand a processor in
+            // the mode-transition code.
             unsafe { space.unmap_region(VirtAddr::new(base), PAGE) }
-        })?,
+        })?
     };
 
     // Both outcomes matter and only one can be returned. A failed cleanup is the

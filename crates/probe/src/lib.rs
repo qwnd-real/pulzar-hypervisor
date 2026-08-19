@@ -191,12 +191,10 @@ unsafe extern "win64" fn attempt_read(msr: u32, value: *mut u64) -> bool {
         // RDX, which RDMSR is about to overwrite with half of the value it
         // returns, so it is moved out of the way first.
         "mov r9, rdx",
-
         // The read, at the address the handler recognises.
         ".globl probe_read_fault",
         "probe_read_fault:",
         "rdmsr",
-
         // RDMSR answers in EDX:EAX with the upper half of each register
         // cleared, so the value is assembled out of the two halves rather
         // than merely moved.
@@ -205,7 +203,6 @@ unsafe extern "win64" fn attempt_read(msr: u32, value: *mut u64) -> bool {
         "mov [r9], rax",
         "mov eax, 1",
         "ret",
-
         // Where the handler sends this routine when the read faulted. Nothing of
         // this routine's own is on the stack, so the top of it is still the
         // caller's return address: answering is a zero and a return, and what
@@ -240,7 +237,6 @@ unsafe extern "win64" fn attempt_write(msr: u32, value: u64) -> bool {
         "wrmsr",
         "mov eax, 1",
         "ret",
-        
         // As above: the recovery label is this routine's other answer, reached
         // with the stack exactly as the faulting instruction left it.
         ".globl probe_write_resume",

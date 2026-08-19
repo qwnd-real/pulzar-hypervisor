@@ -11,8 +11,8 @@
 .globl pulzar_portal_start
 pulzar_portal_start:
     // r11 -> the parameter page, one page after this one. Every later use of
-    // {SYSTEM_TABLE}, {GUEST_IMAGE_HANDLE}, and {ORIGINAL_EXIT_BOOT_SERVICES}
-    // is relative to this pointer.
+    // the system table, image handles, state, and original service is relative
+    // to this pointer.
     lea r11, [rip + pulzar_portal_data]
 
     // rbx -> firmware's boot-services table, read from the live system table
@@ -36,10 +36,12 @@ pulzar_portal_start:
     mov dword ptr [rbx + {HEADER_CRC}], 0
 
     // CalculateCrc32(this = rbx, DataSize = header.size, &Crc32) via the
-    // System V x86-64 ABI: rcx/rdx/r8/r9 are the first three arguments, and
+    // Microsoft x64 ABI: rcx/rdx/r8/r9 are the first four arguments, and
     // 32 bytes of shadow space are reserved below rsp for the callee even
     // though UEFI is Microsoft-ABI, matching the convention `uefi_raw`
     // assumes throughout this crate.
+    // Keep the captured stack layout intact: this entry is a jump into
+    // firmware's live call chain, not a normal function entry we may realign.
     sub rsp, 48
     mov rcx, rbx
     mov edx, dword ptr [rbx + {HEADER_SIZE}]
@@ -93,9 +95,9 @@ pulzar_portal_halt:
     jmp 1b
 
 // Installed in place of firmware's real ExitBootServices. Firmware and the
-// boot manager see an ordinary function at this address and call it with
-// the ordinary ExitBootServices arguments already in rcx/rdx; neither is
-// touched here; both simply flow through to the original.
+// boot manager see an ordinary function at this address and call it with the
+// ordinary ExitBootServices arguments already in rcx/rdx. Those arguments are
+// preserved while the first call unloads the loader and notifies the host.
 .globl pulzar_portal_exit_boot_services
 pulzar_portal_exit_boot_services:
     // r11 is caller-saved by convention but is still in active use by the
@@ -103,15 +105,45 @@ pulzar_portal_exit_boot_services:
     // than assumed free, then reloaded with the parameter-page pointer this
     // wrapper needs.
     push r11
+    push rcx
+    push rdx
     lea r11, [rip + pulzar_portal_data]
 
+    // The first call unloads the loader while boot services are still live.
+    // UnloadImage changes the memory map, so the real EBS call below is
+    // expected to reject this attempt and make the guest retry with a fresh key.
+    cmp qword ptr [r11 + {LOADER_STATE}], {LOADER_PENDING}
+    jne 1f
+    mov rax, [r11 + {SYSTEM_TABLE}]
+    mov rax, [rax + {SYSTEM_BOOT_SERVICES}]
+    sub rsp, 32
+    mov rcx, [r11 + {LOADER_IMAGE_HANDLE}]
+    call qword ptr [rax + {BOOT_UNLOAD_IMAGE}]
+    add rsp, 32
+    test rax, rax
+    jnz 0f
+    mov rdx, {LOADER_UNLOADED}
+    vmmcall
+    jmp 1f
+0:
+    // Deletion is best effort. The host records the EFI status in rax and
+    // marks the portal so retries never call UnloadImage a second time.
+    mov rdx, {LOADER_SKIPPED}
+    vmmcall
+1:
+    // UnloadImage follows the firmware ABI and may destroy every volatile
+    // register, including r11. Rebuild the portal pointer before reading the
+    // saved ExitBootServices target below.
+    lea r11, [rip + pulzar_portal_data]
+    pop rdx
+    pop rcx
+
     // Call through to firmware's real ExitBootServices, exactly as if the
-    // wrapper were not here, aside from the shadow space this call site
-    // itself owes its callee under the same convention used above.
+    // wrapper were not here, aside from the shadow space this call site owes
+    // its callee under the same convention used above.
     sub rsp, 32
     call qword ptr [r11 + {ORIGINAL_EXIT_BOOT_SERVICES}]
     add rsp, 32
-
     // A nonzero EFI_STATUS means boot services did not actually exit — the
     // memory map the guest passed was stale and firmware is asking for it to
     // be rebuilt and retried. Nothing observable to the host has happened
@@ -139,7 +171,9 @@ pulzar_portal_exit_boot_services:
 pulzar_portal_data:
     .quad 0   // system_table
     .quad 0   // guest_image_handle
+    .quad 0   // loader_image_handle
     .quad 0   // original_exit_boot_services
+    .quad 0   // loader_state
 
 // Marks the end of the reservation `Portal::place` copies and bounds-checks
 // against; nothing is emitted here, only the symbol `blob()` measures against

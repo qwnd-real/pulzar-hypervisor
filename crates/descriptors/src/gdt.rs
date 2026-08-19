@@ -74,9 +74,9 @@ use crate::{
     nesting::{self, Cpu},
 };
 
-/// Descriptors this crate adds: a code segment, a data segment, and the two
-/// entries a task descriptor occupies.
-const OWN_ENTRIES: usize = 4;
+/// Descriptors this crate adds: a data segment and the two entries a task
+/// descriptor occupies.
+const OWN_ENTRIES: usize = 1 + TASK_DESCRIPTOR_ENTRIES;
 
 /// The 64-bit ring 0 code segment, as the value a table holds.
 const CODE: u64 = match Descriptor::kernel_code_segment() {

@@ -149,7 +149,8 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
     let reserved = firmware::reserve()?;
     let chunk_base = reserved.chunk;
     info!(
-        "loader: reserved chunk at {chunk_base:#x}, {:#x} bytes, trampoline page at {:#x}",
+        "loader: reserved chunk at {chunk_base:#x}, {:#x} bytes, temporary boot-services-data \
+         trampoline at {:#x}",
         chunk::CHUNK_SIZE,
         reserved.trampoline
     );

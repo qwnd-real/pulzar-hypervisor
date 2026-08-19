@@ -9,9 +9,11 @@
 //! arrives in that one structure.
 //!
 //! The structure lives in the loader's reserved memory chunk rather than in
-//! either image, because the loader's image is wiped moments after the jump.
-//! The pointer the hypervisor receives is a direct-map address, so it stays
-//! valid after the firmware half of the address space is dropped.
+//! either image. The portal needs the loader image's identity until its first
+//! `ExitBootServices` hook, and the handoff must survive the loader being
+//! unloaded and wiped there. The pointer the hypervisor receives is a
+//! direct-map address, so it stays valid after the firmware half of the address
+//! space is dropped.
 //!
 //! Reading it is a validated operation, not a blind dereference: the same
 //! entry point is reachable by a user launching the image from the UEFI shell,
@@ -45,8 +47,9 @@ pub struct Handoff {
     /// UEFI system table, and through it boot services. Valid only until the
     /// hypervisor drops the firmware half of its address space.
     pub system_table: *mut SystemTable,
-    /// Image handle of `hv-loader`, for the `UnloadImage` that evicts it. The
-    /// hypervisor image has no handle of its own: firmware never loaded it.
+    /// Image handle of `hv-loader`, retained until the portal calls
+    /// `UnloadImage` from its first `ExitBootServices` hook. The hypervisor
+    /// image has no handle of its own: firmware never loaded it.
     pub loader_image_handle: Handle,
     /// Physical base of the loader's image, to be wiped after it unloads.
     pub loader_image_base: u64,
@@ -128,16 +131,14 @@ pub struct Handoff {
     /// from, and everything after it is that number plus elapsed time.
     pub boot_wall_nanos: u64,
 
-    /// Physical base of the page reserved for the trampoline the other
-    /// processors start on, always below 1 MiB and always frame-aligned.
+    /// Physical base of the boot-services-data page the other processors start
+    /// on, always below 1 MiB and always frame-aligned.
     ///
     /// A processor answering a startup interprocessor interrupt begins in real
     /// mode at `vector << 12`, and the vector is eight bits wide, so the first
-    /// instruction it executes has to be somewhere in the first megabyte. That
-    /// is firmware's memory, and firmware is still using it — its own idle
-    /// processors are parked down there — so the page is asked for rather than
-    /// picked. It is reserved memory, like the chunk, which is what lets the
-    /// other processors be started long after the loader is gone.
+    /// instruction it executes has to be somewhere in the first megabyte. The
+    /// page is held as boot-services data through EBS, used only after firmware
+    /// has returned successfully, and then zeroed and unmapped after startup.
     pub ap_trampoline_base: u64,
 
     /// Direct-map address of the state firmware was running with, captured

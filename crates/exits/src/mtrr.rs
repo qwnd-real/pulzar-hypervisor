@@ -34,8 +34,11 @@
 //! The fixed-range routing bits need one extra step during seeding. AMD hides
 //! them when `SYSCFG.MtrrFixDramModEn` is clear, so the host briefly opens that
 //! read window, captures the complete fixed-range values, and restores the
-//! control bit. Guest accesses afterwards begin and end in the per-processor
-//! copy, and the real MTRRs stay the host's for the rest of their life.
+//! control bit. Some virtual machine monitors do not expose that write; in
+//! that case the ranges are captured as the hardware exposes them and the
+//! unavailable routing bits remain clear. Guest accesses afterwards begin and
+//! end in the per-processor copy, and the real MTRRs stay the host's for the
+//! rest of their life.
 //!
 //! A start-up message does not disturb the copy, because `INIT` does not
 //! disturb the registers: an application processor released by one comes up
@@ -113,7 +116,7 @@ use core::{
 };
 
 use bitflags::bitflags;
-use log::info;
+use log::{info, warn};
 use probe::{read as probe_read, write as probe_write};
 use x86_64::registers::model_specific::Msr;
 
@@ -378,7 +381,12 @@ impl SystemConfiguration {
 /// fields during per-processor initialization.
 static FIXED_CAPTURE_LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Captures fixed ranges with AMD's hidden routing fields made readable.
+/// Captures fixed ranges, opening AMD's hidden routing fields when available.
+///
+/// A virtual machine monitor may expose the fixed-range registers without
+/// exposing the `SYSCFG` write that reveals their routing bits. The capture
+/// remains useful in that case: the raw register values are retained and the
+/// unavailable routing bits stay clear in the guest shadow.
 fn capture_fixed() -> [u64; FIXED.len()] {
     let _window = FixedCaptureWindow::open();
     FIXED.map(read)
@@ -387,6 +395,7 @@ fn capture_fixed() -> [u64; FIXED.len()] {
 /// The temporary host-side `MtrrFixDramModEn` window.
 struct FixedCaptureWindow {
     was_open: bool,
+    opened: bool,
 }
 
 impl FixedCaptureWindow {
@@ -402,18 +411,20 @@ impl FixedCaptureWindow {
         let value = read(SYSCFG);
         let syscfg = Syscfg::from_bits_retain(value);
         let was_open = syscfg.contains(Syscfg::FIX_DRAM_MOD_EN);
-        if !was_open {
-            write(SYSCFG, value | Syscfg::FIX_DRAM_MOD_EN.bits());
+        let opened =
+            was_open || probe_write(SYSCFG, value | Syscfg::FIX_DRAM_MOD_EN.bits()).is_ok();
+        if !opened {
+            warn!("exits: fixed-range routing bits are unavailable; preserving the raw ranges");
         }
-        Self { was_open }
+        Self { was_open, opened }
     }
 }
 
 impl Drop for FixedCaptureWindow {
     fn drop(&mut self) {
-        if !self.was_open {
+        if self.opened && !self.was_open {
             let value = read(SYSCFG) & !Syscfg::FIX_DRAM_MOD_EN.bits();
-            write(SYSCFG, value);
+            let _ = probe_write(SYSCFG, value);
         }
         FIXED_CAPTURE_LOCK.store(false, Ordering::Release);
     }
@@ -602,14 +613,6 @@ fn read(msr: u32) -> u64 {
     // hypervisor, and the optional ones are read only where the capability
     // register says the machine has them. Reading one has no side effect.
     unsafe { Msr::new(msr).read() }
-}
-
-/// Writes one of the host registers used while capturing the initial state.
-fn write(msr: u32, value: u64) {
-    // SAFETY: callers pass only architectural MTRR and SYSCFG indices, and the
-    // values preserve every field not deliberately changed by the capture
-    // window. These writes occur before the guest can execute.
-    unsafe { Msr::new(msr).write(value) }
 }
 
 /// Bits of a physical address this processor does not implement, which either

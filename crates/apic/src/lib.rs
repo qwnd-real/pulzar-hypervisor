@@ -76,11 +76,11 @@
 //! # Starting the others
 //!
 //! [`start`] is the whole of it, and what it needs is a page below one megabyte
-//! to put a trampoline in — reserved by the loader, because firmware still owns
-//! low memory and parks its own idle processors in it. It is deliberately not
-//! tied to bring-up: nothing it uses is alive only then, so processors can be
-//! started at any later point, and leaving it uncalled leaves a working machine
-//! with one processor.
+//! to put a trampoline in. The loader allocates that page as boot-services data
+//! because firmware still owns low memory and parks its idle processors there.
+//! The hypervisor uses it while the guest is stopped at successful EBS, then
+//! clears it and removes the executable identity mapping before resuming the
+//! guest.
 
 #![no_std]
 

@@ -1,11 +1,10 @@
 //! The first guest's progress out of firmware, and what the host owes it at
 //! each step.
 //!
-//! Three things happen once and in one order: the boot manager is started
-//! through the portal, `ExitBootServices` succeeds, and the guest leaves the
-//! portal for good. The first is the loader's and the hypervisor's bring-up;
-//! the other two arrive here, and each of them is the moment something the host
-//! was waiting to do becomes possible.
+//! The boot manager is started through the portal, the loader is handled on the
+//! first `ExitBootServices` hook, EBS eventually succeeds, and the guest leaves
+//! the portal for good. Each transition arrives here as a notification, and
+//! each is the moment something the host was waiting to do becomes possible.
 
 use log::{error, info, warn};
 use partition::Partition;
@@ -22,8 +21,8 @@ const VMMCALL_BYTES: u64 = 3;
 /// What the host does once firmware's services are gone.
 ///
 /// The other processors are started here rather than during bring-up because
-/// starting one takes memory below a megabyte away from firmware, and firmware
-/// still owns every byte of the machine until `ExitBootServices` returns.
+/// starting one uses the temporary low page only after firmware has returned
+/// successfully from `ExitBootServices`.
 #[derive(Clone, Copy, Debug)]
 pub struct Boot {
     /// Where the trampoline the other processors start on has been placed.
@@ -39,6 +38,9 @@ enum Stage {
     /// Inside the portal, with firmware's boot services live and the
     /// `ExitBootServices` wrapper installed in them.
     Portal,
+    /// The first EBS hook has handled the loader, either by wiping it after a
+    /// successful unload or by recording that firmware rejected the unload.
+    LoaderHandled,
     /// The wrapper reported success, so firmware's services are gone and the
     /// other processors have been started — but the guest is still returning
     /// through the portal, which therefore has to stay where it is.
@@ -77,10 +79,12 @@ impl Firmware {
         }
     }
 
-    /// Acts on one of the portal's two notifications.
+    /// Acts on one of the portal's notifications.
     pub(crate) fn notified(&mut self, vcpu: &mut Vcpu) -> Flow {
         let marker = vcpu.registers().rdx;
         match Notification::from_bits(marker) {
+            Some(Notification::LoaderUnloaded) => self.loader(vcpu, true),
+            Some(Notification::LoaderSkipped) => self.loader(vcpu, false),
             Some(Notification::ExitSucceeded) => self.handed(vcpu),
             Some(Notification::StartReturned) => {
                 error!(
@@ -98,6 +102,43 @@ impl Firmware {
                 Flow::Leave
             }
         }
+    }
+
+    /// Records the first EBS hook and removes the loader's contents after
+    /// firmware has released its image pages.
+    fn loader(&mut self, vcpu: &mut Vcpu, unloaded: bool) -> Flow {
+        if self.stage != Stage::Portal {
+            error!("exits: duplicate or out-of-order loader notification");
+            return Flow::Leave;
+        }
+        let status = vcpu.save().rax;
+        let wiped = if unloaded {
+            match self.portal.wipe_loader() {
+                Ok(()) => {
+                    info!("exits: hv-loader image unloaded and wiped");
+                    true
+                }
+                Err(error) => {
+                    warn!("exits: hv-loader was unloaded but could not be wiped: {error}");
+                    false
+                }
+            }
+        } else {
+            warn!("exits: firmware rejected hv-loader UnloadImage with status {status:#x}");
+            false
+        };
+        let transition = if wiped {
+            self.portal.mark_loader_handled()
+        } else {
+            self.portal.mark_loader_skipped()
+        };
+        if let Err(error) = transition {
+            error!("exits: could not publish the loader state: {error}");
+            return Flow::Leave;
+        }
+        self.stage = Stage::LoaderHandled;
+        advance(vcpu, VMMCALL_BYTES);
+        Flow::Resume
     }
 
     /// Takes the portal back, once the guest has finished with it.
@@ -136,8 +177,9 @@ impl Firmware {
         }
     }
 
-    /// Takes the legacy interrupt controllers back and starts the other
-    /// processors, now that firmware no longer owns the machine.
+    /// Restores firmware's table, takes the legacy interrupt controllers back,
+    /// and starts the other processors now that firmware no longer owns the
+    /// machine.
     ///
     /// The controllers go first, and before anything else here, because they
     /// are the one piece of the machine that was handed *to* the guest
@@ -152,6 +194,15 @@ impl Firmware {
     /// cannot be read back.
     fn handed(&mut self, vcpu: &mut Vcpu) -> Flow {
         if self.stage == Stage::Portal {
+            error!("exits: ExitBootServices succeeded before the loader transition");
+            return Flow::Leave;
+        }
+        if self.stage == Stage::LoaderHandled {
+            if let Err(error) = self.portal.restore_boot_services() {
+                error!("exits: the original BootServices table could not be restored: {error}");
+                return Flow::Leave;
+            }
+            info!("exits: restored the original BootServices table");
             match apic::mask_legacy() {
                 Ok(true) => {
                     info!("exits: legacy controllers masked again, firmware is done with them");
@@ -185,6 +236,9 @@ impl Firmware {
                     return Flow::Leave;
                 }
             }
+        } else {
+            error!("exits: duplicate or out-of-order successful ExitBootServices notification");
+            return Flow::Leave;
         }
         advance(vcpu, VMMCALL_BYTES);
         Flow::Resume
