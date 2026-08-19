@@ -151,13 +151,13 @@ fn address(label: Label) -> VirtAddr {
 
 /// One of the labels the two routines export, taken as a symbol rather than as
 /// something to call.
-type Label = unsafe extern "sysv64" fn();
+type Label = unsafe extern "win64" fn();
 
 // The labels themselves, declared so that their addresses can be had. Calling
 // one would be meaningless — the first is an instruction in the middle of a
 // routine and the second is that routine's second answer — which is why nothing
 // here does.
-unsafe extern "sysv64" {
+unsafe extern "win64" {
     /// The `RDMSR` a fault at is one this crate asked for.
     fn probe_read_fault();
     /// Where [`attempt_read`] carries on when that read faulted.
@@ -171,10 +171,13 @@ unsafe extern "sysv64" {
 /// Reads the register `msr` names into `*value`, answering whether the machine
 /// allowed it.
 ///
-/// System V rather than the target's own C convention, which for the hypervisor
-/// image is the Microsoft one: the index arrives in `EDI` and the destination
-/// in `RSI` whichever platform this crate is built for, so the assembly is
-/// written once and is right for the image and for a host build alike.
+/// The Microsoft convention, pinned explicitly rather than left to the
+/// target's default, which for a host build is System V: pinning it here is
+/// what keeps this assembly correct on both, and it is also the convention
+/// this hypervisor's own C ABI already assumes elsewhere (see `portal`). It
+/// pays for itself immediately, too — the index arrives in `ECX`, the very
+/// register `RDMSR` reads it from, so there is nothing to move before the
+/// read.
 ///
 /// # Safety
 ///
@@ -182,20 +185,27 @@ unsafe extern "sysv64" {
 /// vouching for: one the machine does not implement is the case this answers
 /// `false` for rather than a way to go wrong.
 #[unsafe(naked)]
-unsafe extern "sysv64" fn attempt_read(msr: u32, value: *mut u64) -> bool {
+unsafe extern "win64" fn attempt_read(msr: u32, value: *mut u64) -> bool {
     naked_asm!(
-        "mov ecx, edi",
-        // The read, at the address the handler recognises. `RDMSR` answers in
-        // `EDX:EAX` with the upper half of each register cleared, so the value
-        // is assembled out of the two halves rather than merely moved.
+        // The index is already in ECX. The destination pointer arrives in
+        // RDX, which RDMSR is about to overwrite with half of the value it
+        // returns, so it is moved out of the way first.
+        "mov r9, rdx",
+
+        // The read, at the address the handler recognises.
         ".globl probe_read_fault",
         "probe_read_fault:",
         "rdmsr",
+
+        // RDMSR answers in EDX:EAX with the upper half of each register
+        // cleared, so the value is assembled out of the two halves rather
+        // than merely moved.
         "shl rdx, 32",
         "or rax, rdx",
-        "mov [rsi], rax",
+        "mov [r9], rax",
         "mov eax, 1",
         "ret",
+
         // Where the handler sends this routine when the read faulted. Nothing of
         // this routine's own is on the stack, so the top of it is still the
         // caller's return address: answering is a zero and a return, and what
@@ -217,20 +227,20 @@ unsafe extern "sysv64" fn attempt_read(msr: u32, value: *mut u64) -> bool {
 /// *means* is another matter — a register the machine has is really written,
 /// and the caller owns that decision.
 #[unsafe(naked)]
-unsafe extern "sysv64" fn attempt_write(msr: u32, value: u64) -> bool {
+unsafe extern "win64" fn attempt_write(msr: u32, value: u64) -> bool {
     naked_asm!(
-        // The index, and the value split the way `WRMSR` takes it: low half in
-        // `EAX`, high half in `EDX`. Both come out of the one argument register,
-        // which is copied twice rather than shifted in place.
-        "mov ecx, edi",
-        "mov eax, esi",
-        "mov rdx, rsi",
+        // The index is already in ECX, again exactly where WRMSR expects it.
+        // The value arrives whole in RDX and is split the way WRMSR takes it:
+        // its low half copied into EAX before its high half is shifted down
+        // into EDX.
+        "mov eax, edx",
         "shr rdx, 32",
         ".globl probe_write_fault",
         "probe_write_fault:",
         "wrmsr",
         "mov eax, 1",
         "ret",
+        
         // As above: the recovery label is this routine's other answer, reached
         // with the stack exactly as the faulting instruction left it.
         ".globl probe_write_resume",
@@ -270,8 +280,8 @@ mod tests {
     /// an exact address rather than a routine to be anywhere inside of.
     #[test]
     fn an_address_no_attempt_can_fault_at_is_left_alone() {
-        let read: unsafe extern "sysv64" fn(u32, *mut u64) -> bool = attempt_read;
-        let write: unsafe extern "sysv64" fn(u32, u64) -> bool = attempt_write;
+        let read: unsafe extern "win64" fn(u32, *mut u64) -> bool = attempt_read;
+        let write: unsafe extern "win64" fn(u32, u64) -> bool = attempt_write;
         assert_eq!(recovery(VirtAddr::from_ptr(read as *const ())), None);
         assert_eq!(recovery(VirtAddr::from_ptr(write as *const ())), None);
         assert_eq!(recovery(address(probe_read_resume as Label)), None);
