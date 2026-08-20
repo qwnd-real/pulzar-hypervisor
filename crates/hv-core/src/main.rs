@@ -25,6 +25,7 @@
 #![no_main]
 #![no_std]
 
+mod avic;
 mod error;
 mod heap;
 
@@ -205,6 +206,10 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     let here = apic::local()?.id();
     cpu::attach(here)?;
     ipi::install()?;
+    // The decision about whether the guest's interrupts stay the host's to
+    // deliver, taken once where both the roster and this processor's own
+    // feature words are known.
+    avic::establish(cpu::roster()?);
     // After the interprocessor interrupts it takes a vector from, and before
     // any other processor is started: a controller has to exist before anything
     // can deliver to it, and before the processor it belongs to does.

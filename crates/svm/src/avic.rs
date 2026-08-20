@@ -176,6 +176,11 @@ pub enum IpiFailure {
     /// The vector the guest asked to deliver is not one the hardware will
     /// deliver.
     InvalidIpiVector = 4,
+    /// The guest sent an interrupt the encrypted-virtualization extension
+    /// refuses to deliver in hardware. Only a processor with that extension
+    /// reports it; like [`IpiFailure::InvalidInterruptType`], the answer is
+    /// for the hypervisor to emulate the request itself.
+    UnacceleratedIpi = 5,
 }
 
 impl IpiFailure {
@@ -189,6 +194,7 @@ impl IpiFailure {
             2 => Self::InvalidTarget,
             3 => Self::InvalidBackingPage,
             4 => Self::InvalidIpiVector,
+            5 => Self::UnacceleratedIpi,
             _ => return None,
         })
     }
@@ -199,6 +205,145 @@ impl IpiFailure {
         self as u32
     }
 }
+
+/// What an `AVIC_INCOMPLETE_IPI` exit is saying.
+///
+/// The interrupt the guest asked for, decoded whole out of the two
+/// exit-information fields: the request itself as the controller's command
+/// register would have taken it, why the hardware could not deliver it, and
+/// the destination the tables were consulted for where the cause is one about
+/// a destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IncompleteIpiExit {
+    icr: u64,
+    cause: IpiFailure,
+    index: u16,
+}
+
+impl IncompleteIpiExit {
+    /// The exit decoded out of the two exit-information fields the processor
+    /// writes into the control block.
+    ///
+    /// Total rather than fallible: a cause encoding the architecture does not
+    /// define decodes as [`IpiFailure::InvalidInterruptType`], because full
+    /// software emulation is the one answer that is safe for a request
+    /// nothing else understands.
+    #[must_use]
+    pub const fn from_exit_info(exit_info_1: u64, exit_info_2: u64) -> Self {
+        let cause = match IpiFailure::from_bits((exit_info_2 >> u32::BITS) as u32) {
+            Some(cause) => cause,
+            None => IpiFailure::InvalidInterruptType,
+        };
+        Self {
+            icr: exit_info_1,
+            cause,
+            index: (exit_info_2 & INDEX_MASK) as u16,
+        }
+    }
+
+    /// The request the guest made, as the controller's command register would
+    /// have taken it.
+    #[must_use]
+    pub const fn icr(&self) -> u64 {
+        self.icr
+    }
+
+    /// Why the hardware could not deliver it.
+    #[must_use]
+    pub const fn cause(&self) -> IpiFailure {
+        self.cause
+    }
+
+    /// The destination the tables were consulted for. Only the causes about a
+    /// destination give this meaning.
+    #[must_use]
+    pub const fn index(&self) -> u16 {
+        self.index
+    }
+}
+
+/// What an `AVIC_UNACCELERATED_ACCESS` exit is saying.
+///
+/// One access to one controller register the hardware does not accelerate:
+/// its direction, the register's offset in the controller's page, and — only
+/// for the one write where it is part of the request — the vector being
+/// retired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnacceleratedAccessExit {
+    write: bool,
+    offset: u16,
+    eoi_vector: Option<u8>,
+}
+
+impl UnacceleratedAccessExit {
+    /// The exit decoded out of the two exit-information fields the processor
+    /// writes into the control block.
+    ///
+    /// The vector names the interrupt an end-of-interrupt write retires, and
+    /// is present only for that one access: for every other register the
+    /// second field is not the guest's and is not decoded.
+    #[must_use]
+    pub const fn from_exit_info(exit_info_1: u64, exit_info_2: u64) -> Self {
+        let write = exit_info_1 & ACCESS_IS_WRITE != 0;
+        let offset = (exit_info_1 & OFFSET_MASK) as u16;
+        let eoi_vector = if write && offset == EOI_OFFSET {
+            Some((exit_info_2 & VECTOR_MASK) as u8)
+        } else {
+            None
+        };
+        Self {
+            write,
+            offset,
+            eoi_vector,
+        }
+    }
+
+    /// Whether the guest wrote the register rather than read it.
+    #[must_use]
+    pub const fn is_write(&self) -> bool {
+        self.write
+    }
+
+    /// The register's offset in the controller's page.
+    #[must_use]
+    pub const fn offset(&self) -> u16 {
+        self.offset
+    }
+
+    /// The vector an end-of-interrupt write retires, where that is what this
+    /// was.
+    #[must_use]
+    pub const fn eoi_vector(&self) -> Option<u8> {
+        self.eoi_vector
+    }
+}
+
+/// Bits of the second exit-information field of an incomplete delivery that
+/// name a destination.
+const INDEX_MASK: u64 = 0xFFF;
+
+/// The bit of the first exit-information field of an unaccelerated access that
+/// says the access was a write.
+const ACCESS_IS_WRITE: u64 = 1 << 32;
+
+/// Bits of the first exit-information field of an unaccelerated access that
+/// name a register offset.
+const OFFSET_MASK: u64 = 0xFF0;
+
+/// The end-of-interrupt register's offset in the controller's page.
+const EOI_OFFSET: u16 = 0xB0;
+
+/// The bits of the second exit-information field of an unaccelerated access
+/// that an end-of-interrupt write carries its retired vector in.
+const VECTOR_MASK: u64 = 0xFF;
+
+/// The index of the register that rings [`Doorbell`].
+///
+/// It sits in the range of model-specific registers a hypervisor owns, and a
+/// guest reaching it could poke whichever physical processor it named — so
+/// every guest's permission map intercepts it, and the access is refused
+/// rather than forwarded.
+pub const AVIC_DOORBELL: u32 = 0xC001_011B;
 
 /// Signals another physical processor that one of its guests has an interrupt
 /// waiting.
@@ -233,3 +378,101 @@ const _: () = assert!(
     MAX_PHYSICAL_ID < 0xFF,
     "the broadcast identifier cannot name one processor",
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A second exit-information field carrying this cause and this index.
+    fn exit_info_2(cause: IpiFailure, index: u64) -> u64 {
+        (u64::from(cause.into_bits()) << u32::BITS) | index
+    }
+
+    #[test]
+    fn ipi_failure_encodings_round_trip() {
+        for cause in [
+            IpiFailure::InvalidInterruptType,
+            IpiFailure::TargetNotRunning,
+            IpiFailure::InvalidTarget,
+            IpiFailure::InvalidBackingPage,
+            IpiFailure::InvalidIpiVector,
+            IpiFailure::UnacceleratedIpi,
+        ] {
+            assert_eq!(IpiFailure::from_bits(cause.into_bits()), Some(cause));
+        }
+    }
+
+    #[test]
+    fn ipi_failure_refuses_undefined_encodings() {
+        assert_eq!(IpiFailure::from_bits(6), None);
+        assert_eq!(IpiFailure::from_bits(u32::MAX), None);
+    }
+
+    #[test]
+    fn an_incomplete_ipi_exit_carries_the_request_cause_and_index() {
+        let icr = 0x0000_0000_000C_4A20;
+        let exit = IncompleteIpiExit::from_exit_info(
+            icr,
+            exit_info_2(IpiFailure::TargetNotRunning, 0x1FE),
+        );
+        assert_eq!(exit.icr(), icr);
+        assert_eq!(exit.cause(), IpiFailure::TargetNotRunning);
+        assert_eq!(exit.index(), 0x1FE);
+    }
+
+    #[test]
+    fn an_incomplete_ipi_exit_masks_the_index_to_twelve_bits() {
+        let exit = IncompleteIpiExit::from_exit_info(
+            0,
+            exit_info_2(IpiFailure::InvalidTarget, 0xFFFF_FFFF),
+        );
+        assert_eq!(exit.index(), 0xFFF);
+    }
+
+    #[test]
+    fn an_unknown_cause_decodes_as_full_emulation() {
+        let exit = IncompleteIpiExit::from_exit_info(
+            0,
+            exit_info_2(IpiFailure::TargetNotRunning, 0) | (7 << u32::BITS),
+        );
+        assert_eq!(exit.cause(), IpiFailure::InvalidInterruptType);
+    }
+
+    #[test]
+    fn an_unaccelerated_access_names_its_register_and_direction() {
+        let read = UnacceleratedAccessExit::from_exit_info(0x830, 0);
+        assert!(!read.is_write());
+        assert_eq!(read.offset(), 0x830);
+        assert_eq!(read.eoi_vector(), None);
+
+        let write = UnacceleratedAccessExit::from_exit_info(ACCESS_IS_WRITE | 0x280, 0);
+        assert!(write.is_write());
+        assert_eq!(write.offset(), 0x280);
+    }
+
+    #[test]
+    fn an_unaccelerated_access_ignores_bits_that_are_not_the_offset() {
+        let exit = UnacceleratedAccessExit::from_exit_info(ACCESS_IS_WRITE | 0xFFF_FFFF, 0);
+        assert_eq!(exit.offset(), 0xFF0);
+    }
+
+    #[test]
+    fn an_unaccelerated_access_names_the_vector_only_for_an_eoi_write() {
+        let eoi =
+            UnacceleratedAccessExit::from_exit_info(ACCESS_IS_WRITE | u64::from(EOI_OFFSET), 0x2E);
+        assert_eq!(eoi.eoi_vector(), Some(0x2E));
+
+        let eoi_read = UnacceleratedAccessExit::from_exit_info(u64::from(EOI_OFFSET), 0x2E);
+        assert_eq!(eoi_read.eoi_vector(), None);
+
+        let other_write = UnacceleratedAccessExit::from_exit_info(ACCESS_IS_WRITE | 0x300, 0x2E);
+        assert_eq!(other_write.eoi_vector(), None);
+    }
+
+    #[test]
+    fn an_unaccelerated_access_masks_the_vector_to_eight_bits() {
+        let eoi =
+            UnacceleratedAccessExit::from_exit_info(ACCESS_IS_WRITE | u64::from(EOI_OFFSET), 0x1FF);
+        assert_eq!(eoi.eoi_vector(), Some(0xFF));
+    }
+}

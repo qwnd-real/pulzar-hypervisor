@@ -34,6 +34,7 @@ partition = { workspace = true }
 pci = { workspace = true }
 portal = { workspace = true }
 probe = { workspace = true }
+processor = { workspace = true }
 serial = { workspace = true }
 snapshot = { workspace = true }
 spin = { workspace = true }

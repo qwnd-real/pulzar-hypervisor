@@ -19,6 +19,9 @@
 //!   the processor intercepts whatever that map says. Those reach the machine's
 //!   own register, and one the machine does not have is a fault the guest
 //!   takes.
+//! - The two exits a hardware-driven interrupt controller would raise, answered
+//!   defensively while the controller is still driven in software: logged, and
+//!   resumed or faulted in whichever direction the architecture says is safe.
 //! - Nested page faults, which are how a guest's memory comes to be described
 //!   at all, and how a write to hypervisor memory is stepped over.
 //! - The two notifications the [`portal`] makes, which are the only two things
@@ -56,6 +59,7 @@
 
 #![no_std]
 
+mod avic;
 mod census;
 mod cpuid;
 mod firmware;
@@ -275,6 +279,10 @@ impl<'a> Exits<'a> {
             }
             Some(Reason::NestedPageFault) => {
                 nested::exit(vcpu, self.partition, &mut self.interrupts)
+            }
+            Some(Reason::AvicIncompleteIpi) => avic::incomplete_ipi(vcpu),
+            Some(Reason::AvicUnacceleratedAccess) => {
+                avic::unaccelerated_access(vcpu, &mut self.interrupts)
             }
             Some(Reason::Vmmcall) => self.notified(vcpu),
             Some(

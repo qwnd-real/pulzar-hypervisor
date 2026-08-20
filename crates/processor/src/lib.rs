@@ -17,6 +17,11 @@
 //! wrong there builds a control block the processor reads differently than it
 //! was written.
 //!
+//! [`identity()`] is asked the same way and for the same reason: which
+//! silicon this is decides which of the extension's documented errata apply,
+//! and answering that anywhere else would be a second place computing family,
+//! model and stepping.
+//!
 //! # Why one answer serves every processor
 //!
 //! The answer is read on the first call and kept, which is sound because none
@@ -42,7 +47,7 @@ use raw_cpuid::{
 };
 use spin::Once;
 
-pub use crate::svm::{Svm, SvmFeatures, svm};
+pub use crate::svm::{MemoryEncryption, Svm, SvmFeatures, svm};
 
 bitflags! {
     /// The processor features pulzar adapts to or refuses to run without.
@@ -205,6 +210,65 @@ pub fn physical_address_bits() -> u8 {
     })
 }
 
+/// Which processor this is, in the architecture's own numbering.
+///
+/// Family, model and stepping as `CPUID` reports them once the vendor's
+/// composition rules have been applied — the extended fields folded into the
+/// base ones the way the vendor that made the processor defines, which is what
+/// lets one number name a family across every processor of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+    family: u8,
+    model: u8,
+    stepping: u8,
+}
+
+impl Identity {
+    /// An identity no processor reports, which is what a processor that does
+    /// not implement the leaf describing it answers.
+    pub const UNKNOWN: Self = Self {
+        family: 0,
+        model: 0,
+        stepping: 0,
+    };
+
+    /// The family this processor belongs to.
+    #[must_use]
+    pub const fn family(&self) -> u8 {
+        self.family
+    }
+
+    /// The model within that family.
+    #[must_use]
+    pub const fn model(&self) -> u8 {
+        self.model
+    }
+
+    /// The stepping of that model.
+    #[must_use]
+    pub const fn stepping(&self) -> u8 {
+        self.stepping
+    }
+}
+
+/// Which processor this image runs on.
+///
+/// Read on the first call and kept, which is sound for the same reason the
+/// feature answers are: the identity is fixed at reset and uniform across a
+/// package.
+#[must_use]
+pub fn identity() -> Identity {
+    *IDENTITY.call_once(|| {
+        CpuId::new()
+            .get_feature_info()
+            .map_or(Identity::UNKNOWN, |info| Identity {
+                family: info.family_id(),
+                model: info.model_id(),
+                stepping: info.stepping_id(),
+            })
+    })
+}
+
 /// The four registers returned by one raw `CPUID` query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuidResult {
@@ -259,3 +323,6 @@ static FEATURES: Once<Features> = Once::new();
 
 /// How wide this processor's physical addresses are, read on first use.
 static PHYSICAL_ADDRESS_BITS: Once<u8> = Once::new();
+
+/// Which processor this image runs on, read on first use.
+static IDENTITY: Once<Identity> = Once::new();

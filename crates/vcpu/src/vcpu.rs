@@ -53,6 +53,7 @@ use paging::{DirectMap, Frames};
 use processor::{Features, SvmFeatures};
 use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
+    avic::{AVIC_DOORBELL, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID},
     control::NestedPagingControl,
     intercept::{Intercepts1, Intercepts2, Intercepts2Flags, TlbControl},
     msr::{EFER, IA32_PAT, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR},
@@ -75,11 +76,13 @@ use crate::{
 ///
 /// Three protect the machine's virtualization extension, two define the
 /// guest's offset timestamp domain, the ratio register is hidden because the
-/// extension itself is hidden, and the page-attribute table is virtualized
+/// extension itself is hidden, the page-attribute table is virtualized
 /// because under nested paging the guest's copy of it is a field of this block
-/// rather than the register. Keeping them here makes their permission bits part
+/// rather than the register, and the interrupt controller's doorbell is
+/// refused because it reaches physical processors, which no guest is owed.
+/// Keeping them here makes their permission bits part
 /// of every VCPU rather than policy a caller could forget to install.
-const INTERCEPTED_MSRS: [u32; 7] = [
+const INTERCEPTED_MSRS: [u32; 8] = [
     VM_CR,
     SVM_KEY,
     EFER,
@@ -87,6 +90,7 @@ const INTERCEPTED_MSRS: [u32; 7] = [
     IA32_TSC_ADJUST,
     TSC_RATIO,
     IA32_PAT,
+    AVIC_DOORBELL,
 ];
 
 /// What a guest's control block has to be told about the guest before it can
@@ -342,6 +346,7 @@ impl Vcpu {
             self.control(),
             self.save(),
             processor::physical_address_bits(),
+            x2avic_index_limit(self.host.svm().features),
         )
     }
 
@@ -676,6 +681,18 @@ fn flush_command() -> TlbControl {
     match processor::svm() {
         Some(svm) if svm.features.contains(SvmFeatures::FLUSH_BY_ASID) => TlbControl::FlushGuest,
         _ => TlbControl::FlushAll,
+    }
+}
+
+/// The highest table index this processor's 32-bit controller mode can name.
+///
+/// The extended table reaches further than one page of entries, and whether
+/// this processor has it is a bit of the extension's own feature set.
+fn x2avic_index_limit(features: SvmFeatures) -> u16 {
+    if features.contains(SvmFeatures::X2AVIC_EXT) {
+        X2_EXTENDED_MAX_PHYSICAL_ID
+    } else {
+        X2_MAX_PHYSICAL_ID
     }
 }
 

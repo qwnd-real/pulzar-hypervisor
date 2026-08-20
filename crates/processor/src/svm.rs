@@ -36,13 +36,23 @@ use spin::Once;
 /// feature set but whatever the highest implemented leaf happens to answer.
 const SVM_LEAF: u32 = 0x8000_000A;
 
+/// The highest extended `CPUID` leaf this processor implements.
+///
+/// The answer to every "does this extended leaf exist" question: a leaf above
+/// this one is not reserved so much as absent, and reading it returns whatever
+/// the highest implemented leaf happens to answer.
+const EXTENDED_LIMIT: u32 = 0x8000_0000;
+
+/// The `CPUID` leaf describing the memory-encryption extension.
+const MEMORY_ENCRYPTION_LEAF: u32 = 0x8000_001F;
+
 bitflags! {
     /// What this processor's virtualization extension supports.
     ///
     /// The whole of the leaf's feature word, so that a machine can be described
     /// exactly rather than approximately.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct SvmFeatures: u32 {
+    pub struct SvmFeatures: u64 {
         /// A guest's physical addresses are translated by a second set of page
         /// tables. Without this a hypervisor must maintain shadow page tables
         /// and intercept every change a guest makes to its own, which is both
@@ -145,6 +155,51 @@ bitflags! {
         /// separately from an ordinary halt, so an idle guest can be descheduled
         /// without intercepting every halt it makes.
         const IDLE_HLT = 1 << 30;
+        /// The controller's table of virtual processors may span eight pages
+        /// rather than one, which is what lets a guest address more than 511
+        /// of them.
+        ///
+        /// Not a bit of the leaf's feature word like the rest of this set: it
+        /// is bit 6 of the leaf's count word, which has no word of its own in
+        /// this crate — so it is kept up here, above every bit the feature
+        /// word can hold, and one value still describes the extension.
+        const X2AVIC_EXT = 1 << 38;
+    }
+}
+
+bitflags! {
+    /// What this processor's memory-encryption extension supports.
+    ///
+    /// Only the two bits that decide whether the hypervisor and the extension
+    /// can coexist are modelled: whether a guest's interrupt tables may be
+    /// kept by the hardware at all, and whether the host may write a page a
+    /// guest is using — without which the second cannot be maintained.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MemoryEncryption: u32 {
+        /// The encrypted-virtualization extension keeps a guest's interrupt
+        /// tables itself, so delivery into an encrypted guest does not need
+        /// the host to read what it is not entitled to.
+        const SECURE_AVIC = 1 << 26;
+        /// The host may write pages a guest is using, which is what any
+        /// hypervisor maintaining state on a guest's behalf needs to be
+        /// allowed.
+        const HV_IN_USE_WRITES_ALLOWED = 1 << 30;
+    }
+}
+
+impl MemoryEncryption {
+    /// Asks `CPUID` what the encryption extension supports.
+    ///
+    /// The leaf is only read once the highest extended leaf says it exists,
+    /// because reading an absent leaf would decode whatever the highest
+    /// implemented leaf answers — and a processor with no encryption extension
+    /// is one where these bits have no meaning, which is exactly what an empty
+    /// set says.
+    fn read() -> Self {
+        if cpuid!(EXTENDED_LIMIT).eax < MEMORY_ENCRYPTION_LEAF {
+            return Self::empty();
+        }
+        Self::from_bits_truncate(cpuid!(MEMORY_ENCRYPTION_LEAF).eax)
     }
 }
 
@@ -160,6 +215,10 @@ pub struct Svm {
     pub asids: u32,
     /// What it supports.
     pub features: SvmFeatures,
+    /// What the memory-encryption extension beside it supports, which decides
+    /// whether the hardware may be trusted with a guest's interrupt tables at
+    /// all.
+    pub encryption: MemoryEncryption,
 }
 
 impl Svm {
@@ -177,6 +236,9 @@ impl Svm {
         let missing = SvmFeatures::all().difference(self.features);
         if !missing.is_empty() {
             info!("{who}: svm lacks {missing:?}");
+        }
+        if !self.encryption.is_empty() {
+            info!("{who}: svm encryption has {:?}", self.encryption);
         }
     }
 
@@ -200,9 +262,19 @@ impl Svm {
         Some(Self {
             revision: revision(leaf.eax),
             asids: leaf.ebx,
-            features: SvmFeatures::from_bits_truncate(leaf.edx),
+            features: SvmFeatures::from_bits_truncate(feature_bits(leaf.edx, leaf.ecx)),
+            encryption: MemoryEncryption::read(),
         })
     }
+}
+
+/// The leaf's two feature words as one value.
+///
+/// The feature word where the architecture puts it, and the count word's one
+/// defined bit above every bit the feature word can hold — which is what lets
+/// one set describe both without either colliding.
+const fn feature_bits(edx: u32, ecx: u32) -> u64 {
+    (edx as u64) | ((ecx as u64) << u32::BITS)
 }
 
 /// The revision number out of the leaf's first word.
@@ -226,3 +298,34 @@ pub fn svm() -> Option<Svm> {
 
 /// The extension this image runs on, read on first use.
 static SVM: Once<Option<Svm>> = Once::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_is_the_low_byte_of_the_first_word() {
+        assert_eq!(revision(0x1234_5678), 0x78);
+        assert_eq!(revision(0), 0);
+    }
+
+    #[test]
+    fn the_feature_words_keep_their_bits_apart() {
+        assert_eq!(
+            feature_bits(0, 1 << 6),
+            SvmFeatures::X2AVIC_EXT.bits(),
+            "the count word's bit must land above the feature word"
+        );
+        assert_eq!(
+            feature_bits(u32::MAX, 0),
+            u64::from(u32::MAX),
+            "the feature word must stay in the low half"
+        );
+    }
+
+    #[test]
+    fn truncation_keeps_only_defined_bits_of_the_count_word() {
+        let features = SvmFeatures::from_bits_truncate(feature_bits(0, !0));
+        assert_eq!(features, SvmFeatures::X2AVIC_EXT);
+    }
+}

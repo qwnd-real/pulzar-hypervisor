@@ -25,7 +25,10 @@
 //! holds is checked and the rest is left alone — the address-width rules are
 //! checked because a bit above the width is reserved whatever the mode, while
 //! the low-order bits of a control register are not, because what they mean
-//! changes with paging mode.
+//! changes with paging mode. The interrupt controller's rules are the same
+//! kind: every one of them is conditional on the controller being enabled, and
+//! one of them needs a limit only the machine knows, which is handed in for
+//! the same reason the address width is.
 //!
 //! [`Invalid::Unexplained`] is what remains: the processor refused a control
 //! block that satisfies every rule stated here. It is a real answer and worth
@@ -140,6 +143,43 @@ pub enum Invalid {
         /// What it held.
         encoding: u8,
     },
+    /// The hardware drives a guest's controller in 32-bit mode only by
+    /// driving it at all: the wider mode's bit beside the enable bit and not
+    /// with it names a configuration the architecture does not have.
+    #[error("x2AVIC is enabled without AVIC")]
+    X2AvicWithoutAvic,
+    /// The hardware delivers into a guest's controller through the guest's
+    /// own second-level translation, so it cannot be asked to while that is
+    /// off.
+    #[error("AVIC is enabled without nested paging")]
+    AvicWithoutNestedPaging,
+    /// The hardware answers a guest's task-priority changes itself while it
+    /// drives the controller; an intercept on the register that changes it
+    /// would race the hardware.
+    #[error("AVIC is enabled while writes of CR8 are intercepted")]
+    AvicCr8Intercepted,
+    /// The table of virtual processors names more of them than the mode can
+    /// address.
+    #[error("AVIC's max index {index:#x} is above the mode's limit of {limit:#x}")]
+    AvicMaxIndex {
+        /// What the table held.
+        index: u16,
+        /// What the mode allows.
+        limit: u16,
+    },
+    /// One of the controller's pointer fields is not page aligned, or names an
+    /// address the processor cannot form.
+    #[error(
+        "AVIC's {field} pointer {address:#x} is not a page-aligned address within physical bit {bits}"
+    )]
+    AvicPointerAlignment {
+        /// Which of the four fields.
+        field: AvicField,
+        /// What it held.
+        address: u64,
+        /// How many bits of physical address this processor implements.
+        bits: u8,
+    },
     /// Every rule above holds and the processor refused the block anyway.
     ///
     /// Not a failure of this module so much as its honest edge: the checks here
@@ -150,17 +190,48 @@ pub enum Invalid {
     Unexplained,
 }
 
+/// Which of the interrupt controller's pointer fields a rule is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvicField {
+    /// The base the guest's controller is reached at.
+    ApicBar,
+    /// The page one virtual processor's registers live in.
+    BackingPage,
+    /// The table translating logical destinations.
+    LogicalTable,
+    /// The table of virtual processors.
+    PhysicalTable,
+}
+
+impl core::fmt::Display for AvicField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::ApicBar => "APIC bar",
+            Self::BackingPage => "backing page",
+            Self::LogicalTable => "logical table",
+            Self::PhysicalTable => "physical table",
+        })
+    }
+}
+
 /// The first rule this control block breaks, or `None` if it breaks none.
 ///
 /// `bits` is how many bits of physical address the processor the guest would
-/// run on implements. It is a property of the machine rather than of the block,
-/// which is why it is handed in rather than read here.
+/// run on implements, and `x2avic_limit` is the highest table index that
+/// processor's 32-bit controller mode can name. Both are properties of the
+/// machine rather than of the block, which is why they are handed in rather
+/// than read here.
 ///
 /// One of the architecture's rules is missing on purpose: a guest may not
 /// enable long mode on a processor that has none, and no processor without long
 /// mode can execute this image, so there is nothing here that could be false.
 #[must_use]
-pub fn check(control: &ControlArea, save: &SaveArea, bits: u8) -> Option<Invalid> {
+pub fn check(
+    control: &ControlArea,
+    save: &SaveArea,
+    bits: u8,
+    x2avic_limit: u16,
+) -> Option<Invalid> {
     let efer = EferFlags::from_bits_retain(save.efer);
     let cr0 = Cr0Flags::from_bits_retain(save.cr0);
     let cr4 = Cr4Flags::from_bits_retain(save.cr4);
@@ -230,6 +301,57 @@ pub fn check(control: &ControlArea, save: &SaveArea, bits: u8) -> Option<Invalid
         }
         if let Some(invalid) = pat(save.g_pat) {
             return Some(invalid);
+        }
+    }
+    avic(control, bits, x2avic_limit)
+}
+
+/// Whether one of the rules about the interrupt controller's fields is
+/// broken.
+///
+/// Consulted only when the controller is enabled in one mode or the other: a
+/// block that leaves it off may hold anything in those fields, because the
+/// processor reads none of them.
+fn avic(control: &ControlArea, bits: u8, x2avic_limit: u16) -> Option<Invalid> {
+    let interrupts = control.interrupt_control;
+    if !interrupts.avic_enable() && !interrupts.x2avic_enable() {
+        return None;
+    }
+    if interrupts.x2avic_enable() && !interrupts.avic_enable() {
+        return Some(Invalid::X2AvicWithoutAvic);
+    }
+    if !control.nested_paging.enabled() {
+        return Some(Invalid::AvicWithoutNestedPaging);
+    }
+    if control.intercept_control_registers.intercepts_write(CR8) {
+        return Some(Invalid::AvicCr8Intercepted);
+    }
+    let table = control.avic_physical_table;
+    let limit = if interrupts.x2avic_enable() {
+        x2avic_limit
+    } else {
+        XAVIC_INDEX_LIMIT
+    };
+    if table.max_index() > limit {
+        return Some(Invalid::AvicMaxIndex {
+            index: table.max_index(),
+            limit,
+        });
+    }
+    for (field, address) in [
+        (AvicField::ApicBar, control.avic_apic_bar),
+        (AvicField::BackingPage, control.avic_backing_page),
+        (AvicField::LogicalTable, control.avic_logical_table),
+        // The table's own pointer, whose low twelve bits hold the maximum
+        // index and are read separately above.
+        (AvicField::PhysicalTable, table.address().as_u64()),
+    ] {
+        if address & PAGE_MASK != 0 || above(address, bits) {
+            return Some(Invalid::AvicPointerAlignment {
+                field,
+                address,
+                bits,
+            });
         }
     }
     None
@@ -312,8 +434,192 @@ const UPPER_HALF: u64 = !0 << 32;
 /// How many memory-type fields a page-attribute table has.
 const PAT_FIELDS: u8 = 8;
 
+/// The task-priority control register, whose writes the architecture refuses
+/// to intercept while the hardware drives the guest's interrupt controller.
+const CR8: u8 = 8;
+
+/// The highest table index an eight-bit controller may name.
+///
+/// One more than a table entry can usefully hold, because the all-ones
+/// identifier means "every processor" — the architecture still permits it, so
+/// this is the entry check's limit rather than the useful one.
+const XAVIC_INDEX_LIMIT: u16 = 0xFF;
+
+/// Bits of an address below page alignment.
+const PAGE_MASK: u64 = 0xFFF;
+
 const _: () = assert!(
     EFER_RESERVED & EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE.bits() == 0
         && EFER_RESERVED & EferFlags::LONG_MODE_ENABLE.bits() == 0,
     "the virtualization-enable and long-mode-enable bits are not reserved",
 );
+
+#[cfg(test)]
+mod tests {
+    use svm::{
+        Vmcb,
+        avic::{AvicPhysicalTable, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID},
+        control::NestedPagingControl,
+        intercept::{ControlRegisterIntercepts, Intercepts2},
+    };
+    use x86_64::PhysAddr;
+
+    use super::*;
+
+    /// How many bits of physical address these tests assume.
+    const BITS: u8 = 48;
+
+    /// The 32-bit mode's limit these tests hand in.
+    const X2_LIMIT: u16 = X2_EXTENDED_MAX_PHYSICAL_ID;
+
+    /// A control block that satisfies every rule, with the controller driving
+    /// interrupts in eight-bit mode.
+    fn avic_enabled() -> Vmcb {
+        let mut vmcb = Vmcb::zeroed();
+        vmcb.save.efer = EferFlags::SECURE_VIRTUAL_MACHINE_ENABLE.bits();
+        vmcb.control.intercept_2 = Intercepts2::from_flags(Intercepts2Flags::VMRUN);
+        vmcb.control.asid = 1;
+        vmcb.control.nested_paging = NestedPagingControl::new().with_enabled(true);
+        vmcb.control.interrupt_control = vmcb.control.interrupt_control.with_avic_enable(true);
+        vmcb
+    }
+
+    /// The first rule this block breaks, judged against this module's own
+    /// constants.
+    fn verdict(vmcb: &Vmcb) -> Option<Invalid> {
+        super::check(&vmcb.control, &vmcb.save, BITS, X2_LIMIT)
+    }
+
+    /// The same, judged against this 32-bit limit.
+    fn verdict_with_limit(vmcb: &Vmcb, x2avic_limit: u16) -> Option<Invalid> {
+        super::check(&vmcb.control, &vmcb.save, BITS, x2avic_limit)
+    }
+
+    #[test]
+    fn a_block_the_controller_drives_through_is_accepted() {
+        assert_eq!(verdict(&avic_enabled()), None);
+    }
+
+    #[test]
+    fn x2avic_needs_avic_beside_it() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.interrupt_control = vmcb
+            .control
+            .interrupt_control
+            .with_avic_enable(false)
+            .with_x2avic_enable(true);
+        assert_eq!(verdict(&vmcb), Some(Invalid::X2AvicWithoutAvic));
+    }
+
+    #[test]
+    fn x2avic_with_both_bits_is_a_mode_not_a_mistake() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.interrupt_control = vmcb.control.interrupt_control.with_x2avic_enable(true);
+        assert_eq!(verdict(&vmcb), None);
+    }
+
+    #[test]
+    fn the_controller_needs_nested_paging() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.nested_paging = NestedPagingControl::new();
+        assert_eq!(verdict(&vmcb), Some(Invalid::AvicWithoutNestedPaging));
+    }
+
+    #[test]
+    fn the_controller_races_an_intercepted_task_priority() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.intercept_control_registers = ControlRegisterIntercepts::EMPTY.with_write(CR8);
+        assert_eq!(verdict(&vmcb), Some(Invalid::AvicCr8Intercepted));
+    }
+
+    #[test]
+    fn an_eight_bit_table_cannot_name_two_hundred_and_fifty_six_processors() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.avic_physical_table =
+            AvicPhysicalTable::new().with_max_index(XAVIC_INDEX_LIMIT + 1);
+        assert_eq!(
+            verdict(&vmcb),
+            Some(Invalid::AvicMaxIndex {
+                index: XAVIC_INDEX_LIMIT + 1,
+                limit: XAVIC_INDEX_LIMIT,
+            })
+        );
+    }
+
+    #[test]
+    fn a_thirty_two_bit_table_is_judged_against_the_machines_limit() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.interrupt_control = vmcb.control.interrupt_control.with_x2avic_enable(true);
+        vmcb.control.avic_physical_table = AvicPhysicalTable::new().with_max_index(0x200);
+        assert_eq!(
+            verdict_with_limit(&vmcb, X2_MAX_PHYSICAL_ID),
+            Some(Invalid::AvicMaxIndex {
+                index: 0x200,
+                limit: X2_MAX_PHYSICAL_ID,
+            })
+        );
+        assert_eq!(verdict_with_limit(&vmcb, X2_LIMIT), None);
+    }
+
+    #[test]
+    fn a_pointer_must_be_page_aligned() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.avic_apic_bar = 0x1001;
+        assert_eq!(
+            verdict(&vmcb),
+            Some(Invalid::AvicPointerAlignment {
+                field: AvicField::ApicBar,
+                address: 0x1001,
+                bits: BITS,
+            })
+        );
+    }
+
+    #[test]
+    fn a_pointer_must_not_run_past_physical_memory() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.avic_backing_page = 1 << BITS;
+        assert_eq!(
+            verdict(&vmcb),
+            Some(Invalid::AvicPointerAlignment {
+                field: AvicField::BackingPage,
+                address: 1 << BITS,
+                bits: BITS,
+            })
+        );
+    }
+
+    #[test]
+    fn the_table_pointer_is_judged_without_its_index_bits() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.avic_physical_table = AvicPhysicalTable::new()
+            .with_max_index(3)
+            .with_address(PhysAddr::new(0x2000));
+        assert_eq!(verdict(&vmcb), None);
+
+        vmcb.control.avic_physical_table = AvicPhysicalTable::new()
+            .with_max_index(3)
+            .with_address(PhysAddr::new(1 << BITS));
+        assert_eq!(
+            verdict(&vmcb),
+            Some(Invalid::AvicPointerAlignment {
+                field: AvicField::PhysicalTable,
+                address: 1 << BITS,
+                bits: BITS,
+            })
+        );
+    }
+
+    #[test]
+    fn a_block_that_leaves_the_controller_off_is_not_judged_on_its_fields() {
+        let mut vmcb = avic_enabled();
+        vmcb.control.interrupt_control = vmcb.control.interrupt_control.with_avic_enable(false);
+        vmcb.control.avic_apic_bar = 1;
+        // An unaligned bar, an index past the eight-bit mode's limit, and a
+        // racing intercept: each would be a verdict of its own if the
+        // controller were on.
+        vmcb.control.avic_physical_table = AvicPhysicalTable::new().with_max_index(0xFFF);
+        vmcb.control.intercept_control_registers = ControlRegisterIntercepts::EMPTY.with_write(CR8);
+        assert_eq!(verdict(&vmcb), None);
+    }
+}

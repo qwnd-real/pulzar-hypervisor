@@ -18,7 +18,9 @@
 //! core. The interrupt controller's registers are answered by the guest's own
 //! emulated controller, and an access the architecture does not allow is a
 //! general protection fault the guest is given rather than an error the host
-//! reports.
+//! reports. The controller's doorbell is refused outright: a read of it faults
+//! on the machine anyway, and a write of it would poke whichever physical
+//! processor the guest named — which no guest is owed.
 //!
 //! A seventh kind is not answered at all so much as forwarded. The permission
 //! map covers three ranges of the index space and an access outside all three
@@ -61,6 +63,7 @@ use inject::Pending;
 use log::{error, trace};
 use svm::{
     CleanBits, Event,
+    avic::AVIC_DOORBELL,
     msr::{
         EFER, EFER_RESERVED, IA32_PAT, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR, VmCr,
     },
@@ -132,10 +135,17 @@ impl Virtualization {
         if mtrr::claims(msr) {
             return ranges(vcpu, mtrrs, msr, interrupts);
         }
+        if msr == AVIC_DOORBELL {
+            // A write would poke whichever physical processor the guest named,
+            // and a read faults on the machine anyway — so both directions
+            // are answered with the fault the access earns.
+            trace!("exits: refused the guest's access to the interrupt doorbell");
+            return refuse(vcpu, interrupts);
+        }
         let Some(register) = Hidden::of(msr) else {
             if msrpm_position(msr).is_some() {
                 // Every bit this hypervisor sets in the permission map is set for
-                // one of the registers below, so a register the map covers
+                // one of the registers answered here, so a register the map covers
                 // arriving here is the map disagreeing with this handler rather
                 // than anything the guest did.
                 error!("exits: unexpected intercepted MSR {msr:#x}");
@@ -552,7 +562,7 @@ fn ranges(vcpu: &mut Vcpu, mtrrs: &mut Mtrrs, msr: u32, interrupts: &mut Pending
 /// The instruction pointer is deliberately not advanced: the guest takes the
 /// exception at the instruction that caused it, which is where its handler
 /// expects to find it.
-fn refuse(vcpu: &mut Vcpu, interrupts: &mut Pending) -> Flow {
+pub(crate) fn refuse(vcpu: &mut Vcpu, interrupts: &mut Pending) -> Flow {
     let general_protection = descriptors::Vector::GENERAL_PROTECTION;
     interrupts.raise_exception(vcpu, Event::exception_with_code(general_protection, 0));
     Flow::Resume
