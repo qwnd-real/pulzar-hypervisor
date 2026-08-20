@@ -373,7 +373,13 @@ impl<'a> Exits<'a> {
         if let Err(error) = vlapic::avic_reconcile(vcpu) {
             error!("exits: the interrupt acceleration could not be reconciled: {error}");
         }
-        let accelerated = vlapic::avic_active().unwrap_or(false);
+        // Read out of the block rather than out of the controller, because the
+        // block is what the processor is about to be entered with. The two agree
+        // whenever the reconciliation above succeeded; where it could not, the
+        // controller still asks for the hardware and the block was deliberately
+        // left unarmed, and everything below has to serve the entry that is
+        // actually going to happen.
+        let accelerated = vcpu.control().interrupt_control.avic_enable();
         // Before anything below reads the controller, because the interrupt
         // window one of them arms is judged by the processor against exactly
         // this field. Inert while the hardware drives the controller: the

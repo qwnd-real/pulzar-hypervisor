@@ -192,6 +192,21 @@ pub enum VlapicError {
         /// The largest index the table was sized for.
         max_index: u16,
     },
+    /// The physical table was asked for a largest index the controller mode it
+    /// will be driven in cannot name, which is a table no control block in that
+    /// mode could describe.
+    #[error("a physical interrupt table indexed to {max_index} is beyond the mode's limit {limit}")]
+    IndexBeyondMode {
+        /// The largest index asked for.
+        max_index: u16,
+        /// The largest the mode can name.
+        limit: u16,
+    },
+    /// Arming hardware-driven delivery would have produced a control block the
+    /// processor refuses to enter, so it was left unarmed and this processor's
+    /// interrupts stay the software's to deliver.
+    #[error("hardware delivery cannot be armed: {0}")]
+    AvicRefused(vcpu::Invalid),
     /// The reserved chunk had no frame left, or the window did not reach one
     /// it just handed out.
     #[error(transparent)]

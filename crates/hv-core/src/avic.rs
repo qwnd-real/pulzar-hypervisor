@@ -28,8 +28,16 @@ pub(crate) enum AvicMode {
     /// with eight-bit identifiers.
     XAvic,
     /// The hardware drives the guest's controller, addressing its processors
-    /// with 32-bit identifiers.
-    X2AvicCapable,
+    /// with 32-bit identifiers, reaching as far as this index.
+    ///
+    /// The limit travels with the mode because it is the mode's rather than the
+    /// machine's — one page of table entries, or the eight the extended table
+    /// may span — and everything downstream that has to know how far a table
+    /// may be indexed is asking about the mode.
+    X2AvicCapable {
+        /// The highest table index this mode can name here.
+        limit: u16,
+    },
 }
 
 /// The boot-time decision about hardware interrupt delivery.
@@ -70,11 +78,30 @@ impl AvicPolicy {
     /// Whether delivery uses 32-bit identifiers.
     #[must_use]
     pub(crate) const fn x2avic(self) -> bool {
-        matches!(self.mode, AvicMode::X2AvicCapable)
+        self.x2avic_limit().is_some()
+    }
+
+    /// The highest table index the 32-bit face may name here, or `None` where
+    /// the machine may not be driven in that face at all.
+    ///
+    /// Both halves of one answer, which is why it is one answer: a machine
+    /// without the mode has no limit for it, and a limit without the mode is a
+    /// number nothing may be judged against.
+    #[must_use]
+    pub(crate) const fn x2avic_limit(self) -> Option<u16> {
+        match self.mode {
+            AvicMode::X2AvicCapable { limit } => Some(limit),
+            AvicMode::SoftwareOnly | AvicMode::XAvic => None,
+        }
     }
 
     /// The highest table index delivery may name, which is the smaller of the
     /// mode's limit and the machine's highest identifier.
+    ///
+    /// The machine's answer rather than any one face's: the eight-bit face
+    /// reaches less far than this wherever the machine has processors it cannot
+    /// address, and that clamp belongs with the face rather than here, because
+    /// a guest moves between the faces while it runs.
     #[must_use]
     pub(crate) const fn max_index(self) -> u16 {
         self.max_index
@@ -156,15 +183,15 @@ fn decide(svm: Option<&Svm>, family: u8, max_apic_id: Option<u32>) -> AvicPolicy
     let ipi_virtual = family != ZEN_FAMILY && family != DHYANA_FAMILY;
     if svm.features.contains(SvmFeatures::X2AVIC) {
         let limit = if svm.features.contains(SvmFeatures::X2AVIC_EXT) {
-            u32::from(X2_EXTENDED_MAX_PHYSICAL_ID)
+            X2_EXTENDED_MAX_PHYSICAL_ID
         } else {
-            u32::from(X2_MAX_PHYSICAL_ID)
+            X2_MAX_PHYSICAL_ID
         };
-        if max_apic_id <= limit {
+        if max_apic_id <= u32::from(limit) {
             return AvicPolicy {
-                mode: AvicMode::X2AvicCapable,
+                mode: AvicMode::X2AvicCapable { limit },
                 ipi_virtual,
-                max_index: index_within(max_apic_id, limit),
+                max_index: index_within(max_apic_id, u32::from(limit)),
             };
         }
     }

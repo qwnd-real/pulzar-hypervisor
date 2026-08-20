@@ -45,7 +45,7 @@ mod tables;
 
 use alloc::{vec, vec::Vec};
 
-use svm::avic::{IncompleteIpiExit, UnacceleratedAccessExit};
+use svm::avic::{IncompleteIpiExit, MAX_PHYSICAL_ID, UnacceleratedAccessExit};
 use vcpu::Vcpu;
 use x86_64::PhysAddr;
 
@@ -67,33 +67,44 @@ use crate::{
 /// asked for the address either way and must be given a real one.
 ///
 /// `max_index` is the highest identifier any startable processor answers to,
-/// and sizes the physical table: the hardware walks no further than it.
+/// and sizes the physical table: there is an entry for every identifier up to
+/// it and none past it. How much of that the hardware is told to walk is a
+/// second question, asked again at every transition, because the face being
+/// driven is what answers it.
 /// `ipi_virtual` is whether the silicon's reading of the running bits is
 /// trustworthy — the boot-time policy's answer — and decides whether the
-/// running bits are ever published at all. `x2avic` is whether the
-/// acceleration may drive a controller its guest reaches through
-/// model-specific registers — the policy's answer again — and decides both
-/// whether that face is ever activated and whether the guest is told it
-/// exists.
+/// running bits are ever published at all. `x2avic` is the highest index the
+/// controller face a guest reaches through model-specific registers may name
+/// here, or `None` where the acceleration may not drive that face at all — the
+/// policy's answer again, which decides both whether the face is ever activated
+/// and whether the guest is told it exists. It is also the widest face the
+/// table may be indexed in, and so the limit the table's own extent is judged
+/// against.
 ///
 /// # Errors
 ///
 /// [`VlapicError::AlreadyProvisioned`] on a second call,
 /// [`VlapicError::NotInstalled`] if the emulated controllers do not exist
-/// yet, [`VlapicError::TableTooLarge`] if the table would need more than one
-/// page, [`VlapicError::IdBeyondTable`] if a startable processor's identifier
-/// is beyond `max_index`, or [`VlapicError::Paging`] if the chunk cannot spare
-/// a frame or the window does not reach one it just handed out.
+/// yet, [`VlapicError::TableTooLarge`] if the table would need more entries
+/// than a control block can name, [`VlapicError::IndexBeyondMode`] if the
+/// widest face the machine may drive cannot name `max_index`,
+/// [`VlapicError::IdBeyondTable`] if a startable processor's identifier is
+/// beyond `max_index`, or [`VlapicError::Paging`] if the chunk cannot spare a
+/// frame or the window does not reach one it just handed out.
 pub fn provision(
     space: &mut paging::AddressSpace,
     max_index: u16,
     ipi_virtual: bool,
-    x2avic: bool,
+    x2avic: Option<u16>,
 ) -> Result<vcpu::AvicTables, VlapicError> {
     if activation::provisioned() {
         return Err(VlapicError::AlreadyProvisioned);
     }
-    let mut physical = PhysicalTable::new(max_index)?;
+    // Sized for the widest face the machine may ever drive the table in, which
+    // is the 32-bit one wherever the policy permits it and the eight-bit one
+    // otherwise; each face's own limit is applied where the acceleration is
+    // armed in it.
+    let mut physical = PhysicalTable::new(max_index, x2avic.unwrap_or(MAX_PHYSICAL_ID))?;
     let window = space.direct_map();
     let lapics = registry::lapics()?;
     let mut backing: Vec<Option<PhysAddr>> = vec![None; lapics.all().len()];
@@ -127,7 +138,7 @@ pub fn provision(
         max_index,
         window,
         ipi_virtual,
-        x2avic,
+        x2avic.is_some(),
     );
     Ok(tables)
 }

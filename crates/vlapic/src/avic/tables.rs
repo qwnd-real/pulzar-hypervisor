@@ -37,15 +37,28 @@ pub(crate) struct PhysicalTable {
 }
 
 impl PhysicalTable {
-    /// An empty table whose largest valid index will be `max_index`.
+    /// An empty table whose largest valid index will be `max_index`, for a
+    /// controller mode that can name up to `limit`.
+    ///
+    /// The limit is the mode's rather than the machine's, and it is what makes
+    /// this constructor able to enforce the rule its own documentation is
+    /// about: how far a table may be indexed is a property of the mode the
+    /// hardware will drive it in — the eight-bit mode reaches one byte of
+    /// identifiers, the 32-bit mode a page of entries, and further than that
+    /// only where the extension reports the extended table.
     ///
     /// # Errors
     ///
-    /// [`VlapicError::TableTooLarge`] if the entries would not fit one page.
-    pub(super) fn new(max_index: u16) -> Result<Self, VlapicError> {
+    /// [`VlapicError::TableTooLarge`] if the entries would not fit the run a
+    /// control block can name, or [`VlapicError::IndexBeyondMode`] if the mode
+    /// cannot name the largest index asked for.
+    pub(super) fn new(max_index: u16, limit: u16) -> Result<Self, VlapicError> {
         let count = usize::from(max_index) + 1;
         if count > MAX_ENTRIES {
             return Err(VlapicError::TableTooLarge { entries: count });
+        }
+        if max_index > limit {
+            return Err(VlapicError::IndexBeyondMode { max_index, limit });
         }
         Ok(Self {
             max_index,
@@ -125,10 +138,15 @@ mod tests {
     //! refusals and the shape of an entry are all tested without a machine.
 
     use cpu::ApicId;
+    use svm::avic::{MAX_PHYSICAL_ID, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID};
     use x86_64::PhysAddr;
 
     use super::PhysicalTable;
     use crate::VlapicError;
+
+    /// A limit no mode is narrower than, for the tests that are about sizing
+    /// rather than about which mode may name what.
+    const WIDEST: u16 = X2_EXTENDED_MAX_PHYSICAL_ID;
 
     #[test]
     fn the_table_is_sized_by_its_largest_index() {
@@ -140,7 +158,7 @@ mod tests {
             (0x7FF, 2048, 2),
             (0xFFF, 4096, 3),
         ] {
-            let table = PhysicalTable::new(max_index).expect("a table that fits one page");
+            let table = PhysicalTable::new(max_index, WIDEST).expect("a table the mode can name");
             assert_eq!(table.entries.len(), entries, "{max_index:#x}");
             assert_eq!(table.order(), order, "{max_index:#x}");
         }
@@ -148,15 +166,50 @@ mod tests {
 
     #[test]
     fn a_table_larger_than_one_page_is_refused() {
-        let Err(error) = PhysicalTable::new(0x1000) else {
+        let Err(error) = PhysicalTable::new(0x1000, WIDEST) else {
             panic!("a table past the largest index must be refused");
         };
         assert_eq!(error, VlapicError::TableTooLarge { entries: 4097 });
     }
 
     #[test]
+    fn each_mode_refuses_the_index_it_cannot_name() {
+        // Every boundary as a literal, because the mode's limit is exactly the
+        // thing a wrong hex digit here would move: one byte of identifiers for
+        // the eight-bit mode, one page of entries for the 32-bit one, and eight
+        // pages where the extension reports the extended table.
+        for (limit, over) in [
+            (MAX_PHYSICAL_ID, 0x0FF_u16),
+            (X2_MAX_PHYSICAL_ID, 0x200),
+            (X2_EXTENDED_MAX_PHYSICAL_ID, 0x1000),
+        ] {
+            assert!(
+                PhysicalTable::new(limit, limit).is_ok(),
+                "the mode's own limit is a table it can name: {limit:#x}"
+            );
+            let Err(error) = PhysicalTable::new(over, limit) else {
+                panic!("a table the mode cannot name must be refused: {over:#x}");
+            };
+            // The widest mode's limit is also the widest table a control block
+            // can name, so past it the sizing rule answers first — which is the
+            // one that says the entries would not fit.
+            let expected = if usize::from(over) < super::MAX_ENTRIES {
+                VlapicError::IndexBeyondMode {
+                    max_index: over,
+                    limit,
+                }
+            } else {
+                VlapicError::TableTooLarge {
+                    entries: usize::from(over) + 1,
+                }
+            };
+            assert_eq!(error, expected, "{over:#x}");
+        }
+    }
+
+    #[test]
     fn an_entry_names_the_processors_page_and_starts_not_running() {
-        let mut table = PhysicalTable::new(0xFF).expect("a table that fits one page");
+        let mut table = PhysicalTable::new(0xFF, WIDEST).expect("a table the mode can name");
         let page = PhysAddr::new(0x0012_3000);
         table.describe(ApicId::new(7), page).unwrap();
         let entry = table.entries[7];
@@ -170,7 +223,7 @@ mod tests {
 
     #[test]
     fn an_identifier_beyond_the_largest_index_is_refused() {
-        let mut table = PhysicalTable::new(0xFF).expect("a table that fits one page");
+        let mut table = PhysicalTable::new(0xFF, WIDEST).expect("a table the mode can name");
         assert_eq!(
             table
                 .describe(ApicId::new(0x100), PhysAddr::new(0))

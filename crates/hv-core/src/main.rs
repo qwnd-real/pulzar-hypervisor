@@ -241,7 +241,7 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
                 &mut space,
                 policy.max_index(),
                 policy.ipi_virtual(),
-                policy.x2avic(),
+                policy.x2avic_limit(),
             )
         })
         .transpose()?;

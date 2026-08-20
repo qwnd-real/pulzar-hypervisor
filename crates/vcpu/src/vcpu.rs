@@ -53,7 +53,7 @@ use paging::{DirectMap, Frames};
 use processor::{Features, SvmFeatures};
 use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
-    avic::{AVIC_DOORBELL, AvicPhysicalTable, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID},
+    avic::{AVIC_DOORBELL, AvicPhysicalTable},
     control::NestedPagingControl,
     intercept::{Intercepts1, Intercepts2, Intercepts2Flags, TlbControl},
     msr::{EFER, IA32_PAT, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR},
@@ -68,6 +68,7 @@ use x86_64::{
 
 use crate::{
     Host, Invalid, Registers, VcpuError, invalid,
+    invalid::AvicLimits,
     registers::{RAX, RSP},
     switch,
 };
@@ -408,7 +409,28 @@ impl Vcpu {
             self.control(),
             self.save(),
             processor::physical_address_bits(),
-            x2avic_index_limit(self.host.svm().features),
+            AvicLimits::of(self.host.svm().features),
+        )
+    }
+
+    /// The rule that would make turning the interrupt acceleration on refuse
+    /// this block, or `None` if none would.
+    ///
+    /// `x2avic` says which of the two controller modes the acceleration would
+    /// be armed in, and `max_index` the extent the table of virtual processors
+    /// would be published with. Asked *before* the enable bits are set, because
+    /// the processor's own verdict on them arrives as an exit that executed no
+    /// guest instruction and cannot be resumed from: a block armed and then
+    /// refused ends its guest, where one refused here is one whose interrupts
+    /// the host goes on delivering in software.
+    #[must_use]
+    pub fn avic_refusal(&self, x2avic: bool, max_index: u16) -> Option<Invalid> {
+        invalid::arming(
+            self.control(),
+            x2avic,
+            max_index,
+            processor::physical_address_bits(),
+            AvicLimits::of(self.host.svm().features),
         )
     }
 
@@ -842,18 +864,6 @@ fn flush_command() -> TlbControl {
     match processor::svm() {
         Some(svm) if svm.features.contains(SvmFeatures::FLUSH_BY_ASID) => TlbControl::FlushGuest,
         _ => TlbControl::FlushAll,
-    }
-}
-
-/// The highest table index this processor's 32-bit controller mode can name.
-///
-/// The extended table reaches further than one page of entries, and whether
-/// this processor has it is a bit of the extension's own feature set.
-fn x2avic_index_limit(features: SvmFeatures) -> u16 {
-    if features.contains(SvmFeatures::X2AVIC_EXT) {
-        X2_EXTENDED_MAX_PHYSICAL_ID
-    } else {
-        X2_MAX_PHYSICAL_ID
     }
 }
 

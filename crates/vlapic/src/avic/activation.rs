@@ -39,7 +39,10 @@
 //! plain reference into one of these frames.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::{
+    cmp::min,
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
+};
 
 use apic::REGISTER_STRIDE;
 use cpu::ApicId;
@@ -49,7 +52,7 @@ use paging::DirectMap;
 use spin::{Mutex, Once};
 use svm::{
     CleanBits,
-    avic::{LogicalApicEntry, PhysicalApicEntry},
+    avic::{LogicalApicEntry, MAX_PHYSICAL_ID, PhysicalApicEntry},
 };
 use vcpu::Vcpu;
 use x86_64::PhysAddr;
@@ -102,6 +105,10 @@ struct Activation {
     /// The frame the logical table lives in.
     logical_table: PhysAddr,
     /// The largest valid index of the physical table.
+    ///
+    /// What the table was built for, which is the widest face the machine may
+    /// drive it in; how far the hardware is told to walk it is narrower
+    /// wherever the face being driven is — see [`face_limit`].
     max_index: u16,
     /// The window every access below reaches its frame through.
     window: DirectMap,
@@ -325,6 +332,29 @@ fn move_for(have: Option<Face>, want: Option<Face>) -> Move {
     }
 }
 
+/// The highest table index the hardware can address while it drives a
+/// controller in this face, out of the highest one the machine provisioned.
+///
+/// A property of the face rather than of the machine, which is why it is asked
+/// again at every transition instead of once at provisioning. The older face
+/// resolves a destination out of an eight-bit field whose all-ones encoding
+/// means "every processor", so it reaches no further than [`MAX_PHYSICAL_ID`]
+/// however many processors the machine has — and a control block entered in
+/// that face over a wider table is one the processor refuses outright, with no
+/// guest instruction executed.
+///
+/// Above the limit the guest's processors are unaddressable while it is in that
+/// face, which is the eight-bit field's own behaviour and what the warning
+/// [`crate::install`] says out loud on such a machine is about. The wider face
+/// is what the table was sized for wherever the machine has it, so there its
+/// own extent is the answer.
+fn face_limit(face: Face, provisioned: u16) -> u16 {
+    match face {
+        Face::XAvic => min(provisioned, MAX_PHYSICAL_ID),
+        Face::X2Avic => provisioned,
+    }
+}
+
 /// Brings the control block's acceleration into agreement with the guest it
 /// describes, on the way in.
 ///
@@ -333,16 +363,22 @@ fn move_for(have: Option<Face>, want: Option<Face>) -> Move {
 /// here — the backing page rebuilt from the model on the way up, the
 /// hardware's state carried back into the model on the way down, the
 /// permission map's pass-through granted before the wider face's enable bit
-/// and withdrawn after it — because the rule every transition keeps is that
-/// the software model moves first and the acceleration follows it.
+/// and withdrawn after it, and the extent the table may be walked to published
+/// with the bit that selects the face it belongs to — because the rule every
+/// transition keeps is that the software model moves first and the acceleration
+/// follows it.
 ///
 /// # Errors
 ///
 /// [`VlapicError::NotProvisioned`] is answered as "no acceleration" rather
 /// than reported: a machine the policy left on the software path reaches
-/// here on every entry, and that is not an error. Anything else names a
-/// frame the window does not reach or a processor the roster does not
-/// describe, and the caller degrades rather than refusing the entry.
+/// here on every entry, and that is not an error.
+/// [`VlapicError::AvicRefused`] is a transition the entry rules would not have
+/// survived, reported with the acceleration left exactly as it was. Anything
+/// else names a frame the window does not reach or a processor the roster does
+/// not describe. In every case the caller degrades rather than refusing the
+/// entry, and what the guest is entered with is what the control block says
+/// rather than what the model asked for.
 pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
     let Some(activation) = ACTIVATED.get() else {
         return Ok(());
@@ -388,6 +424,13 @@ fn face_of(vcpu: &Vcpu) -> Option<Face> {
 
 /// Turns the acceleration on for this processor, at the entry that asked.
 ///
+/// What it is about to arm is examined before anything is armed, because the
+/// processor's own verdict on an illegal combination is an exit that executed
+/// no guest instruction and cannot be resumed from — so a block armed and then
+/// refused would end the guest, where a refusal here leaves this processor's
+/// interrupts the software's to deliver. Nothing has been edited when the
+/// refusal is reported.
+///
 /// The permission map's pass-through goes first wherever the wider face is
 /// what turns on: granting an access after its enable bit is set would leave
 /// the guest a window of unguarded registers, and the order that cannot be
@@ -398,6 +441,10 @@ fn enable(
     vlapic: &Vlapic,
     face: Face,
 ) -> Result<(), VlapicError> {
+    let limit = face_limit(face, activation.max_index);
+    if let Some(invalid) = vcpu.avic_refusal(face == Face::X2Avic, limit) {
+        return Err(VlapicError::AvicRefused(invalid));
+    }
     rebuild_backing(vlapic)?;
     activation.rebuilt_at[vlapic.index().get()].store(vlapic.epoch(), Ordering::Relaxed);
     let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
@@ -406,6 +453,10 @@ fn enable(
         soil = soil.union(CleanBits::PERMISSION_MAPS);
     }
     let control = vcpu.control_mut();
+    // The table's extent is published with the enable bits rather than at
+    // provisioning: how far the hardware may walk it is the face's answer, and
+    // this is where the face is decided.
+    control.avic_physical_table = control.avic_physical_table.with_max_index(limit);
     control.interrupt_control = control
         .interrupt_control
         .with_avic_enable(true)
@@ -418,8 +469,10 @@ fn enable(
     // before the redirection existed; nothing but a flush gets rid of it.
     vcpu.flush();
     info!(
-        "vlapic: {} turned hardware delivery on for its guest, in the {face:?} face",
-        vlapic.index()
+        "vlapic: {} turned hardware delivery on for its guest, in the {face:?} face, over {} \
+         addressable entries",
+        vlapic.index(),
+        usize::from(limit) + 1
     );
     Ok(())
 }
@@ -474,29 +527,40 @@ fn disable(
 /// and an activation. The logical table is likewise left alone: the wider
 /// face does not consult it, and the narrower one never stops finding it
 /// populated.
+///
+/// What does not survive the move is how far the table may be walked, because
+/// that is the one thing about the acceleration the two faces disagree on. The
+/// new face's answer is published with the bit that selects it, and examined
+/// before either is written for the same reason [`enable`] examines its own: a
+/// block found illegal here is left in the face it was already in, which the
+/// processor has been entering all along.
 fn switch(
     activation: &Activation,
     vcpu: &mut Vcpu,
     from: Face,
     to: Face,
 ) -> Result<(), VlapicError> {
-    match (from, to) {
-        (Face::XAvic, Face::X2Avic) => {
+    let limit = face_limit(to, activation.max_index);
+    if let Some(invalid) = vcpu.avic_refusal(to == Face::X2Avic, limit) {
+        return Err(VlapicError::AvicRefused(invalid));
+    }
+    // The face being moved to is the whole of what the permission map owes:
+    // the same face twice is the steady state and [`move_for`] does not call
+    // it a switch, so `from` is here to be said in the log.
+    match to {
+        Face::X2Avic => {
             vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
         }
         // A guest cannot step from the wider face back to the narrower one —
         // the base register's state machine refuses the move — so this arm is
         // the defensive one, written anyway because a block found in it must
         // come out of it guarded.
-        (Face::X2Avic, Face::XAvic) => {
+        Face::XAvic => {
             vcpu.intercept_msrs(activation.window, crate::intercepted())?;
-        }
-        (Face::XAvic, Face::XAvic) | (Face::X2Avic, Face::X2Avic) => {
-            // The same face twice is the steady state and is not a switch.
-            return Ok(());
         }
     }
     let control = vcpu.control_mut();
+    control.avic_physical_table = control.avic_physical_table.with_max_index(limit);
     control.interrupt_control = control
         .interrupt_control
         .with_x2avic_enable(to == Face::X2Avic);
@@ -509,8 +573,10 @@ fn switch(
     );
     vcpu.flush();
     info!(
-        "vlapic: {} moved hardware delivery from the {from:?} face to the {to:?} face",
-        current()?.index()
+        "vlapic: {} moved hardware delivery from the {from:?} face to the {to:?} face, over {} \
+         addressable entries",
+        current()?.index(),
+        usize::from(limit) + 1
     );
     Ok(())
 }
@@ -523,9 +589,13 @@ fn switch(
 /// request that lands between the two is one the entry's own look, or the
 /// VMRUN's re-evaluation, still finds.
 ///
-/// Nothing at all on the erratum families: the bit stays clear for the life
-/// of the machine there, and every directed IPI takes the exit it then
-/// cannot avoid.
+/// Nothing at all on the erratum families: the bit stays clear for the life of
+/// the machine there, and every directed IPI takes the exit it then cannot
+/// avoid. Nothing either for a processor whose identifier the face being driven
+/// cannot address: its entry is one the hardware never walks, so a running bit
+/// set there would be a promise nothing reads, and a sender that read it back
+/// would skip the wake the target does need. [`unpublish_running`] is
+/// deliberately not gated the same way — see there.
 ///
 /// # Errors
 ///
@@ -536,6 +606,12 @@ pub(crate) fn publish_running() -> Result<(), VlapicError> {
         return Ok(());
     }
     let vlapic = current()?;
+    let Some(face) = active_face(vlapic) else {
+        return Ok(());
+    };
+    if vlapic.apic_id().get() > u32::from(face_limit(face, activation.max_index)) {
+        return Ok(());
+    }
     activation
         .entry(vlapic.apic_id())?
         .fetch_or(IS_RUNNING, Ordering::Release);
@@ -549,6 +625,15 @@ pub(crate) fn publish_running() -> Result<(), VlapicError> {
 /// answers in host code, which is harmless; a sender that reads it clear
 /// takes the kick path, and the rescan after this is what finds whatever
 /// the kick is for.
+///
+/// Judged against the table's own extent rather than the face's limit, which is
+/// the asymmetry with [`publish_running`] and is deliberate: a bit is only ever
+/// set where the driving face could address it, but it must be clearable
+/// wherever it may have been set. The face can change between the publish and
+/// the withdrawal — a machine-wide demotion is a store any processor may make —
+/// and a withdrawal that declined on that account would leave the bit standing,
+/// which is a sender told this processor is in the guest for the rest of the
+/// machine's life.
 ///
 /// # Errors
 ///
@@ -1229,13 +1314,14 @@ const fn bank_offset(bank: Register, vector: Vector) -> u32 {
 #[cfg(test)]
 mod tests {
     //! The decisions here that need no machine: which face the acceleration
-    //! drives a controller in, which vector an EOI retired, which logical
-    //! destinations name a table entry, and which move an entry owes the
-    //! acceleration.
+    //! drives a controller in, how far it reaches in each, which vector an EOI
+    //! retired, which logical destinations name a table entry, and which move
+    //! an entry owes the acceleration.
 
     use descriptors::Vector;
+    use svm::avic::MAX_PHYSICAL_ID;
 
-    use super::{Face, Mode, Move, driven_face, eoi_vector, logical_slot, move_for};
+    use super::{Face, Mode, Move, driven_face, eoi_vector, face_limit, logical_slot, move_for};
 
     /// Every mode a controller can be in, which is the one term of the
     /// activation gate that is not a boolean.
@@ -1383,5 +1469,50 @@ mod tests {
                 to: Face::XAvic,
             }
         );
+    }
+
+    #[test]
+    fn the_older_face_reaches_no_further_than_the_broadcast_identifier() {
+        // Pinned as literals on both sides of the boundary, because this cap is
+        // the difference between a machine that boots and one whose guest dies
+        // at its first accelerated entry: 0xFE is the highest identifier an
+        // eight-bit destination field can name, 0xFF being the encoding that
+        // means every processor.
+        assert_eq!(face_limit(Face::XAvic, 0x0FE), 0x0FE);
+        for provisioned in [0x0FF_u16, 0x100, 0x1FF, 0x200, 0xFFF] {
+            assert_eq!(
+                face_limit(Face::XAvic, provisioned),
+                0x0FE,
+                "{provisioned:#x}"
+            );
+        }
+        // And it is the constant the architecture's own reason is written
+        // against, not a second spelling of the same number.
+        assert_eq!(face_limit(Face::XAvic, 0xFFF), MAX_PHYSICAL_ID);
+    }
+
+    #[test]
+    fn the_wider_face_reaches_every_entry_the_table_was_sized_for() {
+        // The table is provisioned for the widest face the machine may drive it
+        // in, so in that face nothing is clamped — including the identifier the
+        // older face has to give up.
+        for provisioned in [0x0FE_u16, 0x0FF, 0x100, 0x1FF, 0x200, 0xFFF] {
+            assert_eq!(
+                face_limit(Face::X2Avic, provisioned),
+                provisioned,
+                "{provisioned:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_no_wider_than_the_older_face_is_clamped_by_neither() {
+        // The common machine: every identifier already inside the eight-bit
+        // field, so the two faces agree and a mode change costs no change of
+        // extent at all.
+        for provisioned in [0_u16, 1, 0x0FE] {
+            assert_eq!(face_limit(Face::XAvic, provisioned), provisioned);
+            assert_eq!(face_limit(Face::X2Avic, provisioned), provisioned);
+        }
     }
 }
