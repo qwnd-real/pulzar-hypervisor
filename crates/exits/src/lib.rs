@@ -488,7 +488,8 @@ impl<'a> Exits<'a> {
         // a request that lands between the withdrawal and the rescan is one
         // the rescan finds, and one that landed before it was answered by
         // the exit itself. The rescan inside [`Exits::wakeable`] reads the
-        // backing page under the acceleration, where the request bits live.
+        // backing page wherever the control block still has the acceleration
+        // armed, which is where the request bits live.
         let _ = vlapic::avic_unpublish_running();
         let vcpu = &*vcpu;
         if self.wakeable(vcpu) {
@@ -513,12 +514,27 @@ impl<'a> Exits<'a> {
     /// that is merely pending is not a reason, and the two things that reach a
     /// guest whatever it has masked are — a non-maskable interrupt, and a
     /// startup message from another processor.
+    ///
+    /// The backing page is consulted whenever the control block's own enable
+    /// bit is set, and that is not the same condition as the acceleration
+    /// being permitted. The permission can be withdrawn for the whole
+    /// machine by any processor, while this one is parked and reaching no
+    /// entry — and the page goes on collecting requests from every peer
+    /// still driving its own block until each of them notices at its next
+    /// entry. Judged by the permission, this processor would park again
+    /// with the only copy of a vector in a page it had stopped consulting
+    /// and the kick that announced it already spent. Judged by the enable
+    /// bit, the entry this answer produces settles the page — it either
+    /// leaves the hardware to deliver what is there or takes the page's
+    /// state into the model, and an entry that clears the enable bit
+    /// instead is one after which this is not asked again.
     fn wakeable(&self, vcpu: &Vcpu) -> bool {
         self.interrupts.owed()
             || !vlapic::running().unwrap_or(true)
             || (inject::interrupts_unmasked(vcpu)
                 && (vlapic::nominate().unwrap_or_default().deliverable.is_some()
-                    || vlapic::avic_deliverable().unwrap_or(false)))
+                    || (vcpu.control().interrupt_control.avic_enable()
+                        && vlapic::avic_deliverable().unwrap_or(false))))
     }
 
     /// Brings the control block's virtual task priority into agreement with the

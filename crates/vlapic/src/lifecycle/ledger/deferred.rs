@@ -243,6 +243,17 @@ impl Deferred {
         }
     }
 
+    /// Whether real hardware is holding `vector` and an acknowledgement for it
+    /// is still expected.
+    ///
+    /// Narrower than [`Deferred::holds`], and the difference is what a caller
+    /// about to write a debt off needs: an already abandoned vector is one this
+    /// arm has stopped expecting anything for, so writing it off again would
+    /// count a second stranding for one interrupt.
+    pub(crate) fn owes(&self, vector: Vector) -> bool {
+        self.owed.get(vector)
+    }
+
     /// Whether real hardware is holding `vector` for this guest, whether or not
     /// anything is expected to acknowledge it.
     fn holds(&self, vector: Vector) -> bool {

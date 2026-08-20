@@ -253,16 +253,37 @@ impl Ledger {
 
     /// Records that nothing is expected to acknowledge `vector`.
     ///
-    /// Reached from two places: an arrival the guest refused, which is the one
-    /// exit a single interrupt makes on its own, and the sweep in
-    /// [`Ledger::settle`]. What becomes of the debt is the sharpest difference
-    /// between the two arms — one keeps it and leaves a priority class blocked
-    /// for the life of the machine, the other pays it and stops the vector
-    /// arriving again until the guest is reset.
+    /// Reached from three places: an arrival the guest refused, which is the
+    /// one exit a single interrupt makes on its own; the sweep in
+    /// [`Ledger::settle`]; and a request bit deleted from a backing page
+    /// whose guest has stopped existing. What becomes of the debt is the
+    /// sharpest difference between the two arms — one keeps it and leaves a
+    /// priority class blocked for the life of the machine, the other pays
+    /// it and stops the vector arriving again until the guest is reset.
+    ///
+    /// Only ever called for a vector [`Ledger::owes`] answers for. Writing off
+    /// a debt that does not exist would report one the machine is not
+    /// holding, and on a controller that retires by name it would stop a
+    /// line the guest is still using from being accepted at all.
     pub(crate) fn abandon(&self, vector: Vector, controller: &impl Controller) {
         match self {
             Self::Deferred(deferred) => deferred.abandon(vector),
             Self::Immediate(immediate) => immediate.abandon(vector, controller),
+        }
+    }
+
+    /// Whether real hardware is holding `vector` in service for this guest and
+    /// may still be given an acknowledgement for it.
+    ///
+    /// What a caller about to delete the request a debt is waiting on has to
+    /// ask. A debt already written off is not one — the expectation of an
+    /// acknowledgement is gone, and on the arm that can act it has been retired
+    /// as well — so both arms answer about what is outstanding rather than
+    /// about what they have ever held.
+    pub(crate) fn owes(&self, vector: Vector) -> bool {
+        match self {
+            Self::Deferred(deferred) => deferred.owes(vector),
+            Self::Immediate(immediate) => immediate.owes(vector),
         }
     }
 
@@ -483,6 +504,32 @@ mod tests {
         immediate.owe(VECTOR);
         immediate.abandon(VECTOR, &controller);
         assert_eq!(controller.acts(), ["set_enabled", "retire"]);
+    }
+
+    #[test]
+    fn a_ledger_says_which_vectors_it_is_still_owed_an_acknowledgement_for() {
+        // What a caller about to delete the request a debt is waiting on has to
+        // ask, and the answer is about what is outstanding rather than about what
+        // the controller has ever held. A debt already written off is not owed:
+        // writing one off twice would count a second stranding for one interrupt
+        // on the arm that keeps it, and on the arm that can act it would stop a
+        // vector the guest is using from being accepted at all.
+        for extended in [Extended::empty(), Extended::all()] {
+            let controller = Asked::default();
+            let ledger = Ledger::new(extended);
+            assert!(!ledger.owes(VECTOR));
+
+            ledger.owe(VECTOR);
+            assert!(ledger.owes(VECTOR));
+            ledger.abandon(VECTOR, &controller);
+            assert!(!ledger.owes(VECTOR), "nothing more is expected for it");
+
+            // And a debt the guest discharged is not owed either, which is the
+            // ordinary way one ends.
+            ledger.owe(VECTOR);
+            ledger.release(VECTOR, &controller);
+            assert!(!ledger.owes(VECTOR));
+        }
     }
 
     #[test]

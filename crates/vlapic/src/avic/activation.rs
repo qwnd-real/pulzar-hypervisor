@@ -59,7 +59,7 @@ use x86_64::PhysAddr;
 
 use crate::{
     VlapicError,
-    avic::backing::{Projection, ResetImage},
+    avic::backing::{Life, Projection, ResetImage},
     delivery::error,
     face::{dispatch, dispatch::Written, table::Register},
     machine::{current, registry},
@@ -390,25 +390,67 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
     let vlapic = current()?;
     let have = face_of(vcpu);
     let want = active_face(vlapic);
+    // One reading above the match rather than one inside an arm, because which
+    // life the backing page belongs to is a term of every transition and not of
+    // one: it decides whether a deactivation may carry the page into the model,
+    // and whether the steady state has a page to rebuild at all. Taken once, so
+    // that two arms cannot straddle a reset and disagree about it.
+    let standing = Standing::of(
+        activation.rebuilt_at[vlapic.index().get()].load(Ordering::Relaxed),
+        vlapic.epoch(),
+    );
     match move_for(have, want) {
         Move::Idle => Ok(()),
-        Move::Enable(face) => enable(activation, vcpu, vlapic, face),
-        Move::Disable(face) => disable(activation, vcpu, vlapic, face),
+        Move::Enable(face) => enable(activation, vcpu, vlapic, face, standing),
+        Move::Disable(face) => disable(activation, vcpu, vlapic, face, standing),
         Move::Switch { from, to } => switch(activation, vcpu, vlapic, from, to),
-        // The steady state. One thing can still have moved: a reset rebuilt
-        // the model underneath an active controller, and the page the
-        // hardware serves must be rebuilt after it.
+        // The steady state. One thing can still have moved: a reset cleared the
+        // model underneath an active controller, and the page the hardware
+        // serves holds the state that reset was required to destroy.
         Move::Steady => {
-            let index = vlapic.index().get();
-            if activation.rebuilt_at[index].load(Ordering::Relaxed) != vlapic.epoch() {
-                rebuild_backing(vlapic)?;
-                activation.rebuilt_at[index].store(vlapic.epoch(), Ordering::Relaxed);
+            if !standing.life.carried() {
+                rebuild_backing(activation, vlapic, standing)?;
             }
             // The task priority the guest sets without exiting has to be the
             // model's before anything consults the model about what is
             // deliverable.
             sync_task_priority(activation, vlapic)?;
             Ok(())
+        }
+    }
+}
+
+/// What an entry's transition stands on: the model's reset count, and what that
+/// count makes of the backing page.
+///
+/// One value rather than two arguments because the two are one reading. A
+/// transition that recorded a count other than the one it decided against would
+/// leave the next entry believing a page of the wrong life.
+#[derive(Clone, Copy, Debug)]
+struct Standing {
+    /// The model's reset count as the entry read it.
+    epoch: u64,
+    /// Whose state the page holds.
+    life: Life,
+}
+
+impl Standing {
+    /// Where an entry stands, out of the count the page was last built at and
+    /// the count the model is on now.
+    ///
+    /// The one test of staleness on this path. The count moves whenever the
+    /// register file is cleared or seeded, and only the processor the
+    /// controller belongs to moves it — at an exit boundary, which is where
+    /// a transition is not. So a mismatch read here says exactly one thing:
+    /// the model the page was built from has been replaced since.
+    const fn of(rebuilt_at: u64, epoch: u64) -> Self {
+        Self {
+            epoch,
+            life: if rebuilt_at == epoch {
+                Life::Same
+            } else {
+                Life::Ended
+            },
         }
     }
 }
@@ -444,13 +486,13 @@ fn enable(
     vcpu: &mut Vcpu,
     vlapic: &Vlapic,
     face: Face,
+    standing: Standing,
 ) -> Result<(), VlapicError> {
     let limit = face_limit(face, activation.max_index);
     if let Some(invalid) = vcpu.avic_refusal(face == Face::X2Avic, limit) {
         return Err(VlapicError::AvicRefused(invalid));
     }
-    rebuild_backing(vlapic)?;
-    activation.rebuilt_at[vlapic.index().get()].store(vlapic.epoch(), Ordering::Relaxed);
+    rebuild_backing(activation, vlapic, standing)?;
     let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
     if face == Face::X2Avic {
         vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
@@ -489,11 +531,35 @@ fn enable(
 /// see is a guest that believes it owns its controller's registers while
 /// nothing guards them, and restoring first is the order that cannot make
 /// one.
+///
+/// # A page of a life that has ended is not carried
+///
+/// The carry-back runs only where the model is still the one the page was built
+/// from, and the reset count is what says so. Every model reset is a lifecycle
+/// boundary the architecture requires to clear the task priority, the
+/// in-service bank, the requests and the trigger modes — so a deactivation
+/// reached one entry later would put all four back, and two of them are not
+/// merely wrong: a forced in-service bit is one nothing will ever acknowledge,
+/// which floors the new guest's processor priority for as long as it lives, and
+/// a forced trigger mode claims an acknowledgement is owed after the reset's
+/// own settlement has already been made.
+///
+/// The reset that gets here is the one the guest's face did not survive — its
+/// base register's enable bit cleared, which resets the file and leaves no
+/// controller to drive. An `INIT` and the start-up message after it leave the
+/// face where it was, so they arrive at the steady arm instead, and it rebuilds
+/// the page from the same reading this refuses to carry.
+///
+/// The count is recorded only where the carry-back ran, because that is what
+/// empties the page: a page still holding a dead guest's requests is one the
+/// activation that next rebuilds it must still reconcile, and recording here
+/// would tell that activation the page was this life's.
 fn disable(
     activation: &Activation,
     vcpu: &mut Vcpu,
     vlapic: &Vlapic,
     face: Face,
+    standing: Standing,
 ) -> Result<(), VlapicError> {
     let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
     if face == Face::X2Avic {
@@ -504,7 +570,10 @@ fn disable(
         vcpu.intercept_msrs(activation.window, crate::intercepted())?;
         soil = soil.union(CleanBits::PERMISSION_MAPS);
     }
-    sync_into_model(activation, vlapic)?;
+    if standing.life.carried() {
+        sync_into_model(activation, vlapic)?;
+        activation.rebuilt_at[vlapic.index().get()].store(standing.epoch, Ordering::Relaxed);
+    }
     let control = vcpu.control_mut();
     control.interrupt_control = control
         .interrupt_control
@@ -539,6 +608,12 @@ fn disable(
 /// before either is written for the same reason [`enable`] examines its own: a
 /// block found illegal here is left in the face it was already in, which the
 /// processor has been entering all along.
+///
+/// The reset count is deliberately not recorded here, which is what leaves a
+/// stale page still stale: a face change is not a rebuild, so a model reset the
+/// page has not caught up with is one the next entry's steady arm sees and
+/// answers. Recording the count would be this arm claiming a rebuild it did not
+/// perform.
 fn switch(
     activation: &Activation,
     vcpu: &mut Vcpu,
@@ -709,15 +784,31 @@ pub(crate) fn request(vector: Vector) -> Result<bool, VlapicError> {
 /// software-disabled controller takes nothing, and this is where that is
 /// decided.
 ///
+/// # Whether the page may hold anything at all is the caller's question
+///
+/// Nothing here asks whether the acceleration is *permitted*, and that is the
+/// point. A page goes on holding requests for as long as the control block's
+/// own enable bit is set, which outlives the permission by exactly one entry: a
+/// machine-wide demotion is a store any processor may make, while the processor
+/// whose page it is may be parked and reach no entry until this answers yes.
+/// Refusing on the strength of the permission would leave the only copy of a
+/// vector in a page its own processor had stopped consulting, with the kick
+/// that announced it already spent — and the page is harvested into the model
+/// at an entry, which is the very thing that would then never happen.
+///
+/// So the caller asks the control block instead, and what is asked here is only
+/// the architecture's comparison. The entry that answer produces settles the
+/// page one way or another: while the enable bit is set the transition either
+/// leaves the hardware driving the page or takes its state into the model, and
+/// once the bit is clear the caller stops asking — so a request cannot make
+/// this answer yes forever with nothing draining it.
+///
 /// # Errors
 ///
 /// As [`crate::read_msr`].
 pub(crate) fn deliverable() -> Result<bool, VlapicError> {
     let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
     let vlapic = current()?;
-    if !active_for(vlapic) {
-        return Ok(false);
-    }
     let page = activation.page(vlapic.index().get())?;
     let spurious = activation
         .word(page, Register::SPURIOUS.offset())?
@@ -1099,27 +1190,62 @@ impl Activation {
 /// The mode is taken once and threaded into the projection, because the shape
 /// of two of those registers is the face's and a page built from two loads of
 /// it would be a page in neither face.
-fn rebuild_backing(vlapic: &Vlapic) -> Result<(), VlapicError> {
-    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
+///
+/// # Slot by slot, because the frame has other writers
+///
+/// A whole-page copy over this frame is the one operation that cannot be made
+/// correct here, whatever it is entered with: another processor's hardware sets
+/// a request bit in this page whenever its guest sends an interrupt to this
+/// one, and this processor's own interrupt handler does the same for a device
+/// arrival taken in the host window — the window between the exit that made the
+/// controller eligible and this entry, in which host interrupts are enabled
+/// throughout. Both writers would be erased, and the second one costs more than
+/// the interrupt: an arrival whose real acknowledgement is being withheld
+/// records the debt for it before it publishes the request, so erasing the
+/// request leaves a debt with nothing left that could ever discharge it.
+///
+/// So the image is written through one atomic per register slot, and the
+/// request bank is reconciled rather than overwritten — see
+/// [`ResetImage::publish`], which is where what becomes of each displaced bit
+/// is decided.
+fn rebuild_backing(
+    activation: &Activation,
+    vlapic: &Vlapic,
+    standing: Standing,
+) -> Result<(), VlapicError> {
     let page = activation.page(vlapic.index().get())?;
     let mut image = ResetImage::new(vlapic.apic_id(), vlapic.version());
     Projection::of(vlapic, vlapic.mode()).overlay(&mut image);
-    // SAFETY: the frame is this processor's backing page, host RAM out of the
-    // reserved chunk rather than a device aperture, and nothing holds a Rust
-    // reference into it: every access this crate makes to it is one of the
-    // atomics `Activation::word` forms, and every other access is a processor's
-    // own. The guest is not running — this is an entry boundary — so the one
-    // concurrent writer left is another processor's hardware setting a request
-    // bit, which this copy is not ordered against and which
-    // [`DirectMap::write`] admits to answering as a non-atomic copy would.
-    unsafe { activation.window.write(page, image.bytes())? };
+    let local = apic::local().ok();
+    image.publish(
+        standing.life,
+        |offset| activation.word(page, offset),
+        |vector| {
+            // A request bit the page held that this life's model does not is one
+            // the guest it was meant for never took, and that guest has stopped
+            // existing. Real hardware may still be holding the vector in service
+            // on its behalf, and a debt whose request has just been deleted is
+            // one nothing can ever discharge — the acknowledgement it waits for
+            // is the guest's, for an interrupt this bit was the only record of.
+            // So it is written off here rather than left waiting.
+            //
+            // Only a debt this ledger really has. Writing one off that does not
+            // exist would report a debt the machine is not holding, and on a
+            // controller that retires by name it would stop a line the guest is
+            // still using from being accepted at all.
+            if vlapic.ledger().owes(vector) {
+                vlapic.ledger().abandon(vector, &local);
+            }
+        },
+    )?;
+    activation.rebuilt_at[vlapic.index().get()].store(standing.epoch, Ordering::Relaxed);
     mirror_logical(vlapic)?;
     Ok(())
 }
 
 /// Carries the hardware's state back into the model.
 ///
-/// The direction a deactivation goes: the projection is read back out of the
+/// The direction a deactivation goes: the projection is taken back out of the
 /// page and the model takes what the hardware moved while it drove — the task
 /// priority the guest set without exiting, the command it sent, and whatever
 /// the hardware accepted, took into service and recorded as level, so that
@@ -1127,12 +1253,15 @@ fn rebuild_backing(vlapic: &Vlapic) -> Result<(), VlapicError> {
 /// Which registers those are, and which of them the page merely holds a copy
 /// of, is [`Projection::into_model`]'s.
 ///
-/// Runs at an exit boundary with the guest stopped, so the loads need no
-/// ordering stronger than the exit's own serialization.
+/// Runs at an *entry* boundary, because that is where a transition is
+/// performed: this processor's guest is stopped and its own hardware is reading
+/// nothing. What is not stopped is a peer whose control block still has the
+/// acceleration armed, which goes on setting request bits in this page until
+/// its own next entry — so the three banks are taken with a swap apiece rather
+/// than read, and [`Projection::take`] is where that is argued.
 fn sync_into_model(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
     let page = activation.page(vlapic.index().get())?;
-    Projection::read(|offset| Ok(activation.word(page, offset)?.load(Ordering::Relaxed)))?
-        .into_model(vlapic);
+    Projection::take(|offset| activation.word(page, offset))?.into_model(vlapic);
     Ok(())
 }
 
@@ -1329,13 +1458,17 @@ const fn bank_offset(bank: Register, vector: Vector) -> u32 {
 mod tests {
     //! The decisions here that need no machine: which face the acceleration
     //! drives a controller in, how far it reaches in each, which vector an EOI
-    //! retired, which logical destinations name a table entry, and which move
-    //! an entry owes the acceleration.
+    //! retired, which logical destinations name a table entry, which move an
+    //! entry owes the acceleration, and which life the page it holds belongs
+    //! to.
 
     use descriptors::Vector;
     use svm::avic::MAX_PHYSICAL_ID;
 
-    use super::{Face, Mode, Move, driven_face, eoi_vector, face_limit, logical_slot, move_for};
+    use super::{
+        Face, Life, Mode, Move, Standing, driven_face, eoi_vector, face_limit, logical_slot,
+        move_for,
+    };
 
     /// Every mode a controller can be in, which is the one term of the
     /// activation gate that is not a boolean.
@@ -1530,6 +1663,45 @@ mod tests {
         for provisioned in [0_u16, 1, 0x0FE] {
             assert_eq!(face_limit(Face::XAvic, provisioned), provisioned);
             assert_eq!(face_limit(Face::X2Avic, provisioned), provisioned);
+        }
+    }
+
+    #[test]
+    fn the_page_belongs_to_the_life_the_model_was_on_when_it_was_built() {
+        // The counts a real machine compares. A reset moves the count by two —
+        // it is odd for as long as the stores run — so an entry that finds the
+        // page built two behind is one reset late, and a guest that resets a
+        // processor and starts it again reaches the next transition four behind.
+        // A page built before either reset is no less dead for the second one.
+        assert_eq!(Standing::of(4, 4).life, Life::Same);
+        assert_eq!(Standing::of(4, 6).life, Life::Ended);
+        assert_eq!(Standing::of(4, 8).life, Life::Ended);
+        // The first activation every processor makes: the page holds the image
+        // provisioning wrote, and the model has been reset — and on one processor
+        // seeded from firmware's own registers — since.
+        assert_eq!(Standing::of(0, 2).life, Life::Ended);
+        // What the transition then records is the count it decided against and not
+        // a second reading of it: anything else would leave the next entry judging
+        // the page against a life no transition ever saw.
+        assert_eq!(Standing::of(4, 6).epoch, 6);
+    }
+
+    #[test]
+    fn the_page_is_carried_into_the_model_only_where_the_life_continues() {
+        // The decision the carry-back is gated on. Both arms a reset is followed
+        // by consult it: the steady one, where the model was cleared and the face
+        // survived, and the deactivation, where the guest cleared the face as
+        // well — and the harm the two prevent is the same, a model given back the
+        // task priority, the in-service bank and the requests its reset had just
+        // been required to clear.
+        for (built, now) in [(0_u64, 2_u64), (4, 6), (4, 8), (2, u64::MAX)] {
+            assert!(
+                !Standing::of(built, now).life.carried(),
+                "built at {built}, now {now}"
+            );
+        }
+        for count in [0_u64, 2, 4, u64::MAX] {
+            assert!(Standing::of(count, count).life.carried(), "{count}");
         }
     }
 }

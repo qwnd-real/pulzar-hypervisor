@@ -37,8 +37,25 @@
 //! hardware exits for is one the model was told about at that exit, so the
 //! page's copy is a copy of a value the model already has. What is carried back
 //! is what moves in the page with no exit at all.
+//!
+//! # Neither direction may treat the page as bytes
+//!
+//! A backing page has writers other than the processor performing the
+//! transition, and they do not stop for it. Another processor's hardware sets a
+//! request bit in this page whenever its guest sends an interrupt here, and
+//! this processor's own interrupt handler does the same for an arrival taken in
+//! the host window — so a whole-page copy over the frame loses whatever landed
+//! while it ran, and a single pass of loads over it misses whatever lands
+//! behind the read. Both directions therefore go through one atomic per
+//! register slot: [`ResetImage::publish`] stores every slot and reconciles the
+//! request bank rather than overwriting it, and [`Projection::take`] takes each
+//! bank word with a swap so a set that races it is either included in the value
+//! taken or lands after it, never in neither.
 
-use core::array::from_fn;
+use core::{
+    array::from_fn,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use apic::REGISTER_STRIDE;
 use cpu::ApicId;
@@ -46,7 +63,7 @@ use descriptors::Vector;
 
 use crate::{
     VlapicError,
-    face::table::{PAGE, Register},
+    face::table::{Bank, PAGE, Register},
     registers::{
         FLAT_DESTINATION_FORMAT, SPURIOUS_RESET, Vlapic, base::Mode, bitmap::SLOTS, icr::Command,
         lvt::Entry, xapic_word,
@@ -82,8 +99,72 @@ impl ResetImage {
     }
 
     /// The page's bytes, in the order the hardware reads them.
+    ///
+    /// What provisioning writes into a freshly allocated frame, before anything
+    /// on the machine can reach it. A page a guest has already been driven
+    /// through is written by [`ResetImage::publish`] instead, because by then
+    /// the frame has other writers.
     pub(super) fn bytes(&self) -> &[u8; paging::as_usize(PAGE)] {
         &self.0
+    }
+
+    /// Writes the image into a live backing page, one register slot at a time.
+    ///
+    /// `slot` answers with the page's word at an offset, and the first offset
+    /// it cannot reach fails the whole publication — every slot of one page
+    /// is reached the same way, so a failure names the frame rather than
+    /// the slot.
+    ///
+    /// Every slot of the page is written, including the ones no register sits
+    /// at: which of them a life just ended could have left something in is
+    /// not a question this has to answer, and the reset image holds what
+    /// each of them reads back.
+    ///
+    /// The interrupt-request bank is the exception, because it is the one bank
+    /// another processor's hardware and this processor's own interrupt handler
+    /// write without the model hearing about it. What becomes of a bit they
+    /// left there is `life`'s answer: a page whose guest is still the one
+    /// the model describes keeps it, so the bank becomes the union of the
+    /// two and nothing is lost; a page whose guest has stopped existing
+    /// keeps nothing, and every bit the model does not have is handed to
+    /// `displaced` rather than dropped silently.
+    pub(super) fn publish<'page>(
+        &self,
+        life: Life,
+        mut slot: impl FnMut(u32) -> Result<&'page AtomicU32, VlapicError>,
+        mut displaced: impl FnMut(Vector),
+    ) -> Result<(), VlapicError> {
+        for (offset, word) in self.slots() {
+            let page = slot(offset)?;
+            match (requests(offset), life) {
+                // Every register but the request bank has one writer while the
+                // guest is stopped, and it is this processor performing the
+                // transition.
+                (None, _) => page.store(word, Ordering::Release),
+                (Some(_), Life::Same) => {
+                    page.fetch_or(word, Ordering::AcqRel);
+                }
+                (Some(bank_slot), Life::Ended) => {
+                    let mut lost = page.swap(word, Ordering::AcqRel) & !word;
+                    while lost != 0 {
+                        let bit = lost.trailing_zeros();
+                        lost &= !(1 << bit);
+                        displaced(vector_at(bank_slot, bit));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every register slot of the image, as the offset the architecture puts it
+    /// at and the word the image holds there.
+    fn slots(&self) -> impl Iterator<Item = (u32, u32)> {
+        let (words, _) = self.0.as_chunks::<{ size_of::<u32>() }>();
+        (0..)
+            .step_by(REGISTER_STRIDE as usize)
+            .zip(words.iter().step_by(SLOT_WORDS))
+            .map(|(offset, word)| (offset, u32::from_le_bytes(*word)))
     }
 
     /// Stores `value` in the slot the architecture assigns to `register`.
@@ -104,11 +185,78 @@ impl ResetImage {
     }
 }
 
+/// Whose state a backing page holds, at the moment it is about to be rebuilt or
+/// carried back.
+///
+/// The reset count answers it, and the answer is what every lifecycle boundary
+/// turns on: a controller whose model has been reset since its page was built
+/// is a page describing a guest that has stopped existing, and the architecture
+/// requires that reset to clear exactly the state such a page still holds — the
+/// task priority, the interrupts the guest was servicing, and the requests it
+/// never took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Life {
+    /// The same guest's. Whatever the page gained since the model was last
+    /// taken out of it is that guest's own.
+    Same,
+    /// A guest that has stopped existing. Nothing the page holds belongs to the
+    /// life that follows it.
+    Ended,
+}
+
+impl Life {
+    /// Whether what the page holds may be carried into the model.
+    ///
+    /// Only where the model is the one the page was built from. Carrying a
+    /// deactivation's page into a model a reset has just cleared would put back
+    /// exactly what the reset removed: a task priority the new guest never set,
+    /// an in-service bit nothing will ever acknowledge — which imposes a
+    /// processor-priority floor for as long as that guest lives — and a request
+    /// belonging to an operating system that has stopped existing.
+    pub(super) const fn carried(self) -> bool {
+        matches!(self, Self::Same)
+    }
+}
+
+/// Which slot of the interrupt-request bank a page offset names, or nothing for
+/// an offset in any other register.
+///
+/// Asked of the register table rather than computed here, because where the
+/// three banks are is that table's one statement of it: a second one would be
+/// how a rebuild comes to treat a bank word as an ordinary register.
+fn requests(offset: u32) -> Option<usize> {
+    match bank_at(offset) {
+        Some((Bank::InterruptRequest, slot)) => Some(slot),
+        Some((Bank::InService | Bank::TriggerMode, _)) | None => None,
+    }
+}
+
+/// Which of the three banks a page offset is a slot of, and which slot, if it
+/// is in one at all.
+fn bank_at(offset: u32) -> Option<(Bank, usize)> {
+    Register::at(u64::from(offset))?.bank()
+}
+
+/// The vector a bank slot's bit stands for.
+///
+/// Eight slots of thirty-two bits is exactly the vector space, so a slot inside
+/// a bank and a bit inside a word name nothing outside it.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "eight slots of thirty-two bits is exactly the vector space"
+)]
+const fn vector_at(slot: usize, bit: u32) -> Vector {
+    Vector::new((slot as u32 * u32::BITS + bit) as u8)
+}
+
+/// How many thirty-two-bit words one register slot of the page is long.
+const SLOT_WORDS: usize = REGISTER_STRIDE as usize / size_of::<u32>();
+
 /// Every register a controller's backing page and its software model both hold.
 ///
 /// The state that has to cross a lifecycle boundary, as a value rather than as
 /// a sequence of stores: [`Projection::of`] takes one out of the model,
-/// [`Projection::overlay`] writes it over a reset image, [`Projection::read`]
+/// [`Projection::overlay`] writes it over a reset image, [`Projection::take`]
 /// takes one back out of a page, and [`Projection::into_model`] hands the model
 /// what the hardware moved while it drove.
 ///
@@ -193,20 +341,38 @@ impl Projection {
         self.walk(|offset, word| image.store(offset, *word));
     }
 
-    /// Takes a projection back out of a page, slot by slot.
+    /// Takes a projection out of a page, emptying the three banks as it goes.
     ///
-    /// `word` answers with the page's value at an offset. A slot that cannot be
+    /// `slot` answers with the page's word at an offset. A slot that cannot be
     /// reached fails the whole read, and the first failure is the one reported:
     /// every slot of one page is reached the same way, so the walk finishes
     /// rather than being abandoned and what it costs is a few instructions on a
-    /// path that is already reporting an error.
-    pub(super) fn read(
-        mut word: impl FnMut(u32) -> Result<u32, VlapicError>,
+    /// path that is already reporting an error. Nothing is taken out of a page
+    /// the walk could not reach either, because the failure is the frame's and
+    /// the first slot meets it.
+    ///
+    /// The three banks are *taken* rather than read, with one swap per word,
+    /// and that is what makes this safe to run against a page another
+    /// processor is still writing: a peer whose own control block has the
+    /// acceleration armed goes on setting request bits here until its next
+    /// entry, and a set that races the swap is either included in the value
+    /// taken or lands in a word this has already emptied. It is never in
+    /// neither. Emptying them is also what leaves the page holding nothing
+    /// of this life for the activation that next rebuilds it to have to
+    /// reconcile.
+    pub(super) fn take<'page>(
+        mut slot: impl FnMut(u32) -> Result<&'page AtomicU32, VlapicError>,
     ) -> Result<Self, VlapicError> {
         let mut projection = Self::default();
         let mut failure = None;
-        projection.walk(|offset, slot| match word(offset) {
-            Ok(value) => *slot = value,
+        projection.walk(|offset, word| match slot(offset) {
+            Ok(page) => {
+                *word = if bank_at(offset).is_some() {
+                    page.swap(0, Ordering::AcqRel)
+                } else {
+                    page.load(Ordering::Acquire)
+                };
+            }
             Err(error) => failure = failure.or(Some(error)),
         });
         failure.map_or(Ok(projection), Err)
@@ -232,6 +398,21 @@ impl Projection {
     /// instead of storing it, so a page written in that face holds a word the
     /// model must not be given — the older face's own register would come back
     /// holding a cluster mask it never wrote.
+    ///
+    /// # The three banks are added to what the model holds, not put in its place
+    ///
+    /// Which is what the three `force_*` operations do, and it is deliberate
+    /// rather than an oversight. An interrupt that arrived on the software path
+    /// between the exit which ended the acceleration and the entry that runs
+    /// this is in the model alone — nothing put it in the page, because by
+    /// then nothing was driving the page — so a carry-back that replaced
+    /// the model's banks would delete it.
+    ///
+    /// What makes the union safe rather than merely convenient is that the
+    /// other side of it holds nothing stale by the time this runs.
+    /// [`Projection::take`] empties the page's banks as it takes them, so
+    /// no bit is carried twice; and a page whose guest has stopped existing
+    /// is not carried at all, so the union can never be of two lives.
     pub(super) fn into_model(self, vlapic: &Vlapic) {
         vlapic.set_task_priority(self.task_priority);
         // The whole register out of the two halves the page keeps it in, and
@@ -245,13 +426,16 @@ impl Projection {
             .zip(self.trigger_mode)
             .zip(self.request);
         for (slot, ((in_service, trigger_mode), request)) in banks.enumerate() {
+            // Usually all three, and a slot with nothing in it has the same
+            // answer for all thirty-two of its vectors: a deactivation that
+            // asked each of them separately would make two hundred and
+            // fifty-six decisions to reach it.
+            if in_service | trigger_mode | request == 0 {
+                continue;
+            }
             for bit in 0..u32::BITS {
                 let mask = 1 << bit;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "eight slots of thirty-two bits is exactly the vector space"
-                )]
-                let vector = Vector::new((slot as u32 * u32::BITS + bit) as u8);
+                let vector = vector_at(slot, bit);
                 if trigger_mode & mask != 0 {
                     vlapic.force_trigger_mode(vector);
                 }
@@ -357,7 +541,7 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    //! Two things, matching the two the module holds.
+    //! Three things, matching the three the module holds.
     //!
     //! The image is what the hardware answers a guest's read with, and the
     //! model's reset is what the emulator answers the same read with, so the
@@ -370,13 +554,24 @@ mod tests {
     //! puts in each of those slots is not reachable from here — the fields are
     //! filled through the walk instead, which is what makes every test below
     //! cover a register added to the projection without naming it again.
+    //!
+    //! And both page directions are asserted to lose nothing to a writer they
+    //! cannot exclude. A page here is an array of atomics, which is exactly
+    //! what the two directions reach a real one as, so a test can be the
+    //! concurrent writer: the closure that answers with a slot is where a
+    //! peer's hardware ORs a request bit in, mid-walk, and what must not
+    //! happen is a bit that ends up in neither the page nor the answer.
 
     use alloc::vec::Vec;
+    use core::{array::from_fn, sync::atomic::AtomicU32};
 
     use apic::REGISTER_STRIDE;
     use cpu::ApicId;
 
-    use super::{EXTENDED_LVT_FIRST, EXTENDED_LVT_SLOTS, Projection, ResetImage, SLOTS};
+    use super::{
+        EXTENDED_LVT_FIRST, EXTENDED_LVT_SLOTS, Life, Ordering, PAGE, Projection, ResetImage,
+        SLOTS, VlapicError,
+    };
     use crate::{
         face::table::Register,
         registers::{FLAT_DESTINATION_FORMAT, SPURIOUS_RESET, lvt::Entry, xapic_word},
@@ -388,6 +583,39 @@ mod tests {
     const ID: ApicId = ApicId::new(4);
     const VERSION: u32 = 0x0050_0010;
 
+    /// How many register slots one page holds.
+    const SLOT_COUNT: usize = paging::as_usize(PAGE) / REGISTER_STRIDE as usize;
+
+    /// A backing page, as the words both directions move through it.
+    ///
+    /// One atomic per register slot rather than per word of the page: neither
+    /// direction reaches the twelve bytes the architecture leaves undefined
+    /// above each register.
+    type Page = [AtomicU32; SLOT_COUNT];
+
+    /// A page with `word` in every slot.
+    fn filled(word: u32) -> Page {
+        from_fn(|_| AtomicU32::new(word))
+    }
+
+    /// The slot a page offset names.
+    fn slot(page: &Page, offset: u32) -> Result<&AtomicU32, VlapicError> {
+        page.get(offset as usize / REGISTER_STRIDE as usize)
+            .ok_or(VlapicError::NoLapic)
+    }
+
+    /// The word the page holds at `offset`.
+    fn holds(page: &Page, offset: u32) -> u32 {
+        slot(page, offset)
+            .expect("an offset inside the page names a slot")
+            .load(Ordering::Relaxed)
+    }
+
+    /// The offset of one slot of the interrupt-request bank.
+    fn request_slot(slot: u32) -> u32 {
+        Register::INTERRUPT_REQUEST.offset() + slot * REGISTER_STRIDE
+    }
+
     /// The word at `offset`.
     fn word_at(image: &ResetImage, offset: u32) -> u32 {
         let offset = offset as usize;
@@ -397,6 +625,13 @@ mod tests {
     /// The word at `register`'s slot.
     fn word(image: &ResetImage, register: Register) -> u32 {
         word_at(image, register.offset())
+    }
+
+    /// The image a controller whose guest has lived a while is published from.
+    fn image() -> ResetImage {
+        let mut image = ResetImage::new(ID, VERSION);
+        distinct().overlay(&mut image);
+        image
     }
 
     /// A projection with a different value in every slot it carries, so that a
@@ -540,15 +775,17 @@ mod tests {
     fn a_projection_read_back_out_of_a_page_is_the_one_that_was_written() {
         // The whole of what makes the two directions inverses of each other, and
         // the reason the set is one list: a distinct value in every slot,
-        // written over a reset image and taken back out of it. A field carried
-        // one way and not the other, or written to another field's slot, comes
-        // back as something else.
+        // published into a page and taken back out of it. A field carried one way
+        // and not the other, or written to another field's slot, comes back as
+        // something else.
         let projection = distinct();
-        let mut image = ResetImage::new(ID, VERSION);
-        projection.overlay(&mut image);
-        let read = Projection::read(|offset| Ok(word_at(&image, offset)))
-            .expect("a page-shaped buffer answers at every offset the projection names");
-        assert_eq!(read, projection);
+        let page = filled(0);
+        image()
+            .publish(Life::Ended, |offset| slot(&page, offset), |_| ())
+            .expect("a page-shaped buffer answers at every offset");
+        let taken = Projection::take(|offset| slot(&page, offset))
+            .expect("a page-shaped buffer answers at every offset");
+        assert_eq!(taken, projection);
     }
 
     #[test]
@@ -594,5 +831,191 @@ mod tests {
         };
         wider.overlay(&mut image);
         assert_eq!(word(&image, Register::ID), ID.get());
+    }
+
+    #[test]
+    fn publishing_an_image_reaches_every_slot_of_the_page() {
+        // What the whole-page copy this replaces gave for nothing: a page whose
+        // previous life left something in a slot neither the image nor the
+        // projection names — the processor priority the hardware recomputes above
+        // all — is a page a guest reads that value back out of. So every slot is
+        // written, and the sentinel is what a slot this misses would still hold.
+        let page = filled(0xDEAD_BEEF);
+        image()
+            .publish(Life::Ended, |offset| slot(&page, offset), |_| ())
+            .expect("a page-shaped buffer answers at every offset");
+        for offset in (0..).step_by(REGISTER_STRIDE as usize).take(SLOT_COUNT) {
+            assert_eq!(
+                holds(&page, offset),
+                word_at(&image(), offset),
+                "{offset:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_the_page_gained_survives_a_rebuild_of_the_same_life() {
+        // The interleaving the byte copy lost: a peer's hardware, or this
+        // processor's own interrupt handler in the host window, sets a request bit
+        // after the image has been composed and before the page is written. The
+        // guest it belongs to is the one the page is being rebuilt for, so the
+        // bank becomes the union of the two and the hardware delivers it.
+        let page = filled(0);
+        let image = image();
+        let arrival = 1 << 5;
+        slot(&page, request_slot(2))
+            .expect("a bank slot is inside the page")
+            .fetch_or(arrival, Ordering::Relaxed);
+        let mut displaced = Vec::new();
+        image
+            .publish(
+                Life::Same,
+                |offset| slot(&page, offset),
+                |vector| displaced.push(vector),
+            )
+            .expect("a page-shaped buffer answers at every offset");
+        assert_eq!(
+            holds(&page, request_slot(2)),
+            word_at(&image, request_slot(2)) | arrival
+        );
+        assert!(
+            displaced.is_empty(),
+            "nothing was displaced, so nothing is owed an answer"
+        );
+    }
+
+    #[test]
+    fn a_request_bit_lands_in_a_slot_the_walk_has_not_reached_yet() {
+        // The same interleaving, one step tighter: the arrival lands *during* the
+        // publication, in a slot it has yet to write. A store would erase it; the
+        // union cannot, whichever side of the walk it falls on.
+        let page = filled(0);
+        let image = image();
+        let arrival = 1 << 9;
+        let mut arrived = false;
+        image
+            .publish(
+                Life::Same,
+                |offset| {
+                    if !arrived && offset == request_slot(0) {
+                        arrived = true;
+                        slot(&page, request_slot(7))?.fetch_or(arrival, Ordering::Relaxed);
+                    }
+                    slot(&page, offset)
+                },
+                |_| (),
+            )
+            .expect("a page-shaped buffer answers at every offset");
+        assert!(arrived, "the walk reached the request bank");
+        assert_eq!(
+            holds(&page, request_slot(7)) & arrival,
+            arrival,
+            "a request that raced the walk is still in the page"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_for_a_life_that_ended_reports_every_request_it_deletes() {
+        // The invariant a deleted request bit would otherwise break: real hardware
+        // may be holding that vector in service for the guest, and the debt for it
+        // is discharged by the guest acknowledging the interrupt this bit is the
+        // only record of. So no bit may vanish without being handed back — and the
+        // ones the model itself carries are not deletions at all.
+        let page = filled(0);
+        let image = image();
+        for bank in 0..u32::try_from(SLOTS).expect("eight slots") {
+            slot(&page, request_slot(bank))
+                .expect("a bank slot is inside the page")
+                .store(!0, Ordering::Relaxed);
+        }
+        let mut displaced = Vec::new();
+        image
+            .publish(
+                Life::Ended,
+                |offset| slot(&page, offset),
+                |vector| displaced.push(vector),
+            )
+            .expect("a page-shaped buffer answers at every offset");
+        for bank in 0..u32::try_from(SLOTS).expect("eight slots") {
+            let carried = word_at(&image, request_slot(bank));
+            assert_eq!(
+                holds(&page, request_slot(bank)),
+                carried,
+                "the page holds what the model holds and nothing else"
+            );
+            for bit in 0..u32::BITS {
+                let vector = super::vector_at(usize::try_from(bank).expect("eight slots"), bit);
+                assert_eq!(
+                    displaced.contains(&vector),
+                    carried & (1 << bit) == 0,
+                    "{vector} was set in the page"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_harvest_takes_the_banks_and_loses_nothing_that_lands_behind_it() {
+        // A single pass of loads misses a request bit set behind the read, which
+        // is then in neither the model nor a page anything will consult again. The
+        // swap makes both outcomes safe: the bit is in the value taken, or it is
+        // in the word the swap has already emptied — and the assertion is that it
+        // is in one of them.
+        let page = filled(0);
+        let arrival = 1 << 11;
+        let mut arrived = false;
+        let taken = Projection::take(|offset| {
+            if !arrived && offset == request_slot(0) {
+                arrived = true;
+                slot(&page, request_slot(4))?.fetch_or(arrival, Ordering::Relaxed);
+            }
+            slot(&page, offset)
+        })
+        .expect("a page-shaped buffer answers at every offset");
+        assert!(arrived, "the walk reached the request bank");
+        assert_eq!(
+            taken.request[4], arrival,
+            "the bit was taken rather than read past"
+        );
+        // And the banks are left empty, which is what makes the activation that
+        // next rebuilds this page able to add the model's bits to what it finds
+        // rather than having to tell two lives apart.
+        for bank in 0..u32::try_from(SLOTS).expect("eight slots") {
+            for first in [
+                Register::IN_SERVICE,
+                Register::TRIGGER_MODE,
+                Register::INTERRUPT_REQUEST,
+            ] {
+                let offset = first.offset() + bank * REGISTER_STRIDE;
+                assert_eq!(holds(&page, offset), 0, "{offset:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_harvest_leaves_the_registers_that_are_not_banks_where_they_are() {
+        // Only the banks are taken. A register the page holds a copy of is a
+        // register the model may be asked for again — the task priority above all,
+        // which the steady state carries back on every entry — and emptying its
+        // slot would answer a guest's read out of a zero.
+        let page = filled(0);
+        image()
+            .publish(Life::Ended, |offset| slot(&page, offset), |_| ())
+            .expect("a page-shaped buffer answers at every offset");
+        let before = holds(&page, Register::TASK_PRIORITY.offset());
+        let taken = Projection::take(|offset| slot(&page, offset))
+            .expect("a page-shaped buffer answers at every offset");
+        assert_eq!(taken.task_priority, before);
+        assert_eq!(holds(&page, Register::TASK_PRIORITY.offset()), before);
+        assert_eq!(holds(&page, Register::SPURIOUS.offset()), taken.spurious);
+    }
+
+    #[test]
+    fn only_the_life_that_continues_is_carried_into_the_model() {
+        // The decision a deactivation makes, as a value: the page belongs to the
+        // model it was built from, and a reset under an active controller replaces
+        // that model with one the architecture has just required to be empty.
+        assert!(Life::Same.carried());
+        assert!(!Life::Ended.carried());
     }
 }

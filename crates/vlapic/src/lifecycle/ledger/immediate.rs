@@ -229,6 +229,15 @@ impl Immediate {
             blockings: self.blockings.load(Ordering::Relaxed),
         }
     }
+
+    /// Whether real hardware is holding `vector` and an acknowledgement for it
+    /// is still expected.
+    ///
+    /// A blocked vector is not one: it has already been retired, so there is
+    /// nothing left to settle and nothing a deleted request could strand.
+    pub(crate) fn owes(&self, vector: Vector) -> bool {
+        self.owed.get(vector)
+    }
 }
 
 /// What real hardware is holding for one guest on this kind of controller, and
