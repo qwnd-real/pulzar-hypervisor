@@ -46,7 +46,7 @@ use crate::registers::{
 /// A shorthand answers without looking at the destination field at all, which
 /// is the architecture's rule and not a shortcut: the destination *mode* is
 /// ignored too whenever one is used.
-pub(super) fn targets<'a>(
+pub(crate) fn targets<'a>(
     from: &Vlapic,
     lapics: &'a [Vlapic],
     command: Command,

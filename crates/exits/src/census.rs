@@ -16,7 +16,7 @@
 //! can.
 
 use log::info;
-use svm::ExitCode;
+use svm::{ExitCode, avic::IpiFailure};
 use vcpu::Vcpu;
 
 /// One processor's exit counts since the last summary.
@@ -35,6 +35,20 @@ pub(crate) struct Census {
     sparse: [(ExitCode, u32); Self::SPARSE],
     /// How many of [`Census::sparse`] are in use.
     sparse_used: usize,
+    /// Incomplete inter-processor deliveries, indexed by the failure the
+    /// hardware reported: the two exits the acceleration raises deserve a
+    /// finer account than their code alone, because it is the cause that
+    /// says whether the machine is healthy.
+    incomplete_ipi: [u32; Self::IPI_FAILURES],
+    /// Unaccelerated register accesses, indexed by the slot of the register
+    /// page they named: which register a guest cannot touch accelerated is
+    /// the question this half answers.
+    noaccel: [u32; Self::NOACCEL_SLOTS],
+    /// Hardware doorbells rung since the last summary, as the vlapic crate
+    /// counts them cumulatively.
+    last_doorbells: u64,
+    /// Host-interrupt kicks sent since the last summary, likewise.
+    last_kicks: u64,
     /// Exits counted since the last summary.
     counted: u64,
     /// Exits counted since this processor entered its guest.
@@ -59,12 +73,23 @@ impl Census {
     /// stuck repeats one or two; the rest of the distribution is noise.
     const NAMED: usize = 6;
 
+    /// How many failures an incomplete delivery can report.
+    const IPI_FAILURES: usize = 6;
+
+    /// How many register slots the unaccelerated counts distinguish: the
+    /// page's offset shifted past its four zero bits.
+    const NOACCEL_SLOTS: usize = 256;
+
     /// A census that has counted nothing.
     pub(crate) const fn new() -> Self {
         Self {
             dense: [0; Self::DENSE],
             sparse: [(ExitCode::INVALID, 0); Self::SPARSE],
             sparse_used: 0,
+            incomplete_ipi: [0; Self::IPI_FAILURES],
+            noaccel: [0; Self::NOACCEL_SLOTS],
+            last_doorbells: 0,
+            last_kicks: 0,
             counted: 0,
             lifetime: 0,
         }
@@ -110,6 +135,23 @@ impl Census {
         }
     }
 
+    /// Counts an incomplete inter-processor delivery by the failure the
+    /// hardware reported.
+    pub(crate) fn incomplete_ipi(&mut self, cause: IpiFailure) {
+        let index = cause.into_bits() as usize;
+        if let Some(count) = self.incomplete_ipi.get_mut(index) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// Counts an unaccelerated register access by the slot it named.
+    pub(crate) fn noaccel(&mut self, offset: u16) {
+        let index = usize::from(offset >> 4);
+        if let Some(count) = self.noaccel.get_mut(index) {
+            *count = count.saturating_add(1);
+        }
+    }
+
     /// Writes one summary and starts counting afresh.
     ///
     /// The lifetime total is not reset: it is what says whether a processor
@@ -130,8 +172,40 @@ impl Census {
             }
             self.clear(code);
         }
+        // The acceleration's own account, which the exit codes cannot give:
+        // why deliveries between the guest's processors stopped, which
+        // registers it still touches by hand, and how the running targets
+        // were woken — the measure of whether the acceleration is doing its
+        // job.
+        for (id, count) in self.incomplete_ipi.iter().enumerate() {
+            if *count > 0 {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the index came from an array the failure count fits in"
+                )]
+                let cause = IpiFailure::from_bits(id as u32);
+                info!("exits:   {count} incomplete IPI, cause {cause:?}");
+            }
+        }
+        for (slot, count) in self.noaccel.iter().enumerate() {
+            if *count > 0 {
+                info!(
+                    "exits:   {count} unaccelerated accesses at offset {:#x}",
+                    slot << 4
+                );
+            }
+        }
+        let doorbells = vlapic::avic_doorbells().wrapping_sub(self.last_doorbells);
+        let kicks = vlapic::avic_kicks().wrapping_sub(self.last_kicks);
+        if doorbells > 0 || kicks > 0 {
+            info!("exits:   {doorbells} hardware doorbells rung, {kicks} host-interrupt kicks");
+        }
+        self.last_doorbells = vlapic::avic_doorbells();
+        self.last_kicks = vlapic::avic_kicks();
         self.dense.fill(0);
         self.sparse_used = 0;
+        self.incomplete_ipi.fill(0);
+        self.noaccel.fill(0);
         self.counted = 0;
     }
 

@@ -92,7 +92,7 @@ fn interposed(
 /// Said once. The shapes that reach here are ones a guest can execute in a
 /// loop, and a line per access through a serial port with interrupts masked
 /// would be a worse denial of service than the halt this replaces.
-fn unserviceable(
+pub(crate) fn unserviceable(
     vcpu: &mut Vcpu,
     partition: &Partition,
     gpa: PhysAddr,
@@ -128,7 +128,7 @@ static REPORTED: AtomicBool = AtomicBool::new(false);
 /// The instruction pointer is deliberately unchanged, so the handler returns to
 /// the instruction rather than past it, and whatever progress a repeated move
 /// made is already in the index and count registers.
-fn raise(vcpu: &mut Vcpu, fault: Fault, interrupts: &mut Pending) -> Flow {
+pub(crate) fn raise(vcpu: &mut Vcpu, fault: Fault, interrupts: &mut Pending) -> Flow {
     let vector = Vector::new(fault.vector());
     if let Some(address) = fault.address() {
         // What the handler reads to find out which address it has to describe. The

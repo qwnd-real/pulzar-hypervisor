@@ -11,7 +11,7 @@
 //! A hypervisor that implemented the behaviour twice would be one whose guest
 //! could tell which face it was using by the answers it got.
 
-mod dispatch;
+pub(crate) mod dispatch;
 pub(crate) mod table;
 
 pub(crate) mod mmio;

@@ -81,6 +81,7 @@ impl Vlapic {
             away: AtomicBool::new(false),
             nmi: AtomicU8::new(0),
             owned: AtomicBool::new(false),
+            avic_inhibited: AtomicBool::new(false),
             diagnostics: Diagnostics::new(),
             reported: AtomicU64::new(NOTHING_REPORTED),
         };
@@ -269,6 +270,11 @@ impl Vlapic {
         self.timer_initial.store(0, Ordering::Release);
         self.command.store(0, Ordering::Release);
         self.errors.reset();
+        // A reset is one of the two boundaries at which a demotion is
+        // reconsidered: whatever the hardware-driven path reported is state
+        // of the guest that was, and the guest that comes out of the reset
+        // is entitled to the acceleration.
+        self.avic_inhibited.store(false, Ordering::Release);
     }
 
     /// Publishes a set of stores as one step, as far as anything delivering
@@ -312,6 +318,41 @@ impl Vlapic {
             core::hint::spin_loop();
             None
         })
+    }
+
+    /// The reset count as it stands, for deciding whether something built
+    /// from this register file is stale.
+    ///
+    /// Read at an entry boundary by the processor the controller belongs to,
+    /// where a reset can only be one this processor performed at an exit
+    /// boundary — so the count cannot be moving as it is read.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Whether this controller has been demoted back to software delivery.
+    pub(crate) fn avic_inhibited(&self) -> bool {
+        self.avic_inhibited.load(Ordering::Acquire)
+    }
+
+    /// Demotes this controller back to software delivery.
+    ///
+    /// What an exit handler does when the hardware-driven path reports
+    /// something it cannot answer for: the control block's enable bit follows
+    /// at the next entry, and the guest keeps running on the software path
+    /// with no discontinuity it can see.
+    pub(crate) fn inhibit_avic(&self) {
+        self.avic_inhibited.store(true, Ordering::Release);
+    }
+
+    /// Allows the acceleration again, at a boundary that re-establishes the
+    /// reasons it was taken away.
+    ///
+    /// Called when the guest changes which face its controller answers
+    /// through: the demotion is a statement about the guest that was, and a
+    /// guest that walks its faces is entitled to have the decision remade.
+    pub(crate) fn permit_avic(&self) {
+        self.avic_inhibited.store(false, Ordering::Release);
     }
 }
 

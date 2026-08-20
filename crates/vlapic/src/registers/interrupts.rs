@@ -293,6 +293,33 @@ impl Vlapic {
     pub(crate) fn in_service_count(&self) -> u32 {
         self.in_service.count()
     }
+
+    /// Whether a vector is held in service.
+    pub(crate) fn holds_in_service(&self, vector: Vector) -> bool {
+        self.in_service.get(vector)
+    }
+
+    /// Sets a request bit wholesale, carrying state back into the model.
+    ///
+    /// One of the three used at a transition out of hardware-driven delivery,
+    /// where the backing page holds what the guest has been given and the
+    /// software path must continue from exactly there. No nomination follows
+    /// the stores, so the publish-and-retry dance of [`Vlapic::accept`] has
+    /// nothing to race: a reset under a transition is one the processor
+    /// performing the transition runs, at an exit boundary.
+    pub(crate) fn force_request(&self, vector: Vector) {
+        self.request.set(vector);
+    }
+
+    /// Sets an in-service bit wholesale; see [`Vlapic::force_request`].
+    pub(crate) fn force_in_service(&self, vector: Vector) {
+        self.in_service.set(vector);
+    }
+
+    /// Sets a trigger-mode bit wholesale; see [`Vlapic::force_request`].
+    pub(crate) fn force_trigger_mode(&self, vector: Vector) {
+        self.trigger_mode.set(vector);
+    }
 }
 
 /// What a controller has for its guest, decided from one look at its register

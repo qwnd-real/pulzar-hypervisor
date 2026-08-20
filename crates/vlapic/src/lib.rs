@@ -103,7 +103,13 @@ use descriptors::DescriptorError;
 use thiserror::Error;
 
 pub use crate::{
-    avic::{apic_page, backing_page, provision},
+    avic::{
+        active as avic_active, apic_page, backing_page, deliverable as avic_deliverable,
+        doorbells as avic_doorbells, incomplete_ipi as avic_incomplete_ipi, kicks as avic_kicks,
+        provision, publish_running as avic_publish_running, reconcile as avic_reconcile,
+        trap_access as avic_trap_access, unaccelerated_trap as avic_unaccelerated_trap,
+        unpublish_running as avic_unpublish_running, wake_targets as avic_wake_targets,
+    },
     face::{
         mmio::region,
         msr::{apic_enabled, claims, intercepted, read_msr, write_msr},

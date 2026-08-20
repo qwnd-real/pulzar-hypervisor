@@ -138,6 +138,14 @@ pub(crate) struct Vlapic {
     away: AtomicBool,
     nmi: AtomicU8,
     owned: AtomicBool,
+    /// Whether this controller has been demoted back to software delivery by
+    /// something the hardware-driven path reported.
+    ///
+    /// Set Release by whichever exit handler discovered the trouble, read
+    /// Acquire at every entry, where the control block's enable bit follows
+    /// it; a stale "not inhibited" read costs one more accelerated entry
+    /// before the demotion takes effect, and never more.
+    avic_inhibited: AtomicBool,
     /// What has happened to this controller and what it has already said about
     /// it. Diagnostic only: nothing above reads it back except the report that
     /// writes it and [`crate::describe`].

@@ -167,7 +167,7 @@ impl Device for Page {
         // happen.
         let value = match Access::of(register, vlapic.mode(), vlapic.model()) {
             Access::WriteOnly | Access::Absent => 0,
-            Access::ReadOnly | Access::ReadWrite => dispatch::read(vlapic, register),
+            Access::ReadOnly | Access::ReadWrite => register_value(vlapic, register),
         };
         trace!(
             "vlapic: cpu {} read its {:#05x} register through the page and got {:#010x}",
@@ -202,6 +202,16 @@ impl Device for Page {
             value,
             register.offset()
         );
+        // While the hardware drives the controller, the one register a guest
+        // writes without exiting lives in the backing page: a write that
+        // still reaches this face goes where the hardware reads it, and the
+        // model follows at whichever transition carries the state back.
+        if register == Register::TASK_PRIORITY
+            && crate::avic::activation::active_for(vlapic)
+            && crate::avic::activation::backing_write_task_priority(value).is_ok()
+        {
+            return Commit::Discard;
+        }
         dispatch::acted(vlapic, dispatch::write(vlapic, register, value));
         // Nothing the guest writes here reaches the hardware behind the page.
         // The page a guest sees is this hypervisor's answer, and the real
@@ -307,6 +317,33 @@ fn unclaimed(width: Width) -> Data {
 
 /// How many bytes the widest access the emulator makes carries.
 const VECTOR_BYTES: usize = Width::Vector.bytes();
+
+/// What a register answers with, taken from wherever the register lives.
+///
+/// While the hardware drives the controller, the registers it serves itself
+/// are the backing page's — the task priority the guest set without exiting,
+/// the priorities the hardware computes, and the three banks it moves
+/// vectors between — and a read of one of them must not be answered out of a
+/// model the hardware has not been consulting. Everything else is the
+/// model's in both worlds: the hardware completes those writes into the page
+/// and exits, and the trap's bookkeeping carries the value across.
+///
+/// A backing page that cannot be reached falls back to the model's answer
+/// rather than to a value invented here: a guest reading its controller is
+/// owed an answer, and the model's is the nearest true one.
+fn register_value(vlapic: &Vlapic, register: Register) -> u32 {
+    let hardware_owned = matches!(
+        register,
+        Register::TASK_PRIORITY | Register::ARBITRATION_PRIORITY | Register::PROCESSOR_PRIORITY
+    ) || register.bank().is_some();
+    if hardware_owned
+        && crate::avic::activation::active_for(vlapic)
+        && let Ok(value) = crate::avic::activation::backing_read(register)
+    {
+        return value;
+    }
+    dispatch::read(vlapic, register)
+}
 
 /// What the shape of an access to this page names.
 ///

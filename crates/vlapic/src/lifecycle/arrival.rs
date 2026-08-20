@@ -21,6 +21,7 @@ use log::{trace, warn};
 
 use crate::{
     VlapicError,
+    avic::activation,
     machine::current,
     priority::Priority,
     registers::{Accepted, Vlapic, icr::Trigger},
@@ -88,7 +89,22 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
         vlapic.ledger().debts()
     );
     if !local.in_service(vector) {
+        // The one arrival the acceleration cannot represent faithfully: the
+        // controller never accepted it, so no in-service state exists for
+        // the hardware to keep. It is delivered through the backing page
+        // anyway — the only path the guest can hear — and its
+        // acknowledgement is the legacy controller the guest reaches
+        // directly, exactly as it is on real hardware.
+        if activation::active_for(vlapic) {
+            crate::delivery::avic::warn_external_once();
+            return crate::delivery::avic::arrive(vlapic, local, vector, level);
+        }
         external(vlapic, vector);
+    } else if activation::active_for(vlapic) {
+        // The hardware owns the guest's delivery while it drives the
+        // controller: the request goes where the hardware reads it, and the
+        // target is told by whichever signal its state calls for.
+        return crate::delivery::avic::arrive(vlapic, local, vector, level);
     } else if withholdable(vector, level) {
         withhold(vlapic, local, vector);
     } else {
@@ -168,7 +184,7 @@ fn external(vlapic: &Vlapic, vector: Vector) {
 /// until its driver quiets it, and one the guest is not accepting at all is
 /// delivered again until it is. That still leaves the processor answering the
 /// host between arrivals, which is exactly what withholding would not.
-fn withholdable(vector: Vector, level: bool) -> bool {
+pub(crate) fn withholdable(vector: Vector, level: bool) -> bool {
     level && Priority::of(vector).class() < Priority::of(ipi::FIRST).class()
 }
 

@@ -30,6 +30,7 @@
 //! SMI to rendezvous its processors will wait indefinitely for the ones this
 //! controller owns.
 
+pub(crate) mod avic;
 pub(crate) mod doorbell;
 pub(crate) mod error;
 
@@ -212,7 +213,7 @@ fn accept(from: &Vlapic, target: &Vlapic, delivery: Delivery, command: Command) 
         // It is in the target's register file now, and the target may not be
         // looking at it.
         Accepted::Requested | Accepted::Coalesced => {
-            nudge(from, target);
+            avic::wake(from, target);
             true
         }
         // A vector no controller may deliver is the receiver's to report, and is

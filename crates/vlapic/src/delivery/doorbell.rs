@@ -103,6 +103,17 @@ pub(super) fn nudge(from: &Vlapic, target: &Vlapic) {
     if target.index() == from.index() || !target.away() {
         return;
     }
+    interrupt(from, target);
+}
+
+/// Sends the doorbell interrupt to `target`, retrying the one failure a retry
+/// can cure.
+///
+/// The shared half of [`nudge`] and of the acceleration's kick paths, which
+/// differ only in why they send: a nudge is for a target whose away flag the
+/// sender consulted, a kick for one something else has already said is not
+/// looking.
+pub(crate) fn interrupt(from: &Vlapic, target: &Vlapic) {
     for attempt in 0..DOORBELL_ATTEMPTS {
         let error = match doorbell(target.index()) {
             Ok(()) => return,

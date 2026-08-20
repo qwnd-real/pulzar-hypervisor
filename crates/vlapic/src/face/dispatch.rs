@@ -446,7 +446,14 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // real hardware is holding for it.
         Written::Disabled => settle::disabled(vlapic),
         Written::LogicalDestination => mirror_logical_destination(vlapic),
-        Written::ModeChanged(transition) => entered(vlapic, transition),
+        Written::ModeChanged(transition) => {
+            // A face change is one of the two boundaries a demotion is
+            // reconsidered at: the acceleration's state follows the guest's
+            // mode at the next entry either way, and the reasons it was
+            // taken away belong to the mode that was.
+            vlapic.permit_avic();
+            entered(vlapic, transition);
+        }
         Written::Command(command) => match lapics() {
             Ok(page) => delivery::send(vlapic, page.all(), command),
             Err(error) => warn!("vlapic: a command could not be delivered: {error}"),

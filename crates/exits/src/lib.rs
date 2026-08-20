@@ -19,9 +19,11 @@
 //!   the processor intercepts whatever that map says. Those reach the machine's
 //!   own register, and one the machine does not have is a fault the guest
 //!   takes.
-//! - The two exits a hardware-driven interrupt controller would raise, answered
-//!   defensively while the controller is still driven in software: logged, and
-//!   resumed or faulted in whichever direction the architecture says is safe.
+//! - The two exits a hardware-driven interrupt controller raises: an
+//!   inter-processor delivery the hardware could not finish, completed by the
+//!   rule its failure names, and a register access it does not implement,
+//!   either bookkept — the hardware finished it before it exited — or performed
+//!   against the register page's device.
 //! - Nested page faults, which are how a guest's memory comes to be described
 //!   at all, and how a write to hypervisor memory is stepped over.
 //! - The two notifications the [`portal`] makes, which are the only two things
@@ -77,7 +79,7 @@ use portal::Portal;
 use svm::{CleanBits, Reason};
 use thiserror::Error;
 use vcpu::{Flow, RunPhase, Vcpu, VcpuError};
-use vlapic::{Resumption, VlapicError};
+use vlapic::{Nomination, Resumption, VlapicError};
 use x86_64::instructions::interrupts;
 
 pub use crate::firmware::Boot;
@@ -247,6 +249,11 @@ impl<'a> Exits<'a> {
         // before going back in, so nothing needs to interrupt it to make it
         // look.
         let _ = vlapic::set_away(false);
+        // Withdrawn beside the away flag and for the same reason: a sender
+        // that reads the running bit from here on takes the kick path, and
+        // the rescan every park and every entry performs is what finds what
+        // the kick is for.
+        let _ = vlapic::avic_unpublish_running();
         self.interrupts.complete_iret(vcpu);
         let next_rip = if Pending::needs_next_rip(vcpu) {
             let addressing = Addressing::from_save(vcpu.save());
@@ -280,10 +287,13 @@ impl<'a> Exits<'a> {
             Some(Reason::NestedPageFault) => {
                 nested::exit(vcpu, self.partition, &mut self.interrupts)
             }
-            Some(Reason::AvicIncompleteIpi) => avic::incomplete_ipi(vcpu),
-            Some(Reason::AvicUnacceleratedAccess) => {
-                avic::unaccelerated_access(vcpu, &mut self.interrupts)
-            }
+            Some(Reason::AvicIncompleteIpi) => avic::incomplete_ipi(vcpu, &mut self.census),
+            Some(Reason::AvicUnacceleratedAccess) => avic::unaccelerated_access(
+                vcpu,
+                self.partition,
+                &mut self.interrupts,
+                &mut self.census,
+            ),
             Some(Reason::Vmmcall) => self.notified(vcpu),
             Some(
                 Reason::Vmrun
@@ -355,10 +365,23 @@ impl<'a> Exits<'a> {
             return Flow::Leave;
         }
         let _ = vlapic::set_away(true);
+        // The control block's acceleration follows the guest's own state at
+        // every entry: the enable bit, the backing page and the tables move
+        // here, and an entry that changes nothing pays one comparison for
+        // it. A failure demotes to the software path below rather than
+        // refusing the entry.
+        if let Err(error) = vlapic::avic_reconcile(vcpu) {
+            error!("exits: the interrupt acceleration could not be reconciled: {error}");
+        }
+        let accelerated = vlapic::avic_active().unwrap_or(false);
         // Before anything below reads the controller, because the interrupt
         // window one of them arms is judged by the processor against exactly
-        // this field.
-        Self::mirror_task_priority(vcpu);
+        // this field. Inert while the hardware drives the controller: the
+        // guest's task priority is the backing page's then, and a write here
+        // would only churn a field the hardware ignores.
+        if !accelerated {
+            Self::mirror_task_priority(vcpu);
+        }
         // A non-maskable interrupt another processor sent this one is held by
         // the controller, because the processor that sent it could not reach
         // what this exit loop owns.
@@ -387,7 +410,21 @@ impl<'a> Exits<'a> {
         // its task priority without exiting, so the vector that priority is
         // holding back has to be armed as well as the one it admits — otherwise
         // the guest lowering it is a change nothing on this machine hears about.
-        let nomination = vlapic::nominate().unwrap_or_default();
+        //
+        // Under the acceleration the window is never armed at all: the
+        // pending-interrupt fields are ignored on entry by a processor driving
+        // the controller itself, and leaving one armed would exit on every
+        // window the guest opens. What the model still holds — an arrival the
+        // legacy pin brought in — is injected outright the moment the guest is
+        // willing, which is all the software path owes it.
+        let nomination = if accelerated {
+            Nomination {
+                deliverable: vlapic::nominate().unwrap_or_default().deliverable,
+                blocked: None,
+            }
+        } else {
+            vlapic::nominate().unwrap_or_default()
+        };
         let (candidate, blocked) = (nomination.deliverable, nomination.blocked);
         let injected = self.interrupts.commit(vcpu, candidate, blocked);
         // Only when there was something to decide about. Every exit reaches
@@ -409,6 +446,12 @@ impl<'a> Exits<'a> {
         }
         if let Injected::Interrupt(vector) = injected {
             let _ = vlapic::committed(vector);
+        }
+        // Published last, when everything the entry prepared is in place and
+        // the guest is about to run: from here until the exit, another
+        // processor delivering an IPI may ring this one rather than exit.
+        if accelerated {
+            let _ = vlapic::avic_publish_running();
         }
         Flow::Resume
     }
@@ -435,6 +478,12 @@ impl<'a> Exits<'a> {
     /// wake it.
     fn halted(&mut self, vcpu: &mut Vcpu) -> Flow {
         advance(vcpu, HLT_LENGTH);
+        // Unpublished before the first look below, and the look is the point:
+        // a request that lands between the withdrawal and the rescan is one
+        // the rescan finds, and one that landed before it was answered by
+        // the exit itself. The rescan inside [`Exits::wakeable`] reads the
+        // backing page under the acceleration, where the request bits live.
+        let _ = vlapic::avic_unpublish_running();
         let vcpu = &*vcpu;
         if self.wakeable(vcpu) {
             return Flow::Resume;
@@ -462,7 +511,8 @@ impl<'a> Exits<'a> {
         self.interrupts.owed()
             || !vlapic::running().unwrap_or(true)
             || (inject::interrupts_unmasked(vcpu)
-                && vlapic::nominate().unwrap_or_default().deliverable.is_some())
+                && (vlapic::nominate().unwrap_or_default().deliverable.is_some()
+                    || vlapic::avic_deliverable().unwrap_or(false)))
     }
 
     /// Brings the control block's virtual task priority into agreement with the

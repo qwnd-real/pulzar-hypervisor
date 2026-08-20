@@ -12,6 +12,12 @@
 //! live controller, for two reasons. A live controller is unreachable in a
 //! host test, and a captured page would carry whatever its guest had written
 //! since reset — the image has to describe reset itself.
+//!
+//! One caller needs more than reset: a controller re-activated after its
+//! guest has lived a while keeps the registers the architecture preserves,
+//! and those are the model's rather than reset's. [`ResetImage::overlay`]
+//! replaces slot by slot, so the page rebuilt from a live model is the same
+//! statement as the reset one with the model's values in the model's slots.
 
 use apic::REGISTER_STRIDE;
 use cpu::ApicId;
@@ -46,6 +52,17 @@ impl ResetImage {
     /// The page's bytes, in the order the hardware reads them.
     pub(super) fn bytes(&self) -> &[u8; paging::as_usize(PAGE)] {
         &self.0
+    }
+
+    /// Replaces the reset value of one slot with a value taken from the live
+    /// model.
+    ///
+    /// What an activation of a controller its guest has already lived with
+    /// must show the hardware: the registers the architecture preserves are
+    /// the model's, and everything else stays at the reset this image was
+    /// built with.
+    pub(super) fn overlay(&mut self, register: Register, value: u32) {
+        self.put(register, value);
     }
 
     /// Stores `value` in the slot the architecture assigns to `register`.

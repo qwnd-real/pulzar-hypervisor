@@ -230,6 +230,62 @@ pub(crate) enum Access {
     Absent,
 }
 
+/// What the hardware does with a guest access to a register while it drives
+/// the controller, which is what an unaccelerated-access exit has to know to
+/// answer one.
+///
+/// The classification is the architecture's own table, transcribed once
+/// here: an access the hardware performs without help never exits, one it
+/// completes before it exits is owed the bookkeeping after the store, and
+/// one it refused is owed the instruction it did not finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AvicAccess {
+    /// Performed by the hardware with no exit at all. An exit naming one is
+    /// a mismatch between the table and the silicon, and is answered the
+    /// same way as [`AvicAccess::Fault`].
+    Accelerated,
+    /// Completed by the hardware before the exit: the guest is past the
+    /// access, the value is in the backing page, and what is owed is the
+    /// bookkeeping the register asks for beyond the store.
+    Trap,
+    /// Not completed: the guest is still at the access, and what is owed is
+    /// the access itself, performed and retired, or the fault it earned.
+    Fault,
+}
+
+impl Register {
+    /// What the hardware made of one access to this register.
+    ///
+    /// The two directions are classified apart because the table is not
+    /// symmetric: almost every register is served for a read — the backing
+    /// page answers it — while the writes are where the hardware's help runs
+    /// out. The task priority is the one write the hardware performs whole;
+    /// the command and the end-of-interrupt are performed in part, and trap
+    /// where the part runs out; the identifier and destination registers, the
+    /// local vector table, the spurious vector, the error status and the
+    /// timer's configuration complete into the page and trap for the
+    /// bookkeeping's sake; and whatever is not one of those faults, which is
+    /// the accesses the hardware never implements — the priority reports, the
+    /// vector banks as writes, the timer's remaining count.
+    pub(crate) const fn avic_access(self, write: bool) -> AvicAccess {
+        if !write {
+            // One read faults: the arbitration priority is a computation no
+            // backing page holds. Every other read the page answers.
+            return if self.0 == 0x90 {
+                AvicAccess::Fault
+            } else {
+                AvicAccess::Accelerated
+            };
+        }
+        match self.0 {
+            0x80 => AvicAccess::Accelerated,
+            0x20 | 0xB0 | 0xC0 | 0xD0 | 0xE0 | 0xF0 | 0x280 | 0x2F0 | 0x300 | 0x320 | 0x330
+            | 0x340 | 0x350 | 0x360 | 0x370 | 0x380 | 0x3E0 => AvicAccess::Trap,
+            _ => AvicAccess::Fault,
+        }
+    }
+}
+
 impl Access {
     /// What may be done with a register by a guest in this mode.
     ///
@@ -361,7 +417,7 @@ mod tests {
 
     use apic::{REGISTER_STRIDE, X2APIC_BASE_MSR};
 
-    use super::{Access, Bank, PAGE, Register, X2APIC_LAST_MSR};
+    use super::{Access, AvicAccess, Bank, PAGE, Register, X2APIC_LAST_MSR};
     use crate::{
         hardware::model,
         registers::{base::Mode, bitmap::SLOTS},
@@ -592,6 +648,94 @@ mod tests {
                     "{register:?}"
                 );
             }
+        }
+    }
+
+    /// The accelerated writes, exactly: the architecture's table names one
+    /// register the hardware performs whole — the task priority — and two it
+    /// performs in part, the command and the end-of-interrupt, which trap
+    /// where the part runs out; everything else exits.
+    #[test]
+    fn the_accelerated_write_is_the_task_priority() {
+        assert_eq!(
+            Register::TASK_PRIORITY.avic_access(true),
+            AvicAccess::Accelerated
+        );
+    }
+
+    #[test]
+    fn the_trap_writes_are_the_ones_completed_before_the_exit() {
+        // The identifier and destination registers, the spurious vector, the
+        // error status, the command, every local vector entry the table
+        // names, and the timer's count and divide — each written out rather
+        // than derived, so that a register added without a decision here
+        // fails a test rather than being classified by a fall-through.
+        for register in [
+            Register::ID,
+            Register::END_OF_INTERRUPT,
+            Register::REMOTE_READ,
+            Register::LOGICAL_DESTINATION,
+            Register::DESTINATION_FORMAT,
+            Register::SPURIOUS,
+            Register::ERROR_STATUS,
+            Register::COMMAND_LOW,
+            Register::LVT_TIMER,
+            Register::LVT_THERMAL,
+            Register::LVT_PERFORMANCE,
+            Register::LVT_LINT0,
+            Register::LVT_LINT1,
+            Register::LVT_ERROR,
+            Register::LVT_CORRECTED_MACHINE_CHECK,
+            Register::TIMER_INITIAL_COUNT,
+            Register::TIMER_DIVIDE,
+        ] {
+            assert_eq!(register.avic_access(true), AvicAccess::Trap, "{register:?}");
+        }
+    }
+
+    #[test]
+    fn the_fault_writes_are_the_ones_the_hardware_never_performs() {
+        for register in [
+            Register::VERSION,
+            Register::ARBITRATION_PRIORITY,
+            Register::PROCESSOR_PRIORITY,
+            Register::IN_SERVICE,
+            Register::TRIGGER_MODE,
+            Register::INTERRUPT_REQUEST,
+            Register::COMMAND_HIGH,
+            Register::TIMER_CURRENT_COUNT,
+            Register::SELF_IPI,
+        ] {
+            assert_eq!(
+                register.avic_access(true),
+                AvicAccess::Fault,
+                "{register:?}"
+            );
+        }
+        // Every slot of every bank, not merely the first of each.
+        for offset in 0x100..0x280 {
+            if let Some(register) = Register::at(offset) {
+                assert_eq!(
+                    register.avic_access(true),
+                    AvicAccess::Fault,
+                    "{register:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn almost_every_read_is_served_out_of_the_backing_page() {
+        for offset in (0x000..PAGE).step_by(REGISTER_STRIDE as usize) {
+            let Some(register) = Register::at(offset) else {
+                continue;
+            };
+            let expected = if register == Register::ARBITRATION_PRIORITY {
+                AvicAccess::Fault
+            } else {
+                AvicAccess::Accelerated
+            };
+            assert_eq!(register.avic_access(false), expected, "{register:?}");
         }
     }
 }
