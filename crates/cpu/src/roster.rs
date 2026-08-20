@@ -185,4 +185,79 @@ impl Roster {
             .iter()
             .any(|entry| entry.startable() && !entry.apic_id.fits_xapic())
     }
+
+    /// The first identifier two entries share, if any two do.
+    ///
+    /// Firmware that describes one processor with both an eight-bit and a
+    /// 32-bit structure yields two entries for it, and every consumer of this
+    /// roster then has two positions for one processor while [`Roster::find`]
+    /// can only ever answer with the earlier of them. What that costs depends
+    /// on the consumer — a per-position array with one live half, a processor
+    /// started twice, a page of interrupt-controller registers nothing reads —
+    /// so the roster is refused rather than each consumer defending itself.
+    ///
+    /// Quadratic, and asked once on a table with as many entries as the machine
+    /// has processors: sorting to do better would need a copy of the whole
+    /// roster, and the count is bounded by what one machine's firmware
+    /// describes.
+    pub(crate) fn duplicated(&self) -> Option<ApicId> {
+        self.entries
+            .iter()
+            .enumerate()
+            .find_map(|(position, entry)| {
+                self.entries[..position]
+                    .iter()
+                    .any(|earlier| earlier.apic_id == entry.apic_id)
+                    .then_some(entry.apic_id)
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The roster is a list with no hardware behind it, so what it says about a
+    //! table firmware handed it is decidable here.
+
+    use alloc::vec;
+
+    use acpi::ProcessorState;
+
+    use super::{ApicId, CpuIndex, Entry, Roster};
+
+    /// A roster of processors with these identifiers, described in this order
+    /// and all startable.
+    fn roster(ids: &[u32]) -> Roster {
+        Roster {
+            entries: ids
+                .iter()
+                .enumerate()
+                .map(|(position, id)| Entry {
+                    index: CpuIndex(position),
+                    apic_id: ApicId::new(*id),
+                    uid: 0,
+                    state: ProcessorState::Enabled,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn identifiers_that_are_merely_sparse_are_not_duplicated() {
+        // The machines the roster exists for: unordered, sparse, not starting at
+        // zero, and none of them describing a processor twice.
+        for ids in [vec![], vec![12], vec![0, 2, 32, 34], vec![34, 0, 32, 2]] {
+            assert_eq!(roster(&ids).duplicated(), None, "{ids:?}");
+        }
+    }
+
+    #[test]
+    fn one_identifier_on_two_entries_is_reported() {
+        // The firmware this catches: one processor described with both an
+        // eight-bit and a 32-bit structure, which the table parser puts into
+        // one list.
+        assert_eq!(roster(&[0, 1, 0]).duplicated(), Some(ApicId::new(0)));
+        // Reported at the second of the two, so a machine with several
+        // duplicates names one of them rather than the last.
+        assert_eq!(roster(&[4, 5, 5, 4]).duplicated(), Some(ApicId::new(5)));
+    }
 }

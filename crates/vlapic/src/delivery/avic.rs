@@ -105,12 +105,19 @@ pub(crate) fn incomplete_ipi(exit: IncompleteIpiExit) -> Result<(), VlapicError>
             // interrupt goes through the path that does not need a table.
             let vlapic = current()?;
             vlapic.inhibit_avic();
+            // The destination mode goes with the index because it is what says
+            // which table the index is into: the hardware resolves a directed
+            // interprocessor interrupt through the logical table where the
+            // command names a logical destination and through the physical one
+            // otherwise, and which of the two named a page that is not there is
+            // the whole diagnostic value of the number.
             error!(
                 "vlapic: {} reported an invalid backing page for an IPI, command {:#018x}, \
-                 index {:#x}; this vCPU returns to software delivery",
+                 index {:#x}, destination mode {:?}; this vCPU returns to software delivery",
                 vlapic.index(),
                 exit.icr(),
-                exit.index()
+                exit.index(),
+                Command::from_bits(exit.icr()).destination_mode(),
             );
             activation::complete_command(exit.icr())?;
         }

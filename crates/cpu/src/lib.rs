@@ -65,10 +65,11 @@ pub use crate::{
 ///
 /// # Errors
 ///
-/// [`CpuError::AlreadySurveyed`] for a second call, or
+/// [`CpuError::AlreadySurveyed`] for a second call,
 /// [`CpuError::NoProcessors`] if firmware described none — a machine whose own
 /// tables do not mention the processor reading them is one nothing here can
-/// reason about.
+/// reason about — or [`CpuError::DuplicatedApicId`] if two of the structures
+/// firmware wrote describe one processor.
 pub fn survey(processors: &[Processor]) -> Result<(), CpuError> {
     if processors.is_empty() {
         return Err(CpuError::NoProcessors);
@@ -77,6 +78,14 @@ pub fn survey(processors: &[Processor]) -> Result<(), CpuError> {
         return Err(CpuError::AlreadySurveyed);
     }
     let roster = Roster::new(processors);
+    // Refused here rather than defended against downstream. A roster with two
+    // positions for one processor is wrong for every consumer of it, and the
+    // consumers cannot each tell which position is theirs: identifiers are how
+    // a processor recognizes its own entry, and only the earlier of two
+    // identical ones is ever found.
+    if let Some(apic_id) = roster.duplicated() {
+        return Err(CpuError::DuplicatedApicId { apic_id });
+    }
     let blocks = (0..roster.count())
         .map(|_| AtomicPtr::new(null_mut()))
         .collect::<Vec<_>>()
@@ -203,6 +212,18 @@ pub enum CpuError {
     /// above has sized its arrays by.
     #[error("the processor roster has already been taken")]
     AlreadySurveyed,
+    /// Two of firmware's processor structures carry one local APIC identifier,
+    /// so the roster would describe one processor twice.
+    ///
+    /// ACPI forbids it — a processor whose identifier fits eight bits is
+    /// described the older way and only that way — and firmware that breaks the
+    /// rule leaves a roster in which one processor has two positions and only
+    /// the earlier of them can ever be found.
+    #[error("firmware described two processors with {apic_id}")]
+    DuplicatedApicId {
+        /// The identifier two entries share.
+        apic_id: ApicId,
+    },
     /// Nothing has read firmware's table yet.
     #[error("the processor roster has not been taken yet")]
     NotSurveyed,

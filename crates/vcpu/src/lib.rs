@@ -68,7 +68,7 @@ use thiserror::Error;
 
 pub use crate::{
     host::Host,
-    invalid::Invalid,
+    invalid::{AvicLimits, Invalid},
     registers::{RAX, RSP, Registers},
     vcpu::{AvicProvision, AvicTables, Flow, Guest, MsrPassthrough, RunPhase, Vcpu},
 };

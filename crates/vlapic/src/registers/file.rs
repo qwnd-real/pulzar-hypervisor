@@ -146,8 +146,17 @@ impl Vlapic {
     /// holds, and what a guest reads back has to be something the architecture
     /// says that register can answer with — so firmware's reserved bits are
     /// dropped here rather than carried through to a guest's first read.
+    ///
+    /// The base register is narrowed by the machine as well: a face this
+    /// machine will not serve a guest is one no controller is seeded into, and
+    /// which face that leaves is what everything below is then narrowed in —
+    /// see [`ApicBase::seeded`].
     fn seeded(&self, firmware: &LocalState, base: u64) {
-        let base = ApicBase::seeded(base, self.base().bootstrap());
+        let base = ApicBase::seeded(
+            base,
+            self.base().bootstrap(),
+            crate::avic::activation::x2avic_permitted(),
+        );
         self.base.store(base.bits(), Ordering::Release);
         self.task_priority.store(
             firmware.task_priority & TASK_PRIORITY_MASK,

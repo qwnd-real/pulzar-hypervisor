@@ -176,9 +176,12 @@ pub enum VlapicError {
     /// They were asked of before they were built.
     #[error("the interrupt-acceleration structures have not been provisioned")]
     NotProvisioned,
-    /// The physical table was asked to hold more entries than one page of
-    /// them, which is the most a control block can name.
-    #[error("a physical interrupt table of {entries} entries does not fit one page")]
+    /// The physical table was asked to hold more entries than the run a control
+    /// block can name, which is as many as the twelve-bit index field beside
+    /// its address can reach.
+    #[error(
+        "a physical interrupt table of {entries} entries is more than a control block can name"
+    )]
     TableTooLarge {
         /// How many entries were asked for.
         entries: usize,
@@ -191,6 +194,13 @@ pub enum VlapicError {
         id: u32,
         /// The largest index the table was sized for.
         max_index: u16,
+    },
+    /// Two processors answer to one identifier, so the physical table has one
+    /// entry for both of them and could name only one of their backing pages.
+    #[error("apic id {id} has already been described in the physical interrupt table")]
+    IdDescribedTwice {
+        /// The identifier described twice.
+        id: u32,
     },
     /// The physical table was asked for a largest index the controller mode it
     /// will be driven in cannot name, which is a table no control block in that

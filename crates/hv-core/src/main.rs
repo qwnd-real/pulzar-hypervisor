@@ -213,13 +213,18 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     cpu::attach(here)?;
     ipi::install()?;
     // The decision about whether the guest's interrupts stay the host's to
-    // deliver, taken once where both the roster and this processor's own
-    // feature words are known.
-    avic::establish(cpu::roster()?);
+    // deliver, taken once where the roster, this processor's own feature words
+    // and the face firmware left its controller in are all known.
+    avic::establish(cpu::roster()?, firmware);
+    let policy = avic::policy();
     // After the interprocessor interrupts it takes a vector from, and before
     // any other processor is started: a controller has to exist before anything
     // can deliver to it, and before the processor it belongs to does.
-    vlapic::install(firmware)?;
+    //
+    // The policy's answer about the wider controller face goes with it, because
+    // this is where the one controller seeded from firmware's own register is
+    // built and firmware may have left that register in it.
+    vlapic::install(firmware, policy.x2apic_offered())?;
     // Running, because this is the processor the guest is entered on. Every
     // other one joins the guest held, however long it has been executing.
     vlapic::claim_processor(here, Joining::Running)?;
@@ -233,7 +238,6 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // when delivery is handed to the hardware: before the guest they describe
     // has run, and with it the guest's tag the control blocks are composed
     // with.
-    let policy = avic::policy();
     let avic_tables = policy
         .enabled()
         .then(|| {

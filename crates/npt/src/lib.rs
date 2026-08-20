@@ -55,6 +55,15 @@
 //! do, and it is stated here so that a live-lock is not diagnosed as a bug in
 //! them.
 //!
+//! One page of the chunk may be an exception to both paragraphs, and
+//! [`Npt::sink`] is the whole of it: that page translates to a writable frame
+//! of its own, so a guest reading it sees what a guest wrote rather than zeroes
+//! and a guest writing it faults on nothing. It is the register page of an
+//! interrupt controller the hardware drives itself, which the acceleration
+//! requires to translate to memory the guest may write while redirecting every
+//! access away from it — so nothing ever reads the frame back, and it is
+//! allocated for that page alone and never released.
+//!
 //! # Regions the hardware does not answer for
 //!
 //! [`Npt::protect`] marks a range as one whose accesses belong to something
@@ -579,7 +588,8 @@ impl Npt {
         }
         if let Some(sink) = self.sink {
             info!(
-                "{who}: npt sinks guest physical {:#x} onto frame {:#x}",
+                "{who}: npt sinks guest physical {:#x} onto frame {:#x}, writable and never read \
+                 back",
                 sink.span.base, sink.frame,
             );
         }

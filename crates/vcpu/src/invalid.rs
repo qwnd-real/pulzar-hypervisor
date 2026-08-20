@@ -445,6 +445,17 @@ pub fn arming(
 /// that the same rules answer for an arming that is being considered as for one
 /// that has happened; every caller in this module supplies either the block's
 /// own or exactly one prospective edit of it.
+///
+/// # Why the pointers are judged and the extents are not
+///
+/// [`maps`] next door computes where a permission bitmap *ends* and judges
+/// that, and the asymmetry is the architecture's rather than an oversight: it
+/// states the last-byte rule for the permission maps and states only the
+/// pointers for these structures. So the base is exactly the rule that always
+/// holds. The one structure with an extent worth asking about is the table of
+/// virtual processors, which may span eight pages — and its tail is inside the
+/// reserved chunk by construction, because the run is allocated to the order
+/// the table's own size asks for.
 fn avic(
     control: &ControlArea,
     interrupts: InterruptControl,
@@ -489,7 +500,12 @@ fn avic(
         (AvicField::BackingPage, control.avic_backing_page),
         (AvicField::LogicalTable, control.avic_logical_table),
         // The table's own pointer, whose low twelve bits hold the maximum
-        // index and are read separately above.
+        // index and are read separately above. Only the width half of the rule
+        // below can speak for this one: the type shifts a page number up rather
+        // than storing an address, so it cannot express a misaligned pointer at
+        // all — which is the point of the type, and is why the two halves are
+        // written as one rule over all four fields rather than as a rule per
+        // field.
         (AvicField::PhysicalTable, table.address().as_u64()),
     ] {
         if address & PAGE_MASK != 0 || above(address, bits) {

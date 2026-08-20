@@ -474,3 +474,67 @@ pub struct VirtualizationControl {
     #[bits(60)]
     __: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    //! The word at 060h is the most-written word in the block, and the two bits
+    //! of it that choose how a guest's interrupts are delivered are the ones
+    //! whose positions nothing else can catch: the layout macro fixes the *sum*
+    //! of the field widths to the size of the word, so resizing or reordering
+    //! anything below them moves them and still compiles.
+
+    use super::InterruptControl;
+
+    /// The two enable bits, at bits 31 and 30 of the interrupt-control word
+    /// (APM Table B-1).
+    ///
+    /// Which of the two is which decides whether the hardware drives a guest's
+    /// controller at all and whether it addresses the guest's processors with
+    /// eight-bit or 32-bit identifiers — and a control block that names the
+    /// wider mode without the narrower one is refused outright, with no guest
+    /// instruction executed.
+    #[test]
+    fn the_avic_enables_are_the_two_bits_above_the_vector() {
+        assert_eq!(
+            InterruptControl::new().with_avic_enable(true).into_bits(),
+            1 << 31
+        );
+        assert_eq!(
+            InterruptControl::new().with_x2avic_enable(true).into_bits(),
+            1 << 30
+        );
+        assert_eq!(
+            InterruptControl::new()
+                .with_avic_enable(true)
+                .with_x2avic_enable(true)
+                .into_bits(),
+            (1 << 31) | (1 << 30)
+        );
+    }
+
+    /// The fields either side of them, so that a bit moved into or out of the
+    /// enables fails here rather than at an entry the processor refuses.
+    #[test]
+    fn the_neighbouring_fields_are_where_the_architecture_puts_them() {
+        // The task priority is the low four bits with the four above it
+        // reserved, and the waiting vector is the byte above the enables.
+        assert_eq!(
+            InterruptControl::new().with_virtual_tpr(0xF).into_bits(),
+            0xF
+        );
+        assert_eq!(
+            InterruptControl::new()
+                .with_virtual_vector(0xFF)
+                .into_bits(),
+            0xFF << 32
+        );
+        // The three bits below the enables are reserved, so the field before
+        // them ends where it does.
+        assert_eq!(
+            InterruptControl::new()
+                .with_virtual_nmi_enable(true)
+                .into_bits(),
+            1 << 26
+        );
+    }
+}

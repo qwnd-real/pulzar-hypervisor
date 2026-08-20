@@ -160,9 +160,9 @@ bitflags! {
         /// of them.
         ///
         /// Not a bit of the leaf's feature word like the rest of this set: it
-        /// is bit 6 of the leaf's count word, which has no word of its own in
-        /// this crate — so it is kept up here, above every bit the feature
-        /// word can hold, and one value still describes the extension.
+        /// is bit 6 of `ECX`, which has no word of its own in this crate — so
+        /// it is kept up here, above every bit the feature word can hold, and
+        /// one value still describes the extension.
         const X2AVIC_EXT = 1 << 38;
     }
 }
@@ -170,15 +170,34 @@ bitflags! {
 bitflags! {
     /// What this processor's memory-encryption extension supports.
     ///
-    /// Only the two bits that decide whether the hypervisor and the extension
-    /// can coexist are modelled: whether a guest's interrupt tables may be
-    /// kept by the hardware at all, and whether the host may write a page a
-    /// guest is using — without which the second cannot be maintained.
+    /// Only the three bits the interrupt acceleration turns on are modelled:
+    /// whether the extension's own reverse-map checks can be active at all,
+    /// whether the host may write a page a guest is using — without which
+    /// maintaining a guest's interrupt state under those checks is impossible —
+    /// and whether a guest's interrupt tables may be kept by the hardware
+    /// instead.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MemoryEncryption: u32 {
+        /// Secure nested paging: the extension keeps a reverse map of which
+        /// guest owns each page and checks every access against it.
+        ///
+        /// What matters to a hypervisor that does not run encrypted guests is
+        /// the corollary. Entering *any* guest on a host where the checks are
+        /// active marks the pages that guest's hardware structures live in as
+        /// in use, and a host write to one of those is then a violation rather
+        /// than a write — so a hypervisor maintaining a guest's interrupt state
+        /// from another processor needs
+        /// [`MemoryEncryption::HV_IN_USE_WRITES_ALLOWED`] beside it.
+        const SECURE_NESTED_PAGING = 1 << 4;
         /// The encrypted-virtualization extension keeps a guest's interrupt
         /// tables itself, so delivery into an encrypted guest does not need
         /// the host to read what it is not entitled to.
+        ///
+        /// Reported rather than acted on: this extension is mutually exclusive
+        /// with the enable bit that gives the hardware an *unencrypted* guest's
+        /// controller, which is the only kind pulzar runs, so nothing chooses on
+        /// it. It is worth naming because it is the bit that decides which of
+        /// the two mechanisms a machine has, and the boot log says which.
         const SECURE_AVIC = 1 << 26;
         /// The host may write pages a guest is using, which is what any
         /// hypervisor maintaining state on a guest's behalf needs to be
@@ -270,9 +289,11 @@ impl Svm {
 
 /// The leaf's two feature words as one value.
 ///
-/// The feature word where the architecture puts it, and the count word's one
-/// defined bit above every bit the feature word can hold — which is what lets
-/// one set describe both without either colliding.
+/// `EDX` where the architecture puts the feature word, and `ECX`'s one defined
+/// bit above every bit `EDX` can hold — which is what lets one set describe
+/// both without either colliding. The leaf's remaining words are not features:
+/// `EAX` is the revision and `EBX` the count of address space identifiers, and
+/// both have fields of their own on [`Svm`].
 const fn feature_bits(edx: u32, ecx: u32) -> u64 {
     (edx as u64) | ((ecx as u64) << u32::BITS)
 }
@@ -314,7 +335,7 @@ mod tests {
         assert_eq!(
             feature_bits(0, 1 << 6),
             SvmFeatures::X2AVIC_EXT.bits(),
-            "the count word's bit must land above the feature word"
+            "the bit of `ECX` must land above the feature word"
         );
         assert_eq!(
             feature_bits(u32::MAX, 0),
@@ -324,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_keeps_only_defined_bits_of_the_count_word() {
+    fn truncation_keeps_only_defined_bits_of_the_third_word() {
         let features = SvmFeatures::from_bits_truncate(feature_bits(0, !0));
         assert_eq!(features, SvmFeatures::X2AVIC_EXT);
     }

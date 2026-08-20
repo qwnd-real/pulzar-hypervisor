@@ -8,8 +8,11 @@
 //! delivers to them, evaluates priorities, and even routes interrupts between
 //! the guest's own processors, all without an exit.
 //!
-//! Three tables make that work, and this module is their layout. One page each,
-//! all of them physically addressed by the processor.
+//! Three tables make that work, and this module is their layout. All of them
+//! are physically addressed by the processor, and all but one are a single
+//! page: the table of virtual processors is a run of up to eight, because the
+//! field beside its address gives the hardware a largest valid index rather
+//! than a length.
 //!
 //! # Why the hypervisor is still involved
 //!
@@ -256,6 +259,14 @@ impl IncompleteIpiExit {
 
     /// The destination the tables were consulted for. Only the causes about a
     /// destination give this meaning.
+    ///
+    /// An index into the physical table or into the logical one, and which of
+    /// them is not this field's to say: the cause decides for two of the three
+    /// it is defined for, and for a directed interprocessor interrupt it is the
+    /// destination mode of the command in [`IncompleteIpiExit::icr`] — logical
+    /// where that names a logical destination, physical otherwise. Reported raw
+    /// here for that reason; a consumer that means to say which table has both
+    /// halves to hand.
     #[must_use]
     pub const fn index(&self) -> u16 {
         self.index
@@ -377,6 +388,21 @@ const _: () = assert!(
 const _: () = assert!(
     MAX_PHYSICAL_ID < 0xFF,
     "the broadcast identifier cannot name one processor",
+);
+/// Both 32-bit caps have to survive the twelve-bit field a control block
+/// publishes a table's extent in, or a mode's own limit would be a number
+/// nothing could tell the hardware — and raising one past the field is an edit
+/// that would otherwise compile and only be found where the extent is written.
+const _: () = assert!(
+    AvicPhysicalTable::new()
+        .with_max_index(X2_MAX_PHYSICAL_ID)
+        .max_index()
+        == X2_MAX_PHYSICAL_ID
+        && AvicPhysicalTable::new()
+            .with_max_index(X2_EXTENDED_MAX_PHYSICAL_ID)
+            .max_index()
+            == X2_EXTENDED_MAX_PHYSICAL_ID,
+    "a mode's highest index must survive the field a table's extent is published in",
 );
 
 #[cfg(test)]
@@ -522,5 +548,20 @@ mod tests {
         assert_eq!(table.into_bits(), 0xDEAD_E000 | 0x1FF);
         assert_eq!(table.address(), PhysAddr::new(0xDEAD_E000));
         assert_eq!(table.max_index(), 0x1FF);
+    }
+
+    /// The doorbell: twelve bits of physical identifier at the bottom of the
+    /// register and nothing else in it.
+    ///
+    /// The one field in this module whose width is a judgement rather than a
+    /// transcription — the architecture's figure draws eight and leaves the
+    /// rest must-be-zero — so what it encodes is worth pinning: a narrower
+    /// field would poke the wrong processor on a machine with more than 256
+    /// of them, and a wider one would set a bit the architecture reserves.
+    #[test]
+    fn a_doorbell_carries_the_physical_identifier_and_nothing_else() {
+        assert_eq!(Doorbell::new().with_host_apic_id(0xFFF).into_bits(), 0xFFF);
+        assert_eq!(Doorbell::new().with_host_apic_id(1).into_bits(), 1);
+        assert_eq!(Doorbell::new().into_bits(), 0);
     }
 }

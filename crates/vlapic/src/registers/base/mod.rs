@@ -167,14 +167,33 @@ impl ApicBase {
     /// Everything the architecture reserves is dropped, so that a guest reading
     /// the register back sees what it promises.
     ///
-    /// The wider enable is dropped on its own if the global one did not
-    /// survive. `EXTD` without `EN` is not a state the architecture
-    /// defines, and a controller seeded with it would answer through
-    /// neither face while every recovery a guest could attempt — reading
-    /// the register, setting the enable bit, writing it back — took a
-    /// general protection fault for a transition out of a state that does
-    /// not exist. The check belongs here because this is the one producer
-    /// of this register that is handed a value read out of hardware.
+    /// The wider enable is dropped for either of two reasons, and this is the
+    /// one producer of this register that can be handed it set without a
+    /// transition ever having been judged — so both belong here.
+    ///
+    /// It goes if the global one did not survive. `EXTD` without `EN` is not a
+    /// state the architecture defines, and a controller seeded with it would
+    /// answer through neither face while every recovery a guest could attempt —
+    /// reading the register, setting the enable bit, writing it back — took a
+    /// general protection fault for a transition out of a state that does not
+    /// exist.
+    ///
+    /// It goes as well where `x2apic_permitted` is false, which is the machine
+    /// having no way to serve a guest that face. Such a controller would read
+    /// back `EN|EXTD` while its guest's own `CPUID` denied the feature, and
+    /// software that believes `CPUID` never looks at this register — so it
+    /// would drive the memory-mapped face against a controller that had
+    /// told the rest of this crate it was in the other one, finding
+    /// registers absent and read-only that the face it is using has.
+    /// Starting in the older face instead is the face that `CPUID`
+    /// describes and that every guest knows how to be in.
+    ///
+    /// That half is the total statement rather than the working one: a machine
+    /// whose firmware really did leave this register in the wider face is one
+    /// where hardware delivery is declined altogether, and declining it is what
+    /// makes the face servable again. What this rules out is a controller in a
+    /// face nothing on the machine will answer for — whoever decided that, and
+    /// whatever they decided it from.
     ///
     /// The address is the default one rather than firmware's, and the two are
     /// the same address wherever this is reached: the page is trapped once,
@@ -188,13 +207,14 @@ impl ApicBase {
     /// it is the roster's, established when the controller was built, and no
     /// value read from anywhere can change which processor the machine came up
     /// on.
-    pub(crate) const fn seeded(value: u64, bootstrap: bool) -> Self {
+    pub(crate) const fn seeded(value: u64, bootstrap: bool, x2apic_permitted: bool) -> Self {
         let flag = if bootstrap { BOOTSTRAP } else { 0 };
         let enables = value & (GLOBAL_ENABLE | X2APIC_ENABLE);
-        let enables = if enables & GLOBAL_ENABLE == 0 {
-            0
-        } else {
+        let wider = enables & GLOBAL_ENABLE != 0 && x2apic_permitted;
+        let enables = if wider {
             enables
+        } else {
+            enables & GLOBAL_ENABLE
         };
         Self(enables | Self::DEFAULT_PAGE | flag)
     }
@@ -431,7 +451,7 @@ mod tests {
         // the guest reads the register, sets the enable bit it is missing, and
         // writes back a move from disabled straight into x2APIC.
         let malformed = ApicBase::DEFAULT_PAGE | X2APIC_ENABLE;
-        let seeded = ApicBase::seeded(malformed, false);
+        let seeded = ApicBase::seeded(malformed, false, true);
 
         assert_eq!(seeded.mode(), Mode::Disabled);
         assert_eq!(seeded.bits() & X2APIC_ENABLE, 0);
@@ -439,7 +459,35 @@ mod tests {
         // whole reason the enable bits are taken from it at all.
         let both = ApicBase::DEFAULT_PAGE | GLOBAL_ENABLE | X2APIC_ENABLE;
 
-        assert_eq!(ApicBase::seeded(both, false).mode(), Mode::X2Apic);
+        assert_eq!(ApicBase::seeded(both, false, true).mode(), Mode::X2Apic);
+    }
+
+    #[test]
+    fn a_controller_is_never_seeded_into_a_face_the_machine_will_not_serve() {
+        // Every combination of the two enable bits, on a machine whose policy
+        // withholds the wider face. Firmware leaving `EXTD` set is the case
+        // this exists for: the guest would otherwise start in a face its own
+        // `CPUID` denies, and software that believes `CPUID` drives the
+        // memory-mapped one against a controller that answers as the other.
+        for (value, permitted, expected) in [
+            (0, false, Mode::Disabled),
+            (X2APIC_ENABLE, false, Mode::Disabled),
+            (GLOBAL_ENABLE, false, Mode::XApic),
+            (GLOBAL_ENABLE | X2APIC_ENABLE, false, Mode::XApic),
+            (0, true, Mode::Disabled),
+            (X2APIC_ENABLE, true, Mode::Disabled),
+            (GLOBAL_ENABLE, true, Mode::XApic),
+            (GLOBAL_ENABLE | X2APIC_ENABLE, true, Mode::X2Apic),
+        ] {
+            let seeded = ApicBase::seeded(ApicBase::DEFAULT_PAGE | value, false, permitted);
+            assert_eq!(seeded.mode(), expected, "{value:#x}, permitted {permitted}");
+            // Whichever face it lands in, the register reads back a state that
+            // exists: the wider bit is never set without the global one.
+            assert!(
+                seeded.bits() & X2APIC_ENABLE == 0 || seeded.bits() & GLOBAL_ENABLE != 0,
+                "{value:#x}, permitted {permitted}"
+            );
+        }
     }
 
     /// Every way the capture can describe the controller it read, so that a new

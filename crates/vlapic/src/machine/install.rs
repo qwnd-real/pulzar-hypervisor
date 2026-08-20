@@ -21,7 +21,7 @@ use log::{info, warn};
 use snapshot::FirmwareContext;
 
 use crate::{
-    VlapicError,
+    VlapicError, avic,
     delivery::doorbell,
     hardware::{
         mirror::mirror_logical_destination,
@@ -29,7 +29,10 @@ use crate::{
         sources, timer,
     },
     machine::registry,
-    registers::{Vlapic, base::ApicBase},
+    registers::{
+        Vlapic,
+        base::{ApicBase, Mode},
+    },
 };
 
 /// Builds one controller per processor the machine has, and puts this
@@ -52,6 +55,13 @@ use crate::{
 /// instant they were read, and the timestamp counter beside them is what says
 /// by how much.
 ///
+/// `x2apic_offered` is whether a guest on this machine may be given the
+/// controller face its identifiers are reached through in model-specific
+/// registers. It arrives here rather than with the structures hardware-driven
+/// delivery runs on, which are built later, because the controller seeded below
+/// may already *be* in that face — firmware routinely leaves it there — and
+/// whether it may stay is this answer.
+///
 /// # Errors
 ///
 /// [`VlapicError::AlreadyInstalled`] for a second call,
@@ -61,7 +71,7 @@ use crate::{
 /// free for the sources this crate programs onto real hardware, or
 /// [`VlapicError::Apic`] if this processor's own controller cannot be reached
 /// to be asked which one it is.
-pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
+pub fn install(firmware: &FirmwareContext, x2apic_offered: bool) -> Result<(), VlapicError> {
     // Asked before anything is acquired so that a second call is cheap and
     // leaves nothing behind. It is also the whole of the check: `install` runs on
     // the boot processor before any other processor exists, so nothing can be
@@ -81,6 +91,11 @@ pub fn install(firmware: &FirmwareContext) -> Result<(), VlapicError> {
     {
         return Err(VlapicError::MisplacedPage { page });
     }
+    // Recorded before any controller exists, which is what makes it answerable
+    // for the one seeded below and for every later question about the wider
+    // face — the transition a guest writes, and the feature bit `CPUID`
+    // reports.
+    avic::activation::permit_x2apic(x2apic_offered);
     let local = apic::local()?;
     let here = local.id();
     let roster = cpu::roster()?;
@@ -188,6 +203,21 @@ fn inherit(vlapic: &Vlapic, firmware: &FirmwareContext) {
         return;
     }
     vlapic.seed(&interrupts.local, interrupts.base);
+    // Said where it happens, because the guest cannot see it and nothing else
+    // would: firmware had taken the real controller into the wider face and this
+    // machine may not offer a guest that face, so the emulated one starts in the
+    // older one — which is the face this guest's own `CPUID` describes. A machine
+    // that reaches this is one whose delivery policy should have declined
+    // hardware delivery on the same grounds, so the line is also how a policy
+    // that did not would be found.
+    if ApicBase::from_bits(interrupts.base).mode() == Mode::X2Apic && vlapic.mode() != Mode::X2Apic
+    {
+        warn!(
+            "vlapic: {} starts in the older interface although firmware had left the real \
+             controller in x2apic, because this machine may not offer a guest that face",
+            vlapic.index()
+        );
+    }
     mirror_logical_destination(vlapic);
     if !sources::reprogram(vlapic) {
         warn!(

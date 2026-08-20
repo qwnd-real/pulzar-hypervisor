@@ -210,10 +210,18 @@ impl Partition {
     ///
     /// What the interrupt controllers' register page becomes when the
     /// processor serves the controller itself: a read that no longer exits
-    /// must still land somewhere, and a page of zeroes is the nothing the
-    /// guest is allowed to see there. Called once, before any processor has
+    /// must still land somewhere. Called once, before any processor has
     /// entered the guest, for the same cache coherency reason as
     /// [`Partition::expose`].
+    ///
+    /// The page it leaves behind is the one exception to the rest of the chunk
+    /// being an immutable page of zeroes to the guest, and it is an exception
+    /// in both directions: the frame is writable, so the guest may store to
+    /// hypervisor-owned memory and read back what it stored. That is what the
+    /// acceleration requires — the redirect needs a writable leaf at the
+    /// address it redirects away from — and it is harmless because the
+    /// frame is allocated for this page alone, never released, and read
+    /// back by nothing.
     ///
     /// # Errors
     ///

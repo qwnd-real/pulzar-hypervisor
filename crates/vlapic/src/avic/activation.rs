@@ -118,14 +118,6 @@ struct Activation {
     /// skipped there, so the bit is never set and can never be read stale,
     /// and every directed IPI takes the exit-and-kick path instead.
     ipi_virtual: bool,
-    /// Whether the acceleration may drive a controller its guest reaches
-    /// through model-specific registers.
-    ///
-    /// The boot-time policy's answer: a machine the extension cannot take
-    /// that far — no x2AVIC, or identifiers the wider tables cannot hold —
-    /// is one where the guest is never told the mode exists, and a write
-    /// reaching for it anyway is refused rather than driven.
-    x2avic: bool,
     /// The machine has been told something is wrong with the acceleration
     /// itself, and stays on the software path for the rest of its life.
     ///
@@ -150,6 +142,10 @@ struct Activation {
 /// The runtime state, once provisioning has built it.
 static ACTIVATED: Once<&'static Activation> = Once::new();
 
+/// Whether the wider controller face may be used at all, recorded when the
+/// controllers are built.
+static X2APIC_PERMITTED: Once<bool> = Once::new();
+
 /// Records the structures provisioning just built, for everything that
 /// changes about them afterwards.
 pub(super) fn establish(
@@ -159,7 +155,6 @@ pub(super) fn establish(
     max_index: u16,
     window: DirectMap,
     ipi_virtual: bool,
-    x2avic: bool,
 ) {
     let processors = backing.len();
     let state = Box::new(Activation {
@@ -169,7 +164,6 @@ pub(super) fn establish(
         max_index,
         window,
         ipi_virtual,
-        x2avic,
         machine_inhibited: AtomicBool::new(false),
         logical_lock: Mutex::new(()),
         logical_slots: (0..processors).map(|_| AtomicU16::new(NO_SLOT)).collect(),
@@ -184,16 +178,28 @@ pub(crate) fn provisioned() -> bool {
     ACTIVATED.is_completed()
 }
 
+/// Records whether a guest on this machine may be given the controller face
+/// its identifiers are reached through in model-specific registers.
+///
+/// The boot-time policy's answer, and it has to be taken before the first
+/// controller is built rather than with the structures the acceleration runs
+/// on: a controller seeded from firmware's own register can already *be* in
+/// that face, and whether it may stay there is this question — asked at a
+/// moment when nothing has been provisioned yet.
+pub(crate) fn permit_x2apic(permitted: bool) {
+    X2APIC_PERMITTED.call_once(|| permitted);
+}
+
 /// Whether a guest may be given the controller face its identifiers are
 /// reached through in model-specific registers.
 ///
-/// True wherever the acceleration does not exist at all — a machine the
-/// policy left on the software path emulates that face as it emulates every
-/// other — and false on a machine provisioned for hardware delivery that
-/// cannot drive it, which is where the face would be a promise the entry
-/// boundary could not keep.
+/// The one statement of it, consulted wherever the answer can be observed: the
+/// state a controller is seeded into, the transition a guest writes, and the
+/// feature bit `CPUID` reports. True until [`permit_x2apic`] says otherwise,
+/// which is a window with no controller in it at all — building the controllers
+/// is what records the answer.
 pub(crate) fn x2avic_permitted() -> bool {
-    ACTIVATED.get().is_none_or(|activation| activation.x2avic)
+    X2APIC_PERMITTED.get().copied().unwrap_or(true)
 }
 
 /// Whether this processor's controller is being driven in hardware at this
@@ -239,7 +245,7 @@ fn active_face(vlapic: &Vlapic) -> Option<Face> {
     driven_face(
         activation.machine_inhibited.load(Ordering::Acquire),
         vlapic.mode(),
-        activation.x2avic,
+        x2avic_permitted(),
         vlapic.avic_inhibited(),
     )
 }
@@ -253,7 +259,7 @@ fn active_face(vlapic: &Vlapic) -> Option<Face> {
 ///
 /// The older face is what a provisioned machine was built for wherever it was
 /// built at all; the wider one is driven only where the policy says it can be,
-/// which is the answer [`x2avic_permitted`] gives elsewhere. A controller its
+/// which is what [`x2avic_permitted`] answers. A controller its
 /// guest has globally disabled is driven in neither: with the enable bit of the
 /// base register clear there is no controller to drive, and the guest's only
 /// way back is that register, which is a model-specific register this
@@ -1428,9 +1434,12 @@ mod tests {
 
     #[test]
     fn a_format_that_is_not_flat_follows_the_cluster_model() {
-        // The flat encoding is the only one that is flat: every other value
-        // of the format register is matched the cluster way, which is the
-        // convention the kernel's AVIC uses and the one the plan follows.
+        // The flat encoding is the only one that is flat. The architecture
+        // defines two values for the format register and leaves every other
+        // undefined, so anything that is not the flat one is matched the
+        // cluster way — which is the shape of the table the hardware resolves
+        // a logical destination through, and what the kernel's own
+        // acceleration does with the same register.
         assert_eq!(logical_slot(0x2100_0000, 0x1FFF_FFFF), Some(8));
         assert_eq!(logical_slot(0x2100_0000, 0xEFFF_FFFF), Some(8));
     }
