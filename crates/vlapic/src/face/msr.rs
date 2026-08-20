@@ -19,6 +19,7 @@
 
 use apic::{IA32_TSC_DEADLINE, X2APIC_BASE_MSR};
 use log::{trace, warn};
+use vcpu::MsrPassthrough;
 
 use crate::{
     VlapicError,
@@ -130,6 +131,33 @@ pub fn intercepted() -> impl Iterator<Item = u32> {
     (X2APIC_BASE_MSR..=X2APIC_LAST_MSR).chain([ApicBase::MSR, IA32_TSC_DEADLINE])
 }
 
+/// The accesses to the controller's registers the hardware may answer itself
+/// while it drives a controller its guest reaches through model-specific
+/// registers.
+///
+/// The complement of [`intercepted`]'s hold on the same range: interception
+/// has priority over the acceleration — an access this set does not name
+/// exits even while the hardware drives — so everything not named here stays
+/// guarded. What is named is the set the silicon accelerates whole, in the
+/// directions it accelerates them: the task priority either way, and the
+/// three writes the hardware performs without help — the acknowledgement, the
+/// interrupt command and the self-interrupt. The command's read is kept for
+/// the host deliberately: it answers live state, and the exit is the only
+/// place the host sees one.
+///
+/// One symbol holds the whole of the policy, which is what lets a machine's
+/// measurement widen or narrow it without touching the transitions that
+/// grant and withdraw it.
+pub(crate) fn passthrough() -> impl Iterator<Item = MsrPassthrough> {
+    [
+        MsrPassthrough::both(Register::TASK_PRIORITY.msr()),
+        MsrPassthrough::writes(Register::END_OF_INTERRUPT.msr()),
+        MsrPassthrough::writes(Register::COMMAND_LOW.msr()),
+        MsrPassthrough::writes(Register::SELF_IPI.msr()),
+    ]
+    .into_iter()
+}
+
 /// Whether an index is one this crate answers for.
 ///
 /// The whole of the controller's reserved range counts, not merely the indices
@@ -179,7 +207,14 @@ pub(crate) fn read(vlapic: &Vlapic, index: u32, tsc_offset: u64) -> Result<u64, 
     // requires — and this is the rest of that rule: a guest handed a bit the
     // register does not have would be faulted for writing back what it read.
     if register == Register::COMMAND_LOW {
-        return Ok(vlapic.command().bits() & Command::WRITABLE_X2APIC);
+        let bits = avic_value(vlapic, register).unwrap_or_else(|| vlapic.command().bits());
+        return Ok(bits & Command::WRITABLE_X2APIC);
+    }
+    // The registers the hardware owns while it drives the controller are the
+    // page's while it does, and the page answers them; everything else is
+    // still the model's.
+    if let Some(value) = avic_value(vlapic, register) {
+        return Ok(value);
     }
     Ok(u64::from(dispatch::read(vlapic, register)))
 }
@@ -230,6 +265,9 @@ pub(crate) fn write(
         if value & !Command::WRITABLE_X2APIC != 0 {
             return Err(Fault::Reserved);
         }
+        if let Some(written) = avic_write(vlapic, register, value) {
+            return Ok(written);
+        }
         return Ok(Written::Command(vlapic.set_command(value)));
     }
     // Everything else is a 32-bit register whose upper half is reserved.
@@ -249,7 +287,71 @@ pub(crate) fn write(
     if narrow & reserved(model, register) != 0 {
         return Err(Fault::Reserved);
     }
+    // While the hardware drives the controller, a write the permission map
+    // hands back goes where the hardware reads it, with whatever the register
+    // owes beyond the store; the model's path answers only what the hardware
+    // leaves to it.
+    if let Some(written) = avic_write(vlapic, register, value) {
+        return Ok(written);
+    }
     Ok(dispatch::write(vlapic, register, narrow))
+}
+
+/// The value the hardware serves out of the backing page for one of its own
+/// registers while it drives the controller, where that is not what the
+/// model holds.
+///
+/// `None` leaves the answer to the model's path, for the two reasons there
+/// is one: the register is one the model still owns, or the page could not
+/// be reached — in which case the demotion below is the honest answer, and
+/// the model's value the nearest true one while the control block catches up
+/// at the next entry.
+fn avic_value(vlapic: &Vlapic, register: Register) -> Option<u64> {
+    if !crate::avic::activation::active_for(vlapic) {
+        return None;
+    }
+    match crate::avic::activation::msr_read(register) {
+        Ok(value) => value,
+        Err(error) => {
+            demote(vlapic, register, error);
+            None
+        }
+    }
+}
+
+/// What a write does while the hardware drives the controller, where that is
+/// not what the model's path does.
+///
+/// `None` leaves the write to the model's path, for the same two reasons as
+/// [`avic_value`].
+fn avic_write(vlapic: &Vlapic, register: Register, value: u64) -> Option<Written> {
+    if !crate::avic::activation::active_for(vlapic) {
+        return None;
+    }
+    match crate::avic::activation::msr_write(register, value) {
+        Ok(written) => Some(written),
+        Err(error) => {
+            demote(vlapic, register, error);
+            None
+        }
+    }
+}
+
+/// Demotes the controller to software delivery because its backing page
+/// could not be reached while the hardware was said to drive it, and says
+/// so.
+///
+/// The page is what the claim of driving rests on, so a claim that cannot
+/// reach it is one the processor stops making: the control block's enable
+/// bits follow at the next entry, and the access that discovered the break
+/// is answered by the software path rather than visited on the guest.
+fn demote(vlapic: &Vlapic, register: Register, error: VlapicError) {
+    vlapic.inhibit_avic();
+    warn!(
+        "vlapic: {} could not reach its backing page for {register:?}: {error}; the processor \
+         returns to software delivery",
+        vlapic.index()
+    );
 }
 
 /// Translates a physical deadline into the timestamp domain the guest reads.
@@ -389,10 +491,11 @@ mod tests {
     //! shape.
 
     use apic::{IA32_TSC_DEADLINE, X2APIC_BASE_MSR};
+    use vcpu::MsrPassthrough;
 
     use super::{
         Access, ApicBase, Command, Fault, addressable, claims, guest_deadline, intercepted,
-        physical_deadline, reserved,
+        passthrough, physical_deadline, reserved,
     };
     use crate::{
         hardware::model,
@@ -415,6 +518,35 @@ mod tests {
         // by the guest against the machine's own controller.
         for index in intercepted() {
             assert!(claims(index), "{index:#x} is trapped and unclaimed");
+        }
+    }
+
+    #[test]
+    fn the_passthrough_set_is_the_accelerated_accesses_and_nothing_else() {
+        // Written out as literals so that an access moving fails a test rather
+        // than moving with it: the task priority in both directions, and the
+        // three writes the hardware performs whole. The command's read is
+        // deliberately absent — it answers live state, and the exit is where
+        // the host sees one.
+        assert!(passthrough().eq([
+            MsrPassthrough::both(0x808),
+            MsrPassthrough::writes(0x80B),
+            MsrPassthrough::writes(0x830),
+            MsrPassthrough::writes(0x83F),
+        ]));
+    }
+
+    #[test]
+    fn every_register_passed_through_is_one_this_crate_answers_for() {
+        // An index passed through and unclaimed would be executed by the guest
+        // against the machine's own controller — the sharp end of the same
+        // disagreement the test above guards in the other direction.
+        for access in passthrough() {
+            assert!(
+                claims(access.index),
+                "{:#x} is passed through and unclaimed",
+                access.index
+            );
         }
     }
 

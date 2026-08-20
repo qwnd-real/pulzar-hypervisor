@@ -109,6 +109,7 @@ pub use crate::{
         provision, publish_running as avic_publish_running, reconcile as avic_reconcile,
         trap_access as avic_trap_access, unaccelerated_trap as avic_unaccelerated_trap,
         unpublish_running as avic_unpublish_running, wake_targets as avic_wake_targets,
+        x2apic_offered,
     },
     face::{
         mmio::region,
@@ -195,4 +196,9 @@ pub enum VlapicError {
     /// it just handed out.
     #[error(transparent)]
     Paging(#[from] paging::PagingError),
+    /// A control block refused a change the acceleration asked of it, which
+    /// is the permission map it carries: the structures were being moved at
+    /// an entry boundary, and the block said no.
+    #[error(transparent)]
+    Vcpu(#[from] vcpu::VcpuError),
 }

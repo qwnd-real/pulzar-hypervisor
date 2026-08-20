@@ -70,7 +70,11 @@ use crate::{
 /// and sizes the physical table: the hardware walks no further than it.
 /// `ipi_virtual` is whether the silicon's reading of the running bits is
 /// trustworthy — the boot-time policy's answer — and decides whether the
-/// running bits are ever published at all.
+/// running bits are ever published at all. `x2avic` is whether the
+/// acceleration may drive a controller its guest reaches through
+/// model-specific registers — the policy's answer again — and decides both
+/// whether that face is ever activated and whether the guest is told it
+/// exists.
 ///
 /// # Errors
 ///
@@ -84,6 +88,7 @@ pub fn provision(
     space: &mut paging::AddressSpace,
     max_index: u16,
     ipi_virtual: bool,
+    x2avic: bool,
 ) -> Result<vcpu::AvicTables, VlapicError> {
     if activation::provisioned() {
         return Err(VlapicError::AlreadyProvisioned);
@@ -122,8 +127,23 @@ pub fn provision(
         max_index,
         window,
         ipi_virtual,
+        x2avic,
     );
     Ok(tables)
+}
+
+/// Whether the guest may be told about the controller face its identifiers
+/// are reached through in model-specific registers.
+///
+/// The question the machine's `CPUID` answer is judged against: a guest
+/// offered a face the acceleration cannot drive is one whose mode
+/// transitions would leave it delivered in software at exactly the moments
+/// it believes it is accelerated, so a machine provisioned without the
+/// capability withholds the bit. A machine with no acceleration at all
+/// emulates the face as it emulates everything else, and offers it.
+#[must_use]
+pub fn x2apic_offered() -> bool {
+    activation::x2avic_permitted()
 }
 
 /// The page the processor asking has its controller registers backed by.

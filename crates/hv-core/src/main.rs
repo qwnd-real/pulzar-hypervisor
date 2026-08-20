@@ -230,7 +230,14 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     let policy = avic::policy();
     let avic_tables = policy
         .enabled()
-        .then(|| vlapic::provision(&mut space, policy.max_index(), policy.ipi_virtual()))
+        .then(|| {
+            vlapic::provision(
+                &mut space,
+                policy.max_index(),
+                policy.ipi_virtual(),
+                policy.x2avic(),
+            )
+        })
         .transpose()?;
     let partition = PARTITION.try_call_once(|| Partition::establish(&mut space, avic_tables))?;
     partition.describe("core");

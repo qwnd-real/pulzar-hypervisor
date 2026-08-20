@@ -608,6 +608,49 @@ impl Vcpu {
         window: DirectMap,
         msrs: impl IntoIterator<Item = u32>,
     ) -> Result<(), VcpuError> {
+        let map = self.permission_map(window)?;
+        intercept(map, msrs);
+        self.soil(CleanBits::PERMISSION_MAPS);
+        Ok(())
+    }
+
+    /// Lets the guest's reads and writes of these model-specific registers
+    /// reach their destination without an exit, per direction.
+    ///
+    /// The complement of [`Vcpu::intercept_msrs`], and like it policy-free:
+    /// what makes an access safe to hand to the guest is the caller's
+    /// judgement, stated in the set it passes. An index the permission map
+    /// does not cover is skipped, as in [`Vcpu::intercept_msrs`]: accesses to
+    /// it are intercepted unconditionally, and no bit exists to clear.
+    ///
+    /// Giving an access back is the one direction the caller must order for
+    /// itself: a register the guest believes it owns while whatever made the
+    /// access safe no longer holds is one the guest reaches unprotected, so
+    /// interception must be restored — [`Vcpu::intercept_msrs`] over the same
+    /// set does it, and setting a bit already set changes nothing — before
+    /// whatever made the access safe is taken away.
+    ///
+    /// # Errors
+    ///
+    /// [`VcpuError::Unreachable`] if the permission map cannot be reached
+    /// through `window`.
+    pub fn passthrough_msrs(
+        &mut self,
+        window: DirectMap,
+        msrs: impl IntoIterator<Item = MsrPassthrough>,
+    ) -> Result<(), VcpuError> {
+        let map = self.permission_map(window)?;
+        passthrough(map, msrs);
+        self.soil(CleanBits::PERMISSION_MAPS);
+        Ok(())
+    }
+
+    /// This virtual processor's permission map, reached through the window.
+    ///
+    /// # Errors
+    ///
+    /// [`VcpuError::Unreachable`] if the window does not reach the page.
+    fn permission_map(&mut self, window: DirectMap) -> Result<&mut [u8; MSRPM_BYTES], VcpuError> {
         let mut map = window
             .ptr::<[u8; MSRPM_BYTES]>(self.msrpm_phys)
             .map_err(|_| VcpuError::Unreachable {
@@ -617,10 +660,7 @@ impl Vcpu {
         // reached through the direct map. The guest is not running: a VCPU is
         // not `Send`, so the only processor that could have entered it is this
         // one, and this one is here.
-        let map = unsafe { map.as_mut() };
-        intercept(map, msrs);
-        self.soil(CleanBits::PERMISSION_MAPS);
-        Ok(())
+        Ok(unsafe { map.as_mut() })
     }
 
     /// Puts this virtual processor into the state a real one is in when a
@@ -733,6 +773,65 @@ fn intercept(map: &mut [u8; MSRPM_BYTES], msrs: impl IntoIterator<Item = u32>) {
     }
 }
 
+/// Clears the permission bits every named access says to clear.
+///
+/// The mirror of [`intercept`], direction by direction: a bit stays set
+/// unless the access names it, and a register with neither direction named
+/// is untouched rather than restored, which is what lets a caller hand back
+/// writes alone while keeping reads for itself.
+fn passthrough(map: &mut [u8; MSRPM_BYTES], msrs: impl IntoIterator<Item = MsrPassthrough>) {
+    for msr in msrs {
+        let Some(permission) = msrpm_position(msr.index) else {
+            continue;
+        };
+        if msr.read {
+            map[permission.read.byte] &= !permission.read.mask();
+        }
+        if msr.write {
+            map[permission.write.byte] &= !permission.write.mask();
+        }
+    }
+}
+
+/// Which directions of one model-specific register's accesses the guest may
+/// make without an exit.
+///
+/// What [`Vcpu::passthrough_msrs`] is handed, one of these per register. The
+/// two directions are apart rather than a pair of registers because a
+/// register can be safe to write and not to read — the interrupt controller's
+/// command is exactly one, and its acknowledgement exactly the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsrPassthrough {
+    /// The register's index.
+    pub index: u32,
+    /// Reads reach the register without an exit.
+    pub read: bool,
+    /// Writes reach it without one.
+    pub write: bool,
+}
+
+impl MsrPassthrough {
+    /// An access with both directions handed to the guest.
+    #[must_use]
+    pub const fn both(index: u32) -> Self {
+        Self {
+            index,
+            read: true,
+            write: true,
+        }
+    }
+
+    /// An access with only writes handed to the guest.
+    #[must_use]
+    pub const fn writes(index: u32) -> Self {
+        Self {
+            index,
+            read: false,
+            write: true,
+        }
+    }
+}
+
 /// The narrowest way this processor can discard one guest's translations.
 ///
 /// Flushing by identifier throws away this guest's and nothing else's. A
@@ -787,3 +886,67 @@ const _: () = {
         index += 1;
     }
 };
+
+#[cfg(test)]
+mod tests {
+    //! The permission-map edits are pure functions of the map and the named
+    //! registers, and they are the edits that decide, bit by bit, what a
+    //! guest reaches without the hypervisor hearing — so both directions are
+    //! asserted here rather than trusted.
+
+    use svm::permissions::{MSRPM_BYTES, msrpm_position};
+
+    use super::{MsrPassthrough, intercept, passthrough};
+
+    /// A register the map covers, and one every test here uses.
+    const REGISTER: u32 = 0x808;
+
+    /// The two permission bits of `register`, read out of `map`.
+    fn bits(map: &[u8; MSRPM_BYTES], register: u32) -> (bool, bool) {
+        let permission = msrpm_position(register).expect("the tests use a covered register");
+        (
+            map[permission.read.byte] & permission.read.mask() != 0,
+            map[permission.write.byte] & permission.write.mask() != 0,
+        )
+    }
+
+    #[test]
+    fn intercepting_sets_both_directions() {
+        let mut map = [0; MSRPM_BYTES];
+        intercept(&mut map, [REGISTER]);
+        assert_eq!(bits(&map, REGISTER), (true, true));
+        // And sets nothing beside the registers it was given.
+        assert_eq!(bits(&map, REGISTER + 1), (false, false));
+    }
+
+    #[test]
+    fn passing_an_access_through_clears_exactly_the_directions_it_names() {
+        let mut map = [0; MSRPM_BYTES];
+        intercept(&mut map, [REGISTER]);
+        // Writes alone leave the read bit standing.
+        passthrough(&mut map, [MsrPassthrough::writes(REGISTER)]);
+        assert_eq!(bits(&map, REGISTER), (true, false));
+        // Both directions leave nothing of the pair.
+        passthrough(&mut map, [MsrPassthrough::both(REGISTER)]);
+        assert_eq!(bits(&map, REGISTER), (false, false));
+    }
+
+    #[test]
+    fn intercepting_after_a_passthrough_restores_the_interception_whole() {
+        let mut map = [0; MSRPM_BYTES];
+        intercept(&mut map, [REGISTER]);
+        passthrough(&mut map, [MsrPassthrough::both(REGISTER)]);
+        intercept(&mut map, [REGISTER]);
+        assert_eq!(bits(&map, REGISTER), (true, true));
+    }
+
+    #[test]
+    fn a_register_the_map_does_not_cover_is_skipped_in_either_direction() {
+        let mut map = [0; MSRPM_BYTES];
+        passthrough(&mut map, [MsrPassthrough::both(0xC002_0000)]);
+        intercept(&mut map, [0xC002_0000]);
+        // Nothing to assert but survival: both calls must leave the map
+        // untouched rather than reaching past its end.
+        assert_eq!(map, [0; MSRPM_BYTES]);
+    }
+}

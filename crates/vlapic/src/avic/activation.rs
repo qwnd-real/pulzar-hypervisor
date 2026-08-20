@@ -57,10 +57,13 @@ use x86_64::PhysAddr;
 use crate::{
     VlapicError,
     avic::backing::ResetImage,
-    face::{dispatch, table::Register},
+    delivery::error,
+    face::{dispatch, dispatch::Written, table::Register},
     machine::{current, registry},
     priority::{self, Priority},
-    registers::{FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, icr::Command, lvt::Entry},
+    registers::{
+        FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, error::Errors, icr::Command, lvt::Entry,
+    },
 };
 
 /// The bit of a physical-table entry the owning processor toggles.
@@ -108,6 +111,14 @@ struct Activation {
     /// skipped there, so the bit is never set and can never be read stale,
     /// and every directed IPI takes the exit-and-kick path instead.
     ipi_virtual: bool,
+    /// Whether the acceleration may drive a controller its guest reaches
+    /// through model-specific registers.
+    ///
+    /// The boot-time policy's answer: a machine the extension cannot take
+    /// that far — no x2AVIC, or identifiers the wider tables cannot hold —
+    /// is one where the guest is never told the mode exists, and a write
+    /// reaching for it anyway is refused rather than driven.
+    x2avic: bool,
     /// The machine has been told something is wrong with the acceleration
     /// itself, and stays on the software path for the rest of its life.
     ///
@@ -141,6 +152,7 @@ pub(super) fn establish(
     max_index: u16,
     window: DirectMap,
     ipi_virtual: bool,
+    x2avic: bool,
 ) {
     let processors = backing.len();
     let state = Box::new(Activation {
@@ -150,6 +162,7 @@ pub(super) fn establish(
         max_index,
         window,
         ipi_virtual,
+        x2avic,
         machine_inhibited: AtomicBool::new(false),
         logical_lock: Mutex::new(()),
         logical_slots: (0..processors).map(|_| AtomicU16::new(NO_SLOT)).collect(),
@@ -164,19 +177,32 @@ pub(super) fn provisioned() -> bool {
     ACTIVATED.is_completed()
 }
 
+/// Whether a guest may be given the controller face its identifiers are
+/// reached through in model-specific registers.
+///
+/// True wherever the acceleration does not exist at all — a machine the
+/// policy left on the software path emulates that face as it emulates every
+/// other — and false on a machine provisioned for hardware delivery that
+/// cannot drive it, which is where the face would be a promise the entry
+/// boundary could not keep.
+pub(crate) fn x2avic_permitted() -> bool {
+    ACTIVATED.get().is_none_or(|activation| activation.x2avic)
+}
+
 /// Whether this processor's controller is being driven in hardware at this
 /// moment.
 ///
 /// The question every delivery path asks before taking the hardware's: the
 /// structures must exist, the machine must not have been demoted, the guest
-/// must be in the face the hardware drives, and the processor must not have
+/// must be in a face the hardware drives — the older one always, the wider
+/// one only where the policy allows it — and the processor must not have
 /// been demoted on its own.
 pub(crate) fn active_for(vlapic: &Vlapic) -> bool {
     let Some(activation) = ACTIVATED.get() else {
         return false;
     };
     !activation.machine_inhibited.load(Ordering::Acquire)
-        && vlapic.mode() == Mode::XApic
+        && activation.drives(vlapic.mode())
         && vlapic.software_enabled()
         && !vlapic.avic_inhibited()
 }
@@ -193,15 +219,62 @@ pub(crate) fn own_page() -> Result<PhysAddr, VlapicError> {
     activation.page(vlapic.index().get())
 }
 
+/// The face the control block's acceleration drives, which is the whole of
+/// what its two enable bits mean.
+///
+/// The bits and the face are one decision rather than two because the
+/// architecture defines no state with the wider bit set and the narrower one
+/// clear, and the transitions below never produce one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Face {
+    /// Eight-bit identifiers, reached through the register page.
+    XAvic,
+    /// Thirty-two-bit identifiers, reached through model-specific registers.
+    X2Avic,
+}
+
+/// What an entry owes the acceleration, given the face the control block
+/// carries and the face the guest is in.
+///
+/// Pure rather than folded into [`reconcile`], because the decision is the
+/// part of the transition that must not be wrong, and a decision of values
+/// is the kind of thing that can be read against the table it implements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Move {
+    /// Both agree the software delivers; nothing is owed.
+    Idle,
+    /// Both agree the hardware delivers, in the same face; only the
+    /// steady-state upkeep is owed.
+    Steady,
+    /// The acceleration is turned on, in this face.
+    Enable(Face),
+    /// The acceleration is turned off; it was on in this face.
+    Disable(Face),
+    /// The acceleration stays on and changes face.
+    Switch { from: Face, to: Face },
+}
+
+/// The move an entry owes, as a table rather than a chain of comparisons.
+fn move_for(have: Option<Face>, want: Option<Face>) -> Move {
+    match (have, want) {
+        (None, None) => Move::Idle,
+        (None, Some(face)) => Move::Enable(face),
+        (Some(face), None) => Move::Disable(face),
+        (Some(from), Some(to)) if from != to => Move::Switch { from, to },
+        (Some(_), Some(_)) => Move::Steady,
+    }
+}
+
 /// Brings the control block's acceleration into agreement with the guest it
 /// describes, on the way in.
 ///
 /// Cheap in steady state: a comparison, and nothing else. Where the guest's
-/// face and the control block's bit disagree, the transition is performed
+/// face and the control block's bits disagree, the transition is performed
 /// here — the backing page rebuilt from the model on the way up, the
-/// hardware's state carried back into the model on the way down — because
-/// the rule every transition keeps is that the software model moves first
-/// and the acceleration follows it.
+/// hardware's state carried back into the model on the way down, the
+/// permission map's pass-through granted before the wider face's enable bit
+/// and withdrawn after it — because the rule every transition keeps is that
+/// the software model moves first and the acceleration follows it.
 ///
 /// # Errors
 ///
@@ -215,16 +288,18 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
         return Ok(());
     };
     let vlapic = current()?;
-    let index = vlapic.index().get();
-    let want = active_for(vlapic);
-    let have = vcpu.control().interrupt_control.avic_enable();
-    match (have, want) {
-        (true, false) => deactivate(activation, vcpu, vlapic),
-        (false, true) => activate(activation, vcpu, vlapic),
+    let have = face_of(vcpu);
+    let want = active_for(vlapic).then(|| face_of_guest(vlapic));
+    match move_for(have, want) {
+        Move::Idle => Ok(()),
+        Move::Enable(face) => enable(activation, vcpu, vlapic, face),
+        Move::Disable(face) => disable(activation, vcpu, vlapic, face),
+        Move::Switch { from, to } => switch(activation, vcpu, from, to),
         // The steady state. One thing can still have moved: a reset rebuilt
         // the model underneath an active controller, and the page the
         // hardware serves must be rebuilt after it.
-        (true, true) => {
+        Move::Steady => {
+            let index = vlapic.index().get();
             if activation.rebuilt_at[index].load(Ordering::Relaxed) != vlapic.epoch() {
                 rebuild_backing(vlapic)?;
                 activation.rebuilt_at[index].store(vlapic.epoch(), Ordering::Relaxed);
@@ -235,25 +310,67 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
             sync_task_priority(activation, vlapic)?;
             Ok(())
         }
-        (false, false) => Ok(()),
+    }
+}
+
+/// The face a control block's enable bits name, or nothing while they are
+/// clear.
+fn face_of(vcpu: &Vcpu) -> Option<Face> {
+    let interrupts = vcpu.control().interrupt_control;
+    interrupts.avic_enable().then(|| {
+        if interrupts.x2avic_enable() {
+            Face::X2Avic
+        } else {
+            Face::XAvic
+        }
+    })
+}
+
+/// The face the guest's own mode asks the acceleration for.
+///
+/// Asked only of a controller [`active_for`] has already accepted, so the
+/// switched-off face cannot arrive here, and neither can the wider one on a
+/// machine the policy left without it.
+fn face_of_guest(vlapic: &Vlapic) -> Face {
+    match vlapic.mode() {
+        Mode::X2Apic => Face::X2Avic,
+        Mode::XApic | Mode::Disabled => Face::XAvic,
     }
 }
 
 /// Turns the acceleration on for this processor, at the entry that asked.
-fn activate(activation: &Activation, vcpu: &mut Vcpu, vlapic: &Vlapic) -> Result<(), VlapicError> {
+///
+/// The permission map's pass-through goes first wherever the wider face is
+/// what turns on: granting an access after its enable bit is set would leave
+/// the guest a window of unguarded registers, and the order that cannot be
+/// wrong is the order that cannot be observed.
+fn enable(
+    activation: &Activation,
+    vcpu: &mut Vcpu,
+    vlapic: &Vlapic,
+    face: Face,
+) -> Result<(), VlapicError> {
     rebuild_backing(vlapic)?;
     activation.rebuilt_at[vlapic.index().get()].store(vlapic.epoch(), Ordering::Relaxed);
+    let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
+    if face == Face::X2Avic {
+        vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
+        soil = soil.union(CleanBits::PERMISSION_MAPS);
+    }
     let control = vcpu.control_mut();
-    control.interrupt_control = control.interrupt_control.with_avic_enable(true);
+    control.interrupt_control = control
+        .interrupt_control
+        .with_avic_enable(true)
+        .with_x2avic_enable(face == Face::X2Avic);
     // The enable bit is one clean group and the pointers beside it are
     // another, and both were touched by the life the guest lived since the
     // acceleration was last on.
-    vcpu.soil(CleanBits::INTERRUPT.union(CleanBits::AVIC));
+    vcpu.soil(soil);
     // The processor may have cached a translation of the register page from
     // before the redirection existed; nothing but a flush gets rid of it.
     vcpu.flush();
     info!(
-        "vlapic: {} turned hardware delivery on for its guest",
+        "vlapic: {} turned hardware delivery on for its guest, in the {face:?} face",
         vlapic.index()
     );
     Ok(())
@@ -261,15 +378,34 @@ fn activate(activation: &Activation, vcpu: &mut Vcpu, vlapic: &Vlapic) -> Result
 
 /// Turns the acceleration off for this processor, carrying the hardware's
 /// state back into the model first.
-fn deactivate(
+///
+/// Where the wider face is what turns off, full interception comes back
+/// before the enable bit goes: the one state the architecture must never
+/// see is a guest that believes it owns its controller's registers while
+/// nothing guards them, and restoring first is the order that cannot make
+/// one.
+fn disable(
     activation: &Activation,
     vcpu: &mut Vcpu,
     vlapic: &Vlapic,
+    face: Face,
 ) -> Result<(), VlapicError> {
+    let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
+    if face == Face::X2Avic {
+        // Setting a permission bit already set changes nothing, so the whole
+        // claimed range is restored rather than the handful that was given
+        // back: the result is the map the block was created with, and no
+        // count of what moved in between.
+        vcpu.intercept_msrs(activation.window, crate::intercepted())?;
+        soil = soil.union(CleanBits::PERMISSION_MAPS);
+    }
     sync_into_model(activation, vlapic)?;
     let control = vcpu.control_mut();
-    control.interrupt_control = control.interrupt_control.with_avic_enable(false);
-    vcpu.soil(CleanBits::INTERRUPT.union(CleanBits::AVIC));
+    control.interrupt_control = control
+        .interrupt_control
+        .with_avic_enable(false)
+        .with_x2avic_enable(false);
+    vcpu.soil(soil);
     vcpu.flush();
     // Defensive: the unpublish belongs to the exit and the park boundaries,
     // and a demotion arriving anywhere else must not leave the bit behind.
@@ -277,6 +413,56 @@ fn deactivate(
     info!(
         "vlapic: {} turned hardware delivery off for its guest",
         vlapic.index()
+    );
+    Ok(())
+}
+
+/// Keeps the acceleration on and moves it between faces, at the entry that
+/// asked.
+///
+/// The backing page is the guest's rather than the face's and survives the
+/// move whole — both faces read and write the same registers in it — which
+/// is what makes this a bit and a permission map rather than a deactivation
+/// and an activation. The logical table is likewise left alone: the wider
+/// face does not consult it, and the narrower one never stops finding it
+/// populated.
+fn switch(
+    activation: &Activation,
+    vcpu: &mut Vcpu,
+    from: Face,
+    to: Face,
+) -> Result<(), VlapicError> {
+    match (from, to) {
+        (Face::XAvic, Face::X2Avic) => {
+            vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
+        }
+        // A guest cannot step from the wider face back to the narrower one —
+        // the base register's state machine refuses the move — so this arm is
+        // the defensive one, written anyway because a block found in it must
+        // come out of it guarded.
+        (Face::X2Avic, Face::XAvic) => {
+            vcpu.intercept_msrs(activation.window, crate::intercepted())?;
+        }
+        (Face::XAvic, Face::XAvic) | (Face::X2Avic, Face::X2Avic) => {
+            // The same face twice is the steady state and is not a switch.
+            return Ok(());
+        }
+    }
+    let control = vcpu.control_mut();
+    control.interrupt_control = control
+        .interrupt_control
+        .with_x2avic_enable(to == Face::X2Avic);
+    // The enable word moved and so did the permission map, and a translation
+    // cached under the old face's redirection is one the flush alone retires.
+    vcpu.soil(
+        CleanBits::INTERRUPT
+            .union(CleanBits::AVIC)
+            .union(CleanBits::PERMISSION_MAPS),
+    );
+    vcpu.flush();
+    info!(
+        "vlapic: {} moved hardware delivery from the {from:?} face to the {to:?} face",
+        current()?.index()
     );
     Ok(())
 }
@@ -511,6 +697,132 @@ pub(crate) fn backing_write_task_priority(value: u32) -> Result<(), VlapicError>
     Ok(())
 }
 
+/// What the guest reads out of one of the registers the hardware owns while
+/// it drives the controller, where that is not what the model holds.
+///
+/// `None` answers for a register the model is still the truth of — the
+/// identifier, the version, the local vector entries and everything else the
+/// guest programs through exits — and `Some` for the registers that move
+/// without one: the priorities, the vector banks, and the command the
+/// hardware carries out between the page's two halves.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`].
+pub(crate) fn msr_read(register: Register) -> Result<Option<u64>, VlapicError> {
+    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
+    let vlapic = current()?;
+    let page = activation.page(vlapic.index().get())?;
+    let word = |slot: Register| -> Result<u32, VlapicError> {
+        Ok(activation
+            .word(page, slot.offset())?
+            .load(Ordering::Acquire))
+    };
+    let value = match register {
+        Register::TASK_PRIORITY | Register::PROCESSOR_PRIORITY => u64::from(word(register)?),
+        // The one register the wide face reads whole: the page holds it as
+        // the older face does, in two halves, and a reader of it is owed the
+        // halves as one.
+        Register::COMMAND_LOW => {
+            u64::from(word(Register::COMMAND_LOW)?)
+                | (u64::from(word(Register::COMMAND_HIGH)?) << u32::BITS)
+        }
+        _ if register.bank().is_some() => u64::from(word(register)?),
+        _ => return Ok(None),
+    };
+    Ok(Some(value))
+}
+
+/// Performs a write the permission map handed back while the hardware drives
+/// the controller.
+///
+/// The model is not the truth of these registers while it does — the page
+/// is — so the value goes where the hardware reads it and whatever the
+/// register owes beyond the store is performed here rather than left to the
+/// model's path: the acknowledgement an end-of-interrupt owes real hardware,
+/// the delivery a command asks for, the request a self-interrupt names.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`].
+pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, VlapicError> {
+    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
+    let vlapic = current()?;
+    let page = activation.page(vlapic.index().get())?;
+    match register {
+        // The hardware reads the task priority out of the page while it
+        // drives; the model takes it back at whichever entry next consults
+        // it.
+        Register::TASK_PRIORITY => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the face refused every bit above the low half before this was asked"
+            )]
+            let narrow = value as u32;
+            activation
+                .word(page, register.offset())?
+                .store(narrow, Ordering::Release);
+            Ok(Written::Nothing)
+        }
+        // The interception means the hardware never performed the write, so
+        // what is owed is the acknowledgement whole: the in-service bit the
+        // page holds and the release of whatever real hardware is holding.
+        Register::END_OF_INTERRUPT => {
+            end_of_interrupt(vlapic, None)?;
+            Ok(Written::Nothing)
+        }
+        Register::ERROR_STATUS => {
+            // The write latches the page's copy clear, as it latches the
+            // model's: both are what the guest reads back, depending on
+            // which of them is serving the register at the time.
+            activation
+                .word(page, register.offset())?
+                .store(0, Ordering::Release);
+            Ok(dispatch::write(vlapic, register, 0))
+        }
+        // A command the map handed back is one the hardware never attempted,
+        // and is completed by the software path end to end, exactly as an
+        // incomplete delivery the hardware reported would be.
+        Register::COMMAND_LOW => {
+            complete_command(value)?;
+            Ok(Written::Nothing)
+        }
+        // A self-interrupt is a request against one's own page, with the
+        // architecture's check of the vector performed first.
+        Register::SELF_IPI => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a vector is the low eight bits of the register it is written in"
+            )]
+            let vector = Vector::new(value as u8);
+            if priority::legal(vector) {
+                request(vector)?;
+            } else {
+                error::noticed(
+                    vlapic,
+                    Errors::SEND_ILLEGAL_VECTOR | Errors::RECEIVE_ILLEGAL_VECTOR,
+                );
+            }
+            Ok(Written::Nothing)
+        }
+        // Everything else is a register the guest programs through exits —
+        // the spurious vector, the local vector entries, the timer's
+        // configuration — and the page must hold what the model is told, or
+        // the hardware evaluates state the guest never set.
+        other => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the face refused every bit above the low half before this was asked"
+            )]
+            let narrow = value as u32;
+            activation
+                .word(page, other.offset())?
+                .store(narrow, Ordering::Release);
+            Ok(dispatch::write(vlapic, other, narrow))
+        }
+    }
+}
+
 /// Demotes the whole machine, for the rest of its life.
 ///
 /// For the reports that say the acceleration itself cannot be trusted:
@@ -537,6 +849,22 @@ pub(crate) fn kick_count() -> u64 {
 }
 
 impl Activation {
+    /// Whether the acceleration drives a controller in the face its guest is
+    /// in.
+    ///
+    /// The older face is what this machine was built for wherever it was
+    /// built at all; the wider one is driven only where the policy says it
+    /// can be, which is the answer [`x2avic_permitted`] gives elsewhere and
+    /// the one kept here because the decision and the structures it is about
+    /// are the same state.
+    const fn drives(&self, mode: Mode) -> bool {
+        match mode {
+            Mode::XApic => true,
+            Mode::X2Apic => self.x2avic,
+            Mode::Disabled => false,
+        }
+    }
+
     /// The backing page of the processor at roster position `index`.
     fn page(&self, index: usize) -> Result<PhysAddr, VlapicError> {
         self.backing
@@ -624,9 +952,12 @@ fn rebuild_backing(vlapic: &Vlapic) -> Result<(), VlapicError> {
     let page = activation.page(vlapic.index().get())?;
     let mut image = ResetImage::new(vlapic.apic_id(), vlapic.version());
     image.overlay(Register::SPURIOUS, vlapic.spurious());
+    // In the face of the mode, because the page is what the hardware matches
+    // logical destinations against where it matches them at all, and the two
+    // faces derive them differently.
     image.overlay(
         Register::LOGICAL_DESTINATION,
-        vlapic.logical_destination(Mode::XApic),
+        vlapic.logical_destination(vlapic.mode()),
     );
     image.overlay(Register::DESTINATION_FORMAT, vlapic.destination_format());
     for entry in Entry::ALL {
@@ -860,11 +1191,12 @@ const fn bank_offset(bank: Register, vector: Vector) -> u32 {
 #[cfg(test)]
 mod tests {
     //! The decisions here that need no machine: which vector an EOI retired,
-    //! and which logical destinations name a table entry.
+    //! which logical destinations name a table entry, and which move an
+    //! entry owes the acceleration.
 
     use descriptors::Vector;
 
-    use super::{eoi_vector, logical_slot};
+    use super::{Face, Move, eoi_vector, logical_slot, move_for};
 
     #[test]
     fn an_eoi_retires_the_in_service_top_when_the_exit_agrees_or_says_nothing() {
@@ -916,5 +1248,41 @@ mod tests {
         // convention the kernel's AVIC uses and the one the plan follows.
         assert_eq!(logical_slot(0x2100_0000, 0x1FFF_FFFF), Some(8));
         assert_eq!(logical_slot(0x2100_0000, 0xEFFF_FFFF), Some(8));
+    }
+
+    #[test]
+    fn an_entry_owes_nothing_where_both_sides_agree() {
+        assert_eq!(move_for(None, None), Move::Idle);
+        for face in [Face::XAvic, Face::X2Avic] {
+            assert_eq!(move_for(Some(face), Some(face)), Move::Steady);
+        }
+    }
+
+    #[test]
+    fn an_entry_turns_the_acceleration_on_and_off_in_the_face_it_is_asked_for() {
+        for face in [Face::XAvic, Face::X2Avic] {
+            assert_eq!(move_for(None, Some(face)), Move::Enable(face));
+            assert_eq!(move_for(Some(face), None), Move::Disable(face));
+        }
+    }
+
+    #[test]
+    fn an_entry_moves_a_live_acceleration_between_faces() {
+        assert_eq!(
+            move_for(Some(Face::XAvic), Some(Face::X2Avic)),
+            Move::Switch {
+                from: Face::XAvic,
+                to: Face::X2Avic,
+            }
+        );
+        // The guest's own state machine cannot ask for the other direction,
+        // but a block found in it is one the table still describes.
+        assert_eq!(
+            move_for(Some(Face::X2Avic), Some(Face::XAvic)),
+            Move::Switch {
+                from: Face::X2Avic,
+                to: Face::XAvic,
+            }
+        );
     }
 }

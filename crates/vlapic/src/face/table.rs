@@ -164,6 +164,16 @@ impl Register {
         Self::at((index - X2APIC_BASE_MSR) as u64 * REGISTER_STRIDE as u64)
     }
 
+    /// The model-specific register index x2APIC reaches this register by.
+    ///
+    /// The inverse of [`Register::from_msr`], and the one statement of the
+    /// derivation in this direction: whatever names a register through its
+    /// index — the permission map's pass-through set among it — computes the
+    /// index here rather than transcribing the table a second time.
+    pub(crate) const fn msr(self) -> u32 {
+        X2APIC_BASE_MSR + self.0 / REGISTER_STRIDE
+    }
+
     /// Its offset in the memory-mapped page.
     pub(crate) const fn offset(self) -> u32 {
         self.0
@@ -566,6 +576,24 @@ mod tests {
         assert_eq!(Register::from_msr(X2APIC_LAST_MSR + 1), None);
         assert_eq!(Register::from_msr(0x900), None);
         assert_eq!(Register::from_msr(0x83F), Some(Register::SELF_IPI));
+    }
+
+    #[test]
+    fn a_register_and_its_index_round_trip() {
+        // The derivation in either direction is one statement, and the two
+        // statements must agree register by register: an index derived
+        // wrongly is a permission-map bit set for a register nobody meant.
+        for (register, ..) in MATRIX {
+            assert_eq!(
+                Register::from_msr(register.msr()),
+                Some(register),
+                "{register:?}"
+            );
+        }
+        // The indices the architecture names rather than derives, checked
+        // against the naming itself.
+        assert_eq!(Register::COMMAND_LOW.msr(), 0x830);
+        assert_eq!(Register::SELF_IPI.msr(), 0x83F);
     }
 
     #[test]

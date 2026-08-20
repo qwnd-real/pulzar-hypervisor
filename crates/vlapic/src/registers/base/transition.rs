@@ -97,6 +97,16 @@ impl Vlapic {
         let current = self.base();
         let next = current.written(value, self.model)?;
         let (from, to) = (current.mode(), next.mode());
+        // The wider face is entered only where the machine can drive it: a
+        // controller offered a face its acceleration cannot follow is one the
+        // guest believes accelerated at exactly the moments it is not, and a
+        // guest that was never told the face exists is owed the same answer
+        // its own architecture gives for reaching for a feature it has none
+        // of. The check the processor's own report provides sits in
+        // [`ApicBase::written`]; this one is the policy's.
+        if from != to && to == Mode::X2Apic && !crate::avic::activation::x2avic_permitted() {
+            return Err(BaseFault::Reserved);
+        }
         if from == to {
             // Not a transition. Software that reads the register, changes a
             // field it is entitled to and writes it back has asked for nothing

@@ -43,6 +43,10 @@ const OSXSAVE: u32 = 1 << 27;
 /// `CPUID.01H:EDX[9]`: the local APIC's current enablement state.
 const APIC: u32 = 1 << 9;
 
+/// `CPUID.01H:ECX[21]`: the controller's wider face, reached through
+/// model-specific registers.
+const X2APIC: u32 = 1 << 21;
+
 /// `CPUID.07H:ECX[3]`: static protection-key support.
 const PKU: u32 = 1 << 3;
 
@@ -116,6 +120,16 @@ pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
             && result.ecx & XSAVE != 0
         {
             result.ecx |= OSXSAVE;
+        }
+        // The wider controller face is withheld wherever the interrupt
+        // acceleration exists but cannot drive it: a guest offered the face
+        // would enter a mode whose deliveries fall back to software at the
+        // very moments it believes them accelerated, so the machine presents
+        // the narrower machine it can actually run. A machine with no
+        // acceleration emulates the face as it emulates everything else, and
+        // keeps offering it.
+        if !vlapic::x2apic_offered() {
+            result.ecx &= !X2APIC;
         }
         result.edx &= !APIC;
         if vlapic::apic_enabled().unwrap_or_else(|error| {
