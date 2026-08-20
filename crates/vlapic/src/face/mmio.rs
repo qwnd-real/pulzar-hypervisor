@@ -348,11 +348,18 @@ const VECTOR_BYTES: usize = Width::Vector.bytes();
 ///
 /// While the hardware drives the controller, the registers it serves itself
 /// are the backing page's — the task priority the guest set without exiting,
-/// the priorities the hardware computes, and the three banks it moves
-/// vectors between — and a read of one of them must not be answered out of a
-/// model the hardware has not been consulting. Everything else is the
-/// model's in both worlds: the hardware completes those writes into the page
-/// and exits, and the trap's bookkeeping carries the value across.
+/// the priority it computes, and the three banks it moves vectors between —
+/// and a read of one of them must not be answered out of a model the hardware
+/// has not been consulting. Everything else is the model's in both worlds: the
+/// hardware completes those writes into the page and exits, and the trap's
+/// bookkeeping carries the value across.
+///
+/// The arbitration priority is deliberately not one of them, although it is a
+/// priority and the hardware would otherwise own it. It is the one register
+/// whose read the acceleration *faults* on, which is the architecture saying
+/// the backing page holds no value for it — so an exit that brings one of those
+/// reads here is owed the number the model computes, and a slot that has held
+/// zero since provisioning is not it.
 ///
 /// A backing page that cannot be reached falls back to the model's answer
 /// rather than to a value invented here: a guest reading its controller is
@@ -360,7 +367,7 @@ const VECTOR_BYTES: usize = Width::Vector.bytes();
 fn register_value(vlapic: &Vlapic, register: Register) -> u32 {
     let hardware_owned = matches!(
         register,
-        Register::TASK_PRIORITY | Register::ARBITRATION_PRIORITY | Register::PROCESSOR_PRIORITY
+        Register::TASK_PRIORITY | Register::PROCESSOR_PRIORITY
     ) || register.bank().is_some();
     if hardware_owned
         && crate::avic::activation::active_for(vlapic)

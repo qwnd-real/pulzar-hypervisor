@@ -59,14 +59,12 @@ use x86_64::PhysAddr;
 
 use crate::{
     VlapicError,
-    avic::backing::ResetImage,
+    avic::backing::{Projection, ResetImage},
     delivery::error,
     face::{dispatch, dispatch::Written, table::Register},
     machine::{current, registry},
     priority::{self, Priority},
-    registers::{
-        FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, error::Errors, icr::Command, lvt::Entry,
-    },
+    registers::{FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, error::Errors, icr::Command},
 };
 
 /// The bit of a physical-table entry the owning processor toggles.
@@ -396,7 +394,7 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
         Move::Idle => Ok(()),
         Move::Enable(face) => enable(activation, vcpu, vlapic, face),
         Move::Disable(face) => disable(activation, vcpu, vlapic, face),
-        Move::Switch { from, to } => switch(activation, vcpu, from, to),
+        Move::Switch { from, to } => switch(activation, vcpu, vlapic, from, to),
         // The steady state. One thing can still have moved: a reset rebuilt
         // the model underneath an active controller, and the page the
         // hardware serves must be rebuilt after it.
@@ -529,10 +527,11 @@ fn disable(
 ///
 /// The backing page is the guest's rather than the face's and survives the
 /// move whole — both faces read and write the same registers in it — which
-/// is what makes this a bit and a permission map rather than a deactivation
-/// and an activation. The logical table is likewise left alone: the wider
-/// face does not consult it, and the narrower one never stops finding it
-/// populated.
+/// is what makes this a bit, a permission map and one slot rather than a
+/// deactivation and an activation. The slot is the identifier, whose shape the
+/// face decides: see [`rewrite_identifier`]. The logical table is likewise left
+/// alone: the wider face does not consult it, and the narrower one never stops
+/// finding it populated.
 ///
 /// What does not survive the move is how far the table may be walked, because
 /// that is the one thing about the acceleration the two faces disagree on. The
@@ -543,6 +542,7 @@ fn disable(
 fn switch(
     activation: &Activation,
     vcpu: &mut Vcpu,
+    vlapic: &Vlapic,
     from: Face,
     to: Face,
 ) -> Result<(), VlapicError> {
@@ -550,6 +550,7 @@ fn switch(
     if let Some(invalid) = vcpu.avic_refusal(to == Face::X2Avic, limit) {
         return Err(VlapicError::AvicRefused(invalid));
     }
+    rewrite_identifier(activation, vlapic)?;
     // The face being moved to is the whole of what the permission map owes:
     // the same face twice is the steady state and [`move_for`] does not call
     // it a switch, so `from` is here to be said in the log.
@@ -581,7 +582,7 @@ fn switch(
     info!(
         "vlapic: {} moved hardware delivery from the {from:?} face to the {to:?} face, over {} \
          addressable entries",
-        current()?.index(),
+        vlapic.index(),
         usize::from(limit) + 1
     );
     Ok(())
@@ -928,7 +929,24 @@ pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, Vlapi
         // A command the map handed back is one the hardware never attempted,
         // and is completed by the software path end to end, exactly as an
         // incomplete delivery the hardware reported would be.
+        //
+        // Both authorities are given the value first, because the hardware
+        // performed no part of this write and neither of them otherwise has it:
+        // the page is what a guest's read is answered out of while the
+        // acceleration drives, and the model is what answers it after a
+        // deactivation. The store leaves the delivery status clear as well,
+        // which is how this face requires a guest to write it, so the
+        // completion's own clear of that bit finds nothing left to correct
+        // here — it is there for the command the hardware did attempt.
         Register::COMMAND_LOW => {
+            let command = Command::from_bits(value);
+            activation
+                .word(page, Register::COMMAND_LOW.offset())?
+                .store(command.low(), Ordering::Release);
+            activation
+                .word(page, Register::COMMAND_HIGH.offset())?
+                .store(command.high(), Ordering::Release);
+            let _stored = vlapic.set_command(value);
             complete_command(value)?;
             Ok(Written::Nothing)
         }
@@ -1071,33 +1089,29 @@ impl Activation {
 
 /// Rebuilds this processor's backing page out of the model.
 ///
-/// The reset image, with the registers the architecture preserves written
-/// over it from the live model — the spurious vector and its enable bit, the
-/// destination registers, and whichever local vector entries the controller
-/// behind the model has. The guest's own writes reach the page directly
+/// The reset image with the whole projection written over it. An activation is
+/// invisible to the guest, so every register the page answers a read with has
+/// to hold what the model holds rather than what a reset would have left there
+/// — the task priority and the three banks as much as the spurious vector and
+/// the local vector table. The guest's own writes reach the page directly
 /// afterwards; this is only what has to be there before the first of them.
+///
+/// The mode is taken once and threaded into the projection, because the shape
+/// of two of those registers is the face's and a page built from two loads of
+/// it would be a page in neither face.
 fn rebuild_backing(vlapic: &Vlapic) -> Result<(), VlapicError> {
     let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
     let page = activation.page(vlapic.index().get())?;
     let mut image = ResetImage::new(vlapic.apic_id(), vlapic.version());
-    image.overlay(Register::SPURIOUS, vlapic.spurious());
-    // In the face of the mode, because the page is what the hardware matches
-    // logical destinations against where it matches them at all, and the two
-    // faces derive them differently.
-    image.overlay(
-        Register::LOGICAL_DESTINATION,
-        vlapic.logical_destination(vlapic.mode()),
-    );
-    image.overlay(Register::DESTINATION_FORMAT, vlapic.destination_format());
-    for entry in Entry::ALL {
-        if vlapic.model().has(entry) {
-            image.overlay(entry.register(), vlapic.lvt_readback(entry).into_bits());
-        }
-    }
-    // SAFETY: the frame is this processor's backing page, host RAM out of
-    // the reserved chunk: no device aperture, and nothing holds a reference
-    // to it while the guest is not running — which it is not, since this
-    // runs at an entry boundary.
+    Projection::of(vlapic, vlapic.mode()).overlay(&mut image);
+    // SAFETY: the frame is this processor's backing page, host RAM out of the
+    // reserved chunk rather than a device aperture, and nothing holds a Rust
+    // reference into it: every access this crate makes to it is one of the
+    // atomics `Activation::word` forms, and every other access is a processor's
+    // own. The guest is not running — this is an entry boundary — so the one
+    // concurrent writer left is another processor's hardware setting a request
+    // bit, which this copy is not ordered against and which
+    // [`DirectMap::write`] admits to answering as a non-atomic copy would.
     unsafe { activation.window.write(page, image.bytes())? };
     mirror_logical(vlapic)?;
     Ok(())
@@ -1105,57 +1119,51 @@ fn rebuild_backing(vlapic: &Vlapic) -> Result<(), VlapicError> {
 
 /// Carries the hardware's state back into the model.
 ///
-/// The direction a deactivation goes: the task priority the guest set
-/// without exiting, and whatever the hardware accepted, took into service
-/// and recorded as level, so that software-only delivery continues from
-/// exactly where the hardware left it. Runs at an exit boundary with the
-/// guest stopped, so the loads need no ordering stronger than the exit's
-/// own serialization.
+/// The direction a deactivation goes: the projection is read back out of the
+/// page and the model takes what the hardware moved while it drove — the task
+/// priority the guest set without exiting, the command it sent, and whatever
+/// the hardware accepted, took into service and recorded as level, so that
+/// software-only delivery continues from exactly where the hardware left it.
+/// Which registers those are, and which of them the page merely holds a copy
+/// of, is [`Projection::into_model`]'s.
+///
+/// Runs at an exit boundary with the guest stopped, so the loads need no
+/// ordering stronger than the exit's own serialization.
 fn sync_into_model(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
     let page = activation.page(vlapic.index().get())?;
-    sync_task_priority(activation, vlapic)?;
-    for slot in 0..BANK_SLOTS {
-        let offset = |bank: Register| bank.offset() + slot * REGISTER_STRIDE;
-        let irr = activation
-            .word(page, offset(Register::INTERRUPT_REQUEST))?
-            .load(Ordering::Relaxed);
-        let isr = activation
-            .word(page, offset(Register::IN_SERVICE))?
-            .load(Ordering::Relaxed);
-        let tmr = activation
-            .word(page, offset(Register::TRIGGER_MODE))?
-            .load(Ordering::Relaxed);
-        for bit in 0..u32::BITS {
-            let mask = 1 << bit;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "eight slots of thirty-two bits is exactly the vector space"
-            )]
-            let vector = Vector::new((slot * u32::BITS + bit) as u8);
-            if tmr & mask != 0 {
-                vlapic.force_trigger_mode(vector);
-            }
-            if isr & mask != 0 {
-                vlapic.force_in_service(vector);
-            }
-            // A request the model already holds in service is a level
-            // arrival the software path is already tracking: requesting it
-            // again would deliver it twice.
-            if irr & mask != 0 && !vlapic.holds_in_service(vector) {
-                vlapic.force_request(vector);
-            }
-        }
-    }
+    Projection::read(|offset| Ok(activation.word(page, offset)?.load(Ordering::Relaxed)))?
+        .into_model(vlapic);
     Ok(())
 }
 
 /// Copies the backing task priority into the model.
+///
+/// The one register the steady state carries back, because it is the one the
+/// guest changes without exiting: anything that consults the model about what
+/// is deliverable has to be looking at the number the hardware is looking at.
+/// A deactivation carries it with everything else.
 fn sync_task_priority(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
     let page = activation.page(vlapic.index().get())?;
     let value = activation
         .word(page, Register::TASK_PRIORITY.offset())?
         .load(Ordering::Relaxed);
     vlapic.set_task_priority(value);
+    Ok(())
+}
+
+/// Rewrites the one slot of the backing page whose shape a face change moves.
+///
+/// The page survives a move between the faces whole — both of them read and
+/// write the same registers in it — with the identifier as the exception: the
+/// older face keeps it in the top byte and the wider one uses the whole word,
+/// and the hardware derives the logical destination it matches an
+/// interprocessor interrupt against from that slot. A page left in the shape
+/// the face before it used is a processor the guest can no longer address.
+fn rewrite_identifier(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
+    let page = activation.page(vlapic.index().get())?;
+    activation
+        .word(page, Register::ID.offset())?
+        .store(vlapic.id_register(vlapic.mode()), Ordering::Release);
     Ok(())
 }
 
