@@ -36,7 +36,7 @@
 //!
 //! # How to read this crate
 //!
-//! Six directories, each answering one question about the controller:
+//! Seven directories, each answering one question about the controller:
 //!
 //! - `machine` — one controller per processor, and everything true of the
 //!   machine rather than of any one of them: installation, the registry, which
@@ -49,6 +49,9 @@
 //! - `lifecycle` — what becomes of a controller between one guest and the next,
 //!   and what real hardware is owed across it.
 //! - `hardware` — the surface where the guest's registers become physical ones.
+//! - `avic` — the structures hardware-driven delivery runs on, for a processor
+//!   that delivers a guest's interrupts without an exit: the tables and the
+//!   backing pages, built once before any guest runs.
 //!
 //! `priority` is on its own because it is the one rule everything else
 //! compares against, and it holds no state at all. It is also the one thing
@@ -86,6 +89,7 @@
 
 extern crate alloc;
 
+mod avic;
 mod delivery;
 mod face;
 mod hardware;
@@ -99,6 +103,7 @@ use descriptors::DescriptorError;
 use thiserror::Error;
 
 pub use crate::{
+    avic::{apic_page, backing_page, provision},
     face::{
         mmio::region,
         msr::{apic_enabled, claims, intercepted, read_msr, write_msr},
@@ -157,4 +162,31 @@ pub enum VlapicError {
     /// A processor inside the guest could not be interrupted.
     #[error(transparent)]
     Ipi(#[from] ipi::IpiError),
+    /// The structures hardware-driven delivery runs on were built twice; there
+    /// is one set for the machine.
+    #[error("the interrupt-acceleration structures have already been provisioned")]
+    AlreadyProvisioned,
+    /// They were asked of before they were built.
+    #[error("the interrupt-acceleration structures have not been provisioned")]
+    NotProvisioned,
+    /// The physical table was asked to hold more entries than one page of
+    /// them, which is the most a control block can name.
+    #[error("a physical interrupt table of {entries} entries does not fit one page")]
+    TableTooLarge {
+        /// How many entries were asked for.
+        entries: usize,
+    },
+    /// A startable processor's identifier is beyond the largest index the
+    /// table was sized for, which the table cannot express.
+    #[error("apic id {id} is beyond the physical interrupt table's largest index {max_index}")]
+    IdBeyondTable {
+        /// The identifier that does not fit.
+        id: u32,
+        /// The largest index the table was sized for.
+        max_index: u16,
+    },
+    /// The reserved chunk had no frame left, or the window did not reach one
+    /// it just handed out.
+    #[error(transparent)]
+    Paging(#[from] paging::PagingError),
 }

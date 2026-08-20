@@ -21,6 +21,8 @@
 
 use core::sync::atomic::Ordering;
 
+use cpu::ApicId;
+
 use crate::registers::{Vlapic, base::Mode};
 
 impl Vlapic {
@@ -131,6 +133,15 @@ const XAPIC_ID_SHIFT: u32 = 24;
 /// The part of an identifier the older interface's field can hold.
 const XAPIC_ID_MASK: u32 = 0xFF;
 
+/// The word the older face's identifier register holds for `id`: the part of
+/// the identifier that face can keep, in the byte it keeps it in.
+///
+/// The one statement of that layout outside a controller, because a backing
+/// page holds the same word and must not compute it a second way.
+pub(crate) const fn xapic_word(id: ApicId) -> u32 {
+    (id.get() & XAPIC_ID_MASK) << XAPIC_ID_SHIFT
+}
+
 /// The part of the logical destination register that holds anything.
 pub(super) const LOGICAL_DESTINATION_MASK: u32 = 0xFF00_0000;
 
@@ -139,7 +150,7 @@ pub(super) const DESTINATION_FORMAT_MASK: u32 = 0xF000_0000;
 
 /// The destination format register's reset value: the flat model, with every
 /// reserved bit set.
-pub(super) const FLAT_DESTINATION_FORMAT: u32 = u32::MAX;
+pub(crate) const FLAT_DESTINATION_FORMAT: u32 = u32::MAX;
 
 /// Bits an x2APIC logical identifier's cluster is shifted by.
 const CLUSTER_SHIFT: u32 = 16;

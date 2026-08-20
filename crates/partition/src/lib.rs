@@ -2,10 +2,12 @@
 //!
 //! A virtual processor is one processor's view of a guest; this is the guest.
 //! What lives here is what every one of its processors shares and none of them
-//! owns: the description of its memory, and the tag its cached translations are
-//! kept apart by. What does not live here is anything about running — that is
-//! [`vcpu`], and the split is deliberate, because entering a guest is a
-//! per-processor act and deciding what a guest *is* is not.
+//! owns: the description of its memory, the tag its cached translations are
+//! kept apart by, and — when the processor delivers its interrupts without an
+//! exit — the tables that tell the hardware where. What does not live here is
+//! anything about running — that is [`vcpu`], and the split is deliberate,
+//! because entering a guest is a per-processor act and deciding what a guest
+//! *is* is not.
 //!
 //! Pulzar runs one guest. The type is still a partition rather than a global,
 //! because the interesting properties are all about which guest a thing belongs
@@ -60,17 +62,20 @@ use paging::{AddressSpace, PagingError};
 use spin::{Mutex, Once};
 use svm::exit::NestedPageFault;
 use thiserror::Error;
-use vcpu::{Guest, Host, Vcpu, VcpuError};
+use vcpu::{AvicProvision, Guest, Host, Vcpu, VcpuError};
+use vlapic::VlapicError;
 use x86_64::PhysAddr;
 
 pub use crate::asid::{Asid, Asids};
 
-/// One guest: its memory, and the tag its translations carry.
+/// One guest: its memory, the tag its translations carry, and the tables its
+/// interrupts run on when the hardware delivers them.
 #[derive(Debug)]
 pub struct Partition {
     npt: Mutex<Npt>,
     nested_cr3: PhysAddr,
     asid: Asid,
+    avic: Option<vcpu::AvicTables>,
     devices: Once<Mmio>,
 }
 
@@ -81,12 +86,20 @@ impl Partition {
     /// start empty and the guest's first access to any address is what
     /// describes the region containing it.
     ///
+    /// `avic` is the set of structures hardware-driven interrupt delivery runs
+    /// on, or `None` while every interrupt still exits and is emulated. It is
+    /// shared by every processor of the guest; what is per-processor is
+    /// resolved when each one attaches.
+    ///
     /// # Errors
     ///
     /// [`PartitionError::NoSvm`] on a processor with no virtualization
     /// extension, [`PartitionError::OutOfAsids`] on one that can tag no guest,
     /// or [`PartitionError::Npt`] if the chunk cannot back the tables.
-    pub fn establish(space: &mut AddressSpace) -> Result<Self, PartitionError> {
+    pub fn establish(
+        space: &mut AddressSpace,
+        avic: Option<vcpu::AvicTables>,
+    ) -> Result<Self, PartitionError> {
         let asid = asids()?.take()?;
         let window = space.direct_map();
         let npt = Npt::create(space.frames(), window)?;
@@ -94,6 +107,7 @@ impl Partition {
             nested_cr3: npt.root(),
             npt: Mutex::new(npt),
             asid,
+            avic,
             devices: Once::new(),
         })
     }
@@ -164,13 +178,21 @@ impl Partition {
     /// # Errors
     ///
     /// [`PartitionError::Vcpu`] if the chunk cannot spare a control block or
-    /// the window cannot reach it.
+    /// the window cannot reach it, or [`PartitionError::Vlapic`] if the
+    /// interrupt structures exist but this processor has no place in them.
     pub fn attach(
         &self,
         host: &'static Host,
         space: &mut AddressSpace,
     ) -> Result<Vcpu, PartitionError> {
         let window = space.direct_map();
+        let avic = match self.avic {
+            Some(tables) => Some(AvicProvision {
+                backing_page: vlapic::backing_page()?,
+                tables,
+            }),
+            None => None,
+        };
         Ok(Vcpu::create(
             host,
             space.frames(),
@@ -178,8 +200,28 @@ impl Partition {
             Guest {
                 nested_cr3: self.nested_cr3,
                 asid: self.asid.number(),
+                avic,
             },
         )?)
+    }
+
+    /// Sends one page of the guest's memory to the zero sink rather than the
+    /// hardware behind it.
+    ///
+    /// What the interrupt controllers' register page becomes when the
+    /// processor serves the controller itself: a read that no longer exits
+    /// must still land somewhere, and a page of zeroes is the nothing the
+    /// guest is allowed to see there. Called once, before any processor has
+    /// entered the guest, for the same cache coherency reason as
+    /// [`Partition::expose`].
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionError::Npt`] if the page cannot be sunk — because it is
+    /// already sunk, because it is one the hypervisor has taken over, or
+    /// because the chunk cannot spare the frame behind it.
+    pub fn sink(&self, space: &mut AddressSpace, gpa: PhysAddr) -> Result<(), PartitionError> {
+        Ok(self.npt.lock().sink(space.frames(), gpa)?)
     }
 
     /// Describes the region containing a guest physical address the guest could
@@ -347,6 +389,9 @@ pub enum PartitionError {
     /// A processor could not be prepared to run the guest.
     #[error(transparent)]
     Vcpu(#[from] VcpuError),
+    /// The guest's interrupt structures could not be reached.
+    #[error(transparent)]
+    Vlapic(#[from] VlapicError),
     /// The address space the tables are allocated from could not be reached.
     #[error(transparent)]
     Paging(#[from] PagingError),

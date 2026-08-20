@@ -53,7 +53,7 @@ use paging::{DirectMap, Frames};
 use processor::{Features, SvmFeatures};
 use svm::{
     CleanBits, ControlArea, ExitCode, Reason, SaveArea, Vmcb,
-    avic::{AVIC_DOORBELL, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID},
+    avic::{AVIC_DOORBELL, AvicPhysicalTable, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID},
     control::NestedPagingControl,
     intercept::{Intercepts1, Intercepts2, Intercepts2Flags, TlbControl},
     msr::{EFER, IA32_PAT, IA32_TSC, IA32_TSC_ADJUST, SVM_KEY, TSC_RATIO, VM_CR},
@@ -93,13 +93,57 @@ const INTERCEPTED_MSRS: [u32; 8] = [
     AVIC_DOORBELL,
 ];
 
+/// The structures one guest's interrupt virtualization is built on, shared by
+/// every one of its processors.
+///
+/// The hardware asks each control block for all three of these even though they
+/// describe the guest as a whole rather than one of its processors: where the
+/// guest's controller register page appears, and the two tables that translate
+/// an interrupt's destination into one of its processors. They live here
+/// because a control block is the only place the architecture lets them reach
+/// the processor.
+///
+/// Programming them does not by itself turn the acceleration on: that is a
+/// bit of the interrupt control, and a block may carry complete tables with it
+/// left clear — which is what the architecture asks for, that the structures
+/// be initialized even while they are not in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AvicTables {
+    /// The guest physical address its controllers' register page appears at,
+    /// which the hardware matches its accesses against.
+    pub apic_bar: PhysAddr,
+    /// The table translating a logical controller identifier into the
+    /// processors it names.
+    pub logical_table: PhysAddr,
+    /// The table describing each processor by its physical identifier, with the
+    /// highest index in it that is valid.
+    pub physical_table: AvicPhysicalTable,
+}
+
+/// Everything one virtual processor needs for the guest's interrupt
+/// virtualization: the tables the whole guest shares, plus the page its own
+/// controller registers are backed by.
+///
+/// The backing page is the only part that differs between the guest's
+/// processors; each carries its own, and the hardware reads and writes the
+/// controller's registers in it on the processor's behalf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AvicProvision {
+    /// The page this processor's controller registers are backed by.
+    pub backing_page: PhysAddr,
+    /// The structures the guest as a whole is built on.
+    pub tables: AvicTables,
+}
+
 /// What a guest's control block has to be told about the guest before it can
 /// run at all.
 ///
-/// Two values, and both belong to the guest as a whole rather than to any one
-/// of its processors: where its memory is described, and what its translations
-/// are tagged with. Everything else a control block needs is either fixed by
-/// the architecture or is guest state that nothing here writes.
+/// Where its memory is described, what its translations are tagged with, and —
+/// optionally — the structures its interrupt virtualization runs on. The first
+/// two belong to the guest as a whole, and so does most of the third; what is
+/// per-processor about it travels with the processor that carries it.
+/// Everything else a control block needs is either fixed by the architecture
+/// or is guest state that nothing here writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Guest {
     /// Root of the nested page tables the guest's physical addresses are
@@ -108,6 +152,10 @@ pub struct Guest {
     /// Which address space the guest's translations are tagged with. Never
     /// zero: zero is the host's own, and a guest given it is refused.
     pub asid: u32,
+    /// The structures interrupt virtualization runs on, if the guest is to be
+    /// given them. `None` leaves the control block's fields zeroed, which is
+    /// what a guest without the acceleration must carry.
+    pub avic: Option<AvicProvision>,
 }
 
 /// Whether to enter the guest again.
@@ -140,12 +188,17 @@ impl Vcpu {
     /// Allocates a control block and programs the little of it that is not
     /// guest state.
     ///
-    /// What is written is the mandatory intercept, nested paging and the two
-    /// values in [`Guest`]. What is not written is every register the guest
-    /// will run with: no instruction pointer, no stack pointer, no
-    /// segments, no control registers. Those are a separate decision and a
-    /// separate change, and a block in this state is infrastructure rather
-    /// than a runnable guest — [`Vcpu::validate`] will say so.
+    /// What is written is the mandatory intercept, nested paging, the two
+    /// values in [`Guest`], and — if the guest carries them — the structures
+    /// its interrupt virtualization runs on. Writing those structures does not
+    /// enable the acceleration: the enable bits belong to the interrupt
+    /// control and stay clear, so a block in this state has complete tables
+    /// the processor is not yet asked to use. What is not written is every
+    /// register the guest will run with: no instruction pointer, no stack
+    /// pointer, no segments, no control registers. Those are a separate
+    /// decision and a separate change, and a block in this state is
+    /// infrastructure rather than a runnable guest — [`Vcpu::validate`] will
+    /// say so.
     ///
     /// The block starts as a page of zeroes, which is what the architecture
     /// asks for: every reserved byte zero, and no clean bit set, which is
@@ -216,6 +269,15 @@ impl Vcpu {
         control.nested_paging = NestedPagingControl::new().with_enabled(true);
         control.nested_cr3 = guest.nested_cr3.as_u64();
         control.asid = guest.asid;
+        // The architecture wants these structures initialized even while the
+        // acceleration is off: the enable bits stay clear, but the tables are
+        // already where they must be when they are turned on.
+        if let Some(avic) = guest.avic {
+            control.avic_apic_bar = avic.tables.apic_bar.as_u64();
+            control.avic_backing_page = avic.backing_page.as_u64();
+            control.avic_logical_table = avic.tables.logical_table.as_u64();
+            control.avic_physical_table = avic.tables.physical_table;
+        }
         Ok(vcpu)
     }
 

@@ -70,6 +70,18 @@
 //! containing an address is narrowed until it holds no trapped page, down to a
 //! single page if it must be.
 //!
+//! # One page given rather than trapped
+//!
+//! [`Npt::sink`] is the opposite of [`Npt::protect`]: where trapping keeps a
+//! page from being described so that every access exits, sinking describes one
+//! page as a frame of its own, writable, that nothing reads — a place for the
+//! guest's accesses to go without anywhere to arrive. The use for one is a
+//! device the hardware itself takes over the answering of, where an exit is no
+//! longer the expected shape of an access and the page still has to translate
+//! to something. Like trapping, it is for before a guest has run, and the fill
+//! rule narrows around it the same way: a region holding a sunk page is not
+//! described all at once.
+//!
 //! # Why the memory type is write-back everywhere
 //!
 //! Under nested paging the effective memory type of a guest access is the
@@ -122,6 +134,7 @@ pub struct Npt {
     zero: PhysAddr,
     owned: Span,
     trapped: [Option<Interposed>; TRAPPED_REGIONS],
+    sink: Option<Sink>,
     window: DirectMap,
     large: bool,
 }
@@ -157,6 +170,7 @@ impl Npt {
             zero,
             owned: Span::new(frames.chunk_base(), chunk::CHUNK_SIZE),
             trapped: [None; TRAPPED_REGIONS],
+            sink: None,
             window,
             large: processor::features().contains(Features::GIB_PAGES),
         })
@@ -480,6 +494,63 @@ impl Npt {
         })
     }
 
+    /// Describes one page as a place the guest may touch without anything
+    /// answering: reads see what the frame holds and writes are kept by it,
+    /// but nothing reads it back.
+    ///
+    /// The page gets a frame of its own rather than the shared page of zeroes
+    /// the hypervisor's memory shadows onto, because that one is read-only for
+    /// every address that shadows it at once — a writable sink has to be
+    /// writable for the guest without becoming writable for anything else.
+    ///
+    /// The page is remembered as well as described, for the reason a trapped
+    /// region is: [`Npt::fault`] would otherwise describe a large page
+    /// straight over it the first time the guest touched a neighbour.
+    ///
+    /// # Only before a guest has run
+    ///
+    /// Like [`Npt::protect`], this changes what an entry says while there must
+    /// be no cached translation to disagree with: no processor may have walked
+    /// these tables yet.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::TrapGeometry`] unless the address is page aligned,
+    /// [`NptError::AlreadySunk`] if a page is already sunk,
+    /// [`NptError::Trapped`] if the address is inside a trapped region —
+    /// describing it would overwrite the entry the trap is expressed in and
+    /// quietly untrap it — or an error from allocating or reaching the frame.
+    pub fn sink(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+        let page = Level::Page.span();
+        if !gpa.as_u64().is_multiple_of(page) {
+            return Err(NptError::TrapGeometry {
+                gpa: gpa.as_u64(),
+                bytes: page,
+            });
+        }
+        if self.sink.is_some() {
+            return Err(NptError::AlreadySunk { gpa: gpa.as_u64() });
+        }
+        if self.caught(gpa) {
+            return Err(NptError::Trapped { gpa: gpa.as_u64() });
+        }
+        let frame = frame(frames, self.window)?;
+        walk::map(
+            self.window,
+            self.root,
+            gpa,
+            Level::Page,
+            frame,
+            LEAF,
+            frames,
+        )?;
+        self.sink = Some(Sink {
+            span: Span::new(gpa, page),
+            frame,
+        });
+        Ok(())
+    }
+
     /// Logs the shape of the translation, which is the whole of what a guest's
     /// view of memory is.
     pub fn describe(&self, who: &str) {
@@ -501,6 +572,12 @@ impl Npt {
                     Trap::Writes => "writes only",
                     Trap::Everything => "every access",
                 },
+            );
+        }
+        if let Some(sink) = self.sink {
+            info!(
+                "{who}: npt sinks guest physical {:#x} onto frame {:#x}",
+                sink.span.base, sink.frame,
             );
         }
     }
@@ -534,9 +611,13 @@ impl Npt {
     }
 
     /// Whether the whole `level`-sized region at `base` can be described as
-    /// itself: none of it the hypervisor's own, and none of it trapped.
+    /// itself: none of it the hypervisor's own, none of it trapped, and none
+    /// of it sunk.
     fn describable(&self, base: PhysAddr, level: Level) -> bool {
         !self.owned.overlaps(base, level.span())
+            && self
+                .sink
+                .is_none_or(|sink| !sink.span.overlaps(base, level.span()))
             && !self
                 .trapped
                 .iter()
@@ -791,6 +872,20 @@ pub enum NptError {
         /// How many they remember.
         limit: usize,
     },
+    /// A page was asked to be sunk when one already is; these tables remember
+    /// at most one.
+    #[error("guest physical {gpa:#x} cannot be sunk: a page already is")]
+    AlreadySunk {
+        /// The address that was asked.
+        gpa: u64,
+    },
+    /// A page inside a trapped region was asked to be sunk, which would
+    /// describe what must stay undescribed.
+    #[error("guest physical {gpa:#x} is inside a trapped region and cannot be sunk")]
+    Trapped {
+        /// The address that was asked.
+        gpa: u64,
+    },
 }
 
 /// How many regions of a guest's physical memory may be trapped at once.
@@ -807,6 +902,14 @@ const TRAPPED_REGIONS: usize = 16;
 struct Interposed {
     span: Span,
     trap: Trap,
+}
+
+/// One page the guest may touch freely, and the frame its accesses are kept
+/// by.
+#[derive(Clone, Copy, Debug)]
+struct Sink {
+    span: Span,
+    frame: PhysAddr,
 }
 
 /// A run of guest physical addresses.

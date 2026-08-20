@@ -222,7 +222,17 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // includes the `GS` base a block is reached through, and before any other
     // processor is started, because each of them joins a guest that has to
     // already exist.
-    let partition = PARTITION.try_call_once(|| Partition::establish(&mut space))?;
+    //
+    // The structures hardware-driven interrupt delivery runs on are built here
+    // when delivery is handed to the hardware: before the guest they describe
+    // has run, and with it the guest's tag the control blocks are composed
+    // with.
+    let policy = avic::policy();
+    let avic_tables = policy
+        .enabled()
+        .then(|| vlapic::provision(&mut space, policy.max_index()))
+        .transpose()?;
+    let partition = PARTITION.try_call_once(|| Partition::establish(&mut space, avic_tables))?;
     partition.describe("core");
     let portal = Portal::place(space.direct_map(), handoff)?;
     partition.expose(
@@ -239,8 +249,17 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     )?;
     // Trapped before the guest has ever run, which is what taking a region over
     // requires: reducing what the nested tables permit while a guest is running
-    // would mean discarding every processor's cached translations first.
-    partition.interpose(&mut space, [vlapic::region()?])?;
+    // would mean discarding every processor's cached translations first. When
+    // the processor drives the controller itself the register page is no longer
+    // reached through the hardware: it goes to the zero sink instead, and there
+    // is nothing to take over.
+    let apic_region = if policy.enabled() {
+        partition.sink(&mut space, vlapic::apic_page())?;
+        None
+    } else {
+        Some(vlapic::region()?)
+    };
+    partition.interpose(&mut space, apic_region)?;
     let mut vcpu = virtualize(&mut space)?;
     seed(&mut vcpu, inherited(handoff)?, portal.entry());
     vcpu.describe("core");

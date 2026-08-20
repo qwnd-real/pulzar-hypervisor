@@ -475,4 +475,52 @@ mod tests {
             UnacceleratedAccessExit::from_exit_info(ACCESS_IS_WRITE | u64::from(EOI_OFFSET), 0x1FF);
         assert_eq!(eoi.eoi_vector(), Some(0xFF));
     }
+
+    /// A physical table entry as the architecture lays it out: the valid and
+    /// running bits in the two highest positions, the backing page's number in
+    /// the forty between, and the host's identifier in the lowest twelve
+    /// (APM Table 15-23).
+    #[test]
+    fn a_physical_entry_encodes_where_the_architecture_says() {
+        let entry = PhysicalApicEntry::new()
+            .with_valid(true)
+            .with_is_running(true)
+            .with_backing_page_address(PhysAddr::new(0x0000_0ABC_D000))
+            .with_host_apic_id(0x123);
+        assert_eq!(
+            entry.into_bits(),
+            (1 << 63) | (1 << 62) | 0x0000_0ABC_D000 | 0x123,
+        );
+    }
+
+    /// The backing page enters as its number and leaves as its address, and
+    /// the low bits an entry has no room for are dropped on the way in.
+    #[test]
+    fn a_physical_entry_keeps_the_backing_page_page_aligned() {
+        let entry = PhysicalApicEntry::new().with_backing_page_address(PhysAddr::new(0x0001_2345));
+        assert_eq!(entry.backing_page_address(), PhysAddr::new(0x0001_2000));
+    }
+
+    /// A logical table entry: the guest identifier in the lowest byte and the
+    /// valid bit in the highest, with nothing between them (APM Table 15-24).
+    #[test]
+    fn a_logical_entry_encodes_where_the_architecture_says() {
+        let entry = LogicalApicEntry::new()
+            .with_valid(true)
+            .with_guest_apic_id(0x5A);
+        assert_eq!(entry.into_bits(), (1 << 31) | 0x5A);
+    }
+
+    /// The control-block value naming the physical table: the table's number
+    /// above the largest valid index beside it, with the twelve bits between
+    /// them the only place the index fits.
+    #[test]
+    fn a_physical_table_pointer_keeps_the_index_beside_it() {
+        let table = AvicPhysicalTable::new()
+            .with_max_index(0x1FF)
+            .with_address(PhysAddr::new(0xDEAD_E000));
+        assert_eq!(table.into_bits(), 0xDEAD_E000 | 0x1FF);
+        assert_eq!(table.address(), PhysAddr::new(0xDEAD_E000));
+        assert_eq!(table.max_index(), 0x1FF);
+    }
 }

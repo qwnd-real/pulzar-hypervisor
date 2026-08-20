@@ -351,7 +351,7 @@ pub(crate) const X2APIC_LAST_MSR: u32 = 0xBFF;
 /// Where the page ends is what makes an offset past it a reserved address
 /// rather than a register, so this belongs to the register table and the
 /// aperture that answers for the page takes its length from here.
-pub(super) const PAGE: u64 = 4096;
+pub(crate) const PAGE: u64 = 4096;
 
 #[cfg(test)]
 mod tests {

@@ -84,7 +84,7 @@ const SOFTWARE_ENABLE: u32 = 1 << 8;
 
 /// The spurious-interrupt vector register's reset value: every vector bit set
 /// and the controller software-disabled.
-pub(super) const SPURIOUS_RESET: u32 = 0xFF;
+pub(crate) const SPURIOUS_RESET: u32 = 0xFF;
 
 /// What software may set in the spurious-interrupt vector register.
 ///

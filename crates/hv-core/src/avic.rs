@@ -114,6 +114,18 @@ pub(crate) fn establish(roster: &Roster) {
     policy.describe();
 }
 
+/// The decision, once taken.
+///
+/// # Panics
+///
+/// Before [`establish`], which the boot sequence orders before anything that
+/// asks.
+pub(crate) fn policy() -> &'static AvicPolicy {
+    POLICY
+        .get()
+        .expect("the delivery policy is decided at boot, before anything asks for it")
+}
+
 /// The decision itself, kept pure so it can be read against the rules.
 ///
 /// In order: the extension must exist at all; at least one processor must be

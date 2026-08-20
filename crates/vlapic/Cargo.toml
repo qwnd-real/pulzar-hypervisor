@@ -15,11 +15,14 @@ descriptors = { workspace = true }
 emulate = { workspace = true }
 ipi = { workspace = true }
 log = { workspace = true }
+paging = { workspace = true }
 probe = { workspace = true }
 processor = { workspace = true }
 snapshot = { workspace = true }
 spin = { workspace = true }
+svm = { workspace = true }
 thiserror = { workspace = true }
+vcpu = { workspace = true }
 x86_64 = { workspace = true }
 
 [lints]

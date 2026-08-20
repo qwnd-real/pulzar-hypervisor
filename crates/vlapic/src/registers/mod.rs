@@ -79,8 +79,9 @@ use cpu::{ApicId, CpuIndex};
 
 pub(crate) use crate::registers::{
     error::Raise,
+    identity::{FLAT_DESTINATION_FORMAT, xapic_word},
     interrupts::Accepted,
-    spurious::SPURIOUS_WRITABLE,
+    spurious::{SPURIOUS_RESET, SPURIOUS_WRITABLE},
     startup::{Phase, Startup},
     task_priority::TASK_PRIORITY_MASK,
     timer::TIMER_DIVIDE_MASK,
