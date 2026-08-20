@@ -12,10 +12,16 @@
 //! original firmware service returns success does the wrapper notify the host,
 //! which is where the other processors are started. Each of them joins the same
 //! guest and waits there to be started by it, exactly as a processor still in
-//! reset would. The portal pages are the only hypervisor-owned pages ever
-//! visible to the guest, and only until the guest has left them behind — nested
-//! paging presents the rest of the reserved chunk as an immutable zero page
-//! throughout, and the portal as one too once it has been taken back.
+//! reset would. The portal pages are the only hypervisor-owned pages the guest
+//! is ever given code or data through, and only until it has left them behind —
+//! nested paging presents the rest of the reserved chunk as an immutable zero
+//! page throughout, and the portal as one too once it has been taken back.
+//!
+//! One page of the chunk is an exception, on a machine whose processors drive
+//! the guest's interrupt controller themselves. The acceleration requires the
+//! controller's register page to translate to memory the guest may write, and
+//! redirects every access away from it, so the page is given a frame of the
+//! chunk that nothing ever reads — writable, and never read back by anything.
 //!
 //! The same entry point is also reachable by starting `pulzar.efi` as an
 //! ordinary UEFI application, in which case the first argument is a firmware
@@ -254,19 +260,24 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
         chunk::FRAME_SIZE,
         Exposure::ReadOnly,
     )?;
-    // Trapped before the guest has ever run, which is what taking a region over
+    // Before the guest has ever run, which is what taking a region over
     // requires: reducing what the nested tables permit while a guest is running
-    // would mean discarding every processor's cached translations first. When
-    // the processor drives the controller itself the register page is no longer
-    // reached through the hardware: it goes to the zero sink instead, and there
-    // is nothing to take over.
-    let apic_region = if policy.enabled() {
+    // would mean discarding every processor's cached translations first.
+    //
+    // What the policy decides is only how the guest's own accesses to the
+    // register page arrive. Where the processor drives the controller itself
+    // they do not arrive at all: the hardware redirects them to a backing page,
+    // and the register page — which the acceleration still requires to
+    // translate to writable memory — goes to a frame nothing reads. Where it
+    // does not, the page is trapped and every access faults into the emulator.
+    // Either way the page is a region this hypervisor answers for, because an
+    // access the acceleration declines to perform is reported rather than
+    // performed, and performing one of those means performing it against the
+    // same device a fault would have reached.
+    if policy.enabled() {
         partition.sink(&mut space, vlapic::apic_page())?;
-        None
-    } else {
-        Some(vlapic::region()?)
-    };
-    partition.interpose(&mut space, apic_region)?;
+    }
+    partition.interpose(&mut space, [vlapic::region()?])?;
     let mut vcpu = virtualize(&mut space)?;
     seed(&mut vcpu, inherited(handoff)?, portal.entry());
     vcpu.describe("core");

@@ -16,6 +16,17 @@
 //! can run, there is nothing in existence that could trap a region and nothing
 //! holding the tables that would have to be reached to try.
 //!
+//! # A region need not be trapped at all
+//!
+//! Trapping is how a guest's *own* access arrives here, and it is not the only
+//! way one can. Where the processor serves a device itself and reports back the
+//! accesses it declines to serve, the report carries the address and the
+//! direction, and performing such an access is performing it against the device
+//! that answers the region — with no fault involved and nothing for the nested
+//! tables to say. So a [`Region`] whose `trap` is `None` is registered for
+//! dispatch and leaves the tables untouched, and whatever the guest's ordinary
+//! accesses reach instead is the caller's to arrange.
+//!
 //! # What a device is asked, and what it is not
 //!
 //! A handler is asked what the guest should see, and is *given* what the guest
@@ -315,8 +326,14 @@ pub struct Region {
     /// How long it is. A whole number of pages, because permissions come a page
     /// at a time.
     pub bytes: u64,
-    /// Which of the guest's accesses have to come back to us.
-    pub trap: Trap,
+    /// Which of the guest's accesses have to come back to us, or `None` where
+    /// none of them do.
+    ///
+    /// `None` leaves the nested tables exactly as they are: the guest's own
+    /// accesses go wherever the tables already send them, and the device is
+    /// reached only for the accesses something else declines to serve and
+    /// reports.
+    pub trap: Option<Trap>,
     /// What answers them.
     pub device: Box<dyn Device>,
 }
@@ -474,13 +491,17 @@ impl<'a> Registrar<'a> {
     ///
     /// Either the whole region is taken over or nothing is. Three things have
     /// to happen — the device's registers are mapped where the device reaches
-    /// them at all, the nested tables are told to trap the region, and the
-    /// device is remembered — and each of
+    /// them at all, the nested tables are told to trap the region where the
+    /// region is trapped at all, and the device is remembered — and each of
     /// them can fail, so each is undone if a later one does. The order is
     /// chosen so that the failure of one leaves the least to undo: room to
     /// remember the region is reserved first, because a reservation is the
     /// only step that can fail *after* the tables have been changed and
     /// cannot be undone by changing them back.
+    ///
+    /// A region whose `trap` is `None` skips the middle step entirely and the
+    /// tables are not reached at all, which is what makes registering a device
+    /// and trapping a region two decisions rather than one.
     ///
     /// # Errors
     ///
@@ -527,9 +548,11 @@ impl<'a> Registrar<'a> {
             // writable alias of somebody's hardware that no access ever reaches.
             Hardware::Untouched => Aperture::Untouched { bytes },
         };
-        if let Err(error) = self
-            .npt
-            .protect(self.space.frames(), gpa, bytes, region.trap)
+        // Nothing to change for a region the guest's own accesses never fault
+        // on: the tables already send them somewhere, and this device answers
+        // only what is reported to it.
+        if let Some(trap) = region.trap
+            && let Err(error) = self.npt.protect(self.space.frames(), gpa, bytes, trap)
         {
             // The aperture was made one statement ago, nothing has been handed its
             // address, and the region is not in the list — so nothing derived from
@@ -552,6 +575,7 @@ impl<'a> Registrar<'a> {
         self.regions.push(Interposed {
             gpa,
             end,
+            trap: region.trap,
             aperture,
             device: region.device,
         });
@@ -643,9 +667,9 @@ impl Mmio {
     ///
     /// The counterpart registration never had. A guest that was built and then
     /// abandoned — because a later step of bring-up failed, or because it is
-    /// being taken down — otherwise leaks a window run and a trap slot per
-    /// region, and leaves the nested tables trapping addresses nothing
-    /// answers for.
+    /// being taken down — otherwise leaks a window run per region and a trap
+    /// slot per trapped one, and leaves the nested tables trapping addresses
+    /// nothing answers for.
     ///
     /// Every region is attempted even if one fails, because stopping at the
     /// first failure would leave the rest in exactly the state this exists
@@ -666,7 +690,9 @@ impl Mmio {
         let mut devices = Vec::new();
         let mut failure = None;
         for region in self.regions {
-            if let Err(error) = npt.release(region.gpa, region.end - region.gpa.as_u64()) {
+            if region.trap.is_some()
+                && let Err(error) = npt.release(region.gpa, region.end - region.gpa.as_u64())
+            {
                 failure = failure.or(Some(MmioError::Npt(error)));
             }
             if let Some(cause) = region.aperture.release(space) {
@@ -983,6 +1009,13 @@ struct Interposed {
     /// may end where the physical address space does, and one past that is
     /// not an address that can be constructed.
     end: u64,
+    /// What the nested tables were told to fault on, if anything.
+    ///
+    /// Kept because giving a region back is the exact reverse of taking it
+    /// over: a region the tables were never told about has nothing to tell
+    /// them now, and asking them to release one would be asking about a range
+    /// they have no record of.
+    trap: Option<Trap>,
     aperture: Aperture,
     device: Box<dyn Device>,
 }

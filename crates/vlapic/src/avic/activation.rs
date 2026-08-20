@@ -173,7 +173,7 @@ pub(super) fn establish(
 
 /// Whether the structures exist at all, which is whether the policy chose
 /// hardware delivery for this machine.
-pub(super) fn provisioned() -> bool {
+pub(crate) fn provisioned() -> bool {
     ACTIVATED.is_completed()
 }
 
@@ -192,19 +192,79 @@ pub(crate) fn x2avic_permitted() -> bool {
 /// Whether this processor's controller is being driven in hardware at this
 /// moment.
 ///
-/// The question every delivery path asks before taking the hardware's: the
-/// structures must exist, the machine must not have been demoted, the guest
-/// must be in a face the hardware drives — the older one always, the wider
-/// one only where the policy allows it — and the processor must not have
-/// been demoted on its own.
+/// The question every delivery path asks before taking the hardware's, and
+/// [`active_face`] is the whole of it: the structures must exist, neither
+/// demotion may have fired, and the face the guest is in must be one the
+/// acceleration drives.
+///
+/// # The software-enable bit is not one of the terms
+///
+/// A controller its guest has software-disabled goes on being driven by the
+/// hardware, and that is deliberate. The bit gates *delivery* rather than
+/// access: the hardware evaluates it out of the backing page itself, which is
+/// where [`deliverable`] asks it and the only place it is asked. Registers of a
+/// software-disabled controller are architecturally still readable and
+/// writable, and the backing page is exactly where they should be read and
+/// written.
+///
+/// Making it a term here would be worse than redundant on a machine the policy
+/// provisioned. Reset leaves it clear, so every processor the guest starts
+/// would come up unaccelerated — and the register page a controller then falls
+/// back to is not the emulator's, because the acceleration's redirection is
+/// arranged once before the guest runs and the page translates to a frame
+/// nothing reads for the rest of the machine's life. The guest's write of the
+/// very register that would switch the controller on would land there and be
+/// lost, and no processor but the first would ever have an interrupt
+/// controller.
 pub(crate) fn active_for(vlapic: &Vlapic) -> bool {
-    let Some(activation) = ACTIVATED.get() else {
-        return false;
-    };
-    !activation.machine_inhibited.load(Ordering::Acquire)
-        && activation.drives(vlapic.mode())
-        && vlapic.software_enabled()
-        && !vlapic.avic_inhibited()
+    active_face(vlapic).is_some()
+}
+
+/// The face the acceleration drives this controller in at this instant, or
+/// nothing where it does not drive it at all.
+///
+/// One derivation of what used to be two: whether the acceleration is on for
+/// this processor, and which face it is on in. A caller that asked the first
+/// and then computed the second was deriving one decision twice out of state
+/// that can move between the two questions.
+fn active_face(vlapic: &Vlapic) -> Option<Face> {
+    let activation = ACTIVATED.get()?;
+    driven_face(
+        activation.machine_inhibited.load(Ordering::Acquire),
+        vlapic.mode(),
+        activation.x2avic,
+        vlapic.avic_inhibited(),
+    )
+}
+
+/// The face hardware delivery drives a controller in, out of the state the
+/// decision is made from.
+///
+/// Pure rather than four loads inside [`active_face`], because which terms it
+/// has *is* the activation gate, and a decision of values can be read against
+/// the states it has to cover.
+///
+/// The older face is what a provisioned machine was built for wherever it was
+/// built at all; the wider one is driven only where the policy says it can be,
+/// which is the answer [`x2avic_permitted`] gives elsewhere. A controller its
+/// guest has globally disabled is driven in neither: with the enable bit of the
+/// base register clear there is no controller to drive, and the guest's only
+/// way back is that register, which is a model-specific register this
+/// hypervisor never stops intercepting.
+const fn driven_face(
+    machine_inhibited: bool,
+    mode: Mode,
+    x2avic: bool,
+    inhibited: bool,
+) -> Option<Face> {
+    if machine_inhibited || inhibited {
+        return None;
+    }
+    match mode {
+        Mode::XApic => Some(Face::XAvic),
+        Mode::X2Apic if x2avic => Some(Face::X2Avic),
+        Mode::X2Apic | Mode::Disabled => None,
+    }
 }
 
 /// The backing page of the processor asking.
@@ -289,7 +349,7 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
     };
     let vlapic = current()?;
     let have = face_of(vcpu);
-    let want = active_for(vlapic).then(|| face_of_guest(vlapic));
+    let want = active_face(vlapic);
     match move_for(have, want) {
         Move::Idle => Ok(()),
         Move::Enable(face) => enable(activation, vcpu, vlapic, face),
@@ -324,18 +384,6 @@ fn face_of(vcpu: &Vcpu) -> Option<Face> {
             Face::XAvic
         }
     })
-}
-
-/// The face the guest's own mode asks the acceleration for.
-///
-/// Asked only of a controller [`active_for`] has already accepted, so the
-/// switched-off face cannot arrive here, and neither can the wider one on a
-/// machine the policy left without it.
-fn face_of_guest(vlapic: &Vlapic) -> Face {
-    match vlapic.mode() {
-        Mode::X2Apic => Face::X2Avic,
-        Mode::XApic | Mode::Disabled => Face::XAvic,
-    }
 }
 
 /// Turns the acceleration on for this processor, at the entry that asked.
@@ -560,8 +608,14 @@ pub(crate) fn request(vector: Vector) -> Result<bool, VlapicError> {
 /// withdrawn and before the processor parks, with Acquire loads so that a
 /// request published before the withdrawal is one this scan sees. The
 /// comparison is the architecture's own — the highest request against the
-/// processor priority the backing TPR and in-service state impose — and a
-/// software-disabled controller takes nothing, here as in the model.
+/// processor priority the backing TPR and in-service state impose.
+///
+/// The page's software-enable bit is the only test of it anywhere on this
+/// path, and load-bearing rather than a cross-check: the model gates
+/// *activation* and does not consult the bit at all — see [`active_for`] —
+/// while the page gates *delivery*, which is the question being asked here. A
+/// software-disabled controller takes nothing, and this is where that is
+/// decided.
 ///
 /// # Errors
 ///
@@ -849,22 +903,6 @@ pub(crate) fn kick_count() -> u64 {
 }
 
 impl Activation {
-    /// Whether the acceleration drives a controller in the face its guest is
-    /// in.
-    ///
-    /// The older face is what this machine was built for wherever it was
-    /// built at all; the wider one is driven only where the policy says it
-    /// can be, which is the answer [`x2avic_permitted`] gives elsewhere and
-    /// the one kept here because the decision and the structures it is about
-    /// are the same state.
-    const fn drives(&self, mode: Mode) -> bool {
-        match mode {
-            Mode::XApic => true,
-            Mode::X2Apic => self.x2avic,
-            Mode::Disabled => false,
-        }
-    }
-
     /// The backing page of the processor at roster position `index`.
     fn page(&self, index: usize) -> Result<PhysAddr, VlapicError> {
         self.backing
@@ -1190,13 +1228,74 @@ const fn bank_offset(bank: Register, vector: Vector) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    //! The decisions here that need no machine: which vector an EOI retired,
-    //! which logical destinations name a table entry, and which move an
-    //! entry owes the acceleration.
+    //! The decisions here that need no machine: which face the acceleration
+    //! drives a controller in, which vector an EOI retired, which logical
+    //! destinations name a table entry, and which move an entry owes the
+    //! acceleration.
 
     use descriptors::Vector;
 
-    use super::{Face, Move, eoi_vector, logical_slot, move_for};
+    use super::{Face, Mode, Move, driven_face, eoi_vector, logical_slot, move_for};
+
+    /// Every mode a controller can be in, which is the one term of the
+    /// activation gate that is not a boolean.
+    const MODES: [Mode; 3] = [Mode::Disabled, Mode::XApic, Mode::X2Apic];
+
+    #[test]
+    fn the_acceleration_drives_the_face_of_a_mode_it_has_one_for() {
+        for x2avic in [false, true] {
+            assert_eq!(
+                driven_face(false, Mode::XApic, x2avic, false),
+                Some(Face::XAvic),
+                "the older face is what a provisioned machine was built for"
+            );
+            // A controller its guest has globally disabled has none to drive,
+            // and the way back is a register this hypervisor never stops
+            // intercepting.
+            assert_eq!(driven_face(false, Mode::Disabled, x2avic, false), None);
+        }
+        assert_eq!(
+            driven_face(false, Mode::X2Apic, true, false),
+            Some(Face::X2Avic)
+        );
+        // The wider face on a machine the policy left without it: a mode the
+        // acceleration cannot drive, so the software path serves it.
+        assert_eq!(driven_face(false, Mode::X2Apic, false, false), None);
+    }
+
+    #[test]
+    fn the_gate_is_exactly_no_demotion_and_a_face_the_policy_drives() {
+        // The whole truth table, so that a term added to or taken out of the
+        // gate has to be argued for here as well as written there. The
+        // software-enable bit is deliberately not among the terms: a
+        // controller its guest has switched off stays driven, because the
+        // register that switches it back on is served out of the backing page.
+        //
+        // Whether the structures exist at all is the one term that is not a
+        // value here: it is the `ACTIVATED.get()?` above the call, and cannot
+        // be false while there is an `x2avic` answer to pass.
+        for mode in MODES {
+            for machine_inhibited in [false, true] {
+                for x2avic in [false, true] {
+                    for inhibited in [false, true] {
+                        let driven = !machine_inhibited
+                            && !inhibited
+                            && match mode {
+                                Mode::XApic => true,
+                                Mode::X2Apic => x2avic,
+                                Mode::Disabled => false,
+                            };
+                        assert_eq!(
+                            driven_face(machine_inhibited, mode, x2avic, inhibited).is_some(),
+                            driven,
+                            "{mode:?}, machine inhibited {machine_inhibited}, x2avic \
+                             {x2avic}, inhibited {inhibited}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn an_eoi_retires_the_in_service_top_when_the_exit_agrees_or_says_nothing() {

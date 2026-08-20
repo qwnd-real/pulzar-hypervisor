@@ -111,6 +111,9 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate alloc;
+
 mod walk;
 
 use log::info;
@@ -1017,3 +1020,150 @@ const _: () = assert!(
     "a guest reaches nested memory only through a user page, executes only \
      without no-execute, and keeps its own memory type only under write-back",
 );
+
+#[cfg(test)]
+mod tests {
+    //! The two ways one page of a guest can be described, over a run of host
+    //! memory standing in for the reserved chunk.
+    //!
+    //! Only the chunk has to be real. Every table these tables build is a frame
+    //! of it, reached through the window, and nothing here ever dereferences a
+    //! guest physical address — so a run of memory with a window pointed at it
+    //! is the whole of the machine this needs.
+
+    use alloc::alloc::{Layout, alloc_zeroed};
+
+    use paging::{DirectMap, Frames, chunk::FRAME_SIZE};
+    use svm::exit::NestedPageFault;
+    use x86_64::{PhysAddr, VirtAddr};
+
+    use super::{Npt, NptError, Resolution, Trap, chunk};
+
+    /// Where the interrupt controllers' register page is, which is the one page
+    /// a boot chooses between these two descriptions for.
+    const REGISTER_PAGE: u64 = 0xFEE0_0000;
+
+    #[test]
+    fn a_trapped_page_has_no_translation_and_every_access_to_it_is_reported() {
+        let (mut frames, window) = reserved();
+        let mut npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+
+        npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .expect("the page can be trapped before a guest runs");
+
+        assert_eq!(
+            npt.translate(page).expect("the tables can be walked"),
+            None,
+            "a page every access to which faults must have no translation at all"
+        );
+        for write in [false, true] {
+            assert_eq!(
+                npt.fault(&mut frames, page, fault(write))
+                    .expect("the fault can be answered"),
+                Resolution::Trapped,
+                "a {} of a trapped page belongs to whatever answers for it",
+                if write { "write" } else { "read" }
+            );
+        }
+        assert_eq!(
+            npt.translate(page).expect("the tables can be walked"),
+            None,
+            "answering the fault must not have described the page"
+        );
+    }
+
+    #[test]
+    fn a_sunk_page_translates_to_a_frame_of_its_own_the_guest_may_write() {
+        let (mut frames, window) = reserved();
+        let mut npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+
+        npt.sink(&mut frames, page)
+            .expect("the page can be sunk before a guest runs");
+
+        let translation = npt
+            .translate(page)
+            .expect("the tables can be walked")
+            .expect("a sunk page is described");
+        assert!(
+            translation.writable,
+            "the acceleration requires the register page to be writable memory"
+        );
+        assert_ne!(
+            translation.spa, page,
+            "the sink is a frame of the chunk and never the hardware behind the page"
+        );
+        assert_eq!(
+            npt.fault(&mut frames, page, fault(true))
+                .expect("the fault can be answered"),
+            Resolution::Mapped,
+            "a described page that faults anyway is described rather than reported"
+        );
+    }
+
+    #[test]
+    fn neither_description_performs_the_other() {
+        let (mut frames, window) = reserved();
+        let page = PhysAddr::new(REGISTER_PAGE);
+
+        let mut trapped = Npt::create(&mut frames, window).expect("tables over the chunk");
+        trapped
+            .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .expect("the page can be trapped");
+        assert_eq!(
+            trapped.sink(&mut frames, page),
+            Err(NptError::Trapped { gpa: REGISTER_PAGE }),
+            "trapping leaves the page undescribed, so sinking it would untrap it"
+        );
+
+        let mut sunk = Npt::create(&mut frames, window).expect("tables over the chunk");
+        sunk.sink(&mut frames, page).expect("the page can be sunk");
+        assert_eq!(
+            sunk.release(page, FRAME_SIZE),
+            Err(NptError::NotTrapped {
+                gpa: REGISTER_PAGE,
+                bytes: FRAME_SIZE,
+            }),
+            "sinking records no trapped region, so there is none to give back"
+        );
+    }
+
+    /// A nested page fault of the direction alone, which is all [`Npt::fault`]
+    /// reads of one.
+    fn fault(write: bool) -> NestedPageFault {
+        NestedPageFault::new()
+            .with_write(write)
+            .with_final_address(true)
+    }
+
+    /// An allocator over a run of host memory standing in for the reserved
+    /// chunk, and the window that reaches it.
+    ///
+    /// Physical zero is the run's first byte, so a frame the allocator hands
+    /// out is an address inside the run and every table is written where a
+    /// table really would be. Leaked deliberately: the run stands in for
+    /// memory firmware reserved and nothing ever frees, and a window is a
+    /// raw pointer with no lifetime attached — a run that could be dropped
+    /// while a window still named it would differ from the machine in the
+    /// direction that hides mistakes.
+    fn reserved() -> (Frames, DirectMap) {
+        let size = usize::try_from(chunk::CHUNK_SIZE).expect("a test chunk fits a host pointer");
+        let align =
+            usize::try_from(chunk::CHUNK_ALIGN).expect("a chunk's alignment fits a host pointer");
+        let layout = Layout::from_size_align(size, align).expect("the chunk describes a layout");
+        // SAFETY: the layout is of a non-zero size, which is the whole of what
+        // this asks of a caller.
+        let base = unsafe { alloc_zeroed(layout) };
+        assert!(!base.is_null(), "the test chunk could not be allocated");
+        let window = DirectMap::new(VirtAddr::from_ptr(base), chunk::CHUNK_SIZE)
+            .expect("a window over the test chunk");
+        // SAFETY: the run was just allocated, is a whole chunk long and chunk
+        // aligned, is reached through a window that begins at its first byte,
+        // and is never freed or handed to anything else — which is what the
+        // reservation this stands in for guarantees on a machine.
+        let frames = unsafe { Frames::create(PhysAddr::new(0), window) }
+            .expect("an allocator over the test chunk");
+        (frames, window)
+    }
+}

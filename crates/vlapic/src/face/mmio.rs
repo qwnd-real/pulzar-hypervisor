@@ -1,21 +1,36 @@
 //! The face a guest reaches its controller through when it is memory mapped.
 //!
-//! One page of guest physical memory, trapped in the nested page tables, whose
-//! every access comes back here. The page is at the same address on every
-//! processor and each of them sees its own controller through it — which is why
-//! the device registered for it is one device holding a table of controllers,
-//! and picks this processor's row out of it on each access rather than there
-//! being one device per processor.
+//! One page of guest physical memory, at the same address on every processor
+//! and each of them seeing its own controller through it — which is why the
+//! device registered for it is one device holding a table of controllers, and
+//! picks this processor's row out of it on each access rather than there being
+//! one device per processor.
+//!
+//! # Two ways an access gets here, and one of them is not a fault
+//!
+//! Where this hypervisor serves the page itself, the page is trapped in the
+//! nested page tables and every access to it faults into the emulator, which
+//! performs it against the device below.
+//!
+//! Where the processor serves the page instead — the acceleration driving the
+//! controller out of a backing page of its own — the page is not trapped, the
+//! guest's accesses never fault, and most of them never reach this hypervisor
+//! at all. The ones the acceleration will not perform are reported as an exit
+//! that names the offset and the direction, and the exit path performs them
+//! against this same device. So what arrives here is a subset rather than
+//! something different, and nothing below needs to know which of the two
+//! brought it.
 //!
 //! # This face exists only while the controller is in the older mode
 //!
-//! The page is trapped once, before any guest runs, and cannot be untrapped
-//! while processors are executing — so the aperture outlives the mode it
-//! belongs to. Everything reaching it is therefore gated on the controller
-//! actually being in that mode, before an offset is decoded or an error
-//! recorded. A guest that has switched its controller off, or moved it to the
-//! model-specific registers, must not find a second way to reach the same
-//! registers.
+//! Neither route is taken away when the mode that has a register page is. The
+//! trap is installed once, before any guest runs, and cannot be removed while
+//! processors are executing; the acceleration's own redirection likewise
+//! outlives the mode it belongs to. So the aperture outlives the mode either
+//! way, and everything reaching it is gated on the controller actually being in
+//! that mode, before an offset is decoded or an error recorded. A guest that
+//! has switched its controller off, or moved it to the model-specific
+//! registers, must not find a second way to reach the same registers.
 //!
 //! What it finds instead is what an address nothing decodes answers with, which
 //! is all-ones: outside that mode the page is not claimed by anything, so the
@@ -77,9 +92,20 @@ use crate::{
 
 /// The region of the guest's memory this crate answers for.
 ///
-/// Handed to whatever traps regions before the guest runs. Every access is
-/// trapped, reads included: the values a guest reads out of its controller are
-/// this crate's answers and never the hardware's.
+/// Handed to whatever traps regions before the guest runs, and handed over
+/// whether or not the guest's own accesses are what reach it.
+///
+/// Where the software model serves the page, every access is trapped, reads
+/// included: the values a guest reads out of its controller are this crate's
+/// answers and never the hardware's. Where the processor serves the page
+/// itself, out of the backing page provisioning built, the nested tables are
+/// left alone and no access of the guest's arrives here — but the device is
+/// still owed, because the accesses the acceleration declines to perform come
+/// back as an exit naming the address and the direction, and performing one of
+/// those is performing it against this device.
+///
+/// Which of the two it is follows from whether the acceleration was
+/// provisioned, so this is asked after [`crate::provision`] rather than before.
 ///
 /// # Errors
 ///
@@ -89,7 +115,7 @@ pub fn region() -> Result<Region, VlapicError> {
     Ok(Region {
         gpa: PhysAddr::new(ApicBase::DEFAULT_PAGE),
         bytes: PAGE,
-        trap: Trap::Everything,
+        trap: (!crate::avic::activation::provisioned()).then_some(Trap::Everything),
         device: Box::new(Aperture(page)),
     })
 }
@@ -225,8 +251,8 @@ impl Page {
     /// names none.
     ///
     /// The face itself is gated before any register is decoded, and that comes
-    /// first for a reason. This aperture is trapped once, before any guest
-    /// runs, and stays trapped for the life of the machine — but the
+    /// first for a reason. How this aperture is reached is settled once, before
+    /// any guest runs, and stays settled for the life of the machine — but the
     /// registers behind it exist only while the controller is in the older
     /// mode. A guest that has switched its controller off, or moved it to
     /// the model-specific registers, has no memory-mapped face at all, and

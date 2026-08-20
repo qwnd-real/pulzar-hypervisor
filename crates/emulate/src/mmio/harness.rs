@@ -18,7 +18,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 
 use x86_64::{PhysAddr, VirtAddr};
 
-use super::{Aperture, Device, Hardware, Interposed, Mmio};
+use super::{Aperture, Device, Hardware, Interposed, Mmio, Trap};
 
 /// Builds a set of regions over planted bytes.
 #[derive(Default)]
@@ -38,6 +38,11 @@ impl Harness {
     /// The bytes behind it start as zeroes and are reached exactly as a real
     /// aperture is — and, as at registration, a device that declares it never
     /// reaches the hardware behind its region gets none of them.
+    ///
+    /// Trapped in full, because everything downstream of registration is
+    /// reached the same way whatever brought the access here: what the trap
+    /// decides is only which of the guest's own accesses fault, and nothing
+    /// below is told which one did.
     pub(crate) fn region(mut self, gpa: u64, bytes: u64, device: Box<dyn Device>) -> Self {
         let aperture = match device.hardware() {
             Hardware::Reached => plant(bytes),
@@ -46,6 +51,7 @@ impl Harness {
         self.regions.push(Interposed {
             gpa: PhysAddr::new(gpa),
             end: gpa + bytes,
+            trap: Some(Trap::Everything),
             aperture,
             device,
         });

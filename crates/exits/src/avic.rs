@@ -111,8 +111,10 @@ fn emulate(
     exit: UnacceleratedAccessExit,
 ) -> Flow {
     let Some(devices) = partition.devices() else {
-        // The register page is trapped, so something meant to answer for it;
-        // resuming would fault at the same instruction forever.
+        // The register page is a region of the guest whether or not the nested
+        // tables trap it, and it is registered before any processor enters —
+        // so an unsealed set means the guest was entered before its own memory
+        // was described, and resuming would exit here for ever.
         error!(
             "exits: nothing answers for the unaccelerated access at offset {:#x}",
             exit.offset()
