@@ -10,8 +10,8 @@
 //! 2. Reserves the one chunk of physical memory pulzar will own. It has to
 //!    happen before the memory map is captured, so the chunk appears in the map
 //!    as reserved rather than as memory something might hand out again.
-//! 3. Loads Windows Boot Manager without starting it, retaining the resulting
-//!    image handle for the guest portal.
+//! 3. Loads the guest image without starting it, retaining the resulting image
+//!    handle for the guest portal.
 //! 4. Captures firmware's memory map into the chunk, because the address space
 //!    is sized from it and because firmware's own copy lives in memory the
 //!    hypervisor will lose.
@@ -43,7 +43,7 @@ use clock::Wall;
 use handoff::Handoff;
 use log::{error, info, warn};
 use paging::{
-    AddressSpace, CacheType, DirectMap, PagingError, Protection, Stack, buddy, chunk,
+    AddressSpace, CacheType, DirectMap, PagingError, Protection, Ram, Stack, buddy, chunk,
     kaslr::{self, Entropy, Placement},
 };
 use snapshot::FirmwareContext;
@@ -56,7 +56,7 @@ use x86_64::{
 use crate::{
     error::LoaderError,
     firmware::{ImageFile, Loader, Memory, Reserved, Survey},
-    image::Image,
+    image::{Image, ImageError},
 };
 
 /// Bytes of the image file read before anything else, to parse its headers
@@ -100,6 +100,18 @@ const _: () = assert!(
     "the firmware context does not fit the chunk region reserved for it"
 );
 
+/// The memory-map region holds the loader's decoded copy of firmware's
+/// descriptors, one [`MemoryDescriptor`] per entry, and both images read them
+/// by this same layout. Forty bytes is the UEFI version-1 descriptor size (a
+/// `u32` type and four `u64` fields); a UEFI binding upgrade that changes the
+/// struct must bump [`chunk::LAYOUT`] before either image may adopt the map,
+/// and this assert turns forgetting that into a build failure instead of a
+/// misread map.
+const _: () = assert!(
+    size_of::<MemoryDescriptor>() == 40,
+    "the UEFI memory descriptor layout changed; bump chunk::LAYOUT and re-check both images"
+);
+
 /// Firmware's entry point.
 ///
 /// The capture comes before serial, and serial before everything else. Serial
@@ -127,7 +139,7 @@ fn main() -> Status {
         Ok(never) => match never {},
         Err(error) => {
             error!("loader: boot failed: {error}");
-            Status::LOAD_ERROR
+            error.status()
         }
     }
 }
@@ -140,6 +152,9 @@ fn main() -> Status {
 /// the reserved chunk stays reserved and firmware is left as it was found,
 /// which is what firmware expects of an application that returns an error.
 fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
+    // Read before anything slow, so the gap between this reading and the
+    // hypervisor's own clock coming up is as small as the loader can make it.
+    let boot_wall = firmware::wall_clock();
     let loader = firmware::loaded_self()?;
     info!(
         "loader: own image at {:#x}, {:#x} bytes",
@@ -157,7 +172,7 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
 
     let guest = firmware::load_guest()?;
     info!(
-        "loader: Windows Boot Manager loaded as {:#x}",
+        "loader: guest image loaded as {:#x}",
         wide(guest.handle.as_ptr() as usize)
     );
 
@@ -214,6 +229,7 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
         memory,
         hypervisor,
         placement,
+        boot_wall,
     };
     let handoff = publish(&space, inputs, firmware)?;
     let entry = VirtAddr::new(image.entry(placement.image_base.as_u64()));
@@ -233,26 +249,57 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
 /// # Errors
 ///
 /// [`LoaderError::Paging`] if firmware's identity map does not reach the chunk,
-/// or whatever [`firmware::capture_memory_map`] reports.
+/// [`LoaderError::NotInMemoryMap`] if the map does not describe the chunk, or
+/// whatever [`firmware::capture_memory_map`] reports.
 fn survey_memory(chunk_base: PhysAddr) -> Result<Survey, LoaderError> {
     let capacity = bytes(chunk::MEMORY_MAP_SIZE) / size_of::<MemoryDescriptor>();
     let destination = identity_ptr::<MemoryDescriptor>(chunk_base + chunk::MEMORY_MAP_OFFSET)?;
     // SAFETY: the destination is the chunk's memory-map region, `MEMORY_MAP_SIZE`
     // bytes long and owned by nothing else — no allocator ever hands out the
     // metadata frames — so it holds exactly `capacity` descriptors.
-    unsafe { firmware::capture_memory_map(destination, capacity) }
+    let survey = unsafe { firmware::capture_memory_map(destination, capacity) }?;
+    verify_resident(&survey.ram, chunk_base, chunk::CHUNK_SIZE)?;
+    Ok(survey)
+}
+
+/// Requires a reserved region to be covered by firmware's RAM description.
+///
+/// The direct map is built over the RAM runs [`firmware::capture_memory_map`]
+/// distilled from firmware's map, and the hypervisor reaches the chunk only
+/// through that map once firmware's identity map is gone. Firmware that omits
+/// a reserved descriptor from the map would otherwise leave the chunk silently
+/// outside the direct map, to fail much later and less readably.
+fn verify_resident(ram: &[Ram], start: PhysAddr, len: u64) -> Result<(), LoaderError> {
+    let start = start.as_u64();
+    let end = start + len;
+    if ram
+        .iter()
+        .any(|run| run.start() <= start && end <= run.end())
+    {
+        return Ok(());
+    }
+    Err(LoaderError::NotInMemoryMap { start, len })
 }
 
 /// Reads the front of the hypervisor image and parses its headers.
 ///
 /// # Errors
 ///
-/// [`LoaderError::Firmware`] if the read fails, or [`LoaderError::Image`] if
-/// the image is not one this loader can place.
+/// [`LoaderError::Firmware`] if the read fails, [`LoaderError::ProbeTooSmall`]
+/// if the image's headers do not fit the probe buffer, or
+/// [`LoaderError::Image`] if the image is not one this loader can place.
 fn probe(file: &mut ImageFile) -> Result<Image, LoaderError> {
     let mut headers = [0; PROBE_BYTES];
     let read = file.read_at(0, &mut headers)?;
-    Ok(Image::parse(&headers[..read])?)
+    Image::parse(&headers[..read]).map_err(|error| {
+        if matches!(error, ImageError::Truncated { .. }) && read == headers.len() {
+            LoaderError::ProbeTooSmall {
+                probe_bytes: headers.len(),
+            }
+        } else {
+            error.into()
+        }
+    })
 }
 
 /// What placing the hypervisor image produced.
@@ -280,6 +327,7 @@ struct HandoffInputs {
     memory: Memory,
     hypervisor: Hypervisor,
     placement: Placement,
+    boot_wall: Option<Wall>,
 }
 
 /// Places the hypervisor image and its stack in the new address space.
@@ -451,6 +499,7 @@ fn publish(
         memory,
         hypervisor,
         placement,
+        boot_wall,
     } = inputs;
     let chunk_base = reserved.chunk;
     let context = chunk_base + chunk::FIRMWARE_CONTEXT_OFFSET;
@@ -480,11 +529,10 @@ fn publish(
         memory_map_entry_size: narrow(size_of::<MemoryDescriptor>()),
         top_of_ram: memory.top_of_ram,
         acpi_rsdp: firmware::acpi_rsdp(),
-        // Read here rather than at the start of the boot, so that the gap
-        // between this reading and the hypervisor's clock coming up is as small
-        // as the loader can make it: nothing measures that gap, and whatever it
-        // is, the wall clock is behind by it for good.
-        boot_wall_nanos: firmware::wall_clock().map_or(0, Wall::nanos),
+        // Read at the start of the boot, before the slow image and page table
+        // work, so the unmeasured gap between this reading and the
+        // hypervisor's clock coming up is as small as the loader can make it.
+        boot_wall_nanos: boot_wall.map_or(0, Wall::nanos),
         ap_trampoline_base: reserved.trampoline.as_u64(),
         firmware_context: direct(space, context)?.as_u64(),
     };

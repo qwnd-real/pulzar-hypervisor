@@ -21,9 +21,11 @@
 use paging::Protection;
 use thiserror::Error;
 
-/// Sections this loader accepts in one image. `rust-lld` emits a handful; the
-/// bound exists so the section table fits a fixed array instead of an
-/// allocation.
+/// Sections this loader accepts in one image. `rust-lld` emits a handful, so
+/// the bound is generous in practice; it exists so the section table fits a
+/// fixed array instead of an allocation. An image that exceeds it is refused
+/// with [`ImageError::TooManySections`], and raising the bound is the fix if a
+/// future toolchain ever emits more.
 const MAX_SECTIONS: usize = 24;
 
 /// The only section alignment this loader supports, which is also the page size
@@ -161,6 +163,13 @@ impl Image {
             });
         }
         image.read_sections(headers, optional + optional_size)?;
+        if !image.sections().iter().any(|section| {
+            u64::from(image.entry) >= section.offset
+                && u64::from(image.entry) < section.offset + section.size
+                && section.protection == Protection::ReadExecute
+        }) {
+            return Err(ImageError::EntryNotExecutable { entry: image.entry });
+        }
         Ok(image)
     }
 
@@ -368,6 +377,13 @@ pub enum ImageError {
     /// `AddressOfEntryPoint` is not inside the image.
     #[error("the entry point at {entry:#x} is outside the image")]
     EntryOutsideImage {
+        /// The `AddressOfEntryPoint` field found.
+        entry: u32,
+    },
+    /// `AddressOfEntryPoint` is not inside a section mapped executable, so the
+    /// jump into it would run headers or data, or fault.
+    #[error("the entry point at {entry:#x} is not in an executable section")]
+    EntryNotExecutable {
         /// The `AddressOfEntryPoint` field found.
         entry: u32,
     },

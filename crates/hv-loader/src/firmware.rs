@@ -19,7 +19,10 @@ use log::{info, warn};
 use paging::Ram;
 use uefi::{
     Handle, Status,
-    boot::{self, AllocateType, LoadImageSource, MemoryDescriptor, MemoryType, ScopedProtocol},
+    boot::{
+        self, AllocateType, LoadImageSource, MemoryDescriptor, MemoryType, OpenProtocolAttributes,
+        OpenProtocolParams, ScopedProtocol,
+    },
     cstr16,
     mem::memory_map::{MemoryMap, MemoryMapMut},
     proto::{
@@ -73,7 +76,7 @@ pub struct GuestImage {
     pub handle: Handle,
 }
 
-/// Finds Windows Boot Manager and asks firmware to load it for the guest.
+/// Finds the guest image and asks firmware to load it.
 ///
 /// The path is searched on every Simple File System volume because firmware
 /// gives their handles no meaningful order. More than one match is refused: a
@@ -108,8 +111,23 @@ pub fn load_guest() -> Result<GuestImage, LoaderError> {
 /// firmware error means the volume could not be inspected reliably and stops
 /// the boot rather than making a selection from an incomplete search.
 fn contains_guest(volume: Handle) -> Result<bool, LoaderError> {
-    let mut filesystem = boot::open_protocol_exclusive::<SimpleFileSystem>(volume)
-        .context("open a filesystem volume")?;
+    // SAFETY: `volume` is a handle that publishes `SimpleFileSystem`, installed
+    // by firmware's own driver and left in place for the whole boot-services
+    // phase. A `GetProtocol` open is untracked, so the obligation is that the
+    // interface is neither uninstalled nor reinstalled while the returned
+    // `ScopedProtocol` is alive; nothing the loader or firmware does here does
+    // so, and this runs on the boot processor alone.
+    let mut filesystem = unsafe {
+        boot::open_protocol::<SimpleFileSystem>(
+            OpenProtocolParams {
+                handle: volume,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .context("open a filesystem volume")?;
     let mut root = filesystem
         .open_volume()
         .context("open a filesystem root directory")?;
@@ -117,7 +135,7 @@ fn contains_guest(volume: Handle) -> Result<bool, LoaderError> {
         Ok(_) => Ok(true),
         Err(error) if error.status() == Status::NOT_FOUND => Ok(false),
         Err(error) => Err(LoaderError::Firmware {
-            operation: "inspect a filesystem volume for Windows Boot Manager",
+            operation: "inspect a filesystem volume for the guest image",
             status: error.status(),
         }),
     }
@@ -130,8 +148,20 @@ fn contains_guest(volume: Handle) -> Result<bool, LoaderError> {
 /// path instead of reconstructing a disk or partition path from guessed
 /// firmware details.
 fn load_from(volume: Handle) -> Result<Handle, LoaderError> {
-    let device = boot::open_protocol_exclusive::<DevicePath>(volume)
-        .context("open the guest volume device path")?;
+    // SAFETY: as in `contains_guest`: `volume` publishes `DevicePath` for the
+    // whole boot-services phase, and nothing uninstalls it while this
+    // `ScopedProtocol` is alive on the single running boot processor.
+    let device = unsafe {
+        boot::open_protocol::<DevicePath>(
+            OpenProtocolParams {
+                handle: volume,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .context("open the guest volume device path")?;
     let mut storage = Vec::new();
     let mut builder = build::DevicePathBuilder::with_vec(&mut storage);
     for node in device.node_iter() {
@@ -151,7 +181,7 @@ fn load_from(volume: Handle) -> Result<Handle, LoaderError> {
             boot_policy: BootPolicy::ExactMatch,
         },
     )
-    .context("load Windows Boot Manager")
+    .context("load the guest image")
 }
 
 /// Reports where firmware put the loader image.
@@ -162,8 +192,21 @@ fn load_from(volume: Handle) -> Result<Handle, LoaderError> {
 /// which would mean firmware did not give us the handle it started us with.
 pub fn loaded_self() -> Result<Loader, LoaderError> {
     let handle = boot::image_handle();
-    let mut image = boot::open_protocol_exclusive::<LoadedImage>(handle)
-        .context("open the loader's own loaded-image protocol")?;
+    // SAFETY: `handle` is the handle firmware created for this running image,
+    // whose `LoadedImage` interface firmware installs and keeps for as long as
+    // the image is loaded. Nothing reinstalls it while the returned
+    // `ScopedProtocol` is alive, so the untracked `GetProtocol` open is sound.
+    let mut image = unsafe {
+        boot::open_protocol::<LoadedImage>(
+            OpenProtocolParams {
+                handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .context("open the loader's own loaded-image protocol")?;
     let (base, size) = image.info();
     // SAFETY: the callback is linked into this image and firmware invokes it
     // before releasing the image's pages, which satisfies `set_unload`'s
@@ -213,7 +256,12 @@ pub fn reserve() -> Result<Reserved, LoaderError> {
 /// [`MemoryType::RESERVED`] is what keeps the region out of every later
 /// consumer's hands, firmware's included, and unlike loader-owned memory it
 /// survives the loader being unloaded — which it must, since it holds the page
-/// tables the hypervisor is running on by then.
+/// tables the hypervisor is running on by then. Where firmware refuses to hand
+/// memory out under that type, the request is retried as
+/// [`MemoryType::RUNTIME_SERVICES_DATA`]: the type every implementation must
+/// support, that also survives `ExitBootServices` and is never reclaimed, and
+/// that pulzar owns outright anyway because it never calls the runtime
+/// services.
 ///
 /// Firmware only promises page alignment, so the request is one alignment
 /// larger than the chunk and the base is rounded up inside it. The slack stays
@@ -233,12 +281,25 @@ pub fn reserve() -> Result<Reserved, LoaderError> {
 fn allocate_chunk() -> Result<PhysAddr, LoaderError> {
     let span = paging::chunk::CHUNK_SIZE + paging::chunk::CHUNK_ALIGN;
     let pages = bytes(span / paging::chunk::FRAME_SIZE);
-    let base = boot::allocate_pages(
+    let base = match boot::allocate_pages(
         AllocateType::MaxAddress(FOUR_GIB),
         MemoryType::RESERVED,
         pages,
-    )
-    .context("reserve the hypervisor's memory chunk below 4 GiB")?;
+    ) {
+        Ok(region) => region,
+        Err(error) => {
+            warn!(
+                "loader: firmware refused to reserve the chunk as reserved memory ({error}); \
+                 falling back to runtime-services data"
+            );
+            boot::allocate_pages(
+                AllocateType::MaxAddress(FOUR_GIB),
+                MemoryType::RUNTIME_SERVICES_DATA,
+                pages,
+            )
+            .context("reserve the hypervisor's memory chunk below 4 GiB")?
+        }
+    };
     Ok(PhysAddr::new(
         wide(base.addr().get()).next_multiple_of(paging::chunk::CHUNK_ALIGN),
     ))
@@ -260,6 +321,9 @@ const LAST_SIPI_BYTE: u64 = (1 << 20) - 1;
 ///
 /// [`MemoryType::BOOT_SERVICES_DATA`] keeps the page exclusively owned through
 /// EBS without leaving a permanent reserved-memory hole in the final map.
+///
+/// One page, and nothing more: the startup sequence the hypervisor writes into
+/// it must fit in 4 KiB, a contract this loader cannot check from here.
 ///
 /// # Errors
 ///
