@@ -303,9 +303,9 @@ pub(crate) fn write(
 ///
 /// `None` leaves the answer to the model's path, for the two reasons there
 /// is one: the register is one the model still owns, or the page could not
-/// be reached — in which case the demotion below is the honest answer, and
-/// the model's value the nearest true one while the control block catches up
-/// at the next entry.
+/// be reached — in which case the demotion below is the honest answer, and the
+/// model has just been given whatever the page still held, so that it really is
+/// the nearest true state while the control block catches up at the next entry.
 fn avic_value(vlapic: &Vlapic, register: Register) -> Option<u64> {
     if !crate::avic::activation::active_for(vlapic) {
         return None;
@@ -345,13 +345,27 @@ fn avic_write(vlapic: &Vlapic, register: Register, value: u64) -> Option<Written
 /// reach it is one the processor stops making: the control block's enable
 /// bits follow at the next entry, and the access that discovered the break
 /// is answered by the software path rather than visited on the guest.
+///
+/// A transition rather than a fallback, which is what makes the model the
+/// nearest true state for the answer that follows: the page is carried into it
+/// here, so the guest is not answered out of a task priority it never set nor
+/// out of an in-service bank that stopped tracking its interrupts when the
+/// acceleration was turned on. [`crate::avic::activation::hand_back`] is both
+/// halves of that.
 fn demote(vlapic: &Vlapic, register: Register, error: VlapicError) {
-    vlapic.inhibit_avic();
+    let carried = crate::avic::activation::hand_back(vlapic);
     warn!(
         "vlapic: {} could not reach its backing page for {register:?}: {error}; the processor \
          returns to software delivery",
         vlapic.index()
     );
+    if let Err(carried) = carried {
+        warn!(
+            "vlapic: {} could not carry its backing page into the model as it stepped back: \
+             {carried}; the model answers with what it last held",
+            vlapic.index()
+        );
+    }
 }
 
 /// Translates a physical deadline into the timestamp domain the guest reads.

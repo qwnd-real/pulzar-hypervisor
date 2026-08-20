@@ -231,6 +231,52 @@ impl Bitmap {
             .map(|word| word.load(Ordering::Acquire))
     }
 
+    /// Puts one of the eight registers at what another authority was holding,
+    /// whatever this one held.
+    ///
+    /// For a bank that crossed to an authority which then owned it outright:
+    /// the in-service bank of a controller the hardware has been driving is
+    /// retired in the backing page with no exit for this side to hear, so
+    /// what comes back replaces rather than joins what is here.
+    ///
+    /// Not part of the handshake [`Bitmap::set`] and [`Bitmap::highest`] are
+    /// the two halves of, and neither are [`Bitmap::merge`] and
+    /// [`Bitmap::retire`]: all three are performed by the processor the
+    /// controller belongs to at a boundary where its guest is stopped, and
+    /// the next thing to read what they leave is that processor's own scan.
+    ///
+    /// A slot the register file does not have cannot arrive here — the words a
+    /// caller is putting back came out of a bank of this same length — and
+    /// there is nothing to store for one that did.
+    pub(crate) fn put(&self, slot: usize, word: u32) {
+        if let Some(register) = self.slots.get(slot) {
+            register.store(word, Ordering::Release);
+        }
+    }
+
+    /// Adds every bit of `word` to one of the eight registers.
+    ///
+    /// For a bank both authorities may hold something in, where neither one's
+    /// bits may be dropped: a request accepted on the software path while the
+    /// hardware was being taken off the controller is in this bank alone, and
+    /// one the hardware took is in the other.
+    pub(crate) fn merge(&self, slot: usize, word: u32) {
+        if let Some(register) = self.slots.get(slot) {
+            register.fetch_or(word, Ordering::AcqRel);
+        }
+    }
+
+    /// Clears the bits of `word` in one of the eight registers.
+    ///
+    /// For a bank handed to another authority: exactly what that authority took
+    /// is cleared and nothing else, so a bit another processor set after the
+    /// hand-over read the word is one this register file goes on holding.
+    pub(crate) fn retire(&self, slot: usize, word: u32) {
+        if let Some(register) = self.slots.get(slot) {
+            register.fetch_and(!word, Ordering::AcqRel);
+        }
+    }
+
     /// Clears every bit, which is what reset and INIT leave these.
     pub(crate) fn reset(&self) {
         for slot in &self.slots {
@@ -403,6 +449,31 @@ mod tests {
             None,
             "a slot past the eight the register file has is not a register"
         );
+    }
+
+    #[test]
+    fn a_bank_crosses_between_authorities_a_word_at_a_time() {
+        // The three operations a bank crossing between the two authorities that
+        // may hold it is made of. `put` replaces, because what it comes from
+        // owned the bank outright; `merge` adds, because both sides may hold
+        // something the other never had; `retire` clears exactly what crossed,
+        // so a bit another processor delivered in the meantime stays.
+        let bitmap = Bitmap::new();
+        bitmap.set(Vector::new(1));
+        bitmap.put(0, 0b1100);
+        assert_eq!(bitmap.slot(0), Some(0b1100), "what was held here is gone");
+        bitmap.merge(0, 0b0011);
+        assert_eq!(bitmap.slot(0), Some(0b1111));
+        bitmap.retire(0, 0b0101);
+        assert_eq!(bitmap.slot(0), Some(0b1010));
+        assert_eq!(bitmap.count(), 2);
+        // A slot the register file does not have is not one any of them reaches,
+        // and nothing it holds moves.
+        bitmap.put(SLOTS, !0);
+        bitmap.merge(SLOTS, !0);
+        bitmap.retire(SLOTS, !0);
+        assert_eq!(bitmap.slot(0), Some(0b1010));
+        assert_eq!(bitmap.count(), 2);
     }
 
     #[test]

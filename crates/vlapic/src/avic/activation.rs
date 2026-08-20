@@ -28,6 +28,22 @@
 //!   one is written.
 //! - The inhibits are single atomic booleans, Release on the set.
 //!
+//! # And one authority
+//!
+//! Which of the two copies of a register is the truth is a different question
+//! from which processor may write it, and while a control block carries the
+//! acceleration the answer is the page for four of them: the three vector banks
+//! and the task priority. So the model is emptied of everything the hardware
+//! can deliver at the entry ([`hand_over`]), is not written from the control
+//! block's copy of the task priority at the exit ([`TaskPriority`]), and is
+//! given the page's state back whole when the acceleration comes off
+//! ([`sync_into_model`]) or when this processor stops trusting it
+//! ([`hand_back`]).
+//!
+//! One kind of interrupt is the exception, and it is the one no controller
+//! holds in service: an arrival that came in through the pin that bypasses the
+//! controller stays in the model and is injected from there.
+//!
 //! # How the pages and entries are reached
 //!
 //! Everything below goes through [`Activation::word`] and its siblings, which
@@ -61,13 +77,14 @@ use x86_64::PhysAddr;
 
 use crate::{
     VlapicError,
-    avic::backing::{Life, Projection, ResetImage},
+    avic::backing::{Handover, Life, Projection, ResetImage},
     delivery::error,
     face::{dispatch, dispatch::Written, table::Register},
     machine::{current, registry},
     priority::{self, Priority},
     registers::{
-        FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, error::Errors, icr::Command, lvt::Entry,
+        FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, bitmap::SLOTS, error::Errors, icr::Command,
+        lvt::Entry,
     },
 };
 
@@ -411,14 +428,14 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
         // The steady state. One thing can still have moved: a reset cleared the
         // model underneath an active controller, and the page the hardware
         // serves holds the state that reset was required to destroy.
+        //
+        // The task priority is deliberately not carried here. It is taken at the
+        // exit instead — see [`TaskPriority`] — because the model is consulted
+        // between the two, and an entry is what that consultation decides on.
         Move::Steady => {
             if !standing.life.carried() {
                 rebuild_backing(activation, vlapic, standing)?;
             }
-            // The task priority the guest sets without exiting has to be the
-            // model's before anything consults the model about what is
-            // deliverable.
-            sync_task_priority(activation, vlapic)?;
             Ok(())
         }
     }
@@ -770,6 +787,57 @@ pub(crate) fn request(vector: Vector) -> Result<bool, VlapicError> {
     let word = activation.word(page, bank_offset(Register::INTERRUPT_REQUEST, vector))?;
     let bit = 1u32 << (vector.number() % 32);
     Ok(word.fetch_or(bit, Ordering::Release) & bit == 0)
+}
+
+/// Hands this processor's own interrupts to the hardware that is about to
+/// deliver them, at an entry the acceleration is armed for.
+///
+/// The three vector banks are the backing page's alone while the hardware
+/// drives, and this is what makes that true of the interrupts the *software*
+/// path accepted: a request a peer's software delivery left in the model, an
+/// error interrupt this controller raised on itself, whatever firmware's own
+/// register file was seeded with. Each of them crosses into the page, and the
+/// model stops holding it, so the hardware both delivers the vector and retires
+/// it — out of one bank, against the priority it computes from that same page.
+///
+/// An injection could be neither. An interrupt put into the guest through the
+/// control block's event field while the acceleration is on is one the hardware
+/// never sees: it does not raise the priority the hardware arbitrates with, so
+/// a lower-priority vector can be delivered on top of its handler, and the
+/// guest's acknowledgement of it is performed against the page, where its bit
+/// was never set — which leaves the model's own in-service bank holding it for
+/// as long as the guest lives, refusing everything of that class or below in
+/// every nomination afterwards.
+///
+/// What cannot cross stays and is injected, and it is one thing: an arrival
+/// that came in through the pin that bypasses the controller. See
+/// [`Handover::from_words`], which is where that is decided.
+///
+/// Cheap where there is nothing to do, which is every entry of a guest whose
+/// interrupts are the hardware's already: four loads of this processor's own
+/// register file per bank slot, and no store at all.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`]. A failure leaves the interrupt in the model, where
+/// the entry's own nomination is what delivers it.
+pub(crate) fn hand_over() -> Result<(), VlapicError> {
+    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
+    let vlapic = current()?;
+    let page = activation.page(vlapic.index().get())?;
+    for (slot, within) in (0..)
+        .step_by(REGISTER_STRIDE as usize)
+        .enumerate()
+        .take(SLOTS)
+    {
+        let handover = Handover::of(vlapic, slot);
+        if handover.is_empty() {
+            continue;
+        }
+        handover.publish(within, |offset| activation.word(page, offset))?;
+        handover.retire(vlapic, slot);
+    }
+    Ok(())
 }
 
 /// Whether this processor's backing page holds anything its guest could take
@@ -1144,6 +1212,49 @@ pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, Vlapi
     }
 }
 
+/// Stops driving this controller in hardware from inside an exit, handing the
+/// page's state back to the model first.
+///
+/// What [`disable`] performs at an entry, performed at the moment a caller
+/// stops trusting the acceleration: the access that discovered the trouble is
+/// about to be answered out of the model, and the model is the nearest true
+/// state only once it holds what the page does. Without the carry it is not the
+/// nearest anything for two of its registers — a task priority the guest set
+/// through the page is not in it, so a write the model then accepts is reverted
+/// by the next entry's own carry-back; and an acknowledgement pops an
+/// in-service bank that has not been the guest's since the acceleration was
+/// turned on.
+///
+/// A page belonging to a life that has ended is not carried, for the reason
+/// [`disable`] gives: a model a reset has just cleared is already the nearest
+/// true state, and putting the page back would restore exactly what the reset
+/// was required to destroy.
+///
+/// The demotion itself happens whether or not the carry could, because a claim
+/// that cannot reach the page is one the processor stops making either way; the
+/// control block's enable bits follow at the next entry.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`], from the carry alone.
+pub(crate) fn hand_back(vlapic: &Vlapic) -> Result<(), VlapicError> {
+    let carried = ACTIVATED
+        .get()
+        .ok_or(VlapicError::NotProvisioned)
+        .and_then(|activation| {
+            let standing = Standing::of(
+                activation.rebuilt_at[vlapic.index().get()].load(Ordering::Relaxed),
+                vlapic.epoch(),
+            );
+            if standing.life.carried() {
+                sync_into_model(activation, vlapic)?;
+            }
+            Ok(())
+        });
+    vlapic.inhibit_avic();
+    carried
+}
+
 /// Demotes the whole machine, for the rest of its life.
 ///
 /// For the reports that say the acceleration itself cannot be trusted:
@@ -1332,13 +1443,67 @@ fn sync_into_model(activation: &Activation, vlapic: &Vlapic) -> Result<(), Vlapi
     Ok(())
 }
 
+/// Which of the two copies of the guest's task priority an exit owes the model.
+///
+/// The register is one the guest reaches through two doors, and only one of
+/// them is open at a time. While the hardware drives the controller the guest
+/// writes the backing page with no exit at all, and the whole byte it wrote is
+/// there; otherwise the processor keeps the guest's writes to its task-priority
+/// control register in the control block, four bits of them, and that is the
+/// only place they are.
+///
+/// Never both. The model is consulted between the exit and the next entry — the
+/// park decision asks it whether this processor may sleep — so a task priority
+/// written from one authority and then overwritten from the other is right only
+/// until whichever of the two runs next. Too low, and the processor wakes for a
+/// vector the guest's real priority masks, re-enters, finds the truth restored
+/// and halts again, without bound. Too high, and it sleeps through one the
+/// guest would have taken.
+///
+/// Pure rather than a branch inside the caller, because which authority owns a
+/// register is exactly the kind of thing that has to be readable against the
+/// states it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskPriority {
+    /// The backing page's word, which the guest wrote without exiting.
+    Backing,
+    /// The control block's class, which is what the processor kept for it.
+    Block,
+}
+
+impl TaskPriority {
+    /// Which of the two the guest was running under.
+    ///
+    /// The control block's own enable bit is the term rather than whether the
+    /// acceleration is permitted, because what owned the register is whatever
+    /// the processor was entered with — which after a reconciliation that could
+    /// not finish is not the same answer.
+    pub(crate) const fn owner(accelerated: bool) -> Self {
+        if accelerated {
+            Self::Backing
+        } else {
+            Self::Block
+        }
+    }
+}
+
 /// Copies the backing task priority into the model.
 ///
-/// The one register the steady state carries back, because it is the one the
-/// guest changes without exiting: anything that consults the model about what
-/// is deliverable has to be looking at the number the hardware is looking at.
-/// A deactivation carries it with everything else.
-fn sync_task_priority(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
+/// The one register the guest moves without exiting, so nothing that consults
+/// the model about what is deliverable is looking at the number the hardware is
+/// looking at until this has run.
+///
+/// Called at the *exit* boundary — [`crate::observe_task_priority`] is where
+/// the choice between this and the control block's copy is made — so the model
+/// is right for the whole host-side window rather than only after the next
+/// entry's reconciliation. The park decision falls in that window, and an entry
+/// is precisely what it is deciding whether to make.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`].
+pub(crate) fn sync_task_priority(vlapic: &Vlapic) -> Result<(), VlapicError> {
+    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
     let page = activation.page(vlapic.index().get())?;
     let value = activation
         .word(page, Register::TASK_PRIORITY.offset())?
@@ -1527,7 +1692,8 @@ mod tests {
     //! drives a controller in, how far it reaches in each, which vector an EOI
     //! retired, which logical destinations name a table entry, which move an
     //! entry owes the acceleration, which life the page it holds belongs to,
-    //! and which of its slots a trapped write leaves owing the model's answer.
+    //! which of its slots a trapped write leaves owing the model's answer, and
+    //! which authority an exit owes the guest's task priority to.
 
     use alloc::vec::Vec;
     use core::iter::once;
@@ -1536,8 +1702,8 @@ mod tests {
     use svm::avic::MAX_PHYSICAL_ID;
 
     use super::{
-        Entry, Face, Life, Mode, Move, Register, Standing, Written, driven_face, eoi_vector,
-        face_limit, logical_slot, mirrored, move_for,
+        Entry, Face, Life, Mode, Move, Register, Standing, TaskPriority, Written, driven_face,
+        eoi_vector, face_limit, logical_slot, mirrored, move_for,
     };
 
     /// Every mode a controller can be in, which is the one term of the
@@ -1808,5 +1974,17 @@ mod tests {
             .collect();
         assert_eq!(owed, expected);
         assert_eq!(owed.len(), 1 + Entry::COUNT);
+    }
+
+    #[test]
+    fn the_task_priority_has_one_authority_per_exit() {
+        // The whole of the decision, and the reason it is one: the control block's
+        // copy is taken only where the software was delivering, so the model is
+        // never written from that field and then overwritten from the backing page
+        // at the following entry — with the park decision, which reads the model,
+        // falling between the two.
+        assert_eq!(TaskPriority::owner(false), TaskPriority::Block);
+        assert_eq!(TaskPriority::owner(true), TaskPriority::Backing);
+        assert_ne!(TaskPriority::owner(true), TaskPriority::owner(false));
     }
 }

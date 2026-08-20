@@ -236,15 +236,18 @@ impl<'a> Exits<'a> {
     ///
     /// The order is not a matter of taste. An event whose delivery this exit
     /// interrupted has to be taken back before anything can overwrite the
-    /// injection field; the guest's task priority has to be read out of the
-    /// control block before anything consults it, because with virtualized
-    /// interrupt masking the guest changes it without exiting; and both have to
-    /// happen before the exit is answered, because answering one can send this
-    /// processor an interrupt.
+    /// injection field; the guest's task priority has to be taken out of
+    /// whichever authority owned it before anything consults it, because the
+    /// guest moves that register without exiting either way — through the
+    /// control block where interrupt masking is virtualized, and through
+    /// the backing page while the hardware drives its controller; and both
+    /// have to happen before the exit is answered, because answering one
+    /// can send this processor an interrupt.
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
         let reason = vcpu.reason();
         self.census.record(vcpu);
-        vlapic::observe_task_priority(vcpu.control().interrupt_control.virtual_tpr());
+        let interrupts = vcpu.control().interrupt_control;
+        vlapic::observe_task_priority(interrupts.avic_enable(), interrupts.virtual_tpr());
         // This processor is out of the guest and consults its controller below
         // before going back in, so nothing needs to interrupt it to make it
         // look.
@@ -380,12 +383,24 @@ impl<'a> Exits<'a> {
         // left unarmed, and everything below has to serve the entry that is
         // actually going to happen.
         let accelerated = vcpu.control().interrupt_control.avic_enable();
-        // Before anything below reads the controller, because the interrupt
-        // window one of them arms is judged by the processor against exactly
-        // this field. Inert while the hardware drives the controller: the
-        // guest's task priority is the backing page's then, and a write here
-        // would only churn a field the hardware ignores.
-        if !accelerated {
+        // Which of these two runs is which authority owns this processor's
+        // controller for the run about to happen, and they are exclusive by
+        // construction: one register, one writer, in each direction.
+        if accelerated {
+            // Everything the model is still holding that the hardware can
+            // deliver goes into the backing page, so that the hardware both
+            // delivers each vector and retires it. Nothing is injected below but
+            // the one arrival no controller holds in service, and a failure here
+            // leaves the interrupt in the model for the nomination to carry.
+            if let Err(error) = vlapic::avic_hand_over() {
+                error!(
+                    "exits: the controller could not hand its interrupts to the hardware: {error}"
+                );
+            }
+        } else {
+            // Before anything below reads the controller, because the interrupt
+            // window one of them arms is judged by the processor against exactly
+            // this field.
             Self::mirror_task_priority(vcpu);
         }
         // A non-maskable interrupt another processor sent this one is held by
@@ -420,9 +435,11 @@ impl<'a> Exits<'a> {
         // Under the acceleration the window is never armed at all: the
         // pending-interrupt fields are ignored on entry by a processor driving
         // the controller itself, and leaving one armed would exit on every
-        // window the guest opens. What the model still holds — an arrival the
-        // legacy pin brought in — is injected outright the moment the guest is
-        // willing, which is all the software path owes it.
+        // window the guest opens. What is nominated there is only what the
+        // hand-over above could not give the hardware — an arrival the legacy pin
+        // brought in, which no controller holds in service — and it is injected
+        // outright the moment the guest is willing, which is all the software
+        // path owes it.
         let nomination = if accelerated {
             Nomination {
                 deliverable: vlapic::nominate().unwrap_or_default().deliverable,
@@ -544,16 +561,25 @@ impl<'a> Exits<'a> {
     /// control block's copy, which the processor answers a guest's `CR8` access
     /// from and compares an armed interrupt window against, and the emulated
     /// register the guest writes through the page or a model-specific register.
-    /// [`Exits::exit`] reads the first into the second on the way out; this
-    /// writes the second back into the first on the way in, so that a guest
-    /// which lowered its priority through the register file finds its own `CR8`
-    /// answering the same number and its pending interrupts judged against it.
+    /// [`Exits::exit`] reads the first into the second on the way out, where
+    /// the block is the authority for it; this writes the second back into
+    /// the first on the way in, so that a guest which lowered its priority
+    /// through the register file finds its own `CR8` answering the same
+    /// number and its pending interrupts judged against it.
     ///
-    /// Done on every entry rather than only after an exit, which is what covers
-    /// the two entries that follow no exit at all: the first one, where the
-    /// copy still reads zero and the emulated register holds what firmware
-    /// left, and the one after a startup message, where the emulated
-    /// register has just been reset and the copy has not.
+    /// Done on every entry the software delivers for, rather than only after an
+    /// exit, which is what covers the two entries that follow no exit at all:
+    /// the first one, where the copy still reads zero and the emulated
+    /// register holds what firmware left, and the one after a startup
+    /// message, where the emulated register has just been reset and the
+    /// copy has not.
+    ///
+    /// Not done at all where the hardware drives the controller. The guest
+    /// writes its task priority into the backing page there and the
+    /// processor judges nothing against this field — the interrupt window
+    /// it is compared with is one the acceleration ignores — so the model
+    /// is given the page's byte at the exit instead, and the block's copy
+    /// is left as the last software-driven entry wrote it.
     ///
     /// Only the class is held in the control block, which is the upper nibble
     /// of the emulated byte — and [`vlapic::Priority::class`] is where that

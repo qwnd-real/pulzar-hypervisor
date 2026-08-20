@@ -34,6 +34,18 @@ impl Vlapic {
         self.trigger_mode.slot(slot)
     }
 
+    /// One slot of the record of which requested vectors came in through the
+    /// pin that bypasses this controller.
+    ///
+    /// Not a register the guest has: it is this crate's own note that an
+    /// arrival is one the guest will acknowledge to a legacy controller
+    /// rather than to this one — see [`Vlapic::arrived_externally`] — and
+    /// it is asked about wherever a request is about to be given to
+    /// something that would hold it in service.
+    pub(crate) fn external_slot(&self, slot: usize) -> Option<u32> {
+        self.external.slot(slot)
+    }
+
     /// Accepts an interrupt into this controller, from anywhere.
     ///
     /// This is what delivery means, and it is the one operation any processor
@@ -227,6 +239,18 @@ impl Vlapic {
     /// directly. Holding one would leave a bit the guest has no reason to
     /// clear, blocking its whole interrupt-priority class for as long as
     /// the guest lives.
+    ///
+    /// # While the hardware drives, that arrival is the only thing that gets here
+    ///
+    /// Everything else the model holds is given to the backing page at the
+    /// entry — [`crate::avic::activation::hand_over`] — precisely so that
+    /// it is not injected: an interrupt put into the guest through the
+    /// control block while the hardware owns the controller is one the
+    /// hardware never sees. It does not raise the priority the hardware
+    /// arbitrates with, so a lower-priority vector can be delivered on top
+    /// of its handler; and the guest's acknowledgement of it is performed
+    /// against the page, where its bit was never set, so the bit this sets
+    /// would be one nothing ever retires.
     pub(crate) fn committed(&self, vector: Vector) -> bool {
         if !self.request.clear(vector) {
             return false;
@@ -294,31 +318,53 @@ impl Vlapic {
         self.in_service.count()
     }
 
-    /// Whether a vector is held in service.
-    pub(crate) fn holds_in_service(&self, vector: Vector) -> bool {
-        self.in_service.get(vector)
-    }
-
-    /// Sets a request bit wholesale, carrying state back into the model.
+    /// Stops holding what another authority has taken over, for one slot of the
+    /// banks.
     ///
-    /// One of the three used at a transition out of hardware-driven delivery,
-    /// where the backing page holds what the guest has been given and the
-    /// software path must continue from exactly there. No nomination follows
-    /// the stores, so the publish-and-retry dance of [`Vlapic::accept`] has
-    /// nothing to race: a reset under a transition is one the processor
-    /// performing the transition runs, at an exit boundary.
-    pub(crate) fn force_request(&self, vector: Vector) {
-        self.request.set(vector);
+    /// The entry half of a hand-over to the hardware, performed after the page
+    /// holds the bits and never before: one taken out of here first is one
+    /// nothing would deliver if the page could not be reached.
+    ///
+    /// Exactly the bits that crossed. A request another processor delivered
+    /// after the hand-over read the word is one this controller is still
+    /// holding, and the doorbell that announced it is what brings this
+    /// processor back to look.
+    ///
+    /// The trigger modes are deliberately not cleared. Nothing in this crate
+    /// reads a trigger-mode bit back — the level-or-edge decision comes from
+    /// the real controller's own record — and the bank is the guest's
+    /// readback of how its controller accepted an interrupt, which handing
+    /// the interrupt to the hardware does not undo.
+    pub(crate) fn handed_over(&self, slot: usize, requests: u32, in_service: u32) {
+        self.request.retire(slot, requests);
+        self.in_service.retire(slot, in_service);
     }
 
-    /// Sets an in-service bit wholesale; see [`Vlapic::force_request`].
-    pub(crate) fn force_in_service(&self, vector: Vector) {
-        self.in_service.set(vector);
-    }
-
-    /// Sets a trigger-mode bit wholesale; see [`Vlapic::force_request`].
-    pub(crate) fn force_trigger_mode(&self, vector: Vector) {
-        self.trigger_mode.set(vector);
+    /// Puts one slot of the three banks back into the model, in the terms each
+    /// of them is owed by the authority that has been driving.
+    ///
+    /// The in-service bank is **taken**, in place of what the model holds.
+    /// While the hardware drove it was the only authority for it: the
+    /// guest's acknowledgement retires a bit there with no exit for this
+    /// side to hear, and nothing puts one here while the requests are the
+    /// hardware's. Adding instead would keep every bit the guest
+    /// acknowledged in that window, and each of them floors this
+    /// controller's processor priority for as long as its guest lives.
+    ///
+    /// The requests and the trigger modes are **added**, because the model can
+    /// hold one the page never had: an interrupt accepted on the software path
+    /// between the exit that ended the acceleration and the entry that carries
+    /// the page back is here and nowhere else.
+    pub(crate) fn carry_back(
+        &self,
+        slot: usize,
+        in_service: u32,
+        trigger_modes: u32,
+        requests: u32,
+    ) {
+        self.in_service.put(slot, in_service);
+        self.trigger_mode.merge(slot, trigger_modes);
+        self.request.merge(slot, requests);
     }
 }
 

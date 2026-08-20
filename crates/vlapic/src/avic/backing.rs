@@ -1,7 +1,8 @@
 //! One backing page, in the state the hardware must find it in.
 //!
-//! Two things, and the second is what keeps the first from being the whole
-//! answer.
+//! Three things. The second is what keeps the first from being the whole
+//! answer, and the third is what keeps the guest's interrupts in one authority
+//! while the hardware has the page.
 //!
 //! [`ResetImage`] is the page a controller coming out of reset needs. The
 //! processor serves a number of the controller's registers out of the backing
@@ -37,6 +38,14 @@
 //! hardware exits for is one the model was told about at that exit, so the
 //! page's copy is a copy of a value the model already has. What is carried back
 //! is what moves in the page with no exit at all.
+//!
+//! [`Handover`] is the third, and it is what a guest's interrupts do at every
+//! entry the hardware is driving. A vector the model is holding is one the
+//! hardware knows nothing about: it is not in the bank the hardware delivers
+//! out of, it does not raise the priority the hardware arbitrates with, and the
+//! guest's acknowledgement of it would be performed against the page. So it
+//! crosses into the page instead, and the model stops holding it — one
+//! authority for the three banks for as long as the acceleration is on.
 //!
 //! # Neither direction may treat the page as bytes
 //!
@@ -399,20 +408,35 @@ impl Projection {
     /// model must not be given — the older face's own register would come back
     /// holding a cluster mask it never wrote.
     ///
-    /// # The three banks are added to what the model holds, not put in its place
+    /// # Two of the three banks are added to what the model holds; the third is taken
     ///
-    /// Which is what the three `force_*` operations do, and it is deliberate
+    /// The requests and the trigger modes are added, and that is deliberate
     /// rather than an oversight. An interrupt that arrived on the software path
     /// between the exit which ended the acceleration and the entry that runs
     /// this is in the model alone — nothing put it in the page, because by
     /// then nothing was driving the page — so a carry-back that replaced
-    /// the model's banks would delete it.
+    /// those banks would delete it.
     ///
-    /// What makes the union safe rather than merely convenient is that the
+    /// What makes that union safe rather than merely convenient is that the
     /// other side of it holds nothing stale by the time this runs.
     /// [`Projection::take`] empties the page's banks as it takes them, so
     /// no bit is carried twice; and a page whose guest has stopped existing
     /// is not carried at all, so the union can never be of two lives.
+    ///
+    /// The in-service bank is taken in place of the model's, because while the
+    /// hardware drove it was the only authority for it: the guest acknowledges
+    /// an interrupt against the page with no exit at all, and nothing puts a
+    /// bit in the model's bank while the requests are the hardware's —
+    /// [`Handover`] is what makes the second half of that true. Adding would
+    /// keep every bit the guest acknowledged in that window, and each of those
+    /// floors the controller's processor priority for as long as its guest
+    /// lives. [`Vlapic::carry_back`] is where the asymmetry is argued in the
+    /// model's own terms.
+    ///
+    /// A vector that comes back both requested and in service crosses as both.
+    /// That is an ordinary state of a controller — a further arrival latched
+    /// while the guest is still handling the last one — and both bits are what
+    /// the hardware was holding, so nothing here may choose between them.
     pub(super) fn into_model(self, vlapic: &Vlapic) {
         vlapic.set_task_priority(self.task_priority);
         // The whole register out of the two halves the page keeps it in, and
@@ -426,29 +450,7 @@ impl Projection {
             .zip(self.trigger_mode)
             .zip(self.request);
         for (slot, ((in_service, trigger_mode), request)) in banks.enumerate() {
-            // Usually all three, and a slot with nothing in it has the same
-            // answer for all thirty-two of its vectors: a deactivation that
-            // asked each of them separately would make two hundred and
-            // fifty-six decisions to reach it.
-            if in_service | trigger_mode | request == 0 {
-                continue;
-            }
-            for bit in 0..u32::BITS {
-                let mask = 1 << bit;
-                let vector = vector_at(slot, bit);
-                if trigger_mode & mask != 0 {
-                    vlapic.force_trigger_mode(vector);
-                }
-                if in_service & mask != 0 {
-                    vlapic.force_in_service(vector);
-                }
-                // A request the model already holds in service is a level
-                // arrival the software path is already tracking: requesting it
-                // again would deliver it twice.
-                if request & mask != 0 && !vlapic.holds_in_service(vector) {
-                    vlapic.force_request(vector);
-                }
-            }
+            vlapic.carry_back(slot, in_service, trigger_mode, request);
         }
     }
 
@@ -498,6 +500,123 @@ impl Projection {
     }
 }
 
+/// One bank slot's worth of what the model hands to the hardware at an entry it
+/// is driving.
+///
+/// The three banks are the page's alone while the acceleration is on, so
+/// anything the model is still holding has to cross into it before the guest
+/// runs. What crosses is a value rather than a sequence of stores for the same
+/// reason [`Projection`] is: which bits go and which stay is the decision, and
+/// a decision of words can be read against the states it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Handover {
+    /// The requests the hardware may take over.
+    requests: u32,
+    /// The trigger modes of exactly those requests.
+    trigger_modes: u32,
+    /// What the guest is already servicing, which the hardware arbitrates
+    /// against and retires without an exit.
+    in_service: u32,
+}
+
+impl Handover {
+    /// What the model is holding at bank slot `slot` that the hardware may take
+    /// over.
+    ///
+    /// A slot the register file does not have cannot arrive here — the count of
+    /// slots is the bitmap's own — and a zero is what a register holding
+    /// nothing reads as, exactly as it is for [`Projection::of`].
+    pub(super) fn of(vlapic: &Vlapic, slot: usize) -> Self {
+        Self::from_words(
+            vlapic.request_slot(slot).unwrap_or(0),
+            vlapic.trigger_mode_slot(slot).unwrap_or(0),
+            vlapic.in_service_slot(slot).unwrap_or(0),
+            vlapic.external_slot(slot).unwrap_or(0),
+        )
+    }
+
+    /// What one bank slot hands over, out of the four words the register file
+    /// holds for it.
+    ///
+    /// Every request but one that came in through the pin that bypasses the
+    /// controller. Such an arrival is acknowledged to a legacy controller the
+    /// guest reaches directly, which is why this controller deliberately does
+    /// not hold it in service — and the hardware holds everything it
+    /// delivers, so handing one over would leave a bit in the page that
+    /// nothing ever clears and a priority class blocked for as long as the
+    /// guest lives. Those stay in the model, which injects them.
+    ///
+    /// The trigger modes are narrowed to the requests that cross. That bank is
+    /// what the hardware reads to decide whether an acknowledgement raises an
+    /// exit, and a bit for a vector this hand-over is not giving it is not this
+    /// hand-over's to publish.
+    ///
+    /// The in-service bank crosses whole, because the hardware owns it outright
+    /// while it drives: it computes the priority it arbitrates with out of that
+    /// bank, and retires a bit there when the guest acknowledges.
+    ///
+    /// Pure in the words rather than taking a controller, so that it can be
+    /// read against the states it covers — a controller cannot be built in
+    /// a test.
+    const fn from_words(requests: u32, trigger_modes: u32, in_service: u32, external: u32) -> Self {
+        let requests = requests & !external;
+        Self {
+            requests,
+            trigger_modes: trigger_modes & requests,
+            in_service,
+        }
+    }
+
+    /// Whether nothing crosses, which is every entry of a guest whose
+    /// interrupts are the hardware's already.
+    pub(super) const fn is_empty(self) -> bool {
+        (self.requests | self.in_service) == 0
+    }
+
+    /// Publishes what crosses into a live backing page.
+    ///
+    /// `within` is how far into each bank this slot sits, which is the same
+    /// step [`Projection::walk`] takes over one — the three banks are eight
+    /// consecutive slots apiece and the slot is at the same distance into each.
+    /// `word` answers with the page's word at an offset.
+    ///
+    /// The request bit is published last, and that ordering is the one
+    /// [`Vlapic::accept`] states for the model's own banks: it is the bit that
+    /// makes the hardware act, so everything the hardware classifies the
+    /// interrupt by — the trigger mode that decides whether its acknowledgement
+    /// raises an exit, the in-service state its priority is computed from — has
+    /// to be there before it. Each store is Release for the same reason.
+    ///
+    /// Every one is an OR rather than a store: the page is what the hardware
+    /// has been delivering out of, and a peer's hardware may be setting a
+    /// request bit in it at this moment.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::read_msr`], from the first slot of the page that cannot be
+    /// reached — which names the frame rather than the slot.
+    pub(super) fn publish<'page>(
+        self,
+        within: u32,
+        mut word: impl FnMut(u32) -> Result<&'page AtomicU32, VlapicError>,
+    ) -> Result<(), VlapicError> {
+        word(Register::TRIGGER_MODE.offset() + within)?
+            .fetch_or(self.trigger_modes, Ordering::Release);
+        word(Register::IN_SERVICE.offset() + within)?.fetch_or(self.in_service, Ordering::Release);
+        word(Register::INTERRUPT_REQUEST.offset() + within)?
+            .fetch_or(self.requests, Ordering::Release);
+        Ok(())
+    }
+
+    /// Stops the model holding what the page has just been given.
+    ///
+    /// After the publish and never before it, for the reason
+    /// [`Vlapic::handed_over`] states.
+    pub(super) fn retire(self, vlapic: &Vlapic, slot: usize) {
+        vlapic.handed_over(slot, self.requests, self.in_service);
+    }
+}
+
 /// One bank's eight words, taken out of the model a slot at a time.
 ///
 /// A slot the register file does not have cannot arrive here — the count of
@@ -541,7 +660,7 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    //! Three things, matching the three the module holds.
+    //! Four things, and the first three are the three the module holds.
     //!
     //! The image is what the hardware answers a guest's read with, and the
     //! model's reset is what the emulator answers the same read with, so the
@@ -554,6 +673,11 @@ mod tests {
     //! puts in each of those slots is not reachable from here — the fields are
     //! filled through the walk instead, which is what makes every test below
     //! cover a register added to the projection without naming it again.
+    //!
+    //! The hand-over is asserted as the decision it is — which of a bank slot's
+    //! bits cross to the hardware and which the model keeps holding — and as
+    //! the order the ones that cross are published in, which the closure
+    //! that answers with a page slot is what observes.
     //!
     //! And both page directions are asserted to lose nothing to a writer they
     //! cannot exclude. A page here is an array of atomics, which is exactly
@@ -569,8 +693,8 @@ mod tests {
     use cpu::ApicId;
 
     use super::{
-        EXTENDED_LVT_FIRST, EXTENDED_LVT_SLOTS, Life, Ordering, PAGE, Projection, ResetImage,
-        SLOTS, VlapicError,
+        EXTENDED_LVT_FIRST, EXTENDED_LVT_SLOTS, Handover, Life, Ordering, PAGE, Projection,
+        ResetImage, SLOTS, VlapicError,
     };
     use crate::{
         face::table::{AvicAccess, Register},
@@ -611,9 +735,14 @@ mod tests {
             .load(Ordering::Relaxed)
     }
 
+    /// The offset of one slot of a vector bank.
+    fn bank_word(bank: Register, slot: u32) -> u32 {
+        bank.offset() + slot * REGISTER_STRIDE
+    }
+
     /// The offset of one slot of the interrupt-request bank.
     fn request_slot(slot: u32) -> u32 {
-        Register::INTERRUPT_REQUEST.offset() + slot * REGISTER_STRIDE
+        bank_word(Register::INTERRUPT_REQUEST, slot)
     }
 
     /// The word at `offset`.
@@ -1048,5 +1177,104 @@ mod tests {
         // that model with one the architecture has just required to be empty.
         assert!(Life::Same.carried());
         assert!(!Life::Ended.carried());
+    }
+
+    #[test]
+    fn a_hand_over_leaves_a_pin_arrival_where_it_is() {
+        // The one request that must not cross. The guest acknowledges an arrival
+        // that came in through the pin to a legacy controller it reaches
+        // directly, and the hardware holds in service everything it delivers — so
+        // handing one over would leave a bit in the page that nothing ever clears
+        // and a priority class blocked for as long as the guest lives.
+        //
+        // Asserted whole rather than field by field, because a word written into
+        // another field is exactly the mistake three words of one slot can make.
+        assert_eq!(
+            Handover::from_words(0b1111, 0b1010, 1 << 8, 0b1000),
+            Handover {
+                requests: 0b0111,
+                // The trigger modes narrow to the requests that cross: the level
+                // record of a vector this is not giving the hardware is not this
+                // hand-over's to publish into the bank that decides whether an
+                // acknowledgement raises an exit.
+                trigger_modes: 0b0010,
+                // What the guest is already servicing crosses whole, because the
+                // hardware arbitrates against that bank and retires a bit in it
+                // without an exit.
+                in_service: 1 << 8,
+            }
+        );
+        assert!(!Handover::from_words(0b1111, 0b1010, 1 << 8, 0b1000).is_empty());
+    }
+
+    #[test]
+    fn a_slot_holding_nothing_the_hardware_can_take_hands_over_nothing() {
+        // The steady state, and the same answer by a second route: a slot with
+        // nothing in it, and one holding only arrivals the model has to keep.
+        assert!(Handover::from_words(0, 0, 0, 0).is_empty());
+        assert!(Handover::from_words(0b0110, 0b0110, 0, 0b0110).is_empty());
+        // An in-service bit alone is not nothing: the priority the hardware
+        // arbitrates with is computed out of that bank.
+        assert!(!Handover::from_words(0, 0, 1, 0).is_empty());
+    }
+
+    #[test]
+    fn a_hand_over_publishes_the_request_last_and_into_the_slot_it_came_from() {
+        // The order is the one `Vlapic::accept` states for the model's own banks:
+        // the request bit is what makes the hardware act, so the trigger mode
+        // that decides whether its acknowledgement raises an exit and the
+        // in-service state its priority is computed from are both there first.
+        // The closure that answers with a page word is what can see it.
+        let page = filled(0);
+        let mut reached = Vec::new();
+        Handover::from_words(1 << 5, 1 << 5, 1 << 7, 0)
+            .publish(3 * REGISTER_STRIDE, |offset| {
+                reached.push(offset);
+                slot(&page, offset)
+            })
+            .expect("a page-shaped buffer answers at every offset");
+        assert_eq!(
+            reached,
+            [
+                bank_word(Register::TRIGGER_MODE, 3),
+                bank_word(Register::IN_SERVICE, 3),
+                bank_word(Register::INTERRUPT_REQUEST, 3),
+            ]
+        );
+        assert_eq!(holds(&page, bank_word(Register::TRIGGER_MODE, 3)), 1 << 5);
+        assert_eq!(holds(&page, bank_word(Register::IN_SERVICE, 3)), 1 << 7);
+        assert_eq!(
+            holds(&page, bank_word(Register::INTERRUPT_REQUEST, 3)),
+            1 << 5
+        );
+    }
+
+    #[test]
+    fn a_hand_over_adds_to_what_the_page_already_holds() {
+        // The page is what the hardware has been delivering out of, and a peer's
+        // hardware may be setting a request bit in it while this runs — so each of
+        // the three words is ORed in rather than stored over.
+        let banks = [
+            Register::TRIGGER_MODE,
+            Register::IN_SERVICE,
+            Register::INTERRUPT_REQUEST,
+        ];
+        let page = filled(0);
+        let held = 1 << 1;
+        for bank in banks {
+            slot(&page, bank_word(bank, 0))
+                .expect("a bank slot is inside the page")
+                .store(held, Ordering::Relaxed);
+        }
+        Handover::from_words(1 << 2, 1 << 2, 1 << 2, 0)
+            .publish(0, |offset| slot(&page, offset))
+            .expect("a page-shaped buffer answers at every offset");
+        for bank in banks {
+            assert_eq!(
+                holds(&page, bank_word(bank, 0)),
+                held | (1 << 2),
+                "{bank:?}"
+            );
+        }
     }
 }

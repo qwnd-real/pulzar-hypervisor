@@ -12,6 +12,7 @@ use log::trace;
 
 use crate::{
     VlapicError,
+    avic::activation::{self, TaskPriority},
     machine::current,
     priority::Priority,
     registers::{Nomination, Vlapic},
@@ -95,25 +96,36 @@ pub fn raise_nmi() -> Result<(), VlapicError> {
     current().map(Vlapic::raise_nmi)
 }
 
-/// Records the priority class the guest set through `CR8`.
+/// Records the task priority the guest was running at, out of the authority
+/// that owned the register while it ran.
 ///
-/// With interrupt masking virtualized, the processor keeps `CR8` in the control
-/// block and writes it back on every exit, so this is called on every exit and
-/// not only after a write to that register. What the control block carries is
-/// four bits, so what this records is a class with a zero subclass — including
-/// on an exit that followed a write to the *emulated* task-priority register,
-/// whose subclass is therefore not observable by the guest that wrote it. The
-/// register file's own accessor is where that deviation is argued.
+/// `accelerated` says the hardware was driving this processor's controller, in
+/// which case the register is the backing page's: the guest writes it there
+/// with no exit at all, and the whole byte it wrote is in the page. Otherwise
+/// the processor keeps the guest's writes to its task-priority control register
+/// in the control block and writes them back on every exit, so this is called
+/// on every exit and not only after such a write — and `class` is the four bits
+/// that block carries, which is the whole of what that control register holds.
 ///
-/// `class` is the four bits the control block carries, which is the whole of
-/// what that control register holds.
+/// One authority per exit and never both, which is what [`TaskPriority`] is:
+/// the model is consulted before the next entry, so a value written from one
+/// authority and overwritten from the other is right only until whichever of
+/// the two runs last.
 ///
-/// A failure is deliberately not reported: this is called on every exit before
-/// anything has been decided, and a processor with no controller has nothing
-/// that could want the value.
-pub fn observe_task_priority(class: u8) {
-    if let Ok(vlapic) = current() {
-        vlapic.observe_task_priority(class);
+/// A failure is deliberately not reported. This runs on every exit before
+/// anything has been decided: a processor with no controller has nothing that
+/// could want the value, and a page that cannot be reached would say so several
+/// thousand times a second — the access that meets the same failure in the
+/// face's own path is what demotes the controller, once, and says so there.
+pub fn observe_task_priority(accelerated: bool, class: u8) {
+    let Ok(vlapic) = current() else {
+        return;
+    };
+    match TaskPriority::owner(accelerated) {
+        TaskPriority::Backing => {
+            let _ = activation::sync_task_priority(vlapic);
+        }
+        TaskPriority::Block => vlapic.observe_task_priority(class),
     }
 }
 
@@ -125,6 +137,12 @@ pub fn observe_task_priority(class: u8) {
 /// number — the two are one register on real hardware and must stay one. Only
 /// the class of it goes in the control block, and [`Priority::class`] is where
 /// that narrowing is written.
+///
+/// Not pushed there at all while the hardware drives the controller: the
+/// guest's writes reach the backing page with no exit, the block's copy is not
+/// what the processor judges anything against then, and the model is given the
+/// page's byte at each exit rather than the other way about — see
+/// [`observe_task_priority`].
 ///
 /// # Errors
 ///

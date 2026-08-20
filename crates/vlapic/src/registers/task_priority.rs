@@ -37,17 +37,24 @@ impl Vlapic {
     /// the class and nothing else, and this stores the class over the whole
     /// byte.
     ///
-    /// That is wider than a control-register write would be. A write to that
-    /// register really does clear the task priority's subclass, but this runs
-    /// on *every* exit, including exits that followed a write to the
-    /// emulated register itself: a guest that stores `0x35` through its
-    /// controller reads `0x30` back, because its read is an exit and the
-    /// exit gets here first. The deviation is deliberate and matches what a
-    /// hypervisor using this processor's task-priority virtualization can
-    /// do. Nothing delivered depends on it —
-    /// [`crate::priority::deliverable`] compares classes only —
-    /// so what a guest loses is four bits of a register it wrote and no
-    /// behaviour.
+    /// That is wider than a control-register write would be, and the deviation
+    /// belongs to the world where the software delivers. This runs on *every*
+    /// exit taken there, including exits that followed a write to the emulated
+    /// register itself: a guest that stores `0x35` through its controller reads
+    /// `0x30` back, because its read is an exit and the exit gets here first.
+    /// The deviation is deliberate and matches what a hypervisor using this
+    /// processor's task-priority virtualization can do. Nothing delivered
+    /// depends on it — [`crate::priority::deliverable`] compares classes
+    /// only — so what a guest loses is four bits of a register it wrote and
+    /// no behaviour.
+    ///
+    /// In the world where the hardware drives the controller the register is
+    /// not this one at all. The guest's write reaches the backing page
+    /// without an exit, the whole byte of it is there, and the model is
+    /// given that byte at each exit instead of this class — so a guest that
+    /// stores `0x35` reads `0x35` back, and nothing calls this while the
+    /// acceleration is on. Which of the two runs is
+    /// [`crate::avic::activation::TaskPriority`]'s to say.
     ///
     /// `class` is those four bits, and turning them back into a priority is
     /// [`Priority::of_class`]'s so that the workspace has one statement of

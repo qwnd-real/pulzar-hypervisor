@@ -251,6 +251,23 @@ pub fn unpublish_running() -> Result<(), VlapicError> {
     activation::unpublish_running()
 }
 
+/// Hands this processor's own interrupts to the hardware that is about to
+/// deliver them.
+///
+/// Called at the entry, wherever the control block carries the acceleration:
+/// what the model is still holding crosses into the backing page, where the
+/// hardware both delivers it and retires it, and the entry injects nothing but
+/// the one arrival no controller can hold in service. See
+/// [`activation::hand_over`] for why an injection could not do either.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`]. A failure leaves the interrupt in the model, where
+/// the entry's own nomination is what delivers it.
+pub fn hand_over() -> Result<(), VlapicError> {
+    activation::hand_over()
+}
+
 /// Whether this processor's backing page holds anything its guest could take
 /// at this instant.
 ///
