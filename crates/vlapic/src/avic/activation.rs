@@ -17,10 +17,11 @@
 //!   Release on the clear that withdraws it, and an Acquire load is what every
 //!   decision made from it reads.
 //! - A backing page is written by its own processor alone — by these functions
-//!   at transition boundaries, and by the hardware while the guest runs —
-//!   except for the interrupt-request words, which any processor may atomically
-//!   OR into. The OR is Release: it publishes the request before the doorbell
-//!   or the host interrupt that tells the target to look.
+//!   at transition boundaries and at the exits its own guest's register writes
+//!   raise, and by the hardware while the guest runs — except for the
+//!   interrupt-request words, which any processor may atomically OR into. The
+//!   OR is Release: it publishes the request before the doorbell or the host
+//!   interrupt that tells the target to look.
 //! - The logical table is rebuilt under [`Activation::logical_lock`], held only
 //!   in the LDR/DFR handlers and never across an exit: entries move as whole
 //!   aligned words, and a processor's old entry is invalidated before its new
@@ -41,6 +42,7 @@
 use alloc::boxed::Box;
 use core::{
     cmp::min,
+    iter::once,
     sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
 };
 
@@ -64,7 +66,9 @@ use crate::{
     face::{dispatch, dispatch::Written, table::Register},
     machine::{current, registry},
     priority::{self, Priority},
-    registers::{FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, error::Errors, icr::Command},
+    registers::{
+        FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, error::Errors, icr::Command, lvt::Entry,
+    },
 };
 
 /// The bit of a physical-table entry the owning processor toggles.
@@ -859,6 +863,27 @@ pub(crate) fn complete_command(command_bits: u64) -> Result<(), VlapicError> {
 /// store: the sources reprogrammed by an LVT write, the real hardware quieted
 /// by a disable, the logical table moved by an LDR.
 ///
+/// # And then the page is given what the model made of the value
+///
+/// The word the hardware stored is the guest's raw one; the model's is the
+/// narrowed one, and sometimes the refused one — a reserved bit dropped, a
+/// read-only register left as it was, an entry this controller does not have
+/// not written at all. Every read of these registers is served out of the page
+/// with no exit, so a page left holding the raw word is a guest reading back
+/// what its own controller refused: an identifier it appears to have renamed,
+/// out of which the hardware then resolves a destination the guest cannot
+/// address, or a reserved bit that survives until the next rebuild silently
+/// takes it away. So every slot the write moved is rewritten from the model,
+/// which is [`mirror_slot`], and the page goes back to being a projection of
+/// it. The store costs nothing where the hardware narrowed the value itself.
+///
+/// The error status is that rule rather than an exception to it. Its protocol
+/// is write-then-read — the write latches whatever the controller has noticed
+/// since the last one and a read answers the latched word — so the page is
+/// given the word this write just latched and not the zero the guest wrote.
+/// Latching is the only thing that moves that word, which is why one store here
+/// is the whole of keeping the two in step.
+///
 /// # Errors
 ///
 /// As [`crate::read_msr`].
@@ -872,25 +897,21 @@ pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<
         // An IPI the hardware attempted is completed by the exit it raised;
         // what can be left behind is only the delivery-status bit.
         Register::COMMAND_LOW => clear_command_busy(vlapic),
-        Register::ERROR_STATUS => {
-            // The write latched the page's copy clear, as it latches the
-            // model's: both are what the guest reads back, depending on
-            // which of them is serving the register at the time.
-            dispatch::acted(vlapic, dispatch::write(vlapic, register, 0));
-            let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-            let page = activation.page(vlapic.index().get())?;
-            activation
-                .word(page, register.offset())?
-                .store(0, Ordering::Release);
-            Ok(())
-        }
         other => {
             let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
             let page = activation.page(vlapic.index().get())?;
             let value = activation
                 .word(page, other.offset())?
                 .load(Ordering::Acquire);
-            dispatch::acted(vlapic, dispatch::write(vlapic, other, value));
+            let written = dispatch::write(vlapic, other, value);
+            dispatch::acted(vlapic, written);
+            // After the bookkeeping rather than before it: two of the bits a
+            // local vector entry reads back are the real controller's own
+            // reports, and what has just reprogrammed the source they come from
+            // is the bookkeeping.
+            for slot in mirrored(other, written) {
+                mirror_slot(activation, page, vlapic, slot)?;
+            }
             if matches!(
                 other,
                 Register::LOGICAL_DESTINATION | Register::DESTINATION_FORMAT
@@ -900,6 +921,49 @@ pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<
             Ok(())
         }
     }
+}
+
+/// Which slots of the page a trapped write leaves owing the model's answer.
+///
+/// The register the guest named, always. And every local vector table entry
+/// where the write software-disabled the controller, because that is the one
+/// write the architecture defines as changing registers the guest did not name:
+/// it masks all of them, in the stored entries a guest reads back, and the
+/// hardware serves those slots without an exit — so a page left as it was is a
+/// controller whose sources still read as live after its guest switched it off.
+fn mirrored(register: Register, written: Written) -> impl Iterator<Item = Register> {
+    // The whole table or none of it: the architecture masks every entry, and the
+    // model has already done so by the time this is asked.
+    let masked: &'static [Entry] = if matches!(written, Written::Disabled) {
+        &Entry::ALL
+    } else {
+        &[]
+    };
+    once(register).chain(masked.iter().copied().map(Entry::register))
+}
+
+/// Rewrites one slot of a backing page with what the model answers a read of
+/// that register with.
+///
+/// [`dispatch::read`] is the one statement of what each register answers with,
+/// so nothing here knows which register it has been handed — which is what
+/// keeps the identifier's face-dependent shape, the error status's latched word
+/// and an absent entry's masked reset value from becoming three special cases
+/// of one store.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`].
+fn mirror_slot(
+    activation: &Activation,
+    page: PhysAddr,
+    vlapic: &Vlapic,
+    register: Register,
+) -> Result<(), VlapicError> {
+    activation
+        .word(page, register.offset())?
+        .store(dispatch::read(vlapic, register), Ordering::Release);
+    Ok(())
 }
 
 /// Reads one of the registers the hardware owns out of this processor's
@@ -1009,13 +1073,16 @@ pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, Vlapi
             Ok(Written::Nothing)
         }
         Register::ERROR_STATUS => {
-            // The write latches the page's copy clear, as it latches the
-            // model's: both are what the guest reads back, depending on
-            // which of them is serving the register at the time.
-            activation
-                .word(page, register.offset())?
-                .store(0, Ordering::Release);
-            Ok(dispatch::write(vlapic, register, 0))
+            // The write latches whatever the controller has noticed since the
+            // last one, and a read of the register answers the latched word — so
+            // the page is given that word rather than the zero the guest wrote,
+            // exactly as a trapped write gives it. Nothing reads it through this
+            // face, where the read is intercepted and the model answers it; the
+            // page holds it because the page is a projection of the model, and a
+            // slot that is not is one that changes at the next transition.
+            let written = dispatch::write(vlapic, register, 0);
+            mirror_slot(activation, page, vlapic, register)?;
+            Ok(written)
         }
         // A command the map handed back is one the hardware never attempted,
         // and is completed by the software path end to end, exactly as an
@@ -1288,12 +1355,12 @@ fn sync_task_priority(activation: &Activation, vlapic: &Vlapic) -> Result<(), Vl
 /// and the hardware derives the logical destination it matches an
 /// interprocessor interrupt against from that slot. A page left in the shape
 /// the face before it used is a processor the guest can no longer address.
+///
+/// Which shape that is comes from the model, through [`mirror_slot`], as it
+/// does for the trap that answers a guest's own write of the register.
 fn rewrite_identifier(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
     let page = activation.page(vlapic.index().get())?;
-    activation
-        .word(page, Register::ID.offset())?
-        .store(vlapic.id_register(vlapic.mode()), Ordering::Release);
-    Ok(())
+    mirror_slot(activation, page, vlapic, Register::ID)
 }
 
 /// Clears the delivery-status bit of the backing command register.
@@ -1459,15 +1526,18 @@ mod tests {
     //! The decisions here that need no machine: which face the acceleration
     //! drives a controller in, how far it reaches in each, which vector an EOI
     //! retired, which logical destinations name a table entry, which move an
-    //! entry owes the acceleration, and which life the page it holds belongs
-    //! to.
+    //! entry owes the acceleration, which life the page it holds belongs to,
+    //! and which of its slots a trapped write leaves owing the model's answer.
+
+    use alloc::vec::Vec;
+    use core::iter::once;
 
     use descriptors::Vector;
     use svm::avic::MAX_PHYSICAL_ID;
 
     use super::{
-        Face, Life, Mode, Move, Standing, driven_face, eoi_vector, face_limit, logical_slot,
-        move_for,
+        Entry, Face, Life, Mode, Move, Register, Standing, Written, driven_face, eoi_vector,
+        face_limit, logical_slot, mirrored, move_for,
     };
 
     /// Every mode a controller can be in, which is the one term of the
@@ -1703,5 +1773,40 @@ mod tests {
         for count in [0_u64, 2, 4, u64::MAX] {
             assert!(Standing::of(count, count).life.carried(), "{count}");
         }
+    }
+
+    #[test]
+    fn a_trapped_write_answers_for_the_slot_the_guest_named() {
+        // The whole of what an ordinary trapped write owes the page: the register
+        // it was made to, holding what the model made of it rather than the raw
+        // word the hardware stored.
+        for register in [
+            Register::ID,
+            Register::ERROR_STATUS,
+            Register::REMOTE_READ,
+            Register::SPURIOUS,
+            Register::LVT_TIMER,
+            Register::TIMER_DIVIDE,
+        ] {
+            assert!(
+                mirrored(register, Written::Nothing).eq([register]),
+                "{register:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_software_disable_answers_for_every_entry_it_masked() {
+        // The one write that changes registers the guest did not name. The
+        // architecture has it mask the whole local vector table, and those slots
+        // are ones the hardware answers a read of with no exit at all — so a
+        // disable that rewrote only the register the guest wrote would leave a
+        // controller reading its own sources back live.
+        let owed: Vec<Register> = mirrored(Register::SPURIOUS, Written::Disabled).collect();
+        let expected: Vec<Register> = once(Register::SPURIOUS)
+            .chain(Entry::ALL.map(Entry::register))
+            .collect();
+        assert_eq!(owed, expected);
+        assert_eq!(owed.len(), 1 + Entry::COUNT);
     }
 }

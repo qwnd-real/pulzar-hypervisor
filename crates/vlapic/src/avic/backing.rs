@@ -573,7 +573,7 @@ mod tests {
         SLOTS, VlapicError,
     };
     use crate::{
-        face::table::Register,
+        face::table::{AvicAccess, Register},
         registers::{FLAT_DESTINATION_FORMAT, SPURIOUS_RESET, lvt::Entry, xapic_word},
     };
 
@@ -769,6 +769,37 @@ mod tests {
         once.sort_unstable();
         once.dedup();
         assert_eq!(once.len(), expected.len());
+    }
+
+    #[test]
+    fn the_projection_carries_every_register_a_trapped_write_hands_back() {
+        // What keeps the trap's readback and the rebuild from becoming two
+        // statements of what a slot holds. A register whose write the hardware
+        // completes into the page and then exits for is one the page is given the
+        // model's answer for at that exit, so a rebuild has to put the same
+        // answer there — a register the projection does not carry would be one
+        // the guest watches change at a boundary it cannot see.
+        //
+        // Two of the trap set are left out, and both are registers the model
+        // holds no value for: the acknowledgement, which is write-only, and the
+        // remote read, which every read of answers zero — which is what a rebuilt
+        // page holds in that slot, asserted below rather than assumed.
+        let carried = offsets();
+        for offset in (0..PAGE).step_by(REGISTER_STRIDE as usize) {
+            let Some(register) = Register::at(offset) else {
+                continue;
+            };
+            if register.avic_access(true) != AvicAccess::Trap
+                || matches!(register, Register::END_OF_INTERRUPT | Register::REMOTE_READ)
+            {
+                continue;
+            }
+            assert!(
+                carried.contains(&register.offset()),
+                "{register:?} traps and the projection does not carry it"
+            );
+        }
+        assert_eq!(word(&image(), Register::REMOTE_READ), 0);
     }
 
     #[test]

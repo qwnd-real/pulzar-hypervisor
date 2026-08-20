@@ -213,9 +213,21 @@ fn read_indexed(vlapic: &Vlapic, register: Register) -> u32 {
         // face can say.
         .unwrap_or(0);
     }
-    Entry::of(register)
-        .filter(|entry| vlapic.model().has(*entry))
-        .map_or(0, |entry| vlapic.lvt_readback(entry).into_bits())
+    match Entry::of(register) {
+        // An entry this controller does not have is not a register in either
+        // face, and no access of a guest's reaches here for one — but the
+        // backing page has a slot for it whatever the faces say, and while the
+        // hardware drives the controller it answers a read of that slot with no
+        // exit at all. So what an absent entry answers with is the masked value
+        // a reset leaves one at, which is what every rebuild of that page puts
+        // there: a zero would be an unmasked entry on vector zero, and one the
+        // guest would watch change at the next rebuild.
+        Some(entry) if !vlapic.model().has(entry) => Entry::RESET,
+        Some(entry) => vlapic.lvt_readback(entry).into_bits(),
+        // An offset that is no entry at all: nothing of the register file sits
+        // there, and nothing is what it holds.
+        None => 0,
+    }
 }
 
 /// As [`read_indexed`]. Only the local-vector-table entries are writable; the

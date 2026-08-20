@@ -272,11 +272,29 @@ impl Register {
     /// out. The task priority is the one write the hardware performs whole;
     /// the command and the end-of-interrupt are performed in part, and trap
     /// where the part runs out; the identifier and destination registers, the
-    /// local vector table, the spurious vector, the error status and the
-    /// timer's configuration complete into the page and trap for the
-    /// bookkeeping's sake; and whatever is not one of those faults, which is
-    /// the accesses the hardware never implements — the priority reports, the
-    /// vector banks as writes, the timer's remaining count.
+    /// six local vector table entries the table names, the spurious vector, the
+    /// error status and the timer's configuration complete into the page and
+    /// trap for the bookkeeping's sake; and whatever is not one of those
+    /// faults, which is the accesses the hardware never implements — the
+    /// priority reports, the vector banks as writes, the timer's remaining
+    /// count.
+    ///
+    /// # An offset the table does not name is served out of the page
+    ///
+    /// The architecture assigns a behaviour per register and then says that
+    /// every other location of the backing page may be read and written
+    /// directly. The corrected-machine-check entry is such a location — there
+    /// is no row between the error status and the interrupt command — so the
+    /// hardware performs a guest's write to it against the page and raises no
+    /// exit at all, which is why it is classified here with the task priority
+    /// rather than with the six entries that trap.
+    ///
+    /// Two deviations follow, and neither has an exit to be answered at. The
+    /// model is never told what the guest wrote to that entry, so the source
+    /// real hardware is programmed from stays whatever the model holds: one the
+    /// guest armed does not deliver, and one it disarmed is not stopped. And a
+    /// write to a reserved slot between the error status and that entry lands
+    /// in the page instead of recording an illegal-register error.
     pub(crate) const fn avic_access(self, write: bool) -> AvicAccess {
         if !write {
             // One read faults: the arbitration priority is a computation no
@@ -288,9 +306,9 @@ impl Register {
             };
         }
         match self.0 {
-            0x80 => AvicAccess::Accelerated,
-            0x20 | 0xB0 | 0xC0 | 0xD0 | 0xE0 | 0xF0 | 0x280 | 0x2F0 | 0x300 | 0x320 | 0x330
-            | 0x340 | 0x350 | 0x360 | 0x370 | 0x380 | 0x3E0 => AvicAccess::Trap,
+            0x80 | 0x2F0 => AvicAccess::Accelerated,
+            0x20 | 0xB0 | 0xC0 | 0xD0 | 0xE0 | 0xF0 | 0x280 | 0x300 | 0x320 | 0x330 | 0x340
+            | 0x350 | 0x360 | 0x370 | 0x380 | 0x3E0 => AvicAccess::Trap,
             _ => AvicAccess::Fault,
         }
     }
@@ -682,11 +700,25 @@ mod tests {
     /// The accelerated writes, exactly: the architecture's table names one
     /// register the hardware performs whole — the task priority — and two it
     /// performs in part, the command and the end-of-interrupt, which trap
-    /// where the part runs out; everything else exits.
+    /// where the part runs out; everything else it names exits.
     #[test]
     fn the_accelerated_write_is_the_task_priority() {
         assert_eq!(
             Register::TASK_PRIORITY.avic_access(true),
+            AvicAccess::Accelerated
+        );
+    }
+
+    #[test]
+    fn a_write_to_an_offset_the_table_does_not_name_raises_no_exit() {
+        // The corrected-machine-check entry sits between the error status and
+        // the interrupt command, where the architecture's table has no row at
+        // all — and a location it does not name is one the hardware lets the
+        // access complete against the backing page. So no exit can be raised for
+        // it, and a trap classification would claim bookkeeping for a write this
+        // hypervisor is never told about.
+        assert_eq!(
+            Register::LVT_CORRECTED_MACHINE_CHECK.avic_access(true),
             AvicAccess::Accelerated
         );
     }
@@ -697,7 +729,9 @@ mod tests {
         // error status, the command, every local vector entry the table
         // names, and the timer's count and divide — each written out rather
         // than derived, so that a register added without a decision here
-        // fails a test rather than being classified by a fall-through.
+        // fails a test rather than being classified by a fall-through. The
+        // corrected-machine-check entry is deliberately not among them: the
+        // table names no behaviour for it, which is the test above.
         for register in [
             Register::ID,
             Register::END_OF_INTERRUPT,
@@ -713,7 +747,6 @@ mod tests {
             Register::LVT_LINT0,
             Register::LVT_LINT1,
             Register::LVT_ERROR,
-            Register::LVT_CORRECTED_MACHINE_CHECK,
             Register::TIMER_INITIAL_COUNT,
             Register::TIMER_DIVIDE,
         ] {
