@@ -245,11 +245,11 @@ impl Immediate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Owing {
     /// How many vectors the guest may still acknowledge.
-    pub(super) owed: u32,
+    pub(crate) owed: u32,
     /// How many vectors this controller has been told not to accept.
-    pub(super) blocked: u32,
+    pub(crate) blocked: u32,
     /// How many have been blocked since the controller was built.
-    pub(super) blockings: u32,
+    pub(crate) blockings: u32,
 }
 
 impl Owing {

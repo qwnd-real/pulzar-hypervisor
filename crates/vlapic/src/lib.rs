@@ -125,6 +125,10 @@ pub use crate::{
         },
         install::install,
         ownership::{Joining, bring_up_finished, claim_processor},
+        snapshot::{
+            Acceleration, Counted, Face, Ledger, Snapshot, StartupPhase, State, Timing,
+            read_backing_page, read_logical_table, read_physical_table, snapshot,
+        },
     },
     priority::Priority,
     registers::{Nomination, StartupPage},

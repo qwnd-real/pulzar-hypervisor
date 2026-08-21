@@ -327,6 +327,49 @@ pub(crate) fn x2avic_permitted() -> bool {
     X2APIC_PERMITTED.get().copied().unwrap_or(true)
 }
 
+/// What the machine built hardware delivery on, for a reader that has to say
+/// what the acceleration would be driving.
+///
+/// Everything here is written once, by provisioning, except the machine-wide
+/// demotion — which is why this is a value read at an instant rather than a
+/// borrow of the state itself. It is deliberately not what any decision is made
+/// from: [`driving`] and [`accelerated`] are the two questions this module
+/// answers for that, and neither can be reconstructed from these fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Policy {
+    /// The frame the physical table was written to.
+    pub(crate) physical_table: PhysAddr,
+    /// The frame the logical table lives in.
+    pub(crate) logical_table: PhysAddr,
+    /// The largest valid index the table was sized for, which is the widest
+    /// face the machine may drive it in.
+    pub(crate) max_index: u16,
+    /// How many entries the logical table holds.
+    pub(crate) logical_entries: usize,
+    /// The window every one of those frames is reached through.
+    pub(crate) window: DirectMap,
+    /// Whether the silicon's reading of the running bits is trusted, without
+    /// which the bit is never published at all.
+    pub(crate) ipi_virtual: bool,
+    /// Whether the machine has been taken off the accelerated path for the rest
+    /// of its life.
+    pub(crate) machine_inhibited: bool,
+}
+
+/// The machine's policy, or `None` where nothing was ever provisioned.
+pub(crate) fn policy() -> Option<Policy> {
+    let activation = *ACTIVATED.get()?;
+    Some(Policy {
+        physical_table: activation.physical_table,
+        logical_table: activation.logical_table,
+        max_index: activation.max_index,
+        logical_entries: LOGICAL_ENTRIES,
+        window: activation.window,
+        ipi_virtual: activation.ipi_virtual,
+        machine_inhibited: activation.machine_inhibited.load(Ordering::Relaxed),
+    })
+}
+
 /// Whether this processor's controller is being driven in hardware at this
 /// moment.
 ///

@@ -316,15 +316,15 @@ impl Deferred {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Owing {
     /// How many vectors the guest may still acknowledge.
-    pub(super) owed: u32,
+    pub(crate) owed: u32,
     /// How many it has acknowledged that are waiting for their turn at the top.
-    pub(super) released: u32,
+    pub(crate) released: u32,
     /// How many are held with no acknowledgement expected, and so for good.
-    pub(super) abandoned: u32,
+    pub(crate) abandoned: u32,
     /// How many have been abandoned since the controller was built.
-    pub(super) strandings: u32,
+    pub(crate) strandings: u32,
     /// How many came due against a controller that was not holding them.
-    pub(super) phantoms: u32,
+    pub(crate) phantoms: u32,
 }
 
 impl Owing {

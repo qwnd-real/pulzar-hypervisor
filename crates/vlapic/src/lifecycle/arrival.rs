@@ -7,13 +7,14 @@
 //! guest can reach is programmed onto real hardware with the guest's own
 //! vector.
 //!
-//! Whether real hardware may be acknowledged now is the whole of what is
-//! decided here, and three things decide it: whether the real controller is
-//! holding the vector in service at all, which is what tells an interrupt it
-//! delivered from one that came in through the pin that bypasses it; the
-//! controller's own record of whether the interrupt arrived level triggered;
-//! and the vector, because an acknowledgement withheld in the priority class
-//! the host keeps for itself would hold the host's own interrupts off with it.
+//! Which authority the guest is given it through, and whether real hardware may
+//! be acknowledged now, are the whole of what is decided here — [`taken`] is
+//! both — and three things decide them: whether the real controller is holding
+//! the vector in service at all, which is what tells an interrupt it delivered
+//! from one that came in through the pin that bypasses it; the controller's own
+//! record of whether the interrupt arrived level triggered; and the vector,
+//! because an acknowledgement withheld in the priority class the host keeps for
+//! itself would hold the host's own interrupts off with it.
 
 use apic::LocalApic;
 use descriptors::Vector;
@@ -33,9 +34,12 @@ use crate::{
 /// vector that nothing in the hypervisor claimed, which on a machine whose I/O
 /// controllers are passed through means it was meant for the guest.
 ///
-/// Whether real hardware may be acknowledged now is the whole of what is
-/// decided here, and the controller itself is asked: it recorded, as it
-/// accepted the interrupt, whether the interrupt arrived level triggered.
+/// Which authority the guest is given it through, and whether real hardware may
+/// be acknowledged now, are the whole of what is decided — [`taken`] is where
+/// both are — and the controller itself is asked for two of the three terms: it
+/// recorded, as it accepted the interrupt, whether the interrupt arrived level
+/// triggered, and it is holding the vector in service if it accepted the
+/// interrupt at all.
 ///
 /// An edge-triggered interrupt is finished with once taken, so it is
 /// acknowledged immediately and the guest is given it. A level-triggered one is
@@ -88,29 +92,76 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
         vlapic.task_priority(),
         vlapic.ledger().debts()
     );
-    if !local.in_service(vector) {
-        // The one arrival the acceleration cannot represent faithfully: the
-        // controller never accepted it, so no in-service state exists for
-        // the hardware to keep. It is delivered through the backing page
-        // anyway — the only path the guest can hear — and its
-        // acknowledgement is the legacy controller the guest reaches
-        // directly, exactly as it is on real hardware.
-        if activation::active_for(vlapic) {
-            crate::delivery::avic::warn_external_once();
-            return crate::delivery::avic::arrive(vlapic, local, vector, level);
-        }
-        external(vlapic, vector);
-    } else if activation::active_for(vlapic) {
-        // The hardware owns the guest's delivery while it drives the
-        // controller: the request goes where the hardware reads it, and the
-        // target is told by whichever signal its state calls for.
-        return crate::delivery::avic::arrive(vlapic, local, vector, level);
-    } else if withholdable(vector, level) {
-        withhold(vlapic, local, vector);
-    } else {
-        acknowledge(vlapic, local, vector, level);
+    match taken(
+        local.in_service(vector),
+        activation::active_for(vlapic),
+        withholdable(vector, level),
+    ) {
+        Taken::Injected => external(vlapic, vector),
+        Taken::Published => return crate::delivery::avic::arrive(vlapic, local, vector, level),
+        Taken::Withheld => withhold(vlapic, local, vector),
+        Taken::Acknowledged => acknowledge(vlapic, local, vector, level),
     }
     Ok(())
+}
+
+/// Which authority an arrival is given to the guest through, and what real
+/// hardware is owed for it.
+///
+/// Written as a decision over values because one of its rows is the one this
+/// path must not get wrong, and a row is the kind of thing that can be read
+/// against the states it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+    /// The model, which injects it and holds nothing in service for it, and
+    /// nothing is acknowledged. See [`external`].
+    Injected,
+    /// The backing page the hardware delivers out of, which is where an arrival
+    /// the real controller accepted goes while the hardware drives this
+    /// controller. What real hardware is then owed is decided there, by the
+    /// same rule as here — see [`crate::delivery::avic::arrive`].
+    Published,
+    /// The model, with real hardware's acknowledgement withheld until the guest
+    /// gives its own.
+    Withheld,
+    /// The model, with real hardware acknowledged at once.
+    Acknowledged,
+}
+
+/// Where one arrival goes, out of the three facts that decide it.
+///
+/// `held` is whether the real controller is holding the vector in service, and
+/// it is asked first because it is not a question about which authority is
+/// delivering. A controller sets that bit as it accepts an interrupt and clears
+/// it only when acknowledged, so an arrival without it is one the controller
+/// never accepted: it came in through the pin that bypasses it, and no
+/// controller holds one of those — neither the model, which is what
+/// [`Vlapic::arrived_externally`] records, nor the hardware, which has no such
+/// state to keep.
+///
+/// So the model takes it whichever authority is delivering the rest, and that
+/// is the row nothing else can repair. The hardware holds in service everything
+/// it delivers, so a request published into a backing page for such an arrival
+/// is a bit the guest has no reason to clear: it floors the processor priority
+/// the hardware arbitrates with, and every later interrupt of that class or
+/// lower is refused for as long as the guest lives. The model is the one
+/// authority that can deliver a vector without holding it —
+/// [`Vlapic::committed`] is where — and an injection is not something the
+/// acceleration takes away: the control block's event field is delivered
+/// whatever the enable bits say, and it is the *pending-interrupt* fields
+/// beside it that a processor driving the controller itself ignores.
+const fn taken(held: bool, accelerated: bool, withholdable: bool) -> Taken {
+    if !held {
+        return Taken::Injected;
+    }
+    if accelerated {
+        return Taken::Published;
+    }
+    if withholdable {
+        Taken::Withheld
+    } else {
+        Taken::Acknowledged
+    }
 }
 
 /// Gives the guest an interrupt its own controller never accepted, and
@@ -133,6 +184,11 @@ pub fn arrived(vector: Vector) -> Result<(), VlapicError> {
 /// And the guest's controller is told not to hold it in service when it hands
 /// it over, because the guest will acknowledge the legacy controller and not
 /// this one — see [`Vlapic::arrived_externally`].
+///
+/// The model holds it whether or not the hardware is driving this controller,
+/// and the entry that follows injects it from there. The record above is also
+/// what keeps it out of the backing page: every way the model reaches that page
+/// asks it, and [`taken`] is why they must.
 fn external(vlapic: &Vlapic, vector: Vector) {
     vlapic.arrived_externally(vector);
     match vlapic.accept(vector, Trigger::Edge) {
@@ -283,13 +339,57 @@ fn withhold(vlapic: &Vlapic, local: LocalApic, vector: Vector) {
 
 #[cfg(test)]
 mod tests {
-    //! Which arrivals may have their acknowledgement withheld is the one
-    //! decision here that needs no controller, and it is the one that costs
-    //! the *machine* rather than the guest if it is wrong.
+    //! Two decisions here need no controller, and they are the two that cost
+    //! the *machine* or the guest's whole timer if they are wrong: which
+    //! authority an arrival is given to, and whose acknowledgement may be
+    //! withheld.
 
     use descriptors::Vector;
 
-    use super::withholdable;
+    use super::{Taken, taken, withholdable};
+
+    #[test]
+    fn an_arrival_no_controller_is_holding_is_the_models_whichever_authority_delivers() {
+        // The one arrival a backing page must never be given, and the row every
+        // other term is irrelevant to. The real controller is not holding the
+        // vector, so what the hardware would hold in service as it delivered is
+        // a bit the guest never acknowledges — it acknowledges a legacy
+        // controller instead, through ports nothing intercepts — and the
+        // processor priority that bit imposes refuses every later interrupt of
+        // its class or lower for as long as the guest lives. For firmware
+        // driving its periodic timer through the pin, that is the timer, one
+        // tick in.
+        for accelerated in [false, true] {
+            for withholdable in [false, true] {
+                assert_eq!(
+                    taken(false, accelerated, withholdable),
+                    Taken::Injected,
+                    "accelerated {accelerated}, withholdable {withholdable}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_arrival_the_controller_accepted_goes_where_the_delivering_authority_reads_it() {
+        // The hardware owns the guest's delivery while it drives the controller,
+        // so the request goes into the page it reads. What real hardware is owed
+        // is decided again there, out of the same withholding rule, which is why
+        // this row does not turn on it.
+        for withholdable in [false, true] {
+            assert_eq!(
+                taken(true, true, withholdable),
+                Taken::Published,
+                "withholdable {withholdable}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_software_path_withholds_exactly_what_it_may() {
+        assert_eq!(taken(true, false, true), Taken::Withheld);
+        assert_eq!(taken(true, false, false), Taken::Acknowledged);
+    }
 
     #[test]
     fn an_edge_arrival_owes_nothing_whatever_its_vector() {

@@ -11,7 +11,13 @@ inject = { workspace = true }
 descriptors = { workspace = true }
 apic = { workspace = true }
 emulate = { workspace = true }
+# The interface a guest's own debugging tool reaches this hypervisor through,
+# and the layout of what it is answered with.
+hypercall = { workspace = true }
 log = { workspace = true }
+# Reaching the buffer a hypercall names, which is a linear address of the
+# calling guest and has to be walked as one.
+memory = { workspace = true }
 npt = { workspace = true }
 partition = { workspace = true }
 portal = { workspace = true }

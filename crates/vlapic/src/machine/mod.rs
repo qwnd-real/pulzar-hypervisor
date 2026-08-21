@@ -22,5 +22,6 @@ pub(crate) mod exits;
 pub(crate) mod install;
 pub(crate) mod ownership;
 pub(crate) mod registry;
+pub(crate) mod snapshot;
 
 pub(crate) use crate::machine::registry::{current, of};

@@ -287,17 +287,17 @@ fn saturate(counter: &AtomicU32) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Counts {
     /// Interrupts handed to this guest from real hardware.
-    arrivals: u32,
+    pub(crate) arrivals: u32,
     /// How many of those were level triggered.
-    level: u32,
+    pub(crate) level: u32,
     /// Interrupts this controller declined.
-    declined: u32,
+    pub(crate) declined: u32,
     /// Interrupts lost.
-    dropped: u32,
+    pub(crate) dropped: u32,
     /// Periodic counts raised to the shortest period.
-    clamped: u32,
+    pub(crate) clamped: u32,
     /// Wakes this processor sent, by what each was for.
-    wakes: Wakes,
+    pub(crate) wakes: Wakes,
 }
 
 impl Display for Counts {

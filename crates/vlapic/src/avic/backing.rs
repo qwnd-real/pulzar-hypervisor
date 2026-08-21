@@ -48,6 +48,11 @@
 //! crosses into the page instead, and the model stops holding it — one
 //! authority for the three banks for as long as the acceleration is on.
 //!
+//! One request never crosses, by either door, and [`page_requests`] is the
+//! whole of that rule: an arrival that came in through the pin bypassing the
+//! controller is one no controller holds in service, and the hardware holds
+//! everything it delivers.
+//!
 //! [`publish_request`] is that same publication for one vector, and it is where
 //! an interrupt real hardware took for a guest whose page is already the
 //! authority goes. Such an arrival never reaches the model at all, so the two
@@ -289,6 +294,26 @@ const fn vector_at(slot: usize, bit: u32) -> Vector {
 /// How many thirty-two-bit words one register slot of the page is long.
 const SLOT_WORDS: usize = REGISTER_STRIDE as usize / size_of::<u32>();
 
+/// Which of one bank slot's requests a backing page may be given.
+///
+/// Every one but a request that came in through the pin bypassing the
+/// controller. Such an arrival is acknowledged to a legacy controller the guest
+/// reaches directly, which is why this controller deliberately does not hold it
+/// in service — and the hardware holds in service everything it delivers, so a
+/// bit of one in a page is a bit the guest has no reason to clear: it floors
+/// the processor priority the hardware arbitrates with, and every later
+/// interrupt of that class or lower is refused for as long as the guest lives.
+/// Those stay in the model, which is the one authority that can deliver a
+/// vector without holding it.
+///
+/// Asked by both ways the model reaches a page, because a rule stated twice is
+/// one that comes to hold at one door and not the other: the [`Handover`] of
+/// what the model is still holding at an entry, and the [`Projection`] a
+/// transition or a rebuild writes over the page whole.
+pub(super) const fn page_requests(requests: u32, external: u32) -> u32 {
+    requests & !external
+}
+
 /// Every register a controller's backing page and its software model both hold.
 ///
 /// The state that has to cross a lifecycle boundary, as a value rather than as
@@ -336,6 +361,14 @@ impl Projection {
     /// for the reason [`crate::registers::identity`] gives: two of these
     /// registers are shaped by the face the controller is in, and a page built
     /// from two loads of it would be a page in neither face.
+    ///
+    /// The requests are narrowed by [`page_requests`], which is the one thing
+    /// this carries less of than the model has. A page rebuilt with a pin
+    /// arrival in it is the same defect as one handed one at an entry, and this
+    /// is the door such a request is likeliest to be standing at: the rebuild
+    /// runs at the transition that turns the acceleration on, before the very
+    /// entry whose nomination injects what the software path accepted a moment
+    /// earlier.
     pub(super) fn of(vlapic: &Vlapic, mode: Mode) -> Self {
         let command = vlapic.command();
         Self {
@@ -365,7 +398,12 @@ impl Projection {
             }),
             in_service: bank(|slot| vlapic.in_service_slot(slot)),
             trigger_mode: bank(|slot| vlapic.trigger_mode_slot(slot)),
-            request: bank(|slot| vlapic.request_slot(slot)),
+            request: bank(|slot| {
+                Some(page_requests(
+                    vlapic.request_slot(slot)?,
+                    vlapic.external_slot(slot).unwrap_or(0),
+                ))
+            }),
         }
     }
 
@@ -566,13 +604,8 @@ impl Handover {
     /// What one bank slot hands over, out of the four words the register file
     /// holds for it.
     ///
-    /// Every request but one that came in through the pin that bypasses the
-    /// controller. Such an arrival is acknowledged to a legacy controller the
-    /// guest reaches directly, which is why this controller deliberately does
-    /// not hold it in service — and the hardware holds everything it
-    /// delivers, so handing one over would leave a bit in the page that
-    /// nothing ever clears and a priority class blocked for as long as the
-    /// guest lives. Those stay in the model, which injects them.
+    /// Every request [`page_requests`] admits, which is every one but an
+    /// arrival that came in through the pin bypassing the controller.
     ///
     /// The trigger modes are narrowed to the requests that cross. That bank is
     /// what the hardware reads to decide whether an acknowledgement raises an
@@ -587,7 +620,7 @@ impl Handover {
     /// read against the states it covers — a controller cannot be built in
     /// a test.
     const fn from_words(requests: u32, trigger_modes: u32, in_service: u32, external: u32) -> Self {
-        let requests = requests & !external;
+        let requests = page_requests(requests, external);
         Self {
             requests,
             trigger_modes: trigger_modes & requests,
@@ -782,10 +815,12 @@ mod tests {
     //! bits cross to the hardware, which the model keeps holding, and which
     //! trigger modes the crossing takes away — and as the order the ones that
     //! cross are published in, which the closure that answers with a page slot
-    //! is what observes. One arrival's publication is asserted the same way,
-    //! and against the model's own bank as well: the bit a guest's
-    //! acknowledgement is classified by has to be the same in both, so the
-    //! two are compared word for word over the whole bank.
+    //! is what observes. The rule about which requests may be given to a page
+    //! at all is asserted on its own as well, because the hand-over is only
+    //! one of the two doors that asks it. One arrival's publication is
+    //! asserted the same way, and against the model's own bank as well: the
+    //! bit a guest's acknowledgement is classified by has to be the same in
+    //! both, so the two are compared word for word over the whole bank.
     //!
     //! And both page directions are asserted to lose nothing to a writer they
     //! cannot exclude. A page here is an array of atomics, which is exactly
@@ -802,7 +837,7 @@ mod tests {
 
     use super::{
         EXTENDED_LVT_FIRST, EXTENDED_LVT_SLOTS, Handover, Life, Ordering, PAGE, Projection,
-        ResetImage, SLOTS, Trigger, Vector, VlapicError, bank_bit, publish_request,
+        ResetImage, SLOTS, Trigger, Vector, VlapicError, bank_bit, page_requests, publish_request,
     };
     use crate::{
         face::table::{AvicAccess, Register},
@@ -1293,6 +1328,22 @@ mod tests {
         // that model with one the architecture has just required to be empty.
         assert!(Life::Same.carried());
         assert!(!Life::Ended.carried());
+    }
+
+    #[test]
+    fn a_pin_arrival_is_the_one_request_no_page_may_be_given() {
+        // The rule both doors ask. A page given such a request holds the vector
+        // in service the moment it delivers it, the guest acknowledges a legacy
+        // controller instead, and nothing ever clears the bit — which is
+        // firmware driving its timer through the pin losing that timer after one
+        // tick, along with every other interrupt of its class or lower.
+        assert_eq!(page_requests(0b1111, 0), 0b1111);
+        assert_eq!(page_requests(0b1111, 0b1010), 0b0101);
+        assert_eq!(page_requests(0b1111, !0), 0);
+        // A vector recorded as a pin arrival with no request behind it takes
+        // nothing else away: the two banks are read one slot at a time and a
+        // stale record must not delete a request the model really is holding.
+        assert_eq!(page_requests(0b0001, 0b1110), 0b0001);
     }
 
     #[test]

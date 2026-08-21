@@ -16,7 +16,10 @@ use crate::advance;
 
 /// Bytes in `VMMCALL`, for a processor that does not report the address after
 /// an intercepted instruction.
-const VMMCALL_BYTES: u64 = 3;
+///
+/// Both users of the instruction step over it with this: the portal's
+/// notifications here, and the hypercalls [`crate::hypercall`] answers.
+pub(crate) const VMMCALL_BYTES: u64 = 3;
 
 /// What the host does once firmware's services are gone.
 ///

@@ -681,25 +681,6 @@ fn refuse(vlapic: &Vlapic, local: LocalApic, vector: Vector, withholdable: bool)
     }
 }
 
-/// Warns once per machine about an arrival shape the acceleration cannot
-/// represent faithfully, for the defensive corner that should never be
-/// reached.
-pub(crate) fn warn_external_once() {
-    if WARNED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        warn!(
-            "vlapic: an arrival the real controller never accepted reached the accelerated \
-             path; it is delivered through the backing page, and its acknowledgement is the \
-             guest's own legacy controller's"
-        );
-    }
-}
-
-/// Whether the external-arrival warning has been said.
-static WARNED: AtomicBool = AtomicBool::new(false);
-
 #[cfg(test)]
 mod tests {
     //! Four decisions, and between them they are the whole of what these paths

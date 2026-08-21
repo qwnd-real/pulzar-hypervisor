@@ -67,6 +67,7 @@ mod census;
 mod cpuid;
 mod firmware;
 mod hidden_svm;
+mod hypercall;
 mod msr;
 pub mod mtrr;
 mod nested;
@@ -307,7 +308,14 @@ impl<'a> Exits<'a> {
                 &mut self.interrupts,
                 &mut self.census,
             ),
-            Some(Reason::Vmmcall) => self.notified(vcpu),
+            // Two users of one instruction, told apart by the command register:
+            // a word carrying this hypervisor's own selector is a hypercall from
+            // somewhere inside the guest, at any privilege level, and anything
+            // else is the portal telling the host how far firmware has got.
+            Some(Reason::Vmmcall) => match hypercall::exit(vcpu, self.partition) {
+                Some(flow) => flow,
+                None => self.notified(vcpu),
+            },
             Some(
                 Reason::Vmrun
                 | Reason::Vmload
@@ -352,6 +360,11 @@ impl<'a> Exits<'a> {
 
     /// Acts on one of the portal's two notifications, if this processor is the
     /// one that has a portal.
+    ///
+    /// Reached only for an instruction that is not one of this hypervisor's own
+    /// hypercalls: [`hypercall::exit`] decides that, by a selector no
+    /// notification marker can be mistaken for, and answers the ones that
+    /// are.
     fn notified(&mut self, vcpu: &mut Vcpu) -> Flow {
         let Some(firmware) = &mut self.firmware else {
             // The instruction is intercepted for the portal's sake alone, and

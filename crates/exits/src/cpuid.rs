@@ -169,7 +169,7 @@ pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
         result.eax = 0;
         result.ebx = 0;
         result.ecx = 0;
-        result.edx = 0x67;
+        result.edx = 0;
     }
     vcpu.save_mut().rax = u64::from(result.eax);
     let registers = vcpu.registers_mut();

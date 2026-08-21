@@ -1,0 +1,16 @@
+[package]
+name = "hypercall"
+description = "The call a guest makes into the pulzar hypervisor, and what comes back"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Flag sets, for the words that say which parts of a dump are present and which
+# of a controller's boolean states hold.
+bitflags = { workspace = true }
+# The error types a reader reports a buffer it cannot read with.
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
