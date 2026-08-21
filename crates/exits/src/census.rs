@@ -18,6 +18,7 @@
 use log::info;
 use svm::{ExitCode, avic::IpiFailure};
 use vcpu::Vcpu;
+use vlapic::Wakes;
 
 /// One processor's exit counts since the last summary.
 ///
@@ -44,9 +45,10 @@ pub(crate) struct Census {
     /// page they named: which register a guest cannot touch accelerated is
     /// the question this half answers.
     noaccel: [u32; Self::NOACCEL_SLOTS],
-    /// Host-interrupt kicks sent since the last summary, as the vlapic crate
-    /// counts them cumulatively.
-    last_kicks: u64,
+    /// What this processor's controller had counted as sent by the last
+    /// summary, so the next one names only the wakes sent since: the
+    /// controller's counters are cumulative and outlive every guest.
+    wakes: Wakes,
     /// Exits counted since the last summary.
     counted: u64,
     /// Exits counted since this processor entered its guest.
@@ -94,7 +96,10 @@ impl Census {
             sparse_used: 0,
             incomplete_ipi: [0; Self::IPI_FAILURES],
             noaccel: [0; Self::NOACCEL_SLOTS],
-            last_kicks: 0,
+            wakes: Wakes {
+                kicks: 0,
+                nudges: 0,
+            },
             counted: 0,
             lifetime: 0,
         }
@@ -190,9 +195,10 @@ impl Census {
         }
         // The acceleration's own account, which the exit codes cannot give:
         // why deliveries between the guest's processors stopped, which
-        // registers it still touches by hand, and how many of its targets the
-        // hardware could not tell on its own — which is the measure of how much
-        // of the work the acceleration is really taking.
+        // registers it still touches by hand, and how many targets this
+        // processor had to interrupt to make them look at what had been left
+        // for them — which between them are the measure of how much of the work
+        // the acceleration is really taking.
         for (bucket, count) in self.incomplete_ipi.iter().enumerate() {
             if *count == 0 {
                 continue;
@@ -221,16 +227,52 @@ impl Census {
                 );
             }
         }
-        let kicks = vlapic::avic_kicks().wrapping_sub(self.last_kicks);
-        if kicks > 0 {
-            info!("exits:   {kicks} host-interrupt kicks to wake targets it could not announce to");
+        // Both transports carry the same host interrupt, so what each number
+        // says is where the target will find what it is being woken for: a page
+        // the hardware wrote and could not announce, or a model the software
+        // path accepted into.
+        let sent = self.since(vlapic::wakes());
+        for (count, what) in [
+            (
+                sent.kicks,
+                "a request the hardware left in its backing page",
+            ),
+            (
+                sent.nudges,
+                "a request the software path accepted into its model",
+            ),
+        ] {
+            if count > 0 {
+                info!("exits:   {count} host interrupts to make a target look at {what}");
+            }
         }
-        self.last_kicks = vlapic::avic_kicks();
         self.dense.fill(0);
         self.sparse_used = 0;
         self.incomplete_ipi.fill(0);
         self.noaccel.fill(0);
         self.counted = 0;
+    }
+
+    /// What this processor has sent since the last summary, recording what it
+    /// has now sent so that the next summary names only what came after.
+    ///
+    /// Per processor, out of that processor's own controller, exactly as every
+    /// other number in a summary is — which is what makes each wake appear in
+    /// one summary, on the processor that sent it. A machine-wide counter
+    /// differenced against a per-processor last-seen value reported every wake
+    /// on the machine in as many summaries as the machine has processors, each
+    /// of them presenting it as its own.
+    ///
+    /// Saturating because the counters saturate: a controller that has sent
+    /// `u32::MAX` of something stops counting, where a difference that wrapped
+    /// would report a processor that had sent almost none.
+    fn since(&mut self, now: Wakes) -> Wakes {
+        let sent = Wakes {
+            kicks: now.kicks.saturating_sub(self.wakes.kicks),
+            nudges: now.nudges.saturating_sub(self.wakes.nudges),
+        };
+        self.wakes = now;
+        sent
     }
 
     /// The most frequent code still counted, or `None` once none is left.
@@ -267,11 +309,13 @@ impl Census {
 
 #[cfg(test)]
 mod tests {
-    //! Which bucket an incomplete delivery is counted in, which is the one
-    //! decision here that needs no guest: everything else this type does is
-    //! counting, and what it counts is an exit code the architecture assigns.
+    //! Which bucket an incomplete delivery is counted in, and what a summary
+    //! makes of the wakes its processor has sent. Those are the two decisions
+    //! here that need no guest: everything else this type does is counting, and
+    //! what it counts is an exit code the architecture assigns.
 
     use svm::avic::IpiFailure;
+    use vlapic::Wakes;
 
     use super::Census;
 
@@ -333,5 +377,53 @@ mod tests {
         for defined in 0..bucket {
             assert!(IpiFailure::from_bits(defined).is_some(), "{defined}");
         }
+    }
+
+    #[test]
+    fn every_wake_is_named_once_by_the_processor_that_sent_it() {
+        // Four processors, one kick and one nudge each, and the summaries between
+        // them account for those eight wakes exactly once. What each summary
+        // differences is its own processor's controller, so a wake belongs to one
+        // summary — where a machine-wide counter differenced against a
+        // per-processor last-seen value put every wake on the machine into every
+        // processor's next summary, each of them presenting it as its own.
+        let mut censuses = [const { Census::new() }; 4];
+        let named: u32 = censuses
+            .iter_mut()
+            .map(|census| {
+                let sent = census.since(Wakes {
+                    kicks: 1,
+                    nudges: 1,
+                });
+                sent.kicks + sent.nudges
+            })
+            .sum();
+        assert_eq!(named, 8);
+    }
+
+    #[test]
+    fn a_summary_names_the_wakes_sent_since_the_last_one_and_no_others() {
+        // The counters are the controller's and cumulative — they outlive every
+        // guest and are what a machine with no serial port is read from
+        // afterwards — so what a summary owes is the difference, per transport.
+        let mut census = Census::new();
+        let three = Wakes {
+            kicks: 3,
+            nudges: 0,
+        };
+        assert_eq!(census.since(three), three);
+        assert_eq!(census.since(three), Wakes::default());
+        // A transport that moved while the other stood still is the only one
+        // named, which is the whole point of counting them apart.
+        assert_eq!(
+            census.since(Wakes {
+                kicks: 3,
+                nudges: 2
+            }),
+            Wakes {
+                kicks: 0,
+                nudges: 2
+            }
+        );
     }
 }

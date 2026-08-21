@@ -48,9 +48,9 @@
 //!
 //! What the *hardware* deposits in a page it announces itself, and the one case
 //! it cannot — a target that was not in the guest — is the only wake these
-//! paths owe: a host interrupt each, counted, because how many of them a guest
-//! costs is the measure of how often the acceleration cannot finish what it
-//! started.
+//! paths owe: a host interrupt each, counted in the sending controller, because
+//! how many of them a guest costs is the measure of how often the acceleration
+//! cannot finish what it started.
 //!
 //! # Which targets those are is asked of the tables, not of the model
 //!
@@ -59,7 +59,7 @@
 //! oracle from the two tables the hardware resolved through. [`Resolved`] is
 //! what it is worked out of instead, and why is argued there.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use apic::LocalApic;
 use descriptors::Vector;
@@ -79,14 +79,6 @@ use crate::{
         icr::{Command, DestinationMode, Shorthand, Trigger},
     },
 };
-
-/// Host-interrupt kicks sent by these paths, cumulative.
-static KICKS: AtomicU64 = AtomicU64::new(0);
-
-/// How many host-interrupt kicks these paths have sent.
-pub(crate) fn kicks() -> u64 {
-    KICKS.load(Ordering::Relaxed)
-}
 
 /// Answers an interrupt the hardware could not finish delivering between the
 /// guest's own processors.
@@ -515,12 +507,18 @@ const fn owed(sender: bool, owned: bool, running: bool) -> bool {
 /// Wakes a target with the host doorbell interrupt, whether or not it said it
 /// was away.
 ///
-/// What this adds to [`doorbell::nudge`] is the count; what it leaves out is
-/// the away flag, and [`owed`] is where that and every other term of the
-/// decision are argued. Nothing is re-examined here.
+/// What this leaves out that [`doorbell::nudge`] has is the away flag, and
+/// [`owed`] is where that and every other term of the decision are argued.
+/// Nothing is re-examined here. The two are counted apart because which
+/// authority is holding the interrupt decides where the target finds it.
 fn kick(from: &Vlapic, target: &Vlapic) {
     doorbell::interrupt(from, target);
-    KICKS.fetch_add(1, Ordering::Relaxed);
+    // Counted against the sender, in the sender's own controller, because this
+    // is the sender's path: the target is parked and is not executing anything
+    // that could count it. A machine-wide word here was a read-modify-write
+    // every processor made on the path the acceleration exists to make cheap,
+    // and no processor could tell its own wakes from the machine's.
+    from.diagnostics().kicked();
 }
 
 /// Gives one processor an interrupt that arrived for its guest through real

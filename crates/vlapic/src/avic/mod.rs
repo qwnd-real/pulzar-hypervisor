@@ -410,18 +410,6 @@ pub fn wake_targets(command_bits: u64) -> Result<(), VlapicError> {
     crate::delivery::avic::wake_targets(command_bits)
 }
 
-/// How many host-interrupt kicks the acceleration's paths have sent,
-/// cumulative.
-///
-/// The census's account of how often hardware delivery between the guest's
-/// processors could not finish on its own: each of these is a target the
-/// hardware deposited an interrupt for and could not tell, so the host had to
-/// force it out of the guest to make it look.
-#[must_use]
-pub fn kicks() -> u64 {
-    activation::kick_count()
-}
-
 /// Whether an access the hardware reported as unaccelerated is one it
 /// completed before it exited.
 ///

@@ -104,6 +104,11 @@ pub(super) fn nudge(from: &Vlapic, target: &Vlapic) {
         return;
     }
     interrupt(from, target);
+    // Counted against the sender, in the sender's own controller: this is the
+    // transport that announces a request the software path accepted into a
+    // model, and how many of them a processor sends is what the census tells
+    // apart from the acceleration's own wakes.
+    from.diagnostics().nudged();
 }
 
 /// Sends the doorbell interrupt to `target`, retrying the one failure a retry

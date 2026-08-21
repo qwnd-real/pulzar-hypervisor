@@ -13,11 +13,25 @@
 //! That is what replaces the locks a migrating hypervisor would need:
 //!
 //! - Entry *i* of the physical table is written only by pCPU *i*, and its two
-//!   mutable bits — whether the processor is in the guest, and whether a peer's
-//!   hardware may resolve an interrupt to it at all — are each toggled with a
-//!   read-modify-write: Release on the set that publishes one, Release on the
-//!   clear that withdraws it, and an Acquire load is what every decision made
-//!   from it reads.
+//!   mutable bits are each toggled with a read-modify-write. The bit that says
+//!   a peer's hardware may resolve an interrupt here at all is Release on the
+//!   set that publishes it and Release on the clear that withdraws it, and an
+//!   Acquire load is what every decision made from it reads.
+//! - The bit that says the processor is in the guest is sequentially consistent
+//!   on both, and so is the rescan the withdrawal precedes. That is not
+//!   caution: the two halves of the park protocol are a store followed by a
+//!   load of a *different* location on each side — the target withdraws the bit
+//!   and then rescans its page, while a sender's hardware sets a request bit in
+//!   that page and then reads the bit — and the argument that neither half can
+//!   miss the other needs every access in it to be in the single total order
+//!   that only sequentially consistent operations join. `delivery::doorbell`
+//!   makes that argument in full for the software half of the same protocol,
+//!   spells out why a release read-modify-write and an acquire load do not give
+//!   it, and shows that on this processor it costs no instructions at all. What
+//!   this hypervisor cannot spell is the hardware's half, and what it assumes
+//!   of it is that the hardware's read of an entry is coherent with a locked
+//!   write from the core that entry describes: nothing in the design covers
+//!   that read answering from before the withdrawal.
 //! - A backing page is written by its own processor alone — by these functions
 //!   at transition boundaries and at the exits its own guest's register writes
 //!   raise, and by the hardware while the guest runs — except for the
@@ -33,10 +47,18 @@
 //!   taken wherever an entry moves — the handlers that answer a guest's write
 //!   of its logical identity, and the transitions that change the face the
 //!   acceleration drives a controller in — and never held across an exit.
-//!   Entries move as whole aligned words, and an entry is invalidated before
-//!   another is written, so a resolution racing the rebuild reads one entry or
-//!   the other and never two naming one processor.
-//! - The inhibits are single atomic booleans, Release on the set.
+//!   Entries move as whole aligned words, and a processor's old entry is
+//!   invalidated before its new one is published, the publishing store being
+//!   Release so that nothing in the model permits the two being reordered. The
+//!   lock does not establish that, because the reader it has to hold against is
+//!   not a thread and takes no lock: it is the AVIC hardware of any core. So a
+//!   resolution racing a rebuild reads the old entry, the new one, or no entry
+//!   — a delivery, a delivery, or an exit the software path completes — and
+//!   never two entries naming one processor.
+//! - The inhibits are single atomic booleans, and Relaxed on every access. A
+//!   boolean is the whole of what either publishes: nothing is written before
+//!   one that a reader of it must see, and every reader acts on the boolean
+//!   alone.
 //!
 //! # And one authority
 //!
@@ -68,6 +90,7 @@
 use alloc::boxed::Box;
 use core::{
     cmp::min,
+    fmt,
     iter::once,
     sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
 };
@@ -75,7 +98,7 @@ use core::{
 use apic::REGISTER_STRIDE;
 use cpu::{ApicId, CpuIndex};
 use descriptors::Vector;
-use log::{info, warn};
+use log::{info, trace, warn};
 use paging::DirectMap;
 use spin::{Mutex, Once};
 use svm::{
@@ -83,14 +106,14 @@ use svm::{
     avic::{LogicalApicEntry, MAX_PHYSICAL_ID, PhysicalApicEntry},
 };
 use vcpu::Vcpu;
-use x86_64::PhysAddr;
+use x86_64::{PhysAddr, instructions::interrupts};
 
 use crate::{
     VlapicError,
     avic::backing::{Handover, Life, Projection, ResetImage, bank_bit, publish_request},
     delivery::error,
     face::{dispatch, dispatch::Written, table::Register},
-    machine::{current, registry},
+    machine::{current, diagnostics::Report, registry},
     priority::{self, Priority},
     registers::{
         FLAT_DESTINATION_FORMAT, Vlapic,
@@ -164,8 +187,33 @@ struct Activation {
     /// it are either broken hypervisor state or a guest the hardware cannot
     /// be trusted to resolve destinations for, and neither announces when it
     /// has gone away.
+    ///
+    /// Written by any processor and read by all of them, Relaxed on both:
+    /// nothing is published with it, and a reader that acted on it a moment
+    /// late is a processor taking one more accelerated entry, which is what
+    /// every reading of it is one entry away from anyway.
     machine_inhibited: AtomicBool,
-    /// Held while the logical table is rebuilt, and never across an exit.
+    /// Held while the logical table and the record of what is in it move.
+    ///
+    /// Taken with host interrupts off on both of the paths that take it, which
+    /// is what bounds the wait for it. The transitions reach it from inside the
+    /// entry callback, where both interrupt flags are already clear — a
+    /// processor spinning there answers no doorbell, no translation shootdown
+    /// and no non-maskable interrupt while it waits — and the handlers that
+    /// answer a guest's write of its logical identity reach it from an exit,
+    /// where interrupts are enabled and a holder could otherwise be interrupted
+    /// for orders of magnitude longer than the critical section itself. Three
+    /// rules keep that safe, and all three are the caller's to honour:
+    ///
+    /// 1. **Nothing under it waits for another processor.** What it guards is a
+    ///    bounded run of atomic loads and stores over one frame and one array:
+    ///    no second lock, no serial output, nothing that can fault. So a holder
+    ///    always finishes, and a spinner waits exactly that long.
+    /// 2. **No reentry.** Nothing reached under it settles the table again.
+    /// 3. **Nothing that reports is under it.** A line of serial output is
+    ///    taken with a machine-wide lock and is far longer than what this
+    ///    guards, so [`mirror_logical`] drops the guard and lets interrupts
+    ///    back in before it says anything.
     logical_lock: Mutex<()>,
     /// The logical-table slot each processor's identity is published in,
     /// indexed by roster position; [`NO_SLOT`] while it has none.
@@ -294,7 +342,7 @@ pub(crate) fn active_for(vlapic: &Vlapic) -> bool {
 fn active_face(vlapic: &Vlapic) -> Option<Face> {
     let activation = ACTIVATED.get()?;
     driven_face(
-        activation.machine_inhibited.load(Ordering::Acquire),
+        activation.machine_inhibited.load(Ordering::Relaxed),
         vlapic.mode(),
         x2avic_permitted(),
         vlapic.avic_inhibited(),
@@ -735,11 +783,14 @@ fn enable(
     // The processor may have cached a translation of the register page from
     // before the redirection existed; nothing but a flush gets rid of it.
     vcpu.flush();
-    info!(
-        "vlapic: {} turned hardware delivery on for its guest, in the {face:?} face, over {} \
-         addressable entries",
-        vlapic.index(),
-        usize::from(limit) + 1
+    transitioned(
+        vlapic,
+        Report::Accelerated,
+        format_args!(
+            "turned hardware delivery on for its guest, in the {face:?} face, over {} addressable \
+             entries",
+            usize::from(limit) + 1
+        ),
     );
     Ok(())
 }
@@ -840,9 +891,10 @@ fn disable(
     // Defensive: the unpublish belongs to the exit and the park boundaries,
     // and a demotion arriving anywhere else must not leave the bit behind.
     let _ = unpublish_running();
-    info!(
-        "vlapic: {} turned hardware delivery off for its guest",
-        vlapic.index()
+    transitioned(
+        vlapic,
+        Report::Unaccelerated,
+        format_args!("turned hardware delivery off for its guest"),
     );
     if standing.life.carried() {
         sync_into_model(activation, vlapic)?;
@@ -939,13 +991,44 @@ fn switch(
             .union(CleanBits::PERMISSION_MAPS),
     );
     vcpu.flush();
-    info!(
-        "vlapic: {} moved hardware delivery from the {from:?} face to the {to:?} face, over {} \
-         addressable entries",
-        vlapic.index(),
-        usize::from(limit) + 1
+    transitioned(
+        vlapic,
+        Report::FaceMoved,
+        format_args!(
+            "moved hardware delivery from the {from:?} face to the {to:?} face, over {} \
+             addressable entries",
+            usize::from(limit) + 1
+        ),
     );
     Ok(())
+}
+
+/// Says what a transition did, once per controller for each kind of transition,
+/// and traces every one after it.
+///
+/// How often these happen is the guest's own choice. The register that decides
+/// which face its controller answers through is a model-specific register this
+/// hypervisor never stops intercepting, so a write of it that moves the face is
+/// a legal exit a guest may take in a loop — and each of these lines leaves
+/// through a polled serial register taken with a machine-wide lock, from inside
+/// the entry callback with both interrupt flags clear, which costs orders of
+/// magnitude more than the exit that asked for it. Unlatched, that is a denial
+/// of service rather than a diagnostic, and it is the shape every other
+/// repeated report in this crate has already been given.
+///
+/// One line per controller per kind of transition is also the whole of what the
+/// line is for: a bring-up reads as one activation per processor, and what the
+/// line says needs no repeating to stay true.
+fn transitioned(vlapic: &Vlapic, report: Report, what: fmt::Arguments) {
+    if vlapic.diagnostics().say(report) {
+        info!(
+            "vlapic: {} {what}; later transitions of this kind on this controller are traced \
+             rather than reported",
+            vlapic.index()
+        );
+        return;
+    }
+    trace!("vlapic: {} {what}", vlapic.index());
 }
 
 /// Says this processor is in the guest, at the entry boundary.
@@ -956,6 +1039,11 @@ fn switch(
 /// request that lands between the two is one the entry's own look, or the
 /// VMRUN's re-evaluation, still finds.
 ///
+/// Sequentially consistent, as the withdrawal and the rescan after it are: the
+/// module header is where that ordering is argued, and it is the same argument
+/// on both boundaries because the bit is one word two halves of one protocol
+/// agree about.
+///
 /// Nothing at all on the erratum families: the bit stays clear for the life of
 /// the machine there, and every directed IPI takes the exit it then cannot
 /// avoid. Nothing either for a processor whose identifier the face being driven
@@ -963,6 +1051,26 @@ fn switch(
 /// set there would be a promise nothing reads, and a sender that read it back
 /// would skip the wake the target does need. [`unpublish_running`] is
 /// deliberately not gated the same way — see there.
+///
+/// # Every entry, where only the park boundary needs it
+///
+/// Correctness needs the park: for every other exit the processor is entered
+/// again, and an entry re-evaluates the page — so a doorbell rung into a
+/// host-side window is dropped and nothing waits on it. What the pair costs is
+/// one locked read-modify-write each way, on a line the first eight entries of
+/// the table share and every sender's hardware reads while it resolves a
+/// destination; and it costs interrupts as well, because a peer that reads this
+/// bit clear during a brief host window takes the exit-and-kick path rather
+/// than writing a doorbell. What publishing once and clearing only at the park
+/// would buy is those two prices, and what it would spend is a target reported
+/// as running while it is in host code.
+///
+/// So which is cheaper is a measurement rather than an argument: how many kicks
+/// a guest costs against how many exits it takes, which is what the exit census
+/// now reports per processor. It stays as it is until that measurement exists,
+/// because the state it would move to is only correct on the strength of the
+/// re-evaluation above — and a wrong guess there is a parked processor with a
+/// pending interrupt and nothing to wake it.
 ///
 /// # Errors
 ///
@@ -981,7 +1089,7 @@ pub(crate) fn publish_running() -> Result<(), VlapicError> {
     }
     activation
         .entry(vlapic.apic_id())?
-        .fetch_or(IS_RUNNING, Ordering::Release);
+        .fetch_or(IS_RUNNING, Ordering::SeqCst);
     Ok(())
 }
 
@@ -995,6 +1103,12 @@ pub(crate) fn publish_running() -> Result<(), VlapicError> {
 /// entry after this exit re-evaluates it. A sender that reads it clear has the
 /// target reported as not running instead, and the rescan after this is what
 /// finds whatever the kick that follows is for.
+///
+/// Sequentially consistent, and this is the half of that pairing the park
+/// protocol turns on: this store and the first load of the rescan that follows
+/// it are a store-then-load against a hardware reader doing the same to the
+/// same two locations in the other order. The module header is where the
+/// argument is, and [`deliverable`] is the rescan.
 ///
 /// Judged against the table's own extent rather than the face's limit, which is
 /// the asymmetry with [`publish_running`] and is deliberate: a bit is only ever
@@ -1016,7 +1130,7 @@ pub(crate) fn unpublish_running() -> Result<(), VlapicError> {
     let vlapic = current()?;
     activation
         .entry(vlapic.apic_id())?
-        .fetch_and(!IS_RUNNING, Ordering::Release);
+        .fetch_and(!IS_RUNNING, Ordering::SeqCst);
     Ok(())
 }
 
@@ -1071,8 +1185,12 @@ fn unpublish_entry(activation: &Activation, vlapic: &Vlapic) -> Result<(), Vlapi
 
 /// Whether the processor `id` is in the guest at this instant.
 ///
-/// An Acquire load, pairing with the publisher's Release: whatever the
-/// publisher stored before withdrawing is visible to whatever this decides.
+/// An Acquire load, which is all a decision made on the host side needs: the
+/// publisher's read-modify-write is sequentially consistent and so includes the
+/// release this pairs with, and nothing here is one half of the store-then-load
+/// the module header argues about — the caller has just been told by the
+/// hardware that the target was not running, and this narrows a wake rather
+/// than deciding whether one is owed at all.
 /// A processor the table does not hold is not running anywhere.
 ///
 /// # Errors
@@ -1186,8 +1304,12 @@ pub(crate) fn hand_over() -> Result<(), VlapicError> {
 /// at this instant.
 ///
 /// The second half of the park protocol: asked after the running bit was
-/// withdrawn and before the processor parks, with Acquire loads so that a
-/// request published before the withdrawal is one this scan sees. The
+/// withdrawn and before the processor parks, with sequentially consistent loads
+/// so that a request published before the withdrawal is one this scan sees. The
+/// module header is where that ordering is argued; every load of this scan
+/// takes part in it rather than only the first, because one ordering for the
+/// whole scan is one policy where an exception would be a second. On this
+/// processor they are the plain moves an Acquire load already was. The
 /// comparison is the architecture's own — the highest request against the
 /// processor priority the backing TPR and in-service state impose.
 ///
@@ -1226,22 +1348,22 @@ pub(crate) fn deliverable() -> Result<bool, VlapicError> {
     let page = activation.page(vlapic.index().get())?;
     let spurious = activation
         .word(page, Register::SPURIOUS.offset())?
-        .load(Ordering::Acquire);
+        .load(Ordering::SeqCst);
     if spurious & SOFTWARE_ENABLE == 0 {
         return Ok(false);
     }
     let task = activation
         .word(page, Register::TASK_PRIORITY.offset())?
-        .load(Ordering::Acquire);
+        .load(Ordering::SeqCst);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "only the low byte of the task priority register carries meaning"
     )]
     let task = task as u8;
-    let servicing = activation.highest(page, Register::IN_SERVICE, Ordering::Acquire)?;
+    let servicing = activation.highest(page, Register::IN_SERVICE, Ordering::SeqCst)?;
     let processor = priority::processor_priority(Priority::new(task), servicing);
     Ok(activation
-        .highest(page, Register::INTERRUPT_REQUEST, Ordering::Acquire)?
+        .highest(page, Register::INTERRUPT_REQUEST, Ordering::SeqCst)?
         .is_some_and(|vector| priority::deliverable(vector, processor)))
 }
 
@@ -1618,19 +1740,17 @@ pub(crate) fn hand_back(vlapic: &Vlapic) -> Result<(), VlapicError> {
 /// For the reports that say the acceleration itself cannot be trusted:
 /// destinations resolving somewhere the guest did not name them, or an exit
 /// the architecture has no reason to raise.
+///
+/// The exchange is Relaxed, as every access to the flag is: what it orders is
+/// nothing but the line below, and the flag itself is the whole of what any
+/// other processor reads.
 pub(crate) fn inhibit_machine(reason: &str) {
     let Some(activation) = ACTIVATED.get() else {
         return;
     };
-    if !activation.machine_inhibited.swap(true, Ordering::AcqRel) {
+    if !activation.machine_inhibited.swap(true, Ordering::Relaxed) {
         warn!("vlapic: hardware delivery inhibited for the machine: {reason}");
     }
-}
-
-/// How many host-interrupt kicks the AVIC paths have sent, for the exit
-/// census.
-pub(crate) fn kick_count() -> u64 {
-    crate::delivery::avic::kicks()
 }
 
 impl Activation {
@@ -2065,7 +2185,9 @@ fn eoi_vector(
 ///
 /// Whole aligned words are what move, so a resolution racing this reads the old
 /// entry, the new one, or no entry — a delivery, a delivery, or an exit the
-/// handlers complete.
+/// handlers complete. Which of the three it cannot be is two entries naming
+/// this processor, and [`publish_logical`] is where the ordering that rules
+/// that out is argued.
 ///
 /// # Errors
 ///
@@ -2081,31 +2203,42 @@ fn mirror_logical(vlapic: &Vlapic, face: Option<Face>) -> Result<(), VlapicError
         vlapic.destination_format(),
     );
     let entry = |slot: usize| activation.logical(slot);
-    let guard = activation.logical_lock.lock();
-    withdraw(record, entry)?;
-    // Asked of the other controllers' models rather than of their published
-    // slots, because a controller the hardware does not drive still answers to
-    // its logical identifier — the software delivers to it — and an entry
-    // published for the one of them the hardware can reach is one the hardware
-    // resolves with no exit at all, leaving the other with nothing.
-    let claimant = match wanted {
-        None => None,
-        Some(slot) => registry::lapics()?
-            .all()
-            .iter()
-            .find(|peer| peer.index() != vlapic.index() && claims(peer, slot)),
-    };
-    let published = publication(wanted, claimant.is_some());
-    match published {
-        Publish::Nothing => {}
-        Publish::Take(slot) => publish_logical(record, slot, vlapic.apic_id(), entry)?,
-        Publish::Contested(slot) => disclaim(&activation.logical_slots, slot, entry)?,
-    }
-    drop(guard);
-    // Outside the lock: a byte of serial output leaves through a polled register
-    // and every other processor that logs waits behind the same lock while it
-    // goes out.
-    if let (Publish::Contested(slot), Some(peer)) = (published, claimant) {
+    // Host interrupts off for the whole of the critical section, on this path as
+    // on the transitions that reach it with both flags already clear: a holder
+    // that could be interrupted is every spinner stalled for as long as the
+    // handler runs, and one of those spinners is inside an entry callback and
+    // answering nothing. What the section may contain for that to be safe is
+    // three rules, and they are stated where the lock is declared.
+    let settled = interrupts::without_interrupts(
+        || -> Result<(Publish, Option<&'static Vlapic>), VlapicError> {
+            let _guard = activation.logical_lock.lock();
+            withdraw(record, entry)?;
+            // Asked of the other controllers' models rather than of their
+            // published slots, because a controller the hardware does not drive
+            // still answers to its logical identifier — the software delivers to
+            // it — and an entry published for the one of them the hardware can
+            // reach is one the hardware resolves with no exit at all, leaving
+            // the other with nothing.
+            let claimant = match wanted {
+                None => None,
+                Some(slot) => registry::lapics()?
+                    .all()
+                    .iter()
+                    .find(|peer| peer.index() != vlapic.index() && claims(peer, slot)),
+            };
+            let published = publication(wanted, claimant.is_some());
+            match published {
+                Publish::Nothing => {}
+                Publish::Take(slot) => publish_logical(record, slot, vlapic.apic_id(), entry)?,
+                Publish::Contested(slot) => disclaim(&activation.logical_slots, slot, entry)?,
+            }
+            Ok((published, claimant))
+        },
+    )?;
+    // Outside the lock, and outside the window the interrupts were held off for:
+    // a byte of serial output leaves through a polled register and every other
+    // processor that logs waits behind the same lock while it goes out.
+    if let (Publish::Contested(slot), Some(peer)) = settled {
         say_aliased(peer.index(), vlapic.index(), slot);
     }
     Ok(())
@@ -2216,6 +2349,19 @@ fn withdraw<'a>(
 /// the invalidate: the record and the entry are one fact, and a failure must
 /// leave the record describing the table rather than an intention.
 ///
+/// # The store is Release, for a reader that is not a thread
+///
+/// The invariant it buys is the table's own: a processor's old entry is
+/// invalidated before its new one appears, so nothing resolving a logical
+/// destination ever finds two entries naming one processor. Those are stores to
+/// two different words, and Relaxed constrains only each word's own
+/// modification order — so nothing in the model would keep them in that order,
+/// and the lock above does not help. It orders this processor against other
+/// *processors*, and the reader here is the AVIC hardware of any core, which
+/// takes no lock and participates in no happens-before. A Release store is what
+/// forbids the earlier invalidate being moved after this one, and it is the
+/// whole of what is needed: the record store below is read only under the lock.
+///
 /// # Errors
 ///
 /// As [`withdraw`].
@@ -2232,7 +2378,7 @@ fn publish_logical<'a>(
     let named = LogicalApicEntry::new()
         .with_guest_apic_id(id.get() as u8)
         .with_valid(true);
-    entry(slot)?.store(named.into_bits(), Ordering::Relaxed);
+    entry(slot)?.store(named.into_bits(), Ordering::Release);
     record.store(recorded(slot), Ordering::Relaxed);
     Ok(())
 }

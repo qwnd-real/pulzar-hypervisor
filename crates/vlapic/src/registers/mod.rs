@@ -141,14 +141,16 @@ pub(crate) struct Vlapic {
     /// Whether this controller has been demoted back to software delivery by
     /// something the hardware-driven path reported.
     ///
-    /// Set Release by whichever exit handler discovered the trouble, read
-    /// Acquire at every entry, where the control block's enable bit follows
-    /// it; a stale "not inhibited" read costs one more accelerated entry
-    /// before the demotion takes effect, and never more.
+    /// Set by whichever exit handler discovered the trouble and read at every
+    /// entry, where the control block's enable bit follows it — both on the
+    /// processor this controller belongs to, which is the only one that touches
+    /// it. Relaxed: it publishes nothing but itself, and a stale "not
+    /// inhibited" read is not a state it can be in.
     avic_inhibited: AtomicBool,
     /// What has happened to this controller and what it has already said about
-    /// it. Diagnostic only: nothing above reads it back except the report that
-    /// writes it and [`crate::describe`].
+    /// it. Diagnostic only: nothing above reads it back but the report that
+    /// writes it, [`crate::describe`], and the exit census, which names what
+    /// this processor sent between one summary and the next.
     diagnostics: Diagnostics,
     /// The last selection state `Vlapic::report` logged, packed into one word
     /// by that function, so a controller whose answer has not changed stays

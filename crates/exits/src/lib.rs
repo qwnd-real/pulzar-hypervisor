@@ -473,7 +473,8 @@ impl<'a> Exits<'a> {
         }
         // Published last, when everything the entry prepared is in place and
         // the guest is about to run: from here until the exit, another
-        // processor delivering an IPI may ring this one rather than exit.
+        // processor's own hardware may resolve an interprocessor interrupt to
+        // this one and announce it without raising an exit on either side.
         if driving.publishes_running() {
             let _ = vlapic::avic_publish_running();
         }
@@ -507,7 +508,9 @@ impl<'a> Exits<'a> {
         // the rescan finds, and one that landed before it was answered by
         // the exit itself. The rescan inside [`Exits::wakeable`] reads the
         // backing page wherever the control block still has the acceleration
-        // armed, which is where the request bits live.
+        // armed, which is where the request bits live. What makes that pairing
+        // an argument rather than a hope is the ordering on both of its halves,
+        // which `vlapic` states where the bit is withdrawn.
         let _ = vlapic::avic_unpublish_running();
         let vcpu = &*vcpu;
         if self.wakeable(vcpu) {

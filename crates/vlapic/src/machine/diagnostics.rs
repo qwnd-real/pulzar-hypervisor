@@ -40,7 +40,11 @@ use core::{
 
 use log::info;
 
-use crate::{hardware::sources::Refusal, machine::registry::lapics, registers::lvt::Entry};
+use crate::{
+    hardware::sources::Refusal,
+    machine::registry::{current, lapics},
+    registers::lvt::Entry,
+};
 
 /// Logs what each processor's controller is doing, and everything that has
 /// happened to it since the machine came up.
@@ -115,6 +119,12 @@ pub(crate) struct Diagnostics {
     /// Periodic timer counts raised to the shortest period this hypervisor puts
     /// on real hardware.
     clamped: AtomicU32,
+    /// Host interrupts this processor sent to make a target look at a request
+    /// the hardware left in its backing page and could not announce itself.
+    kicks: AtomicU32,
+    /// Host interrupts it sent to make a target look at a request the software
+    /// path accepted into that target's model.
+    nudges: AtomicU32,
     /// Which of the one-shot diagnostics this controller has already said, one
     /// bit per [`Report`].
     said: AtomicU32,
@@ -132,6 +142,8 @@ impl Diagnostics {
             declined: AtomicU32::new(0),
             dropped: AtomicU32::new(0),
             clamped: AtomicU32::new(0),
+            kicks: AtomicU32::new(0),
+            nudges: AtomicU32::new(0),
             said: AtomicU32::new(0),
             refusals: AtomicU32::new(0),
         }
@@ -167,6 +179,26 @@ impl Diagnostics {
         saturate(&self.clamped);
     }
 
+    /// Counts a host interrupt sent to make a target look at a request the
+    /// hardware left in its backing page.
+    ///
+    /// Counted against the *sender*, which is the processor executing this and
+    /// so the one whose cache line this word is on: how many wakes a processor
+    /// had to send is a fact about the path the sender took. What it replaces
+    /// is a machine-wide read-modify-write on the path the acceleration
+    /// exists to make cheap, made by every processor on the machine — the
+    /// same construct, and the same reason, as the arrival counter next
+    /// door.
+    pub(crate) fn kicked(&self) {
+        saturate(&self.kicks);
+    }
+
+    /// Counts a host interrupt sent to make a target look at a request the
+    /// software path accepted into its model.
+    pub(crate) fn nudged(&self) {
+        saturate(&self.nudges);
+    }
+
     /// Whether this is the first time this controller has had `report` to make,
     /// and records that it has now.
     pub(crate) fn say(&self, report: Report) -> bool {
@@ -195,8 +227,47 @@ impl Diagnostics {
             declined: self.declined.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             clamped: self.clamped.load(Ordering::Relaxed),
+            wakes: self.wakes(),
         }
     }
+
+    /// How many wakes this controller's processor has sent, cumulative.
+    pub(crate) fn wakes(&self) -> Wakes {
+        Wakes {
+            kicks: self.kicks.load(Ordering::Relaxed),
+            nudges: self.nudges.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// How many wakes this processor has sent, cumulative, by what each was for.
+///
+/// For the exit census, which reports what this processor sent between one
+/// summary and the next. Answers zeros where this processor has no controller,
+/// which is not a state a census is written in: a summary comes out of a
+/// guest's own exit, and no guest is entered before the controllers exist.
+#[must_use]
+pub fn wakes() -> Wakes {
+    current()
+        .map(|vlapic| vlapic.diagnostics().wakes())
+        .unwrap_or_default()
+}
+
+/// How many wakes one processor has sent, by what each of them was for.
+///
+/// Two transports carrying one host interrupt, and what tells them apart is
+/// which authority is holding the interrupt the target is being made to look
+/// for: a kick announces a request the *hardware* deposited in the target's
+/// backing page and could not announce itself, and a nudge announces one the
+/// *software* path accepted into the target's model. How the two divide is how
+/// much of the delivery between a guest's processors the acceleration is really
+/// taking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wakes {
+    /// Sent for a request the hardware left in a backing page.
+    pub kicks: u32,
+    /// Sent for a request the software path left in a model.
+    pub nudges: u32,
 }
 
 /// Adds one to a counter without ever wrapping.
@@ -225,6 +296,8 @@ pub(crate) struct Counts {
     dropped: u32,
     /// Periodic counts raised to the shortest period.
     clamped: u32,
+    /// Wakes this processor sent, by what each was for.
+    wakes: Wakes,
 }
 
 impl Display for Counts {
@@ -238,6 +311,8 @@ impl Display for Counts {
             (self.declined, "declined"),
             (self.dropped, "lost"),
             (self.clamped, "periods raised"),
+            (self.wakes.kicks, "kicks sent"),
+            (self.wakes.nudges, "nudges sent"),
         ] {
             if count != 0 {
                 write!(formatter, ", {count} {what}")?;
@@ -288,6 +363,12 @@ pub(crate) enum Report {
     /// The backing page could not be reached while the hardware was said to be
     /// driving this controller, so it was demoted.
     Demoted,
+    /// Hardware delivery was turned on for this controller.
+    Accelerated,
+    /// It was turned off again.
+    Unaccelerated,
+    /// It stayed on and moved between the two faces.
+    FaceMoved,
     /// An `INIT` another processor sent this one.
     InitSent,
     /// An `INIT` this processor applied to itself.
@@ -325,7 +406,7 @@ pub(crate) enum Report {
 impl Report {
     /// Every one of them, so that the word they are latched in can be shown to
     /// be wide enough and each of them shown to have a bit of its own.
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 30] = [
         Self::RefusedRead,
         Self::RefusedWrite,
         Self::IllegalRegister,
@@ -339,6 +420,9 @@ impl Report {
         Self::OutOfStep,
         Self::UnperformableAccess,
         Self::Demoted,
+        Self::Accelerated,
+        Self::Unaccelerated,
+        Self::FaceMoved,
         Self::InitSent,
         Self::Initialized,
         Self::StartupSent,
@@ -383,7 +467,7 @@ mod tests {
 
     use descriptors::Vector;
 
-    use super::{Diagnostics, Ordering, Report};
+    use super::{Diagnostics, Ordering, Report, Wakes};
     use crate::{hardware::sources::Refusal, registers::lvt::Entry};
 
     #[test]
@@ -431,9 +515,33 @@ mod tests {
         diagnostics.declined();
         diagnostics.dropped();
         diagnostics.clamped();
+        diagnostics.kicked();
+        diagnostics.nudged();
         assert_eq!(
             format!("{}", diagnostics.counts()),
-            "2 arrivals, 1 level triggered, 1 declined, 1 lost, 1 periods raised"
+            "2 arrivals, 1 level triggered, 1 declined, 1 lost, 1 periods raised, 1 kicks sent, 1 \
+             nudges sent"
+        );
+    }
+
+    #[test]
+    fn a_processors_wakes_are_counted_by_what_each_of_them_was_for() {
+        // Two transports carrying one host interrupt, told apart because which
+        // authority is holding the interrupt decides whether the target finds it
+        // in a backing page or in a model. A machine-wide word could say how many
+        // wakes the machine sent and nothing about either question.
+        let diagnostics = Diagnostics::new();
+        assert_eq!(diagnostics.wakes(), Wakes::default());
+
+        diagnostics.kicked();
+        diagnostics.kicked();
+        diagnostics.nudged();
+        assert_eq!(
+            diagnostics.wakes(),
+            Wakes {
+                kicks: 2,
+                nudges: 1
+            }
         );
     }
 

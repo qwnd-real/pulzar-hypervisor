@@ -283,7 +283,7 @@ impl Vlapic {
         // reconsidered: whatever the hardware-driven path reported is state
         // of the guest that was, and the guest that comes out of the reset
         // is entitled to the acceleration.
-        self.avic_inhibited.store(false, Ordering::Release);
+        self.avic_inhibited.store(false, Ordering::Relaxed);
     }
 
     /// Publishes a set of stores as one step, as far as anything delivering
@@ -341,7 +341,7 @@ impl Vlapic {
 
     /// Whether this controller has been demoted back to software delivery.
     pub(crate) fn avic_inhibited(&self) -> bool {
-        self.avic_inhibited.load(Ordering::Acquire)
+        self.avic_inhibited.load(Ordering::Relaxed)
     }
 
     /// Demotes this controller back to software delivery.
@@ -350,8 +350,14 @@ impl Vlapic {
     /// something it cannot answer for: the control block's enable bit follows
     /// at the next entry, and the guest keeps running on the software path
     /// with no discontinuity it can see.
+    ///
+    /// Relaxed, as the read is, and that is the whole of what this flag needs:
+    /// it publishes nothing but itself — every reader acts on the boolean and
+    /// on nothing written before it — and both the write and the read are
+    /// made by the processor whose controller this is, at the exit and
+    /// entry boundaries of one guest.
     pub(crate) fn inhibit_avic(&self) {
-        self.avic_inhibited.store(true, Ordering::Release);
+        self.avic_inhibited.store(true, Ordering::Relaxed);
     }
 
     /// Allows the acceleration again, at a boundary that re-establishes the
@@ -361,7 +367,7 @@ impl Vlapic {
     /// through: the demotion is a statement about the guest that was, and a
     /// guest that walks its faces is entitled to have the decision remade.
     pub(crate) fn permit_avic(&self) {
-        self.avic_inhibited.store(false, Ordering::Release);
+        self.avic_inhibited.store(false, Ordering::Relaxed);
     }
 }
 
