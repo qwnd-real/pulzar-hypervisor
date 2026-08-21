@@ -39,6 +39,7 @@ use descriptors::Vector;
 use log::{trace, warn};
 
 use crate::{
+    avic::activation,
     delivery::{self, error},
     face::table::{Bank, Register},
     hardware::{
@@ -457,7 +458,16 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // that has stopped delivering is one whose guest cannot acknowledge what
         // real hardware is holding for it.
         Written::Disabled => settle::disabled(vlapic),
-        Written::LogicalDestination => mirror_logical_destination(vlapic),
+        // Two structures a logical destination is matched against, and the guest
+        // has moved the one register both of them follow: the real controller,
+        // because passed-through interrupts are matched against it, and the
+        // table hardware delivery resolves one through, which every accelerated
+        // processor on the machine reads whether or not this controller's own
+        // interrupts are the hardware's.
+        Written::LogicalDestination => {
+            mirror_logical_destination(vlapic);
+            settle_logical_table(vlapic);
+        }
         Written::ModeChanged(transition) => {
             // A face change is one of the two boundaries a demotion is
             // reconsidered at: the acceleration's state follows the guest's
@@ -465,6 +475,16 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
             // taken away belong to the mode that was.
             vlapic.permit_avic();
             entered(vlapic, transition);
+            // And the face is what decides whether the table hardware delivery
+            // resolves a logical destination through names this controller at
+            // all, only the older face being resolved through it. Settled here
+            // rather than left to the next entry, so that no peer resolves to an
+            // identity the guest has just given up — and only where the face
+            // really moved, because that table is machine-wide and a write
+            // naming the face already held has asked for nothing.
+            if !matches!(transition, Transition::Unchanged) {
+                settle_logical_table(vlapic);
+            }
         }
         Written::Command(command) => match lapics() {
             Ok(page) => delivery::send(vlapic, page.all(), command),
@@ -474,6 +494,23 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // controller may deliver is its error to be told about rather than the
         // receiver's — even though the two are the same controller here.
         Written::SelfIpi(vector) => self_ipi(vlapic, vector),
+    }
+}
+
+/// Brings the table hardware delivery resolves a logical destination through
+/// into agreement with this controller.
+///
+/// Two of a guest's writes move it — its logical identity, and the face that
+/// decides whether the table names this controller at all — and neither has
+/// anything to do about a failure but say so: the guest's write has succeeded
+/// architecturally, and the table is settled again at the next transition of
+/// the acceleration.
+fn settle_logical_table(vlapic: &Vlapic) {
+    if let Err(error) = activation::observe_logical_identity(vlapic) {
+        warn!(
+            "vlapic: {}'s logical identity could not be published for hardware delivery: {error}",
+            vlapic.index()
+        );
     }
 }
 

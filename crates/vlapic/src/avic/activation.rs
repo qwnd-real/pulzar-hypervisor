@@ -29,10 +29,13 @@
 //!   also Release, because a processor that observed the request without it
 //!   would read an acknowledgement's fate out of the record of an earlier
 //!   arrival — see [`request`].
-//! - The logical table is rebuilt under [`Activation::logical_lock`], held only
-//!   in the LDR/DFR handlers and never across an exit: entries move as whole
-//!   aligned words, and a processor's old entry is invalidated before its new
-//!   one is written.
+//! - The logical table is rebuilt under [`Activation::logical_lock`], which is
+//!   taken wherever an entry moves — the handlers that answer a guest's write
+//!   of its logical identity, and the transitions that change the face the
+//!   acceleration drives a controller in — and never held across an exit.
+//!   Entries move as whole aligned words, and an entry is invalidated before
+//!   another is written, so a resolution racing the rebuild reads one entry or
+//!   the other and never two naming one processor.
 //! - The inhibits are single atomic booleans, Release on the set.
 //!
 //! # And one authority
@@ -70,7 +73,7 @@ use core::{
 };
 
 use apic::REGISTER_STRIDE;
-use cpu::ApicId;
+use cpu::{ApicId, CpuIndex};
 use descriptors::Vector;
 use log::{info, warn};
 use paging::DirectMap;
@@ -164,10 +167,13 @@ struct Activation {
     machine_inhibited: AtomicBool,
     /// Held while the logical table is rebuilt, and never across an exit.
     logical_lock: Mutex<()>,
-    /// The logical-table slot each processor's identity was last published
-    /// in, indexed by roster position; [`NO_SLOT`] while it has none.
+    /// The logical-table slot each processor's identity is published in,
+    /// indexed by roster position; [`NO_SLOT`] while it has none.
     ///
-    /// Written only by the processor's own pCPU, inside the rebuild.
+    /// Written by the processor's own pCPU, and by any processor that takes a
+    /// contested entry out of the table — both under
+    /// [`Activation::logical_lock`], which is what makes a record and the entry
+    /// it names one fact rather than two.
     logical_slots: Box<[AtomicU16]>,
     /// The reset count each backing page was last rebuilt at, indexed by
     /// roster position: a model reset under an active controller is a page
@@ -446,12 +452,18 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
         // model underneath an active controller, and the page the hardware
         // serves holds the state that reset was required to destroy.
         //
+        // The logical table is settled with the page and for the same reason:
+        // the reset cleared the logical identity the entry was derived from, so
+        // an entry left behind names this processor for a destination its model
+        // no longer answers to.
+        //
         // The task priority is deliberately not carried here. It is taken at the
         // exit instead — see [`TaskPriority`] — because the model is consulted
         // between the two, and an entry is what that consultation decides on.
         Move::Steady => {
             if !standing.life.carried() {
                 rebuild_backing(activation, vlapic, standing)?;
+                mirror_logical(vlapic, want)?;
             }
             Ok(())
         }
@@ -525,6 +537,11 @@ fn face_of(vcpu: &Vcpu) -> Option<Face> {
 /// page this processor is not driving: whichever step reports one, the
 /// acceleration is left off and the entry invalid, and the next entry performs
 /// the whole transition again.
+///
+/// The logical table is published before it, and may survive a failure that the
+/// physical entry does not, which costs nothing: a logically addressed
+/// interrupt resolves through it into a physical entry that is still invalid,
+/// which is an exit the software path completes.
 fn enable(
     activation: &Activation,
     vcpu: &mut Vcpu,
@@ -537,6 +554,7 @@ fn enable(
         return Err(VlapicError::AvicRefused(invalid));
     }
     rebuild_backing(activation, vlapic, standing)?;
+    mirror_logical(vlapic, Some(face))?;
     let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
     if face == Face::X2Avic {
         vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
@@ -584,6 +602,13 @@ fn enable(
 /// back to the model, where a request would wait for the next activation to
 /// notice it.
 ///
+/// The logical table's entry goes with it, and for the same reason rather than
+/// a weaker one: that table is walked by whichever processor is resolving a
+/// logically addressed interrupt, so an entry left behind is one a peer
+/// resolves through to a controller the software is now delivering for.
+/// Withdrawn second, because the physical entry is what gates delivery and a
+/// failure reaching one table must not leave the other standing.
+///
 /// # A page of a life that has ended is not carried
 ///
 /// The carry-back runs only where the model is still the one the page was built
@@ -614,6 +639,7 @@ fn disable(
     standing: Standing,
 ) -> Result<(), VlapicError> {
     unpublish_entry(activation, vlapic)?;
+    mirror_logical(vlapic, None)?;
     let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
     if face == Face::X2Avic {
         // Setting a permission bit already set changes nothing, so the whole
@@ -651,18 +677,28 @@ fn disable(
 /// move whole — both faces read and write the same registers in it — which
 /// is what makes this a bit, a permission map and one slot rather than a
 /// deactivation and an activation. The slot is the identifier, whose shape the
-/// face decides: see [`rewrite_identifier`]. The logical table is likewise left
-/// alone: the wider face does not consult it, and the narrower one never stops
-/// finding it populated. So is this processor's entry in the physical table,
-/// which says a peer's hardware may deliver here — true across the move, and in
-/// both faces.
+/// face decides: see [`rewrite_identifier`]. So is this processor's entry in
+/// the physical table, which says a peer's hardware may deliver here — true
+/// across the move, and in both faces.
 ///
-/// What does not survive the move is how far the table may be walked, because
-/// that is the one thing about the acceleration the two faces disagree on. The
-/// new face's answer is published with the bit that selects it, and examined
-/// before either is written for the same reason [`enable`] examines its own: a
-/// block found illegal here is left in the face it was already in, which the
-/// processor has been entering all along.
+/// The logical table does not survive it, and that is the one thing about this
+/// move the table's own shape decides. Only the older face is resolved through
+/// it: the wider one derives a logical identifier from the processor's own
+/// identifier and never reads the table at all. But the table is read by
+/// whichever processor is *resolving*, whatever face the controller it resolves
+/// to is in — so a controller that has moved into the wider face and kept its
+/// entry goes on answering, through a peer still in the older face, to an
+/// eight-bit logical identifier the architecture says it no longer has. The
+/// entry is therefore settled for the face being moved to, before anything else
+/// the move touches, so that no peer resolves to an identity this controller
+/// has already given up.
+///
+/// What else does not survive the move is how far the table may be walked,
+/// because that is the one thing about the acceleration the two faces disagree
+/// on. The new face's answer is published with the bit that selects it, and
+/// examined before either is written for the same reason [`enable`] examines
+/// its own: a block found illegal here is left in the face it was already in,
+/// which the processor has been entering all along.
 ///
 /// The reset count is deliberately not recorded here, which is what leaves a
 /// stale page still stale: a face change is not a rebuild, so a model reset the
@@ -680,6 +716,7 @@ fn switch(
     if let Some(invalid) = vcpu.avic_refusal(to == Face::X2Avic, limit) {
         return Err(VlapicError::AvicRefused(invalid));
     }
+    mirror_logical(vlapic, Some(to))?;
     rewrite_identifier(activation, vlapic)?;
     // The face being moved to is the whole of what the permission map owes:
     // the same face twice is the steady state and [`move_for`] does not call
@@ -1112,12 +1149,6 @@ pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<
             for slot in mirrored(other, written) {
                 mirror_slot(activation, page, vlapic, slot)?;
             }
-            if matches!(
-                other,
-                Register::LOGICAL_DESTINATION | Register::DESTINATION_FORMAT
-            ) {
-                mirror_logical(vlapic)?;
-            }
             Ok(())
         }
     }
@@ -1546,7 +1577,6 @@ fn rebuild_backing(
         },
     )?;
     activation.rebuilt_at[vlapic.index().get()].store(standing.epoch, Ordering::Relaxed);
-    mirror_logical(vlapic)?;
     Ok(())
 }
 
@@ -1639,6 +1669,37 @@ pub(crate) fn sync_task_priority(vlapic: &Vlapic) -> Result<(), VlapicError> {
         .load(Ordering::Relaxed);
     vlapic.set_task_priority(value);
     Ok(())
+}
+
+/// Brings the logical table into agreement with this controller's model, at the
+/// exit that moved what the table is a projection of.
+///
+/// The second door to [`mirror_logical`], and the one the *software* path uses.
+/// Two writes reach it: the logical identity itself, and the face that decides
+/// whether this controller has an entry in that table at all. Both are answered
+/// here whether the hardware trapped the write or the permission map kept it,
+/// which is what makes the table follow the model rather than the acceleration
+/// — without it a controller whose interrupts are the software's reprograms its
+/// identity with no entry moved, and the table goes on naming it for an
+/// identifier it has given up, which is also what makes a second processor
+/// legitimately taking that identifier look like an alias.
+///
+/// The face is read here rather than given, because this is not a transition:
+/// nothing above has decided anything about the acceleration, so the face the
+/// hardware drives this controller in is whatever it is at the instant the
+/// write is answered.
+///
+/// Answers "nothing to do" where the structures do not exist, which is every
+/// machine the policy left on the software path.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`].
+pub(crate) fn observe_logical_identity(vlapic: &Vlapic) -> Result<(), VlapicError> {
+    if !provisioned() {
+        return Ok(());
+    }
+    mirror_logical(vlapic, active_face(vlapic))
 }
 
 /// Rewrites the one slot of the backing page whose shape a face change moves.
@@ -1774,68 +1835,277 @@ fn eoi_vector(
     }
 }
 
-/// Publishes this processor's logical identity in the table, withdrawing
-/// whatever its previous identity was first, and demotes the machine if two
-/// processors now claim one identity.
+/// Brings the logical table into agreement with what this controller's model
+/// says its logical identity is.
 ///
-/// Called under [`Activation::logical_lock`] semantics — the lock is taken
-/// here — and whole aligned words are what move, so a hardware resolution
-/// racing the rebuild sees either the old entry or the new one, and either
-/// answer is a delivery, or an exit the handlers complete.
-fn mirror_logical(vlapic: &Vlapic) -> Result<(), VlapicError> {
+/// The table is a projection of the model exactly as the backing page is, with
+/// one difference that decides its whole lifecycle: a *peer's* hardware reads
+/// it. Whichever processor is resolving a logically addressed interrupt walks
+/// it, whatever face the controller it resolves to is in — so it may not be
+/// left describing a model that has moved on, and it is settled wherever either
+/// of its two terms moves. The identity moves at the exit that answers a
+/// guest's write of it, whichever door that write came through; the face moves
+/// at the transition that arms, disarms or changes the acceleration.
+///
+/// `face` is the face the acceleration drives this controller in, given rather
+/// than read again: a caller part-way through a transition has already decided
+/// it, and a second reading would be a second answer to the question the
+/// transition is performing.
+///
+/// # Withdrawn first, and published only where the slot is this controller's
+/// alone
+///
+/// The withdrawal is unconditional, so the window in between names this
+/// processor nowhere rather than twice, and so a controller that has left the
+/// older face or lost the acceleration stops being named at all.
+///
+/// The entry is then published only where no other controller's model answers
+/// to the same slot. One entry names one processor, so two controllers claiming
+/// one logical identity is a destination this table cannot express — and rather
+/// than let the later writer overwrite the earlier one, which resolves that
+/// destination to whichever wrote last and silently strands the other, the slot
+/// is taken *out* of the table. An entry the hardware finds invalid is an exit,
+/// and the software path then completes the command against each controller's
+/// own registers, which match both of them. That costs one exit per interrupt
+/// addressed there for as long as both claim it, and nothing else: the rest of
+/// the machine goes on being delivered by the hardware.
+///
+/// Whole aligned words are what move, so a resolution racing this reads the old
+/// entry, the new one, or no entry — a delivery, a delivery, or an exit the
+/// handlers complete.
+///
+/// # Errors
+///
+/// [`VlapicError::NotProvisioned`] before provisioning,
+/// [`VlapicError::NotInstalled`] before the controllers exist, or
+/// [`VlapicError::Paging`] if the window does not reach the table.
+fn mirror_logical(vlapic: &Vlapic, face: Option<Face>) -> Result<(), VlapicError> {
     let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-    let index = vlapic.index().get();
-    let guard = activation.logical_lock.lock();
-    // Withdraw the old entry before publishing a new one, so the window in
-    // between names the processor nowhere rather than twice.
-    let previous = activation.logical_slots[index].swap(NO_SLOT, Ordering::Relaxed);
-    if previous != NO_SLOT {
-        let entry = activation.logical(usize::from(previous))?;
-        entry.fetch_and(!LOGICAL_VALID, Ordering::Relaxed);
-    }
-    let wanted = logical_slot(
+    let record = &activation.logical_slots[vlapic.index().get()];
+    let wanted = entry_slot(
+        face,
         vlapic.logical_destination(Mode::XApic),
         vlapic.destination_format(),
     );
-    if let Some(slot) = wanted {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the logical table's identity field is eight bits wide, and xAVIC identifiers are"
-        )]
-        let entry = LogicalApicEntry::new()
-            .with_guest_apic_id(vlapic.apic_id().get() as u8)
-            .with_valid(true);
-        activation
-            .logical(slot)?
-            .store(entry.into_bits(), Ordering::Relaxed);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a slot is below sixty, which sixteen bits hold with room to spare"
-        )]
-        let stored = slot as u16;
-        activation.logical_slots[index].store(stored, Ordering::Relaxed);
-    }
-    // Two processors claiming one logical identity is a resolution the
-    // hardware cannot be trusted with: the machine steps back to software
-    // delivery, where destinations are matched against each controller's own
-    // state.
-    let aliased = {
-        let mut seen = [false; LOGICAL_ENTRIES];
-        activation.logical_slots.iter().any(|slot| {
-            let claimed = slot.load(Ordering::Relaxed);
-            claimed != NO_SLOT && {
-                let taken = seen[usize::from(claimed)];
-                seen[usize::from(claimed)] = true;
-                taken
-            }
-        })
+    let entry = |slot: usize| activation.logical(slot);
+    let guard = activation.logical_lock.lock();
+    withdraw(record, entry)?;
+    // Asked of the other controllers' models rather than of their published
+    // slots, because a controller the hardware does not drive still answers to
+    // its logical identifier — the software delivers to it — and an entry
+    // published for the one of them the hardware can reach is one the hardware
+    // resolves with no exit at all, leaving the other with nothing.
+    let claimant = match wanted {
+        None => None,
+        Some(slot) => registry::lapics()?
+            .all()
+            .iter()
+            .find(|peer| peer.index() != vlapic.index() && claims(peer, slot)),
     };
+    let published = publication(wanted, claimant.is_some());
+    match published {
+        Publish::Nothing => {}
+        Publish::Take(slot) => publish_logical(record, slot, vlapic.apic_id(), entry)?,
+        Publish::Contested(slot) => disclaim(&activation.logical_slots, slot, entry)?,
+    }
     drop(guard);
-    if aliased {
-        inhibit_machine("two of the guest's processors claim one logical identity");
+    // Outside the lock: a byte of serial output leaves through a polled register
+    // and every other processor that logs waits behind the same lock while it
+    // goes out.
+    if let (Publish::Contested(slot), Some(peer)) = (published, claimant) {
+        say_aliased(peer.index(), vlapic.index(), slot);
     }
     Ok(())
 }
+
+/// The logical-table slot a controller has an entry in, out of the face the
+/// acceleration drives it in and the identity its model holds.
+///
+/// The whole of the table's lifecycle as one decision, which is why it is a
+/// function of values: only the older face is resolved through this table at
+/// all — the wider one derives a logical identifier from the processor's own
+/// identifier and never reads the table — so a controller driven in the wider
+/// face, or driven in neither, has no entry whatever identity it holds. Which
+/// makes a deactivation, a demotion, a guest disabling its controller and a
+/// move into the wider face one answer rather than four.
+///
+/// `ldr` and `dfr` are the older face's own registers, that face being the only
+/// one whose identity this table can express.
+fn entry_slot(face: Option<Face>, ldr: u32, dfr: u32) -> Option<usize> {
+    match face {
+        Some(Face::XAvic) => logical_slot(ldr, dfr),
+        Some(Face::X2Avic) | None => None,
+    }
+}
+
+/// Whether one controller's model answers to the logical-table slot `slot`.
+///
+/// The acceleration is deliberately not a term, and that asymmetry with
+/// [`entry_slot`] is the point: whether a controller has an *entry* is a
+/// question about what the hardware may deliver to it, and whether it *claims*
+/// a slot is a question about what the guest addressed — which a controller
+/// answers whether its interrupts are the hardware's or the software's. A slot
+/// published for the accelerated one of two claimants is a slot the hardware
+/// resolves without an exit, and the software claimant never hears about the
+/// interrupt at all.
+fn claims(vlapic: &Vlapic, slot: usize) -> bool {
+    matches!(vlapic.mode(), Mode::XApic)
+        && logical_slot(
+            vlapic.logical_destination(Mode::XApic),
+            vlapic.destination_format(),
+        ) == Some(slot)
+}
+
+/// What a controller's identity owes the logical table, beyond the withdrawal
+/// every settle begins with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Publish {
+    /// Nothing. The controller answers to no logical destination this table can
+    /// express, or the hardware does not drive it in the face the table is read
+    /// in.
+    Nothing,
+    /// The slot is this controller's alone, and the entry names this processor.
+    Take(usize),
+    /// Another controller's model answers to the same slot. One entry names one
+    /// processor, so the slot leaves the table instead, and every interrupt
+    /// addressed there is resolved by the software path — which matches both.
+    Contested(usize),
+}
+
+/// What the table owes, out of the slot a controller wants and whether another
+/// controller answers to that slot too.
+///
+/// Pure rather than a pair of branches inside the settle, because refusing to
+/// publish is what keeps a live entry from being overwritten, and a decision of
+/// values can be read against the three states it covers.
+const fn publication(wanted: Option<usize>, claimed_by_another: bool) -> Publish {
+    match wanted {
+        None => Publish::Nothing,
+        Some(slot) if claimed_by_another => Publish::Contested(slot),
+        Some(slot) => Publish::Take(slot),
+    }
+}
+
+/// Withdraws whatever entry a processor's record names, and stops recording
+/// one.
+///
+/// `entry` reaches one slot of the table, for the reason
+/// [`ResetImage::publish`] takes the same shape: the sequence is then
+/// exercisable over an array of words rather than over a frame a window has to
+/// reach.
+///
+/// The entry is invalidated *before* the record of it is cleared, and that
+/// order is what makes a failure safe. A table the window cannot reach leaves
+/// the entry valid — and leaves the record still naming it, so the next
+/// withdrawal tries again and another controller taking that identity is still
+/// seen taking it. Clearing the record first would leave a valid entry nothing
+/// knows about and nothing will ever clear.
+///
+/// # Errors
+///
+/// [`VlapicError::Paging`] if the window does not reach the table.
+fn withdraw<'a>(
+    record: &AtomicU16,
+    entry: impl Fn(usize) -> Result<&'a AtomicU32, VlapicError>,
+) -> Result<(), VlapicError> {
+    let previous = record.load(Ordering::Relaxed);
+    if previous == NO_SLOT {
+        return Ok(());
+    }
+    entry(usize::from(previous))?.fetch_and(!LOGICAL_VALID, Ordering::Relaxed);
+    record.store(NO_SLOT, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Publishes `slot` as the entry naming the processor `id`, and records it.
+///
+/// Recorded after the store for the reason [`withdraw`] clears its record after
+/// the invalidate: the record and the entry are one fact, and a failure must
+/// leave the record describing the table rather than an intention.
+///
+/// # Errors
+///
+/// As [`withdraw`].
+fn publish_logical<'a>(
+    record: &AtomicU16,
+    slot: usize,
+    id: ApicId,
+    entry: impl Fn(usize) -> Result<&'a AtomicU32, VlapicError>,
+) -> Result<(), VlapicError> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the logical table's identity field is eight bits wide, and xAVIC identifiers are"
+    )]
+    let named = LogicalApicEntry::new()
+        .with_guest_apic_id(id.get() as u8)
+        .with_valid(true);
+    entry(slot)?.store(named.into_bits(), Ordering::Relaxed);
+    record.store(recorded(slot), Ordering::Relaxed);
+    Ok(())
+}
+
+/// Takes a slot out of the table that two controllers' models both answer to,
+/// and stops whichever processor held it being recorded as holding it.
+///
+/// The entry goes rather than either claim, because both claims are legitimate:
+/// the two controllers really do answer to that logical identifier, and the
+/// table can name one of them. An invalid entry is what makes the hardware exit
+/// and the software path deliver to both.
+///
+/// # Errors
+///
+/// As [`withdraw`].
+fn disclaim<'a>(
+    records: &[AtomicU16],
+    slot: usize,
+    entry: impl Fn(usize) -> Result<&'a AtomicU32, VlapicError>,
+) -> Result<(), VlapicError> {
+    entry(slot)?.fetch_and(!LOGICAL_VALID, Ordering::Relaxed);
+    let held = recorded(slot);
+    for record in records {
+        if record.load(Ordering::Relaxed) == held {
+            record.store(NO_SLOT, Ordering::Relaxed);
+        }
+    }
+    Ok(())
+}
+
+/// A slot as the record of one holds it.
+///
+/// One statement of the narrowing, because two would be two spellings of the
+/// same number.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a slot is below sixty, which sixteen bits hold with room to spare"
+)]
+const fn recorded(slot: usize) -> u16 {
+    slot as u16
+}
+
+/// Says once per machine that two of the guest's processors answer to one
+/// logical destination, naming both and the entry they claim.
+///
+/// Once for the machine rather than once per controller, because the table is
+/// the machine's: a guest that alternates two identity writes would otherwise
+/// produce a line per pair of stores, each taken with a machine-wide lock held.
+/// What it reports needs no repeating to stay true — the slot is out of the
+/// table for as long as both claim it, and every interrupt addressed there is
+/// delivered by the software path.
+fn say_aliased(claimant: CpuIndex, refused: CpuIndex, slot: usize) {
+    if SAID_ALIASED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        warn!(
+            "vlapic: {refused} answers to the same logical destination as {claimant}, which one \
+             table entry cannot name: logical entry {slot} is taken out of the table, and \
+             interrupts addressed there are delivered by the software path"
+        );
+    }
+}
+
+/// Whether two processors claiming one logical destination has been reported.
+static SAID_ALIASED: AtomicBool = AtomicBool::new(false);
 
 /// The logical-table slot a logical destination names in a destination
 /// format, if it names one at all.
@@ -1862,29 +2132,57 @@ mod tests {
     //! The decisions here that need no machine: which face the acceleration
     //! drives a controller in, how far it reaches in each, which vector an
     //! acknowledgement retires and which of the two doors it came through,
-    //! which logical destinations name a table entry, which move an entry
-    //! owes the acceleration, which life the page it holds belongs to,
-    //! which of its slots a trapped write leaves owing the model's answer,
-    //! which authority an exit owes the guest's task priority to, and what
-    //! the two read-modify-writes over a physical-table entry leave of the
-    //! rest of it.
+    //! which logical destinations name a table entry, whether a controller has
+    //! one at all and what a slot two of them claim becomes, which move an
+    //! entry owes the acceleration, which life the page it holds belongs
+    //! to, which of its slots a trapped write leaves owing the model's
+    //! answer, which authority an exit owes the guest's task priority to,
+    //! and what the two read-modify-writes over a physical-table entry
+    //! leave of the rest of it.
+    //!
+    //! The logical table's own three operations are here too, and they are the
+    //! one thing in this file that touches a structure rather than deciding
+    //! something. They reach it through a closure, so a test supplies an array
+    //! of words in place of the frame — which is what makes the order of a
+    //! withdrawal's two steps, and what a failure between them leaves behind,
+    //! something a test can observe.
 
     use alloc::vec::Vec;
-    use core::iter::once;
+    use core::{
+        array::from_fn,
+        iter::once,
+        sync::atomic::{AtomicU16, AtomicU32, Ordering},
+    };
 
     use descriptors::Vector;
     use svm::avic::{MAX_PHYSICAL_ID, PhysicalApicEntry};
     use x86_64::PhysAddr;
 
     use super::{
-        Acknowledged, Entry, Face, IS_RUNNING, IS_VALID, Life, Mode, Move, Register, Standing,
-        TaskPriority, Written, driven_face, eoi_vector, face_limit, logical_slot, mirrored,
-        move_for,
+        Acknowledged, ApicId, Entry, FLAT_DESTINATION_FORMAT, Face, IS_RUNNING, IS_VALID,
+        LOGICAL_ENTRIES, LOGICAL_VALID, Life, Mode, Move, NO_SLOT, Publish, Register, Standing,
+        TaskPriority, VlapicError, Written, disclaim, driven_face, entry_slot, eoi_vector,
+        face_limit, logical_slot, mirrored, move_for, publication, publish_logical, withdraw,
     };
 
     /// Every mode a controller can be in, which is the one term of the
     /// activation gate that is not a boolean.
     const MODES: [Mode; 3] = [Mode::Disabled, Mode::XApic, Mode::X2Apic];
+
+    /// A flat logical identifier naming the third entry of the table.
+    const FLAT_THIRD: u32 = 0x0400_0000;
+
+    /// A table a test can hold: the same aligned words the window would have
+    /// reached, in an array.
+    fn table() -> [AtomicU32; LOGICAL_ENTRIES] {
+        from_fn(|_| AtomicU32::new(0))
+    }
+
+    /// A window that does not reach the table, which is the one failure these
+    /// operations have.
+    fn unreached(_: usize) -> Result<&'static AtomicU32, VlapicError> {
+        Err(VlapicError::NotProvisioned)
+    }
 
     #[test]
     fn the_acceleration_drives_the_face_of_a_mode_it_has_one_for() {
@@ -2039,6 +2337,143 @@ mod tests {
         // acceleration does with the same register.
         assert_eq!(logical_slot(0x2100_0000, 0x1FFF_FFFF), Some(8));
         assert_eq!(logical_slot(0x2100_0000, 0xEFFF_FFFF), Some(8));
+    }
+
+    #[test]
+    fn a_controller_has_a_table_entry_only_where_the_hardware_drives_it_in_the_older_face() {
+        // The table's whole lifecycle, read against the state it is decided from:
+        // the mode, the two demotions, the policy's answer about the wider face,
+        // and the identity the model holds. Only the older face is resolved
+        // through this table, so a deactivation, a demotion of this processor, a
+        // demotion of the machine, a guest switching its controller off and a
+        // move into the wider face are one answer rather than five — no entry.
+        for mode in MODES {
+            for machine_inhibited in [false, true] {
+                for x2avic in [false, true] {
+                    for inhibited in [false, true] {
+                        let face = driven_face(machine_inhibited, mode, x2avic, inhibited);
+                        assert_eq!(
+                            entry_slot(face, FLAT_THIRD, FLAT_DESTINATION_FORMAT),
+                            (face == Some(Face::XAvic)).then_some(2),
+                            "{mode:?}, machine inhibited {machine_inhibited}, x2avic {x2avic}, \
+                             inhibited {inhibited}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_in_the_older_face_is_whichever_slot_the_identity_names() {
+        // The other half of the same decision: the face admits an entry and the
+        // identity decides which one, or that there is none. Leaving the older
+        // face withdraws it whatever the identity is, and returning publishes it
+        // again from the same two registers — which is why the face is a term
+        // here rather than a reason to keep a second copy of the slot anywhere.
+        for (ldr, dfr, slot) in [
+            (0x0100_0000, FLAT_DESTINATION_FORMAT, Some(0)),
+            (0x8000_0000, FLAT_DESTINATION_FORMAT, Some(7)),
+            (0x2100_0000, 0x0FFF_FFFF, Some(8)),
+            // Two bits, and none: an identity the table cannot express, in a face
+            // that would otherwise have an entry.
+            (0x0300_0000, FLAT_DESTINATION_FORMAT, None),
+            (0, FLAT_DESTINATION_FORMAT, None),
+        ] {
+            assert_eq!(
+                entry_slot(Some(Face::XAvic), ldr, dfr),
+                slot,
+                "{ldr:#x}, {dfr:#x}"
+            );
+            assert_eq!(entry_slot(Some(Face::X2Avic), ldr, dfr), None);
+            assert_eq!(entry_slot(None, ldr, dfr), None);
+        }
+    }
+
+    #[test]
+    fn a_slot_another_controller_answers_to_is_taken_out_rather_than_taken_over() {
+        // The decision that keeps a live entry from being overwritten. One entry
+        // names one processor, so the later writer neither wins nor loses the
+        // slot: it leaves the table, the hardware exits on it, and the software
+        // path completes the command against both controllers' own registers.
+        // Overwriting instead resolved the destination to whichever wrote last
+        // and left the other with nothing.
+        assert_eq!(publication(Some(3), false), Publish::Take(3));
+        assert_eq!(publication(Some(3), true), Publish::Contested(3));
+        // Nothing to publish is nothing to contest.
+        for claimed in [false, true] {
+            assert_eq!(publication(None, claimed), Publish::Nothing);
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_that_cannot_reach_the_table_leaves_its_entry_accounted_for() {
+        // The invalidate and the record of it are two steps, and their order is
+        // what a failure between them is judged by. A record cleared first would
+        // leave a valid entry nothing knows about, nothing will ever clear, and
+        // no check of who claims a slot can see — so a second processor taking
+        // that identity would not be noticed.
+        let entries = table();
+        let reach = |slot: usize| entries.get(slot).ok_or(VlapicError::NotProvisioned);
+        let record = AtomicU16::new(5);
+        entries[5].store(LOGICAL_VALID | 0x07, Ordering::Relaxed);
+
+        assert!(withdraw(&record, unreached).is_err());
+        assert_eq!(record.load(Ordering::Relaxed), 5);
+        assert_eq!(entries[5].load(Ordering::Relaxed), LOGICAL_VALID | 0x07);
+
+        // Reached, both steps happen: the entry stops being valid and the record
+        // stops naming it. The identifier beside the bit is left alone, because
+        // an invalid entry is not a slot that has to be blanked.
+        assert!(withdraw(&record, reach).is_ok());
+        assert_eq!(record.load(Ordering::Relaxed), NO_SLOT);
+        assert_eq!(entries[5].load(Ordering::Relaxed), 0x07);
+
+        // And a processor with no entry has nothing to withdraw, so it cannot
+        // fail even where the table is out of reach.
+        assert!(withdraw(&record, unreached).is_ok());
+    }
+
+    #[test]
+    fn publishing_names_this_processor_and_records_where_it_was_named() {
+        let entries = table();
+        let reach = |slot: usize| entries.get(slot).ok_or(VlapicError::NotProvisioned);
+        let record = AtomicU16::new(NO_SLOT);
+
+        assert!(publish_logical(&record, 9, ApicId::new(0x21), reach).is_ok());
+        assert_eq!(entries[9].load(Ordering::Relaxed), LOGICAL_VALID | 0x21);
+        assert_eq!(record.load(Ordering::Relaxed), 9);
+
+        // The record follows the store for the reason the withdrawal's clear
+        // follows its invalidate: a failure leaves the record describing the
+        // table rather than an intention.
+        assert!(publish_logical(&record, 9, ApicId::new(0x21), unreached).is_err());
+        assert_eq!(record.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn a_contested_slot_leaves_the_table_and_nobody_is_recorded_as_holding_it() {
+        // What two controllers claiming one logical destination becomes. The
+        // incumbent's entry is not replaced and the newcomer's is not published:
+        // the slot is invalid, which is an exit rather than a delivery to one of
+        // them, and no record claims an entry that is no longer there.
+        let entries = table();
+        let reach = |slot: usize| entries.get(slot).ok_or(VlapicError::NotProvisioned);
+        let records = [
+            AtomicU16::new(3),
+            AtomicU16::new(NO_SLOT),
+            AtomicU16::new(7),
+        ];
+        entries[3].store(LOGICAL_VALID | 0x01, Ordering::Relaxed);
+        entries[7].store(LOGICAL_VALID | 0x02, Ordering::Relaxed);
+
+        assert!(disclaim(&records, 3, reach).is_ok());
+        assert_eq!(entries[3].load(Ordering::Relaxed), 0x01);
+        assert_eq!(records[0].load(Ordering::Relaxed), NO_SLOT);
+        // Nobody else is disturbed: one slot leaves the table, not the table.
+        assert_eq!(records[1].load(Ordering::Relaxed), NO_SLOT);
+        assert_eq!(records[2].load(Ordering::Relaxed), 7);
+        assert_eq!(entries[7].load(Ordering::Relaxed), LOGICAL_VALID | 0x02);
     }
 
     #[test]
