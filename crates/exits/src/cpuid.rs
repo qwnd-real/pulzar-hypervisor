@@ -57,9 +57,6 @@ const OSPKE: u32 = 1 << 4;
 /// extension.
 const EXTENDED_FEATURES: u32 = 0x8000_0001;
 
-/// The virtualization extension's bit in that word.
-const SVM: u32 = 1 << 2;
-
 /// The extended APIC register space's bit in the same word.
 const EXTENDED_APIC_SPACE: u32 = 1 << 3;
 
