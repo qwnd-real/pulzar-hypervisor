@@ -50,7 +50,7 @@ use crate::{
 const IMAGE_PATH: &uefi::CStr16 = cstr16!("\\pulzar.efi");
 
 /// UEFI path of the image the initial guest starts.
-const GUEST_IMAGE_PATH: &uefi::CStr16 = cstr16!("\\EFI\\limine\\limine_x64.efi");
+const GUEST_IMAGE_PATH: &uefi::CStr16 = cstr16!("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
 
 /// The loader's own image, as firmware describes it.
 ///

@@ -248,6 +248,15 @@ impl Madt {
             madt.add(kind, &table.nested(offset, length)?)?;
             offset += length;
         }
+        let before = madt.processors.len();
+        madt.processors = fold_processors(&madt.processors);
+        if madt.processors.len() != before {
+            info!(
+                "madt: {} entries repeated an identifier already described; the first \
+                 description stands",
+                before - madt.processors.len()
+            );
+        }
         Ok(madt)
     }
 
@@ -336,6 +345,88 @@ pub struct Processor {
     apic_id: u32,
     state: ProcessorState,
     x2apic: bool,
+}
+
+/// Collapses the descriptions of one identifier down to the first of them.
+///
+/// A processor may be described by a Processor Local APIC structure, by a
+/// Processor Local x2APIC structure, or several times over: firmware in the
+/// wild appends whole runs of further entries that repeat an identifier the
+/// table already described, as filler after the processors it really has. The
+/// descriptions all name one processor, so the first stands and every later
+/// description of the same identifier is dropped — whichever kinds they wear,
+/// and whether the repeat agrees with the first or not.
+///
+/// First rather than best is deliberate: nothing downstream reads the
+/// structure kind (the face a controller is addressed through comes from the
+/// processor's own base register at capture time), firmware describes its real
+/// processors before whatever it pads the table with, and a rule that picked
+/// between agreeing descriptions would need a third rule for disagreeing ones.
+/// What leaves here names each identifier exactly once, which is the shape
+/// every consumer of the roster assumes.
+fn fold_processors(processors: &[Processor]) -> Vec<Processor> {
+    let mut folded: Vec<Processor> = Vec::with_capacity(processors.len());
+    for processor in processors {
+        if !folded.iter().any(|kept| kept.apic_id == processor.apic_id) {
+            folded.push(*processor);
+        }
+    }
+    folded
+}
+
+#[cfg(test)]
+mod tests {
+    //! The fold, over tables of processors built by hand.
+
+    use alloc::{vec, vec::Vec};
+
+    use super::{Processor, ProcessorState, fold_processors};
+
+    /// One described processor.
+    fn processor(apic_id: u32, x2apic: bool) -> Processor {
+        Processor {
+            uid: apic_id,
+            apic_id,
+            state: ProcessorState::new(1),
+            x2apic,
+        }
+    }
+
+    #[test]
+    fn a_processor_described_twice_is_described_once() {
+        let both = vec![processor(0, false), processor(0, true), processor(1, false)];
+        let folded = fold_processors(&both);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].apic_id, 0);
+        // The first description stands, whichever kind wore it.
+        assert!(!folded[0].x2apic);
+        assert_eq!(folded[1].apic_id, 1);
+    }
+
+    #[test]
+    fn distinct_processors_pass_through_untouched() {
+        let machine = vec![processor(0, false), processor(1, true), processor(2, false)];
+        let folded = fold_processors(&machine);
+        assert_eq!(folded.len(), 3);
+        for (position, processor) in folded.iter().enumerate() {
+            let expected = u32::try_from(position).expect("three identifiers fit u32");
+            assert_eq!(processor.apic_id, expected);
+        }
+    }
+
+    #[test]
+    fn a_run_of_repeats_collapses_to_the_first_description() {
+        // The shape one board ships: every real processor once, then a tail of
+        // entries all repeating the first identifier.
+        let mut table = (0..16).map(|id| processor(id, false)).collect::<Vec<_>>();
+        for _ in 0..16 {
+            table.push(processor(0, true));
+        }
+        let folded = fold_processors(&table);
+        assert_eq!(folded.len(), 16);
+        assert!(folded.iter().all(|kept| kept.apic_id != 0 || kept.uid == 0));
+        assert_eq!(folded[0], processor(0, false));
+    }
 }
 
 impl Processor {
