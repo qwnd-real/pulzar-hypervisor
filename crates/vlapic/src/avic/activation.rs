@@ -24,6 +24,11 @@
 //!   interrupt-request words, which any processor may atomically OR into. The
 //!   OR is Release: it publishes the request before the doorbell or the host
 //!   interrupt that tells the target to look.
+//! - The trigger-mode words go with them. A request published into a page
+//!   carries the trigger mode the hardware classifies it by, written first and
+//!   also Release, because a processor that observed the request without it
+//!   would read an acknowledgement's fate out of the record of an earlier
+//!   arrival — see [`request`].
 //! - The logical table is rebuilt under [`Activation::logical_lock`], held only
 //!   in the LDR/DFR handlers and never across an exit: entries move as whole
 //!   aligned words, and a processor's old entry is invalidated before its new
@@ -79,13 +84,17 @@ use x86_64::PhysAddr;
 
 use crate::{
     VlapicError,
-    avic::backing::{Handover, Life, Projection, ResetImage},
+    avic::backing::{Handover, Life, Projection, ResetImage, bank_bit, publish_request},
     delivery::error,
     face::{dispatch, dispatch::Written, table::Register},
     machine::{current, registry},
     priority::{self, Priority},
     registers::{
-        FLAT_DESTINATION_FORMAT, Vlapic, base::Mode, bitmap::SLOTS, error::Errors, icr::Command,
+        FLAT_DESTINATION_FORMAT, Vlapic,
+        base::Mode,
+        bitmap::SLOTS,
+        error::Errors,
+        icr::{Command, Trigger},
         lvt::Entry,
     },
 };
@@ -846,24 +855,28 @@ pub(crate) fn is_running(id: ApicId) -> Result<bool, VlapicError> {
     Ok(activation.entry(id)?.load(Ordering::Acquire) & IS_RUNNING != 0)
 }
 
-/// Sets a vector in this processor's backing request bits: the device path's
-/// delivery under hardware-driven mode.
+/// Sets a vector in this processor's backing request bits, with the trigger
+/// mode the hardware classifies it by: the device path's delivery under
+/// hardware-driven mode.
 ///
-/// The OR is Release, so the request is published before the doorbell or the
-/// host interrupt that follows it, and idempotent, so an arrival that races
-/// itself coalesces exactly as the software path's does. Answers whether
-/// the bit was newly set.
+/// Both are Release and the request is published second, so that a processor
+/// which observes the request bit cannot then read a trigger mode from before
+/// it was set. The request is idempotent, so an arrival that races itself
+/// coalesces exactly as the software path's does; answers whether the bit was
+/// newly set.
+///
+/// What the trigger mode is for, and why the bank is written rather than added
+/// to, is [`publish_request`]'s — which is also what keeps this and
+/// [`Vlapic::accept`] from becoming two accounts of the same bank.
 ///
 /// # Errors
 ///
 /// As [`crate::read_msr`].
-pub(crate) fn request(vector: Vector) -> Result<bool, VlapicError> {
+pub(crate) fn request(vector: Vector, trigger: Trigger) -> Result<bool, VlapicError> {
     let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
     let vlapic = current()?;
     let page = activation.page(vlapic.index().get())?;
-    let word = activation.word(page, bank_offset(Register::INTERRUPT_REQUEST, vector))?;
-    let bit = 1u32 << (vector.number() % 32);
-    Ok(word.fetch_or(bit, Ordering::Release) & bit == 0)
+    publish_request(vector, trigger, |offset| activation.word(page, offset))
 }
 
 /// Hands this processor's own interrupts to the hardware that is about to
@@ -1035,10 +1048,10 @@ pub(crate) fn complete_command(command_bits: u64) -> Result<(), VlapicError> {
 pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<(), VlapicError> {
     let vlapic = current()?;
     match register {
-        // The one trap whose value is not in the page: the hardware retired
-        // the interrupt before it exited, and what is owed is the release of
-        // whatever real hardware is holding for it.
-        Register::END_OF_INTERRUPT => end_of_interrupt(vlapic, exit_vector),
+        // The one trap whose value is not in the page: what the guest wrote is
+        // not a value at all, and what is owed is the release of whatever real
+        // hardware is holding for the vector the hardware named.
+        Register::END_OF_INTERRUPT => end_of_interrupt(vlapic, Acknowledged::Trapped(exit_vector)),
         // An IPI the hardware attempted is completed by the exit it raised;
         // what can be left behind is only the delivery-status bit.
         Register::COMMAND_LOW => clear_command_busy(vlapic),
@@ -1214,7 +1227,7 @@ pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, Vlapi
         // what is owed is the acknowledgement whole: the in-service bit the
         // page holds and the release of whatever real hardware is holding.
         Register::END_OF_INTERRUPT => {
-            end_of_interrupt(vlapic, None)?;
+            end_of_interrupt(vlapic, Acknowledged::Intercepted)?;
             Ok(Written::Nothing)
         }
         Register::ERROR_STATUS => {
@@ -1254,7 +1267,9 @@ pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, Vlapi
             Ok(Written::Nothing)
         }
         // A self-interrupt is a request against one's own page, with the
-        // architecture's check of the vector performed first.
+        // architecture's check of the vector performed first. It is an edge
+        // whatever else the vector has been: this face's register carries no
+        // trigger mode, and the interrupt is complete once taken.
         Register::SELF_IPI => {
             #[expect(
                 clippy::cast_possible_truncation,
@@ -1262,7 +1277,7 @@ pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, Vlapi
             )]
             let vector = Vector::new(value as u8);
             if priority::legal(vector) {
-                request(vector)?;
+                request(vector, Trigger::Edge)?;
             } else {
                 error::noticed(
                     vlapic,
@@ -1618,55 +1633,102 @@ pub(crate) fn clear_command_busy(vlapic: &Vlapic) -> Result<(), VlapicError> {
     Ok(())
 }
 
-/// Completes the host's half of an EOI the hardware trapped.
+/// Completes the host's half of an acknowledgement the guest gave its
+/// controller while the hardware was driving it.
 ///
-/// The hardware raised the exit because the interrupt being acknowledged is
-/// level triggered, and what a level acknowledgement owes is the release of
-/// whatever real hardware is holding for the vector. The vector comes from
-/// the backing in-service bank where the delivery recorded it, with the
-/// exit's own report consulted where the two disagree — see [`eoi_vector`].
+/// What is owed is the release of whatever real hardware is holding for the
+/// vector, and — where the hardware performed no part of the write — the
+/// retirement of the in-service bit the page holds. Which vector that is comes
+/// from the backing in-service bank where the delivery recorded it, reconciled
+/// with what the hardware says it already did: see [`eoi_vector`].
 ///
-/// The in-service bit itself is cleared idempotently: whichever of the
-/// hardware and this cleared it first, the second clear is a no-op, and
-/// nothing here retires anything twice.
-fn end_of_interrupt(vlapic: &Vlapic, exit_vector: Option<u8>) -> Result<(), VlapicError> {
+/// The controller is resolved before anything is retired. The guest's own bit
+/// is the record that an acknowledgement is still to come, and consuming it and
+/// then failing to reach the controller would leave the withheld physical
+/// acknowledgement owed with nothing left that could ever produce another one —
+/// the line stays asserted for the life of the machine.
+///
+/// The in-service bit itself is cleared idempotently: whichever of the hardware
+/// and this cleared it first, the second clear is a no-op, and nothing here
+/// retires anything twice.
+fn end_of_interrupt(vlapic: &Vlapic, acknowledged: Acknowledged) -> Result<(), VlapicError> {
     let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
     let page = activation.page(vlapic.index().get())?;
     let top = activation.highest(page, Register::IN_SERVICE, Ordering::Acquire)?;
-    let Some(vector) = eoi_vector(top, exit_vector) else {
+    let owed = top.is_some_and(|vector| vlapic.ledger().owes(vector));
+    let Some(vector) = eoi_vector(top, acknowledged, owed) else {
         // An EOI with nothing in service is the architectural no-op, and a
         // guest is entitled to make one.
         return Ok(());
     };
-    if top == Some(vector) {
-        let word = activation.word(page, bank_offset(Register::IN_SERVICE, vector))?;
-        word.fetch_and(!(1u32 << (vector.number() % 32)), Ordering::AcqRel);
-    }
     let local = apic::local()?;
+    if top == Some(vector) {
+        let (within, bit) = bank_bit(vector);
+        activation
+            .word(page, Register::IN_SERVICE.offset() + within)?
+            .fetch_and(!bit, Ordering::AcqRel);
+    }
     vlapic.ledger().release(vector, &local);
     Ok(())
 }
 
-/// Which vector an EOI retired, given the in-service bank and the exit's
-/// own report.
+/// What the hardware had already done with the guest's acknowledgement by the
+/// time the host got it.
 ///
-/// The two agree wherever the hardware exited before it retired the
-/// interrupt: the bank's top is the vector. Where they disagree, the
-/// hardware had already retired the top — cleared the bit — before the exit,
-/// and the report is the only place the vector still is. A report of nothing
-/// usable falls back to the bank whatever it holds.
-fn eoi_vector(in_service_top: Option<Vector>, exit_vector: Option<u8>) -> Option<Vector> {
-    let reported = exit_vector
-        .map(Vector::new)
-        .filter(|vector| priority::legal(*vector));
-    match reported {
-        // A report that disagrees with the bank is the hardware having
-        // retired the bank's top before it exited; a report where the bank
-        // holds nothing is the only place the vector is.
-        Some(reported) if in_service_top != Some(reported) => Some(reported),
-        // The two agree, or there is no usable report: the bank's top is the
-        // answer, which is nothing at all for an empty bank.
-        _ => in_service_top,
+/// The two doors an acknowledgement reaches the host through, and they say
+/// different things about the same in-service bank — which is why the vector is
+/// decided from this rather than from the presence of a reported one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Acknowledged {
+    /// The permission map kept the access, so the hardware performed no part of
+    /// the write: the bank is exactly as the delivery left it.
+    Intercepted,
+    /// The hardware trapped the write because the vector being retired is level
+    /// triggered, reporting the vector it saw in service — or, on hardware that
+    /// leaves the field alone, reporting nothing usable.
+    Trapped(Option<u8>),
+}
+
+/// Which vector an acknowledgement retired, given the in-service bank, what the
+/// hardware had already done and whether the bank's top is a vector real
+/// hardware is owed an acknowledgement for.
+///
+/// An intercepted write is the unambiguous one: nothing has happened yet, so
+/// the bank's top is the vector the guest is acknowledging, exactly as it is
+/// for [`Vlapic::end_of_interrupt`] on the software path — and an empty bank is
+/// the architectural no-op.
+///
+/// A trapped write is the write the hardware already performed some part of,
+/// and what it reports is the vector it saw in service. Where that disagrees
+/// with the bank, the hardware retired the bank's top before it exited and the
+/// report is the only place the vector still is.
+///
+/// # A trap that reports nothing is the one ambiguous case, and the ledger
+/// decides it
+///
+/// The architecture defines the field, and hardware that leaves it alone is not
+/// ruled out; a trap carrying nothing usable is then either a vector the
+/// hardware has not retired — the bank's top, which is what should be retired —
+/// or one it has, in which case the bank's top is the *next* interrupt down and
+/// the guest is still servicing it. Nothing in the exit tells the two apart.
+///
+/// The ledger does, because a trap happens only where a trigger-mode bit is set
+/// and this hypervisor sets one only for an arrival whose physical
+/// acknowledgement it is withholding. So a top the ledger is holding a debt for
+/// is the acknowledged vector, and one it is not is a vector nothing is owed
+/// for — where acting would retire an interrupt underneath a guest that is
+/// still servicing it, and declining costs nothing that was owed.
+fn eoi_vector(
+    in_service_top: Option<Vector>,
+    acknowledged: Acknowledged,
+    owed: bool,
+) -> Option<Vector> {
+    match acknowledged {
+        Acknowledged::Intercepted => in_service_top,
+        Acknowledged::Trapped(reported) => reported
+            .map(Vector::new)
+            .filter(|vector| priority::legal(*vector))
+            .or_else(|| in_service_top.filter(|_| owed)),
     }
 }
 
@@ -1753,17 +1815,13 @@ fn logical_slot(ldr: u32, dfr: u32) -> Option<usize> {
         .then(|| cluster * 4 + members.trailing_zeros() as usize)
 }
 
-/// The offset of the bank slot a vector sits in.
-const fn bank_offset(bank: Register, vector: Vector) -> u32 {
-    bank.offset() + (vector.number() as u32 / u32::BITS) * REGISTER_STRIDE
-}
-
 #[cfg(test)]
 mod tests {
     //! The decisions here that need no machine: which face the acceleration
-    //! drives a controller in, how far it reaches in each, which vector an EOI
-    //! retired, which logical destinations name a table entry, which move an
-    //! entry owes the acceleration, which life the page it holds belongs to,
+    //! drives a controller in, how far it reaches in each, which vector an
+    //! acknowledgement retires and which of the two doors it came through,
+    //! which logical destinations name a table entry, which move an entry
+    //! owes the acceleration, which life the page it holds belongs to,
     //! which of its slots a trapped write leaves owing the model's answer,
     //! which authority an exit owes the guest's task priority to, and what
     //! the two read-modify-writes over a physical-table entry leave of the
@@ -1777,8 +1835,9 @@ mod tests {
     use x86_64::PhysAddr;
 
     use super::{
-        Entry, Face, IS_RUNNING, IS_VALID, Life, Mode, Move, Register, Standing, TaskPriority,
-        Written, driven_face, eoi_vector, face_limit, logical_slot, mirrored, move_for,
+        Acknowledged, Entry, Face, IS_RUNNING, IS_VALID, Life, Mode, Move, Register, Standing,
+        TaskPriority, Written, driven_face, eoi_vector, face_limit, logical_slot, mirrored,
+        move_for,
     };
 
     /// Every mode a controller can be in, which is the one term of the
@@ -1842,25 +1901,69 @@ mod tests {
     }
 
     #[test]
-    fn an_eoi_retires_the_in_service_top_when_the_exit_agrees_or_says_nothing() {
+    fn an_intercepted_acknowledgement_retires_what_the_bank_holds() {
+        // The hardware performed no part of the write, so the bank is exactly as
+        // the delivery left it and its top is what the guest is acknowledging —
+        // the same answer the software path's own acknowledgement gives, and it
+        // does not depend on a debt: every guest EOI in this face arrives here
+        // wherever the permission map is keeping the register.
         let top = Some(Vector::new(0x42));
-        assert_eq!(eoi_vector(top, Some(0x42)), top);
-        assert_eq!(eoi_vector(top, None), top);
-        // A report of an illegal vector is a report of nothing.
-        assert_eq!(eoi_vector(top, Some(0x05)), top);
-        assert_eq!(eoi_vector(None, None), None);
+        for owed in [false, true] {
+            assert_eq!(eoi_vector(top, Acknowledged::Intercepted, owed), top);
+            assert_eq!(eoi_vector(None, Acknowledged::Intercepted, owed), None);
+        }
     }
 
     #[test]
-    fn an_eoi_whose_report_disagrees_retires_the_report() {
-        // The bank's top has moved on, which is the hardware having retired
-        // the interrupt before it exited; the exit's own word is the only
-        // place the vector still is.
-        assert_eq!(
-            eoi_vector(Some(Vector::new(0x31)), Some(0x42)),
-            Some(Vector::new(0x42))
-        );
-        assert_eq!(eoi_vector(None, Some(0x42)), Some(Vector::new(0x42)));
+    fn a_trapped_acknowledgement_retires_the_vector_the_hardware_named() {
+        // Whatever the bank says. Where the two agree the report is the top; where
+        // they disagree the hardware retired the top before it exited and the
+        // report is the only place the vector still is. The ledger is not a term
+        // of either: the hardware has named the vector.
+        let top = Some(Vector::new(0x42));
+        for owed in [false, true] {
+            assert_eq!(
+                eoi_vector(top, Acknowledged::Trapped(Some(0x42)), owed),
+                top
+            );
+            assert_eq!(
+                eoi_vector(
+                    Some(Vector::new(0x31)),
+                    Acknowledged::Trapped(Some(0x42)),
+                    owed
+                ),
+                Some(Vector::new(0x42))
+            );
+            assert_eq!(
+                eoi_vector(None, Acknowledged::Trapped(Some(0x42)), owed),
+                Some(Vector::new(0x42))
+            );
+        }
+    }
+
+    #[test]
+    fn a_trap_that_reports_nothing_retires_only_a_vector_hardware_is_owed_for() {
+        // The one ambiguous case, and the ledger is what decides it. A report of
+        // an illegal vector is a report of nothing, exactly as an absent one is:
+        // both are hardware leaving the field alone rather than naming a vector.
+        //
+        // With a debt, the bank's top is the vector the trap was raised for — a
+        // trigger-mode bit is set only where an acknowledgement is being withheld.
+        // Without one, the top is either an interrupt the guest is still
+        // servicing, which acting on would retire underneath it, or a vector
+        // nothing is owed for, where declining costs nothing.
+        let top = Some(Vector::new(0x42));
+        for reported in [None, Some(0x00), Some(0x05)] {
+            assert_eq!(eoi_vector(top, Acknowledged::Trapped(reported), true), top);
+            assert_eq!(
+                eoi_vector(top, Acknowledged::Trapped(reported), false),
+                None
+            );
+            assert_eq!(
+                eoi_vector(None, Acknowledged::Trapped(reported), true),
+                None
+            );
+        }
     }
 
     #[test]

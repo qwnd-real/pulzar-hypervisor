@@ -1,8 +1,9 @@
 //! One backing page, in the state the hardware must find it in.
 //!
-//! Three things. The second is what keeps the first from being the whole
-//! answer, and the third is what keeps the guest's interrupts in one authority
-//! while the hardware has the page.
+//! Three things and one arrival. The second is what keeps the first from being
+//! the whole answer, the third is what keeps the guest's interrupts in one
+//! authority while the hardware has the page, and the last is what a single
+//! interrupt costs once the page is already that authority.
 //!
 //! [`ResetImage`] is the page a controller coming out of reset needs. The
 //! processor serves a number of the controller's registers out of the backing
@@ -47,6 +48,13 @@
 //! crosses into the page instead, and the model stops holding it — one
 //! authority for the three banks for as long as the acceleration is on.
 //!
+//! [`publish_request`] is that same publication for one vector, and it is where
+//! an interrupt real hardware took for a guest whose page is already the
+//! authority goes. Such an arrival never reaches the model at all, so the two
+//! banks that classify it — the trigger mode the hardware tests an
+//! acknowledgement against, and the request bit that makes it act — are written
+//! here, in the same order and for the same reason.
+//!
 //! # Neither direction may treat the page as bytes
 //!
 //! A backing page has writers other than the processor performing the
@@ -74,8 +82,12 @@ use crate::{
     VlapicError,
     face::table::{Bank, PAGE, Register},
     registers::{
-        FLAT_DESTINATION_FORMAT, SPURIOUS_RESET, Vlapic, base::Mode, bitmap::SLOTS, icr::Command,
-        lvt::Entry, xapic_word,
+        FLAT_DESTINATION_FORMAT, SPURIOUS_RESET, Vlapic,
+        base::Mode,
+        bitmap::SLOTS,
+        icr::{Command, Trigger},
+        lvt::Entry,
+        xapic_word,
     },
 };
 
@@ -244,6 +256,22 @@ fn requests(offset: u32) -> Option<usize> {
 /// is in one at all.
 fn bank_at(offset: u32) -> Option<(Bank, usize)> {
     Register::at(u64::from(offset))?.bank()
+}
+
+/// Where one vector's bit is inside a bank: how far into the bank the slot
+/// holding it sits, and the bit inside that slot's word.
+///
+/// The same `within` [`Handover::publish`] is given for a whole slot, worked
+/// out for a single vector — the three banks are eight consecutive slots
+/// apiece, and a vector is at the same distance into each of them. One answer
+/// rather than two, because a caller holding the distance without the bit is
+/// one reading the right word to modify the wrong bit of it.
+pub(super) const fn bank_bit(vector: Vector) -> (u32, u32) {
+    let number = vector.number() as u32;
+    (
+        (number / u32::BITS) * REGISTER_STRIDE,
+        1 << (number % u32::BITS),
+    )
 }
 
 /// The vector a bank slot's bit stands for.
@@ -587,9 +615,16 @@ impl Handover {
     /// raises an exit, the in-service state its priority is computed from — has
     /// to be there before it. Each store is Release for the same reason.
     ///
-    /// Every one is an OR rather than a store: the page is what the hardware
-    /// has been delivering out of, and a peer's hardware may be setting a
-    /// request bit in it at this moment.
+    /// The two banks before it are published in the order they are because the
+    /// in-service word this hand-over finds is a term of what the trigger modes
+    /// owe: see [`Handover::edges`]. That word is this processor's own to read
+    /// while its guest is stopped — the one bank another processor's hardware
+    /// writes is the requests — so the value the store answers with needs no
+    /// ordering beyond the store's own.
+    ///
+    /// Every store is a read-modify-write rather than a store of the word: the
+    /// page is what the hardware has been delivering out of, and a peer's
+    /// hardware may be setting a request bit in it at this moment.
     ///
     /// # Errors
     ///
@@ -600,9 +635,11 @@ impl Handover {
         within: u32,
         mut word: impl FnMut(u32) -> Result<&'page AtomicU32, VlapicError>,
     ) -> Result<(), VlapicError> {
-        word(Register::TRIGGER_MODE.offset() + within)?
-            .fetch_or(self.trigger_modes, Ordering::Release);
-        word(Register::IN_SERVICE.offset() + within)?.fetch_or(self.in_service, Ordering::Release);
+        let held = word(Register::IN_SERVICE.offset() + within)?
+            .fetch_or(self.in_service, Ordering::Release);
+        let trigger_mode = word(Register::TRIGGER_MODE.offset() + within)?;
+        trigger_mode.fetch_and(!self.edges(held), Ordering::Release);
+        trigger_mode.fetch_or(self.trigger_modes, Ordering::Release);
         word(Register::INTERRUPT_REQUEST.offset() + within)?
             .fetch_or(self.requests, Ordering::Release);
         Ok(())
@@ -615,6 +652,73 @@ impl Handover {
     pub(super) fn retire(self, vlapic: &Vlapic, slot: usize) {
         vlapic.handed_over(slot, self.requests, self.in_service);
     }
+
+    /// Which vectors of this slot owe the page a *cleared* trigger mode, given
+    /// the in-service word the hand-over found there.
+    ///
+    /// The ones crossing that the model records as edges, less any that will be
+    /// in service once this publication finishes — whether the page was already
+    /// holding them or this hand-over is what puts them there.
+    ///
+    /// A trigger-mode bit is the hardware's whole test of whether an
+    /// acknowledgement is performed without an exit or raises the one a
+    /// withheld physical acknowledgement is released from, and nothing but
+    /// a publication ever clears one — so an edge crossing on a vector that
+    /// arrived level earlier in this guest's life has to take the stale bit
+    /// with it, or the next acknowledgement of that vector is classified by
+    /// the record of the last.
+    ///
+    /// A vector in service is the exception, and it is the one case where
+    /// clearing would cost what the bank is for: that interrupt has been
+    /// delivered and its acknowledgement is still to come, so a bit taken away
+    /// from it now is the exit that pays real hardware not happening at all. A
+    /// model holding a further request for such a vector — an interprocessor
+    /// interrupt, which is always an edge — is describing the arrival *after*
+    /// the one in service, and the bank has one bit for both. Keeping the bit
+    /// costs an acknowledgement that exits with nothing to release; taking it
+    /// away costs a line that never fires again.
+    const fn edges(self, held: u32) -> u32 {
+        self.requests & !self.trigger_modes & !(held | self.in_service)
+    }
+}
+
+/// Publishes one arrival into a live backing page: the trigger mode the
+/// hardware classifies it by, and then the request bit that makes it act.
+///
+/// Where an interrupt real hardware took for a guest the acceleration is
+/// driving goes. `word` answers with the page's word at an offset. Answers
+/// whether the request bit was newly set, so that an arrival coalescing into
+/// one the guest has not taken yet can be told from a first.
+///
+/// The trigger mode is *written* — set for a level arrival, cleared for an edge
+/// one — which is what [`Vlapic::accept`] does to the model's own bank. The
+/// page needs the same discipline for a reason the model does not have: this is
+/// the bank the hardware tests to decide whether the guest's acknowledgement is
+/// performed without an exit or raises the one a withheld physical
+/// acknowledgement is released from, so a bit left set from an earlier level
+/// arrival would classify an edge one, and a bit left clear for a level arrival
+/// is a line real hardware holds in service for the rest of the machine's life.
+///
+/// The order the two are written in is [`Handover::publish`]'s, and is argued
+/// there.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`], from the first slot that cannot be reached — which
+/// names the frame rather than the slot.
+pub(super) fn publish_request<'page>(
+    vector: Vector,
+    trigger: Trigger,
+    mut word: impl FnMut(u32) -> Result<&'page AtomicU32, VlapicError>,
+) -> Result<bool, VlapicError> {
+    let (within, bit) = bank_bit(vector);
+    let trigger_mode = word(Register::TRIGGER_MODE.offset() + within)?;
+    match trigger {
+        Trigger::Level => trigger_mode.fetch_or(bit, Ordering::Release),
+        Trigger::Edge => trigger_mode.fetch_and(!bit, Ordering::Release),
+    };
+    let request = word(Register::INTERRUPT_REQUEST.offset() + within)?;
+    Ok(request.fetch_or(bit, Ordering::Release) & bit == 0)
 }
 
 /// One bank's eight words, taken out of the model a slot at a time.
@@ -675,9 +779,13 @@ mod tests {
     //! cover a register added to the projection without naming it again.
     //!
     //! The hand-over is asserted as the decision it is — which of a bank slot's
-    //! bits cross to the hardware and which the model keeps holding — and as
-    //! the order the ones that cross are published in, which the closure
-    //! that answers with a page slot is what observes.
+    //! bits cross to the hardware, which the model keeps holding, and which
+    //! trigger modes the crossing takes away — and as the order the ones that
+    //! cross are published in, which the closure that answers with a page slot
+    //! is what observes. One arrival's publication is asserted the same way,
+    //! and against the model's own bank as well: the bit a guest's
+    //! acknowledgement is classified by has to be the same in both, so the
+    //! two are compared word for word over the whole bank.
     //!
     //! And both page directions are asserted to lose nothing to a writer they
     //! cannot exclude. A page here is an array of atomics, which is exactly
@@ -694,11 +802,13 @@ mod tests {
 
     use super::{
         EXTENDED_LVT_FIRST, EXTENDED_LVT_SLOTS, Handover, Life, Ordering, PAGE, Projection,
-        ResetImage, SLOTS, VlapicError,
+        ResetImage, SLOTS, Trigger, Vector, VlapicError, bank_bit, publish_request,
     };
     use crate::{
         face::table::{AvicAccess, Register},
-        registers::{FLAT_DESTINATION_FORMAT, SPURIOUS_RESET, lvt::Entry, xapic_word},
+        registers::{
+            FLAT_DESTINATION_FORMAT, SPURIOUS_RESET, bitmap::Bitmap, lvt::Entry, xapic_word,
+        },
     };
 
     /// The identifier in the slot's own format, and a version word with a
@@ -709,6 +819,12 @@ mod tests {
 
     /// How many register slots one page holds.
     const SLOT_COUNT: usize = paging::as_usize(PAGE) / REGISTER_STRIDE as usize;
+
+    /// The vector an arrival is published on: a middling priority class, bit
+    /// two of the third slot of a bank, so that a word written into the
+    /// wrong slot or the wrong bit is a failure rather than a zero agreeing
+    /// with a zero.
+    const ARRIVAL: Vector = Vector::new(0x42);
 
     /// A backing page, as the words both directions move through it.
     ///
@@ -1225,6 +1341,10 @@ mod tests {
         // that decides whether its acknowledgement raises an exit and the
         // in-service state its priority is computed from are both there first.
         // The closure that answers with a page word is what can see it.
+        //
+        // The in-service bank goes first of the two, because the word it finds is
+        // what says which of the crossing vectors the hardware is still holding —
+        // and those are the ones a trigger mode may not be taken away from.
         let page = filled(0);
         let mut reached = Vec::new();
         Handover::from_words(1 << 5, 1 << 5, 1 << 7, 0)
@@ -1236,8 +1356,8 @@ mod tests {
         assert_eq!(
             reached,
             [
-                bank_word(Register::TRIGGER_MODE, 3),
                 bank_word(Register::IN_SERVICE, 3),
+                bank_word(Register::TRIGGER_MODE, 3),
                 bank_word(Register::INTERRUPT_REQUEST, 3),
             ]
         );
@@ -1247,6 +1367,94 @@ mod tests {
             holds(&page, bank_word(Register::INTERRUPT_REQUEST, 3)),
             1 << 5
         );
+    }
+
+    #[test]
+    fn a_hand_over_clears_the_trigger_modes_of_the_edges_it_crosses_and_no_others() {
+        // The decision as a value. Four vectors cross, two of them recorded level
+        // by the model; what the other two owe the page is a *cleared* bit,
+        // because nothing else ever clears one and the hardware would otherwise
+        // classify their acknowledgement by the record of an earlier arrival.
+        let crossing = Handover::from_words(0b1111, 0b0011, 0, 0);
+        assert_eq!(crossing.edges(0), 0b1100);
+        // A vector in service keeps its bit whatever the model says about the
+        // request behind it: that interrupt has been delivered and its
+        // acknowledgement is still to come, which is the one thing the bit is
+        // for. Both ways of being in service count — the page was holding it
+        // already, or this hand-over is what puts it there.
+        assert_eq!(crossing.edges(0b0100), 0b1000);
+        assert_eq!(
+            Handover::from_words(0b1111, 0b0011, 0b1000, 0).edges(0),
+            0b0100
+        );
+        assert_eq!(crossing.edges(!0), 0);
+        // Nothing crossing owes nothing, and a bit outside the crossing set is
+        // never named however the page is holding it.
+        assert_eq!(Handover::from_words(0, 0, 0, 0).edges(0), 0);
+        assert_eq!(crossing.edges(0) & !0b1111, 0);
+    }
+
+    #[test]
+    fn a_hand_over_takes_a_stale_trigger_mode_with_the_edge_it_crosses() {
+        // What the clear is for: the vector arrived level earlier in this guest's
+        // life, its debt has been settled, and the bit is still set — so an edge
+        // crossing on the same vector would be acknowledged with an exit that has
+        // nothing to release, and under a report the hardware leaves unpopulated
+        // that exit retires nothing at all.
+        let page = filled(0);
+        let stale = 1 << 3;
+        let neighbour = 1 << 9;
+        slot(&page, bank_word(Register::TRIGGER_MODE, 0))
+            .expect("a bank slot is inside the page")
+            .store(stale | neighbour, Ordering::Relaxed);
+        Handover::from_words(stale, 0, 0, 0)
+            .publish(0, |offset| slot(&page, offset))
+            .expect("a page-shaped buffer answers at every offset");
+        assert_eq!(
+            holds(&page, bank_word(Register::TRIGGER_MODE, 0)),
+            neighbour,
+            "the crossing vector's bit and no other"
+        );
+    }
+
+    #[test]
+    fn a_hand_over_leaves_the_trigger_mode_of_what_is_in_service_either_way() {
+        // The interleaving that makes the clear conditional: a level arrival whose
+        // physical acknowledgement is being withheld is in service, and the model
+        // is holding a further request for the same vector — an interprocessor
+        // interrupt, which is always an edge. Clearing the bit would be the
+        // guest's acknowledgement of the interrupt in service going out without
+        // the exit that pays real hardware, which is a line that never fires
+        // again.
+        //
+        // Asserted for both authorities of that in-service bit: the page holding
+        // it already, which is the ordinary case while the hardware drives, and
+        // the model handing it over in this same publication.
+        for (page_held, crossing) in [(true, false), (false, true)] {
+            let page = filled(0);
+            let level = 1 << 3;
+            slot(&page, bank_word(Register::TRIGGER_MODE, 0))
+                .expect("a bank slot is inside the page")
+                .store(level, Ordering::Relaxed);
+            if page_held {
+                slot(&page, bank_word(Register::IN_SERVICE, 0))
+                    .expect("a bank slot is inside the page")
+                    .store(level, Ordering::Relaxed);
+            }
+            Handover::from_words(level, 0, if crossing { level } else { 0 }, 0)
+                .publish(0, |offset| slot(&page, offset))
+                .expect("a page-shaped buffer answers at every offset");
+            assert_eq!(
+                holds(&page, bank_word(Register::TRIGGER_MODE, 0)),
+                level,
+                "page held {page_held}, crossing {crossing}"
+            );
+            assert_eq!(
+                holds(&page, bank_word(Register::INTERRUPT_REQUEST, 0)),
+                level,
+                "the request crosses either way"
+            );
+        }
     }
 
     #[test]
@@ -1275,6 +1483,98 @@ mod tests {
                 held | (1 << 2),
                 "{bank:?}"
             );
+        }
+    }
+
+    #[test]
+    fn an_arrival_publishes_its_trigger_mode_before_the_request_that_makes_it_act() {
+        // The order the hand-over states, for the one vector a device arrival
+        // publishes: the request bit is what makes the hardware act, so the bit
+        // that decides what the guest's acknowledgement of it costs is there
+        // first. Both land in the slot the vector's own bit is in.
+        let page = filled(0);
+        let mut reached = Vec::new();
+        let newly = publish_request(ARRIVAL, Trigger::Level, |offset| {
+            reached.push(offset);
+            slot(&page, offset)
+        })
+        .expect("a page-shaped buffer answers at every offset");
+        assert!(newly, "the page was holding nothing for this vector");
+        let (within, bit) = bank_bit(ARRIVAL);
+        let trigger = Register::TRIGGER_MODE.offset() + within;
+        let request = Register::INTERRUPT_REQUEST.offset() + within;
+        assert_eq!(reached, [trigger, request]);
+        assert_eq!(holds(&page, trigger), bit);
+        assert_eq!(holds(&page, request), bit);
+        assert_eq!(trigger, bank_word(Register::TRIGGER_MODE, 2));
+        assert_eq!(bit, 1 << 2, "vector 0x42 is bit two of the third slot");
+    }
+
+    #[test]
+    fn an_edge_arrival_takes_away_the_record_of_a_level_one() {
+        // Nothing else ever clears that bit, and it is the hardware's whole test
+        // of whether the guest's acknowledgement raises an exit — so an edge
+        // arrival on a vector that arrived level earlier has to take the stale bit
+        // with it. Its neighbours in the word belong to other vectors.
+        let page = filled(0);
+        let (within, bit) = bank_bit(ARRIVAL);
+        let trigger = Register::TRIGGER_MODE.offset() + within;
+        let neighbour = 1 << 7;
+        slot(&page, trigger)
+            .expect("a bank slot is inside the page")
+            .store(bit | neighbour, Ordering::Relaxed);
+        publish_request(ARRIVAL, Trigger::Edge, |offset| slot(&page, offset))
+            .expect("a page-shaped buffer answers at every offset");
+        assert_eq!(holds(&page, trigger), neighbour);
+    }
+
+    #[test]
+    fn an_arrival_that_coalesces_into_a_request_says_so() {
+        // What the model answers for the same case: a vector already requested and
+        // not yet taken is one bit and one interrupt. The trigger mode is
+        // published either way, because it classifies the arrival rather than
+        // counting arrivals — the second one here is level, and the page says so.
+        let page = filled(0);
+        let published = |trigger| {
+            publish_request(ARRIVAL, trigger, |offset| slot(&page, offset))
+                .expect("a page-shaped buffer answers at every offset")
+        };
+        assert!(published(Trigger::Edge));
+        assert!(!published(Trigger::Level));
+        let (within, bit) = bank_bit(ARRIVAL);
+        assert_eq!(holds(&page, Register::TRIGGER_MODE.offset() + within), bit);
+    }
+
+    #[test]
+    fn the_page_and_the_model_record_one_trigger_mode_for_one_arrival() {
+        // Two authorities for one bank, and they must not drift: the model's is a
+        // `Bitmap` moved the way `Vlapic::accept` moves it, the page's is moved by
+        // the publication above. A guest whose page said edge where its model said
+        // level would have the same interrupt classified one way by the hardware
+        // and settled the other — the difference between an acknowledgement that
+        // pays real hardware and one that is swallowed.
+        //
+        // Compared word for word over the whole bank, so a vector published into
+        // another slot fails here rather than agreeing with whatever was there.
+        for trigger in [Trigger::Edge, Trigger::Level] {
+            let page = filled(0);
+            let model = Bitmap::new();
+            for vector in [Vector::new(0x10), ARRIVAL, Vector::new(0xFF)] {
+                publish_request(vector, trigger, |offset| slot(&page, offset))
+                    .expect("a page-shaped buffer answers at every offset");
+                match trigger {
+                    Trigger::Level => model.set(vector),
+                    Trigger::Edge => model.clear(vector),
+                };
+            }
+            for bank in 0..SLOTS {
+                let word = u32::try_from(bank).expect("eight slots");
+                assert_eq!(
+                    holds(&page, bank_word(Register::TRIGGER_MODE, word)),
+                    model.slot(bank).expect("the bank has eight slots"),
+                    "{trigger:?}, slot {bank}"
+                );
+            }
         }
     }
 }

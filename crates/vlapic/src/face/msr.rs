@@ -138,12 +138,22 @@ pub fn intercepted() -> impl Iterator<Item = u32> {
 /// The complement of [`intercepted`]'s hold on the same range: interception
 /// has priority over the acceleration — an access this set does not name
 /// exits even while the hardware drives — so everything not named here stays
-/// guarded. What is named is the set the silicon accelerates whole, in the
-/// directions it accelerates them: the task priority either way, and the
-/// three writes the hardware performs without help — the acknowledgement, the
-/// interrupt command and the self-interrupt. The command's read is kept for
-/// the host deliberately: it answers live state, and the exit is the only
-/// place the host sees one.
+/// guarded. What is named is the set the silicon answers in the directions it
+/// answers them: the task priority either way, and three writes it performs
+/// itself — the acknowledgement, the interrupt command and the self-interrupt.
+/// The command's read is kept for the host deliberately: it answers live state,
+/// and the exit is the only place the host sees one.
+///
+/// Two of those three writes are answered whole only for part of what a guest
+/// may write, and the acknowledgement is the one this hypervisor depends on:
+/// the hardware performs it without an exit for an edge-triggered interrupt and
+/// traps it where the vector being retired is level triggered, which is the
+/// exit a withheld physical acknowledgement is released from. The trap is
+/// therefore load-bearing rather than incidental, and what makes it fire is the
+/// trigger-mode bank of the backing page, which
+/// [`crate::avic::activation::request`] maintains — with a test pinning the two
+/// moving together, because passing this register through without that bank is
+/// the acceleration swallowing every acknowledgement the ledger is waiting for.
 ///
 /// One symbol holds the whole of the policy, which is what lets a machine's
 /// measurement widen or narrow it without touching the transitions that
@@ -539,9 +549,15 @@ mod tests {
     fn the_passthrough_set_is_the_accelerated_accesses_and_nothing_else() {
         // Written out as literals so that an access moving fails a test rather
         // than moving with it: the task priority in both directions, and the
-        // three writes the hardware performs whole. The command's read is
+        // three writes the hardware performs itself. The command's read is
         // deliberately absent — it answers live state, and the exit is where
         // the host sees one.
+        //
+        // The acknowledgement is the entry that costs something if it is wrong
+        // in either direction: taking it out is an exit on every interrupt the
+        // guest finishes, and leaving it in without the trigger-mode bank that
+        // makes a level acknowledgement trap is every withheld physical
+        // acknowledgement lost.
         assert!(passthrough().eq([
             MsrPassthrough::both(0x808),
             MsrPassthrough::writes(0x80B),

@@ -44,7 +44,10 @@ use crate::{
     avic::activation,
     delivery::{doorbell, targets},
     machine::{current, ownership, registry},
-    registers::{Vlapic, icr::Command},
+    registers::{
+        Vlapic,
+        icr::{Command, Trigger},
+    },
 };
 
 /// Host-interrupt kicks sent by these paths, cumulative.
@@ -225,13 +228,16 @@ fn kick(from: &Vlapic, target: &Vlapic) {
 /// Gives one processor an interrupt that arrived for its guest through real
 /// hardware, while its controller is driven by the acceleration.
 ///
-/// The request is left in the backing page, where the hardware reads it, and
-/// the target is told about it by whichever signal its state calls for: the
-/// hardware doorbell for one in the guest, the host interrupt for one that is
-/// not. What real hardware is owed is decided exactly as the software path
-/// decides it — a level arrival below the host's own class keeps its
-/// acknowledgement until the guest's, and everything else is acknowledged at
-/// once.
+/// The request is left in the backing page, where the hardware reads it. What
+/// real hardware is owed is decided exactly as the software path decides it — a
+/// level arrival below the host's own class keeps its acknowledgement until the
+/// guest's, and everything else is acknowledged at once — and the same decision
+/// is what the page is told: the trigger mode published with the request is
+/// level for the arrival whose acknowledgement is being withheld and edge for
+/// every other, because that bit is what makes the guest's own acknowledgement
+/// raise the exit this hypervisor pays real hardware from. An arrival already
+/// acknowledged owes nothing and is handed over as the edge it now is, which is
+/// what [`crate::lifecycle::arrival`] gives the model for the same case.
 ///
 /// # Errors
 ///
@@ -251,14 +257,16 @@ pub(crate) fn arrive(
         );
         return Ok(());
     }
-    if crate::lifecycle::arrival::withholdable(vector, level) {
+    let trigger = if crate::lifecycle::arrival::withholdable(vector, level) {
         // The debt is recorded before the request is published, so that a
         // guest which acknowledges immediately finds the debt already there.
         vlapic.ledger().owe(vector);
+        Trigger::Level
     } else {
         local.end_of_interrupt();
-    }
-    let requested = activation::request(vector)?;
+        Trigger::Edge
+    };
+    let requested = activation::request(vector, trigger)?;
     if !requested {
         trace!(
             "vlapic: {vector} coalesced into {}'s backing page",
