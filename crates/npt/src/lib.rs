@@ -122,7 +122,7 @@
 extern crate alloc;
 
 mod map;
-mod walk;
+mod tree;
 
 use log::{error, info};
 use paging::{DirectMap, Frames, chunk};
@@ -137,7 +137,7 @@ use x86_64::{
 pub use crate::map::{Access, Kind, MapError, Range, RegionTag, Trap, Verdict};
 use crate::{
     map::Map,
-    walk::{Level, Meeting, PARENT},
+    tree::walk::{self, Level, Meeting, PARENT},
 };
 
 /// One guest's nested page tables.
