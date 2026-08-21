@@ -157,7 +157,7 @@ pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
         result = processor::cpuid(leaf, subleaf);
     }
     if leaf == EXTENDED_FEATURES {
-        result.ecx &= !(SVM | EXTENDED_APIC_SPACE);
+        result.ecx &= !EXTENDED_APIC_SPACE;
     }
     if leaf == STANDARD_FEATURES {
         result.ecx &= !HYPERVISOR_PRESENT;
