@@ -35,10 +35,10 @@ pub(crate) struct Census {
     sparse: [(ExitCode, u32); Self::SPARSE],
     /// How many of [`Census::sparse`] are in use.
     sparse_used: usize,
-    /// Incomplete inter-processor deliveries, indexed by the failure the
-    /// hardware reported: the two exits the acceleration raises deserve a
-    /// finer account than their code alone, because it is the cause that
-    /// says whether the machine is healthy.
+    /// Incomplete inter-processor deliveries, indexed by the bucket the
+    /// identifier the hardware reported falls in: the two exits the
+    /// acceleration raises deserve a finer account than their code alone,
+    /// because it is the cause that says whether the machine is healthy.
     incomplete_ipi: [u32; Self::IPI_FAILURES],
     /// Unaccelerated register accesses, indexed by the slot of the register
     /// page they named: which register a guest cannot touch accelerated is
@@ -71,8 +71,16 @@ impl Census {
     /// stuck repeats one or two; the rest of the distribution is noise.
     const NAMED: usize = 6;
 
-    /// How many failures an incomplete delivery can report.
-    const IPI_FAILURES: usize = 6;
+    /// How many buckets an incomplete delivery is counted in: one per failure
+    /// the architecture defines, and [`Census::UNDEFINED_IPI`] beyond them.
+    const IPI_FAILURES: usize = 7;
+
+    /// The bucket an identifier the architecture does not define is counted in.
+    ///
+    /// Its index *is* such an identifier — the first one — which is what lets
+    /// the summary name every bucket through the same decoder that refuses this
+    /// one, rather than through a second table that could disagree with it.
+    const UNDEFINED_IPI: usize = 6;
 
     /// How many register slots the unaccelerated counts distinguish: the
     /// page's offset shifted past its four zero bits.
@@ -134,8 +142,19 @@ impl Census {
 
     /// Counts an incomplete inter-processor delivery by the failure the
     /// hardware reported.
-    pub(crate) fn incomplete_ipi(&mut self, cause: IpiFailure) {
-        let index = cause.into_bits() as usize;
+    ///
+    /// Keyed on the raw identifier rather than on the decoded cause, because
+    /// the decoder answers an undefined identifier with the cause whose
+    /// treatment is safe for a request nothing models — the right answer
+    /// for the handler and the wrong one here. Such an identifier is
+    /// silicon describing something this hypervisor was not built for, and
+    /// counted as the commonest legitimate cause it is the one thing in the
+    /// summary a reader could not see.
+    pub(crate) fn incomplete_ipi(&mut self, reported: u32) {
+        let index = match IpiFailure::from_bits(reported) {
+            Some(cause) => cause.into_bits() as usize,
+            None => Self::UNDEFINED_IPI,
+        };
         if let Some(count) = self.incomplete_ipi.get_mut(index) {
             *count = count.saturating_add(1);
         }
@@ -174,14 +193,24 @@ impl Census {
         // registers it still touches by hand, and how many of its targets the
         // hardware could not tell on its own — which is the measure of how much
         // of the work the acceleration is really taking.
-        for (id, count) in self.incomplete_ipi.iter().enumerate() {
-            if *count > 0 {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "the index came from an array the failure count fits in"
-                )]
-                let cause = IpiFailure::from_bits(id as u32);
-                info!("exits:   {count} incomplete IPI, cause {cause:?}");
+        for (bucket, count) in self.incomplete_ipi.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the index came from an array the failure count fits in"
+            )]
+            let cause = IpiFailure::from_bits(bucket as u32);
+            match cause {
+                Some(cause) => info!("exits:   {count} incomplete IPI, cause {cause:?}"),
+                // The bucket the decoder refuses, which is where an identifier
+                // it refused was counted. Named rather than printed as an
+                // absent cause, because this is the one line an operator reads
+                // on a machine with no console.
+                None => info!(
+                    "exits:   {count} incomplete IPI of a cause the architecture does not define"
+                ),
             }
         }
         for (slot, count) in self.noaccel.iter().enumerate() {
@@ -232,6 +261,77 @@ impl Census {
                 entry.1 = 0;
                 return;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Which bucket an incomplete delivery is counted in, which is the one
+    //! decision here that needs no guest: everything else this type does is
+    //! counting, and what it counts is an exit code the architecture assigns.
+
+    use svm::avic::IpiFailure;
+
+    use super::Census;
+
+    /// How often a bucket has been counted.
+    fn counted(census: &Census, bucket: usize) -> u32 {
+        census.incomplete_ipi[bucket]
+    }
+
+    #[test]
+    fn each_defined_cause_is_counted_in_its_own_bucket() {
+        let mut census = Census::new();
+        for cause in [
+            IpiFailure::InvalidInterruptType,
+            IpiFailure::TargetNotRunning,
+            IpiFailure::InvalidTarget,
+            IpiFailure::InvalidBackingPage,
+            IpiFailure::InvalidIpiVector,
+            IpiFailure::UnacceleratedIpi,
+        ] {
+            census.incomplete_ipi(cause.into_bits());
+            assert_eq!(counted(&census, cause.into_bits() as usize), 1, "{cause:?}");
+        }
+    }
+
+    #[test]
+    fn an_undefined_cause_is_told_from_the_commonest_one() {
+        // The decoder answers an undefined identifier with the invalid-type
+        // cause, which is the safe treatment for a request nothing models and
+        // would be an invisible defect here: a machine reporting a failure this
+        // hypervisor does not model would be indistinguishable in the summary
+        // from the cause almost every healthy guest produces most of.
+        let mut census = Census::new();
+        for reported in [6, 7, 0x1FF, u32::MAX] {
+            census.incomplete_ipi(reported);
+        }
+        assert_eq!(counted(&census, Census::UNDEFINED_IPI), 4);
+        assert_eq!(
+            counted(
+                &census,
+                IpiFailure::InvalidInterruptType.into_bits() as usize
+            ),
+            0,
+            "the cause the decoder substitutes must not have been counted"
+        );
+    }
+
+    #[test]
+    fn the_undefined_bucket_is_an_identifier_the_architecture_leaves_undefined() {
+        // What lets the summary name every bucket through the decoder rather
+        // than through a second table: the bucket the undefined identifiers are
+        // counted in is itself one the decoder refuses, so the line it produces
+        // says "undefined" without anything having to remember which index that
+        // was.
+        let bucket = u32::try_from(Census::UNDEFINED_IPI).expect("a bucket index is small");
+        assert_eq!(IpiFailure::from_bits(bucket), None);
+        assert_eq!(Census::UNDEFINED_IPI, Census::IPI_FAILURES - 1);
+        // And every bucket below it is a cause the decoder does name, so no
+        // defined cause shares the undefined one's line.
+        for defined in 0..bucket {
+            assert!(IpiFailure::from_bits(defined).is_some(), "{defined}");
         }
     }
 }

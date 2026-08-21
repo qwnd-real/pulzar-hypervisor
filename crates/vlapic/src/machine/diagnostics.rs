@@ -279,6 +279,9 @@ pub(crate) enum Report {
     /// A doorbell that could not be sent, so a target will not look at its
     /// controller until it exits for another reason.
     Undelivered,
+    /// An exit only hardware delivery raises, taken while the software is the
+    /// authority for this controller.
+    OutOfStep,
     /// An `INIT` another processor sent this one.
     InitSent,
     /// An `INIT` this processor applied to itself.
@@ -316,7 +319,7 @@ pub(crate) enum Report {
 impl Report {
     /// Every one of them, so that the word they are latched in can be shown to
     /// be wide enough and each of them shown to have a bit of its own.
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 25] = [
         Self::RefusedRead,
         Self::RefusedWrite,
         Self::IllegalRegister,
@@ -327,6 +330,7 @@ impl Report {
         Self::Unaccepted,
         Self::Resetting,
         Self::Undelivered,
+        Self::OutOfStep,
         Self::InitSent,
         Self::Initialized,
         Self::StartupSent,

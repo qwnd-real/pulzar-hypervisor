@@ -855,6 +855,28 @@ pub(crate) fn is_running(id: ApicId) -> Result<bool, VlapicError> {
     Ok(activation.entry(id)?.load(Ordering::Acquire) & IS_RUNNING != 0)
 }
 
+/// What this hypervisor believes the physical table holds at `index`.
+///
+/// For the one report that has to be readable against the table it accuses. The
+/// hardware reporting an entry that names an unusable backing page is reporting
+/// something about a structure nothing but this hypervisor writes, and the
+/// value is what tells the two possibilities apart: an entry this hypervisor
+/// never described, which is a table walked further than it was built for, or
+/// one it described with a page the processor then refused.
+///
+/// # Errors
+///
+/// [`VlapicError::NotProvisioned`] before provisioning,
+/// [`VlapicError::IdBeyondTable`] for an index the table does not hold, or
+/// [`VlapicError::Paging`] if the window does not reach the table.
+pub(crate) fn physical_entry(index: u16) -> Result<PhysicalApicEntry, VlapicError> {
+    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
+    let bits = activation
+        .entry(ApicId::new(u32::from(index)))?
+        .load(Ordering::Acquire);
+    Ok(PhysicalApicEntry::from_bits(bits))
+}
+
 /// Sets a vector in this processor's backing request bits, with the trigger
 /// mode the hardware classifies it by: the device path's delivery under
 /// hardware-driven mode.
@@ -1052,9 +1074,29 @@ pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<
         // not a value at all, and what is owed is the release of whatever real
         // hardware is holding for the vector the hardware named.
         Register::END_OF_INTERRUPT => end_of_interrupt(vlapic, Acknowledged::Trapped(exit_vector)),
-        // An IPI the hardware attempted is completed by the exit it raised;
-        // what can be left behind is only the delivery-status bit.
-        Register::COMMAND_LOW => clear_command_busy(vlapic),
+        // A command reported through this exit is a command the hardware did
+        // *not* accelerate — the trap is raised where the acceleration ran out —
+        // so the delivery is the software path's whole business and there is no
+        // second attempt to collide with. The value is the page's two halves,
+        // which is where the trap left the guest's own write and the only place
+        // it is: this exit reports an offset rather than a value.
+        //
+        // Which is what the intercepted write of the same register does with it,
+        // and the two doors to it have to agree. A trap answered with the
+        // delivery-status bit alone drops the interrupt outright, and clearing
+        // that bit is what stops the guest even waiting for it.
+        Register::COMMAND_LOW => {
+            let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
+            let page = activation.page(vlapic.index().get())?;
+            let half = |register: Register| -> Result<u32, VlapicError> {
+                Ok(activation
+                    .word(page, register.offset())?
+                    .load(Ordering::Acquire))
+            };
+            let command =
+                Command::from_halves(half(Register::COMMAND_LOW)?, half(Register::COMMAND_HIGH)?);
+            complete_command(command.bits())
+        }
         other => {
             let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
             let page = activation.page(vlapic.index().get())?;

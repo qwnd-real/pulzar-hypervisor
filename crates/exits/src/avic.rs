@@ -36,10 +36,12 @@ use crate::{census::Census, nested};
 pub(crate) fn incomplete_ipi(vcpu: &Vcpu, census: &mut Census) -> Flow {
     let control = vcpu.control();
     let exit = IncompleteIpiExit::from_exit_info(control.exit_info_1, control.exit_info_2);
-    census.incomplete_ipi(exit.cause());
+    census.incomplete_ipi(exit.reported());
     trace!(
-        "exits: an interrupt the hardware delivers stopped: {:?}, icr {:#018x}, index {:#x}",
+        "exits: an interrupt the hardware delivers stopped: {:?} (identifier {}), icr {:#018x}, \
+         index {:#x}",
         exit.cause(),
+        exit.reported(),
         exit.icr(),
         exit.index()
     );

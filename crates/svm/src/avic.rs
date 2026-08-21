@@ -213,13 +213,15 @@ impl IpiFailure {
 ///
 /// The interrupt the guest asked for, decoded whole out of the two
 /// exit-information fields: the request itself as the controller's command
-/// register would have taken it, why the hardware could not deliver it, and
-/// the destination the tables were consulted for where the cause is one about
-/// a destination.
+/// register would have taken it, why the hardware could not deliver it — as the
+/// cause a handler acts on and as the encoding the hardware actually named —
+/// and the destination the tables were consulted for where the cause is one
+/// about a destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IncompleteIpiExit {
     icr: u64,
     cause: IpiFailure,
+    reported: u32,
     index: u16,
 }
 
@@ -231,15 +233,21 @@ impl IncompleteIpiExit {
     /// define decodes as [`IpiFailure::InvalidInterruptType`], because full
     /// software emulation is the one answer that is safe for a request
     /// nothing else understands.
+    ///
+    /// The encoding is kept beside the cause it decoded to, because that
+    /// substitution is safe for a handler and wrong for anything counting: see
+    /// [`IncompleteIpiExit::reported`].
     #[must_use]
     pub const fn from_exit_info(exit_info_1: u64, exit_info_2: u64) -> Self {
-        let cause = match IpiFailure::from_bits((exit_info_2 >> u32::BITS) as u32) {
+        let reported = (exit_info_2 >> u32::BITS) as u32;
+        let cause = match IpiFailure::from_bits(reported) {
             Some(cause) => cause,
             None => IpiFailure::InvalidInterruptType,
         };
         Self {
             icr: exit_info_1,
             cause,
+            reported,
             index: (exit_info_2 & INDEX_MASK) as u16,
         }
     }
@@ -255,6 +263,22 @@ impl IncompleteIpiExit {
     #[must_use]
     pub const fn cause(&self) -> IpiFailure {
         self.cause
+    }
+
+    /// The encoding the hardware named the failure by, whether or not the
+    /// architecture defines one.
+    ///
+    /// [`IncompleteIpiExit::cause`] answers what a *handler* should do, and an
+    /// undefined encoding is deliberately answered there as the cause whose
+    /// treatment is safe for a request nothing understands. That substitution
+    /// is wrong for anything that counts or reports: an encoding above the
+    /// defined range is silicon describing something this hypervisor does
+    /// not model, and a log in which it is indistinguishable from the
+    /// commonest legitimate cause hides the one machine worth knowing
+    /// about.
+    #[must_use]
+    pub const fn reported(&self) -> u32 {
+        self.reported
     }
 
     /// The destination the tables were consulted for. Only the causes about a
@@ -443,6 +467,7 @@ mod tests {
         );
         assert_eq!(exit.icr(), icr);
         assert_eq!(exit.cause(), IpiFailure::TargetNotRunning);
+        assert_eq!(exit.reported(), IpiFailure::TargetNotRunning.into_bits());
         assert_eq!(exit.index(), 0x1FE);
     }
 
@@ -456,12 +481,30 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_cause_decodes_as_full_emulation() {
-        let exit = IncompleteIpiExit::from_exit_info(
-            0,
-            exit_info_2(IpiFailure::TargetNotRunning, 0) | (7 << u32::BITS),
-        );
-        assert_eq!(exit.cause(), IpiFailure::InvalidInterruptType);
+    fn an_unknown_cause_decodes_as_full_emulation_and_keeps_its_encoding() {
+        // The substitution is what a handler needs — emulating the request whole
+        // is the one answer that is safe for something nothing here models — and
+        // it is exactly what a count of it must not inherit, or the encoding
+        // arrives in the log as the commonest legitimate cause. So both are
+        // carried, and this is what says they are two answers rather than one.
+        for reported in [6, 7, u32::MAX] {
+            let exit =
+                IncompleteIpiExit::from_exit_info(0, u64::from(reported) << u32::BITS | 0x1FE);
+            assert_eq!(exit.cause(), IpiFailure::InvalidInterruptType);
+            assert_eq!(exit.reported(), reported);
+            assert_eq!(IpiFailure::from_bits(exit.reported()), None);
+            assert_eq!(exit.index(), 0x1FE, "the index is decoded either way");
+        }
+        // And a defined encoding is the cause itself, so nothing reads the two
+        // apart where the architecture named the failure.
+        for cause in [
+            IpiFailure::InvalidInterruptType,
+            IpiFailure::UnacceleratedIpi,
+        ] {
+            let exit = IncompleteIpiExit::from_exit_info(0, exit_info_2(cause, 0));
+            assert_eq!(exit.cause(), cause);
+            assert_eq!(IpiFailure::from_bits(exit.reported()), Some(cause));
+        }
     }
 
     #[test]
