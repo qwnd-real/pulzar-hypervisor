@@ -63,10 +63,20 @@ bitflags! {
         const PERMISSION_MAPS = 1 << 1;
         /// The address-space identifier translations are tagged with.
         const ASID = 1 << 2;
-        /// The whole virtual interrupt control register: the guest's task
-        /// priority, whether an interrupt is pending for it, that interrupt's
-        /// priority and vector, whether the task priority is ignored, and
-        /// whether interrupt masking is virtualized.
+        /// The whole virtual interrupt control register, which is one quadword
+        /// and so one group: the guest's task priority, whether an interrupt is
+        /// pending for it, that interrupt's priority and vector, whether the task
+        /// priority is ignored, the guest's own global interrupt flag and the bit
+        /// that gives it one, its pending and masked non-maskable-interrupt state
+        /// and the bit that virtualizes that masking, whether interrupt masking
+        /// is virtualized at all — and the two bits that turn hardware-driven
+        /// interrupt delivery on and choose which of its two faces it drives.
+        ///
+        /// Those last two are the ones worth naming, because the mistake this
+        /// architecture warns about is reading them as the acceleration's own
+        /// group. They are here and not in [`CleanBits::AVIC`], so software that
+        /// turns the acceleration on or off and clears only that bit has told the
+        /// processor it may reuse the word it just edited.
         const INTERRUPT = 1 << 3;
         /// Nested paging: the root of the second set of page tables and the
         /// guest's page attribute table.
@@ -89,9 +99,15 @@ bitflags! {
         /// The guest's branch-record state: its debug control register, and the
         /// addresses the last branch and last interrupt came from and went to.
         const LAST_BRANCH = 1 << 10;
-        /// Everything locating the guest's hardware-driven interrupt
-        /// controller: the register base, the backing page, and the physical
-        /// and logical table pointers.
+        /// Where the guest's hardware-driven interrupt controller is, and only
+        /// that: the register base, the backing page, the physical and logical
+        /// table pointers, and the largest index of the physical table, which
+        /// the architecture keeps in the low bits of that table's own pointer.
+        ///
+        /// Nothing here says whether the acceleration is *on* — the two enable
+        /// bits are [`CleanBits::INTERRUPT`]'s — so the two groups are not
+        /// interchangeable, and a transition that moves a pointer and an enable
+        /// bit owes both.
         const AVIC = 1 << 11;
         /// The guest's control-flow enforcement state: its supervisor control
         /// register, shadow stack pointer, and interrupt shadow stack table

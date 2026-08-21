@@ -244,10 +244,11 @@ pub(crate) enum Access {
 /// the controller, which is what an unaccelerated-access exit has to know to
 /// answer one.
 ///
-/// The classification is the architecture's own table, transcribed once
-/// here: an access the hardware performs without help never exits, one it
-/// completes before it exits is owed the bookkeeping after the store, and
-/// one it refused is owed the instruction it did not finish.
+/// The classification is the architecture's own table, transcribed once here,
+/// cell by cell and in both directions: an access the hardware performs without
+/// help never exits, one it completes before it exits is owed the bookkeeping
+/// after the store, and one it refused is owed the instruction it did not
+/// finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AvicAccess {
     /// Performed by the hardware with no exit at all. An exit naming one is
@@ -267,49 +268,81 @@ impl Register {
     /// What the hardware made of one access to this register.
     ///
     /// The two directions are classified apart because the table is not
-    /// symmetric: almost every register is served for a read — the backing
-    /// page answers it — while the writes are where the hardware's help runs
-    /// out. The task priority is the one write the hardware performs whole;
-    /// the command and the end-of-interrupt are performed in part, and trap
-    /// where the part runs out; the identifier and destination registers, the
-    /// six local vector table entries the table names, the spurious vector, the
-    /// error status and the timer's configuration complete into the page and
-    /// trap for the bookkeeping's sake; and whatever is not one of those
-    /// faults, which is the accesses the hardware never implements — the
-    /// priority reports, the vector banks as writes, the timer's remaining
-    /// count.
+    /// symmetric. Almost every read is served out of the backing page; the two
+    /// that are not are the registers no page holds a value for — the
+    /// arbitration priority and the timer's remaining count, both of which the
+    /// architecture has the hardware compute rather than store. The writes are
+    /// where the hardware's help runs out: the task priority is the one it
+    /// performs whole, the command and the acknowledgement are performed in
+    /// part and trap where the part runs out, the identifier and
+    /// destination registers, the six local vector table entries the table
+    /// names, the spurious vector, the error status and the timer's count
+    /// and divide complete into the page and trap for the bookkeeping's
+    /// sake, and the version, the priority reports and the three vector
+    /// banks fault.
     ///
     /// # An offset the table does not name is served out of the page
     ///
     /// The architecture assigns a behaviour per register and then says that
     /// every other location of the backing page may be read and written
-    /// directly. The corrected-machine-check entry is such a location — there
-    /// is no row between the error status and the interrupt command — so the
-    /// hardware performs a guest's write to it against the page and raises no
-    /// exit at all, which is why it is classified here with the task priority
-    /// rather than with the six entries that trap.
+    /// directly. That is not a corner: it is the reserved slots between the
+    /// named registers, the destination half of the interrupt command — whose
+    /// write the architecture allows outright, having no immediate side effect
+    /// — and the corrected-machine-check entry, which has no row between
+    /// the error status and the interrupt command. Each of them is
+    /// classified here with the task priority rather than with the entries
+    /// that trap.
     ///
-    /// Two deviations follow, and neither has an exit to be answered at. The
-    /// model is never told what the guest wrote to that entry, so the source
-    /// real hardware is programmed from stays whatever the model holds: one the
-    /// guest armed does not deliver, and one it disarmed is not stopped. And a
-    /// write to a reserved slot between the error status and that entry lands
-    /// in the page instead of recording an illegal-register error.
+    /// Two deviations follow from the corrected-machine-check cell, and neither
+    /// has an exit to be answered at. The model is never told what the guest
+    /// wrote to that entry, so the source real hardware is programmed from
+    /// stays whatever the model holds: one the guest armed does not
+    /// deliver, and one it disarmed is not stopped. And a write to a
+    /// reserved slot between the error status and that entry lands in the
+    /// page instead of recording an illegal-register error.
+    ///
+    /// # The extended space is the one a processor without it presents
+    ///
+    /// The architecture gives the extended register space above `0x400` two
+    /// rows: on a processor reporting `CPUID Fn8000_000A_EDX[27]` the eight
+    /// extended interrupt-LVT registers are read out of the page and their
+    /// writes trap, and on one that does not both directions fault, as they do
+    /// for the extended feature, control and specific-acknowledgement registers
+    /// and the interrupt-enable bank on every processor.
+    ///
+    /// The second row is the one stated here, because it is the controller this
+    /// crate presents: the capability bit is cleared, the version register does
+    /// not announce the space, and every offset of it is a reserved address
+    /// through both faces — see this module's own limitations. Nothing decides
+    /// the cell from a feature bit, so a processor that does report it traps a
+    /// write the table calls a fault; what that costs is in the report for the
+    /// work that stated this row, and closing it needs the bit plumbed here and
+    /// a model for eight registers this crate deliberately does not offer.
     pub(crate) const fn avic_access(self, write: bool) -> AvicAccess {
         if !write {
-            // One read faults: the arbitration priority is a computation no
-            // backing page holds. Every other read the page answers.
-            return if self.0 == 0x90 {
-                AvicAccess::Fault
-            } else {
-                AvicAccess::Accelerated
+            return match self.0 {
+                // The two registers the architecture has the hardware compute
+                // rather than keep in the page, so a read has nothing there to be
+                // answered out of; and the extended space, as a processor without
+                // it presents it.
+                0x90 | 0x390 | 0x400..=0x420 | 0x480..=0xFFF => AvicAccess::Fault,
+                _ => AvicAccess::Accelerated,
             };
         }
         match self.0 {
-            0x80 | 0x2F0 => AvicAccess::Accelerated,
-            0x20 | 0xB0 | 0xC0 | 0xD0 | 0xE0 | 0xF0 | 0x280 | 0x300 | 0x320 | 0x330 | 0x340
-            | 0x350 | 0x360 | 0x370 | 0x380 | 0x3E0 => AvicAccess::Trap,
-            _ => AvicAccess::Fault,
+            0x20 | 0xB0 | 0xC0 | 0xD0 | 0xE0 | 0xF0 | 0x280 | 0x300 | 0x320..=0x380 | 0x3E0 => {
+                AvicAccess::Trap
+            }
+            // The version, the two priority reports the hardware maintains
+            // itself, the three vector banks, the timer's remaining count, and
+            // the extended space.
+            0x30 | 0x90 | 0xA0 | 0x100..=0x270 | 0x390 | 0x400..=0x420 | 0x480..=0xFFF => {
+                AvicAccess::Fault
+            }
+            // The task priority, the destination half of the command, the
+            // self-interrupt register the wider face adds, and every location
+            // the architecture's table does not name.
+            _ => AvicAccess::Accelerated,
         }
     }
 }
@@ -710,28 +743,14 @@ mod tests {
     }
 
     #[test]
-    fn a_write_to_an_offset_the_table_does_not_name_raises_no_exit() {
-        // The corrected-machine-check entry sits between the error status and
-        // the interrupt command, where the architecture's table has no row at
-        // all — and a location it does not name is one the hardware lets the
-        // access complete against the backing page. So no exit can be raised for
-        // it, and a trap classification would claim bookkeeping for a write this
-        // hypervisor is never told about.
-        assert_eq!(
-            Register::LVT_CORRECTED_MACHINE_CHECK.avic_access(true),
-            AvicAccess::Accelerated
-        );
-    }
-
-    #[test]
     fn the_trap_writes_are_the_ones_completed_before_the_exit() {
-        // The identifier and destination registers, the spurious vector, the
-        // error status, the command, every local vector entry the table
-        // names, and the timer's count and divide — each written out rather
-        // than derived, so that a register added without a decision here
-        // fails a test rather than being classified by a fall-through. The
-        // corrected-machine-check entry is deliberately not among them: the
-        // table names no behaviour for it, which is the test above.
+        // The one arm the exit path consults, named register by register rather
+        // than by offset: a register dropped from this set is a write the
+        // hardware completes into the page with the model never told about it,
+        // and one added is bookkeeping run for an access the guest is still
+        // sitting at. The corrected-machine-check entry is deliberately not among
+        // them — the architecture's table has no row for it at all, which is the
+        // named-cell test below.
         for register in [
             Register::ID,
             Register::END_OF_INTERRUPT,
@@ -754,49 +773,188 @@ mod tests {
         }
     }
 
+    /// The architecture's own table for what the hardware does with a guest
+    /// access to each register, transcribed as offset ranges that cover the
+    /// whole page exactly once and in order, with the read cell and then the
+    /// write cell of each.
+    ///
+    /// Every bound is a literal, because a table is the one kind of code a
+    /// wrong hex digit survives review in. The locations the architecture
+    /// leaves *out* of its table are rows here too, because "every other
+    /// location may be read and written" is a cell like any other — and it
+    /// is the cell that answers the corrected-machine-check entry, the
+    /// destination half of the interrupt command, and every reserved slot
+    /// between named registers.
+    const AVIC_MATRIX: [(u64, u64, AvicAccess, AvicAccess); 22] = [
+        // Not in the architecture's table.
+        (
+            0x000,
+            0x010,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // The identifier: read out of the page, write trapped for the
+        // bookkeeping the model owes.
+        (0x020, 0x020, AvicAccess::Accelerated, AvicAccess::Trap),
+        // The version, which nothing may write.
+        (0x030, 0x030, AvicAccess::Accelerated, AvicAccess::Fault),
+        (
+            0x040,
+            0x070,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // The task priority, the one write the hardware performs whole.
+        (
+            0x080,
+            0x080,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // The arbitration priority: computed rather than stored, so neither
+        // direction has a slot of the page to use.
+        (0x090, 0x090, AvicAccess::Fault, AvicAccess::Fault),
+        // The processor priority, which the hardware maintains in the page.
+        (0x0A0, 0x0A0, AvicAccess::Accelerated, AvicAccess::Fault),
+        // The acknowledgement: exitless for an edge-triggered vector, trapped
+        // for a level-triggered one.
+        (0x0B0, 0x0B0, AvicAccess::Accelerated, AvicAccess::Trap),
+        // Remote read, the logical destination, the destination format and the
+        // spurious vector.
+        (0x0C0, 0x0F0, AvicAccess::Accelerated, AvicAccess::Trap),
+        // The three vector banks, which no guest may write.
+        (0x100, 0x270, AvicAccess::Accelerated, AvicAccess::Fault),
+        // The error status, whose write is what latches it.
+        (0x280, 0x280, AvicAccess::Accelerated, AvicAccess::Trap),
+        // Reserved slots and the corrected-machine-check entry, none of which
+        // the table names.
+        (
+            0x290,
+            0x2F0,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // The command's low half: accelerated for a fixed edge delivery and
+        // trapped for the rest, which is one cell either way.
+        (0x300, 0x300, AvicAccess::Accelerated, AvicAccess::Trap),
+        // Its destination half, allowed outright because writing it has no
+        // immediate side effect.
+        (
+            0x310,
+            0x310,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // Six local vector entries and the timer's initial count.
+        (0x320, 0x380, AvicAccess::Accelerated, AvicAccess::Trap),
+        // The timer's remaining count: computed rather than stored, like the
+        // arbitration priority.
+        (0x390, 0x390, AvicAccess::Fault, AvicAccess::Fault),
+        (
+            0x3A0,
+            0x3D0,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // The timer's divide.
+        (0x3E0, 0x3E0, AvicAccess::Accelerated, AvicAccess::Trap),
+        // The self-interrupt register the wider face adds, whose write the
+        // architecture allows the hardware to perform.
+        (
+            0x3F0,
+            0x3F0,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // The extended feature and control registers and the specific
+        // acknowledgement.
+        (0x400, 0x420, AvicAccess::Fault, AvicAccess::Fault),
+        (
+            0x430,
+            0x470,
+            AvicAccess::Accelerated,
+            AvicAccess::Accelerated,
+        ),
+        // The interrupt-enable bank, the extended interrupt-LVT block as a
+        // processor without it presents it, and the reserved tail.
+        (0x480, 0xFF0, AvicAccess::Fault, AvicAccess::Fault),
+    ];
+
     #[test]
-    fn the_fault_writes_are_the_ones_the_hardware_never_performs() {
-        for register in [
-            Register::VERSION,
-            Register::ARBITRATION_PRIORITY,
-            Register::PROCESSOR_PRIORITY,
-            Register::IN_SERVICE,
-            Register::TRIGGER_MODE,
-            Register::INTERRUPT_REQUEST,
-            Register::COMMAND_HIGH,
-            Register::TIMER_CURRENT_COUNT,
-            Register::SELF_IPI,
-        ] {
-            assert_eq!(
-                register.avic_access(true),
-                AvicAccess::Fault,
-                "{register:?}"
-            );
-        }
-        // Every slot of every bank, not merely the first of each.
-        for offset in 0x100..0x280 {
-            if let Some(register) = Register::at(offset) {
-                assert_eq!(
-                    register.avic_access(true),
-                    AvicAccess::Fault,
-                    "{register:?}"
-                );
-            }
+    fn every_cell_of_the_architectures_table_is_the_one_this_table_answers() {
+        // Both directions of every register slot of the page, against the
+        // transcription rather than against a second implementation of it.
+        for offset in (0x000..PAGE).step_by(REGISTER_STRIDE as usize) {
+            let register = Register::at(offset).expect("an aligned offset inside the page");
+            let (.., read, write) = AVIC_MATRIX
+                .into_iter()
+                .find(|(first, last, ..)| (*first..=*last).contains(&offset))
+                .expect("the transcription covers the page");
+            assert_eq!(register.avic_access(false), read, "read of {offset:#x}");
+            assert_eq!(register.avic_access(true), write, "write of {offset:#x}");
         }
     }
 
     #[test]
-    fn almost_every_read_is_served_out_of_the_backing_page() {
-        for offset in (0x000..PAGE).step_by(REGISTER_STRIDE as usize) {
-            let Some(register) = Register::at(offset) else {
-                continue;
-            };
-            let expected = if register == Register::ARBITRATION_PRIORITY {
-                AvicAccess::Fault
-            } else {
-                AvicAccess::Accelerated
-            };
-            assert_eq!(register.avic_access(false), expected, "{register:?}");
+    fn the_transcription_covers_the_page_once_and_in_order() {
+        // A row overlapping its neighbour would let one cell be asserted twice
+        // and another not at all, and a gap would leave a cell unasserted — both
+        // of which the sweep above cannot notice, because it looks each offset
+        // up rather than walking the rows.
+        let mut expected = 0x000;
+        for (first, last, ..) in AVIC_MATRIX {
+            assert_eq!(first, expected, "{first:#x} does not follow {expected:#x}");
+            assert!(first <= last, "{first:#x}");
+            for bound in [first, last] {
+                assert!(
+                    bound.is_multiple_of(u64::from(REGISTER_STRIDE)),
+                    "{bound:#x}"
+                );
+            }
+            expected = last + u64::from(REGISTER_STRIDE);
+        }
+        assert_eq!(expected, PAGE);
+    }
+
+    #[test]
+    fn the_cells_a_reader_is_likeliest_to_take_for_a_mistake() {
+        // The cells the architecture states and a reader would expect to be
+        // otherwise, named here as well as covered by the sweep because each of
+        // them is a place this table was wrong before it was read against the
+        // architecture's cell by cell.
+        //
+        // The corrected-machine-check entry has no row at all, so the hardware
+        // performs a guest's write to it against the page with no exit: a trap
+        // classification claimed bookkeeping that could never run.
+        assert_eq!(
+            Register::LVT_CORRECTED_MACHINE_CHECK.avic_access(true),
+            AvicAccess::Accelerated
+        );
+        // The destination half of the interrupt command is allowed in both
+        // directions, because writing it has no immediate side effect — the
+        // send is the low half's.
+        assert_eq!(
+            Register::COMMAND_HIGH.avic_access(true),
+            AvicAccess::Accelerated
+        );
+        // The self-interrupt register is a write the hardware performs, which is
+        // why the wider face's permission map hands it to the guest.
+        assert_eq!(
+            Register::SELF_IPI.avic_access(true),
+            AvicAccess::Accelerated
+        );
+        // And the timer's remaining count is the faulting read a real guest
+        // performs: the hardware computes it rather than keeping it in the page,
+        // exactly as it does the arbitration priority.
+        for register in [
+            Register::TIMER_CURRENT_COUNT,
+            Register::ARBITRATION_PRIORITY,
+        ] {
+            assert_eq!(
+                register.avic_access(false),
+                AvicAccess::Fault,
+                "{register:?}"
+            );
         }
     }
 }

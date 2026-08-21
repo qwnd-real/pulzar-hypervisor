@@ -39,10 +39,11 @@ use crate::{census::Census, nested};
 ///
 /// The exit is trap-like — the processor has already stepped the guest past
 /// the request — and the finishing is [`vlapic`]'s, keyed by the failure the
-/// hardware reported. Always resumes: every rule either completes the
-/// interrupt in software or wakes whoever the hardware already delivered to,
-/// and a failure of either is logged rather than visited on the guest, which
-/// keeps running on whichever path still works.
+/// hardware reported. Always resumes: every rule either completes the interrupt
+/// in software, wakes whoever the hardware already delivered to, or discards a
+/// command the architecture refuses outright, and a failure of any of the three
+/// is logged rather than visited on the guest, which keeps running on whichever
+/// path still works.
 pub(crate) fn incomplete_ipi(vcpu: &Vcpu, census: &mut Census) -> Flow {
     let control = vcpu.control();
     let exit = IncompleteIpiExit::from_exit_info(control.exit_info_1, control.exit_info_2);

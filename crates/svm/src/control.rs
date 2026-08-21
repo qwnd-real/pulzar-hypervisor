@@ -352,6 +352,13 @@ layout! {
 /// When the hardware drives the guest's interrupt controller directly, the
 /// pending-interrupt fields here are ignored on entry: the controller's own
 /// registers are where a pending interrupt lives instead.
+///
+/// The two bits that turn that driving on live here as well, and they are the
+/// one thing about this register worth knowing before editing it: the whole
+/// quadword is a single clean group — the interrupt one — so a hypervisor that
+/// arms or disarms the acceleration and clears the acceleration's own clean bit
+/// has cleared the wrong one. [`crate::CleanBits::INTERRUPT`] is where both
+/// halves of that are stated.
 #[bitfield_struct::bitfield(u64)]
 #[derive(PartialEq, Eq)]
 pub struct InterruptControl {

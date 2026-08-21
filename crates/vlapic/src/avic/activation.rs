@@ -32,17 +32,25 @@
 //!   of it is that the hardware's read of an entry is coherent with a locked
 //!   write from the core that entry describes: nothing in the design covers
 //!   that read answering from before the withdrawal.
-//! - A backing page is written by its own processor alone — by these functions
-//!   at transition boundaries and at the exits its own guest's register writes
-//!   raise, and by the hardware while the guest runs — except for the
-//!   interrupt-request words, which any processor may atomically OR into. The
-//!   OR is Release: it publishes the request before the doorbell or the host
-//!   interrupt that tells the target to look.
-//! - The trigger-mode words go with them. A request published into a page
-//!   carries the trigger mode the hardware classifies it by, written first and
-//!   also Release, because a processor that observed the request without it
-//!   would read an acknowledgement's fate out of the record of an earlier
-//!   arrival — see [`request`].
+//! - A backing page's host-side writers are all the processor it belongs to:
+//!   these functions at transition boundaries and at the exits its own guest's
+//!   register writes raise, and its own interrupt handler for a device arrival
+//!   taken in the host window. Nothing here writes another processor's page,
+//!   which is why a request the software path accepts is announced with a host
+//!   interrupt and never with a write into the target's page.
+//! - The interrupt-request words have one more writer, and it is not any
+//!   processor's host side: the AVIC hardware of every core whose guest
+//!   addresses this one. It resolves through this page's physical-table entry,
+//!   so the only thing that stops it is that entry's valid bit — not the
+//!   running bit, and not whether this processor is inside a guest at all. A
+//!   page therefore gains request bits while its own processor is in host code
+//!   or parked, which is why neither direction of a rebuild may treat it as
+//!   bytes and why every host-side write of those words is a read-modify-write.
+//! - The trigger-mode words have no writer but this processor. The hardware
+//!   reads that bank to decide whether an acknowledgement exits and never
+//!   stores into it, so a request's trigger mode is whatever this hypervisor
+//!   put there — written before the request bit and Release, because the
+//!   request is the bit that makes the hardware act: see [`request`].
 //! - The logical table is rebuilt under [`Activation::logical_lock`], which is
 //!   taken wherever an entry moves — the handlers that answer a guest's write
 //!   of its logical identity, and the transitions that change the face the
@@ -158,7 +166,11 @@ const NO_SLOT: u16 = u16::MAX;
 /// Built once by provisioning and never freed. The fields that change say
 /// who changes them in their own documentation; everything else was written
 /// before the first activation and is read-only after.
-struct Activation {
+///
+/// Visible to the crate but opaque to it: the faces are handed one so that an
+/// access resolves the state once and performs every part of itself against
+/// that reading — see [`driving`] — and every field below stays this module's.
+pub(crate) struct Activation {
     /// The per-processor backing pages, indexed by roster position; a
     /// processor firmware will not start has none.
     backing: Box<[Option<PhysAddr>]>,
@@ -195,15 +207,24 @@ struct Activation {
     machine_inhibited: AtomicBool,
     /// Held while the logical table and the record of what is in it move.
     ///
-    /// Taken with host interrupts off on both of the paths that take it, which
-    /// is what bounds the wait for it. The transitions reach it from inside the
-    /// entry callback, where both interrupt flags are already clear — a
-    /// processor spinning there answers no doorbell, no translation shootdown
-    /// and no non-maskable interrupt while it waits — and the handlers that
-    /// answer a guest's write of its logical identity reach it from an exit,
-    /// where interrupts are enabled and a holder could otherwise be interrupted
-    /// for orders of magnitude longer than the critical section itself. Three
-    /// rules keep that safe, and all three are the caller's to honour:
+    /// # Who takes it
+    ///
+    /// [`mirror_logical`] and nothing else, reached from six places: the four
+    /// transitions that move the face the acceleration drives a controller in —
+    /// [`enable`], [`disable`], [`switch`] and the steady arm's rebuild — and
+    /// the two handlers that answer a guest's write of its logical identity,
+    /// whichever door that write came through. The first four are inside the
+    /// entry callback, where both interrupt flags are already clear; the other
+    /// two are exits, where interrupts are enabled and a holder could otherwise
+    /// be interrupted for orders of magnitude longer than the critical section
+    /// itself.
+    ///
+    /// # With host interrupts off, and the four rules that buys
+    ///
+    /// The section runs with host interrupts off on every one of those paths,
+    /// which is what bounds the wait for it: a spinner waits exactly the
+    /// holder's own run of loads and stores, and never for a handler that
+    /// preempted the holder. All four rules are the caller's to honour:
     ///
     /// 1. **Nothing under it waits for another processor.** What it guards is a
     ///    bounded run of atomic loads and stores over one frame and one array:
@@ -214,6 +235,20 @@ struct Activation {
     ///    taken with a machine-wide lock and is far longer than what this
     ///    guards, so [`mirror_logical`] drops the guard and lets interrupts
     ///    back in before it says anything.
+    /// 4. **Nothing that can preempt a holder may take it.** No interrupt
+    ///    handler asks for this lock, and none may be given it: with host
+    ///    interrupts off what can still reach a holder is a non-maskable
+    ///    interrupt or a machine check, and a handler for one of those waiting
+    ///    on a lock the processor it interrupted may already hold would never
+    ///    finish. The same rule binds every handler added later.
+    ///
+    /// Rule 1 is also what the interrupt window costs, from the other side: a
+    /// holder answers no translation shootdown while it holds, so the processor
+    /// that sent one waits the critical section's length for its
+    /// acknowledgement. A bounded run of atomic accesses against the hundred
+    /// milliseconds a shootdown allows is why that is safe, and why rule 1 is
+    /// the one that may not be relaxed — the `ipi` crate states the reciprocal
+    /// obligation on the handler's own side.
     logical_lock: Mutex<()>,
     /// The logical-table slot each processor's identity is published in,
     /// indexed by roster position; [`NO_SLOT`] while it has none.
@@ -329,7 +364,9 @@ pub(crate) fn x2avic_permitted() -> bool {
 /// lost, and no processor but the first would ever have an interrupt
 /// controller.
 pub(crate) fn active_for(vlapic: &Vlapic) -> bool {
-    active_face(vlapic).is_some()
+    ACTIVATED
+        .get()
+        .is_some_and(|activation| active_face(activation, vlapic).is_some())
 }
 
 /// The face the acceleration drives this controller in at this instant, or
@@ -339,14 +376,35 @@ pub(crate) fn active_for(vlapic: &Vlapic) -> bool {
 /// this processor, and which face it is on in. A caller that asked the first
 /// and then computed the second was deriving one decision twice out of state
 /// that can move between the two questions.
-fn active_face(vlapic: &Vlapic) -> Option<Face> {
-    let activation = ACTIVATED.get()?;
+///
+/// The runtime state is threaded rather than fetched here, so that a caller
+/// which has it — every one but [`active_for`] does — asks for it once. Both
+/// terms it contributes are read here and not by the caller.
+fn active_face(activation: &Activation, vlapic: &Vlapic) -> Option<Face> {
     driven_face(
         activation.machine_inhibited.load(Ordering::Relaxed),
         vlapic.mode(),
         x2avic_permitted(),
         vlapic.avic_inhibited(),
     )
+}
+
+/// The runtime state, where the hardware is the authority for this controller's
+/// registers, and nothing where the software is.
+///
+/// The one reading an intercepted access to those registers makes. The gate and
+/// the state the access is then performed against are answered together, so the
+/// controller an access is *authorised* for and the state it is *carried out*
+/// against are one reading rather than three — and the page it lands in is
+/// looked up once for the whole access rather than once per arm of it. The two
+/// could not disagree today, because only this processor writes any term of
+/// either; that is the same argument the face's own decoder declines to rely on
+/// when it takes the mode as a value instead of reading it twice.
+pub(crate) fn driving(vlapic: &Vlapic) -> Option<&'static Activation> {
+    let activation = *ACTIVATED.get()?;
+    active_face(activation, vlapic)
+        .is_some()
+        .then_some(activation)
 }
 
 /// The face hardware delivery drives a controller in, out of the state the
@@ -493,48 +551,51 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
     };
     let vlapic = current()?;
     let have = face_of(vcpu);
-    let want = active_face(vlapic);
+    let want = active_face(activation, vlapic);
     // One reading above the match rather than one inside an arm, because which
     // life the backing page belongs to is a term of every transition and not of
     // one: it decides whether a deactivation may carry the page into the model,
     // and whether the steady state has a page to rebuild at all. Taken once, so
-    // that two arms cannot straddle a reset and disagree about it.
-    let standing = Standing::of(
-        activation.rebuilt_at[vlapic.index().get()].load(Ordering::Relaxed),
-        vlapic.epoch(),
-    );
-    let performed = match move_for(have, want) {
-        // Both sides agree the software delivers, so nothing is owed but the one
-        // encoding of the enable bits the architecture rejects — which this is
-        // the only arm that can be left holding.
-        Move::Idle => {
-            normalize(vcpu, vlapic);
-            Ok(())
-        }
-        Move::Enable(face) => enable(activation, vcpu, vlapic, face, standing),
-        Move::Disable(face) => disable(activation, vcpu, vlapic, face, standing),
-        Move::Switch { from, to } => switch(activation, vcpu, vlapic, from, to),
-        // The steady state. One thing can still have moved: a reset cleared the
-        // model underneath an active controller, and the page the hardware
-        // serves holds the state that reset was required to destroy.
-        //
-        // The logical table is settled with the page and for the same reason:
-        // the reset cleared the logical identity the entry was derived from, so
-        // an entry left behind names this processor for a destination its model
-        // no longer answers to.
-        //
-        // The task priority is deliberately not carried here. It is taken at the
-        // exit instead — see [`TaskPriority`] — because the model is consulted
-        // between the two, and an entry is what that consultation decides on.
-        Move::Steady => {
-            if standing.life.carried() {
+    // that two arms cannot straddle a reset and disagree about it — and handed
+    // to the degradation below where it cannot be read at all, because a roster
+    // this processor is not in is the same kind of failure as a frame the window
+    // does not reach.
+    let performed = Standing::read(activation, vlapic).and_then(|standing| {
+        match move_for(have, want) {
+            // Both sides agree the software delivers, so nothing is owed but the
+            // one encoding of the enable bits the architecture rejects — which
+            // this is the only arm that can be left holding.
+            Move::Idle => {
+                normalize(vcpu, vlapic);
                 Ok(())
-            } else {
-                rebuild_backing(activation, vlapic, standing)
-                    .and_then(|()| mirror_logical(vlapic, want))
+            }
+            Move::Enable(face) => enable(activation, vcpu, vlapic, face, standing),
+            Move::Disable(face) => disable(activation, vcpu, vlapic, face, standing),
+            Move::Switch { from, to } => switch(activation, vcpu, vlapic, from, to),
+            // The steady state. One thing can still have moved: a reset cleared
+            // the model underneath an active controller, and the page the
+            // hardware serves holds the state that reset was required to
+            // destroy.
+            //
+            // The logical table is settled with the page and for the same
+            // reason: the reset cleared the logical identity the entry was
+            // derived from, so an entry left behind names this processor for a
+            // destination its model no longer answers to.
+            //
+            // The task priority is deliberately not carried here. It is taken at
+            // the exit instead — see [`TaskPriority`] — because the model is
+            // consulted between the two, and an entry is what that consultation
+            // decides on.
+            Move::Steady => {
+                if standing.life.carried() {
+                    Ok(())
+                } else {
+                    rebuild_backing(activation, vlapic, standing)
+                        .and_then(|()| mirror_logical(activation, vlapic, want))
+                }
             }
         }
-    };
+    });
     degraded(vlapic, performed)
 }
 
@@ -637,6 +698,24 @@ impl Standing {
                 Life::Ended
             },
         }
+    }
+
+    /// The same, out of the record of what this processor's page was last built
+    /// against.
+    ///
+    /// Fallible for the reason [`Activation::page`] is, and reported rather
+    /// than assumed away: the record is one cell per roster position, and a
+    /// processor the roster does not describe has none — the same failure,
+    /// from the same cause, as having no page.
+    ///
+    /// # Errors
+    ///
+    /// [`VlapicError::NoLapic`] if the processor asking has no record.
+    fn read(activation: &Activation, vlapic: &Vlapic) -> Result<Self, VlapicError> {
+        let rebuilt_at = activation
+            .rebuilt_at(vlapic.index().get())?
+            .load(Ordering::Relaxed);
+        Ok(Self::of(rebuilt_at, vlapic.epoch()))
     }
 }
 
@@ -753,17 +832,15 @@ fn enable(
         return Err(VlapicError::AvicRefused(invalid));
     }
     rebuild_backing(activation, vlapic, standing)?;
-    mirror_logical(vlapic, Some(face))?;
-    let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
+    mirror_logical(activation, vlapic, Some(face))?;
     if face == Face::X2Avic {
         vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
-        soil = soil.union(CleanBits::PERMISSION_MAPS);
     }
     if let Err(error) = publish_entry(activation, vlapic) {
         // The grant goes back with the failure: the enable bit below is the whole
         // of what justifies it, and it is not going to be set.
         if face == Face::X2Avic {
-            vcpu.intercept_msrs(activation.window, crate::intercepted())?;
+            vcpu.intercept_msrs(activation.window, crate::face::msr::reintercepted())?;
         }
         return Err(error);
     }
@@ -778,8 +855,11 @@ fn enable(
         .with_x2avic_enable(face == Face::X2Avic);
     // The enable bit is one clean group and the pointers beside it are
     // another, and both were touched by the life the guest lived since the
-    // acceleration was last on.
-    vcpu.soil(soil);
+    // acceleration was last on. The permission map's own group is not named
+    // here: granting an access is what soils it, so a caller that named it as
+    // well would be saying the same thing twice and could come to say it where
+    // no grant happened.
+    vcpu.soil(CleanBits::INTERRUPT.union(CleanBits::AVIC));
     // The processor may have cached a translation of the register page from
     // before the redirection existed; nothing but a flush gets rid of it.
     vcpu.flush();
@@ -867,15 +947,9 @@ fn disable(
     standing: Standing,
 ) -> Result<(), VlapicError> {
     unpublish_entry(activation, vlapic)?;
-    mirror_logical(vlapic, None)?;
-    let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
+    mirror_logical(activation, vlapic, None)?;
     if face == Face::X2Avic {
-        // Setting a permission bit already set changes nothing, so the whole
-        // claimed range is restored rather than the handful that was given
-        // back: the result is the map the block was created with, and no
-        // count of what moved in between.
-        vcpu.intercept_msrs(activation.window, crate::intercepted())?;
-        soil = soil.union(CleanBits::PERMISSION_MAPS);
+        vcpu.intercept_msrs(activation.window, crate::face::msr::reintercepted())?;
     }
     let control = vcpu.control_mut();
     // Everything that can fail is on one side of this or the other, which is what
@@ -886,11 +960,10 @@ fn disable(
         .interrupt_control
         .with_avic_enable(false)
         .with_x2avic_enable(false);
-    vcpu.soil(soil);
+    // The permission map's group is soiled by the restoration above rather than
+    // named again here, for the reason [`enable`] gives.
+    vcpu.soil(CleanBits::INTERRUPT.union(CleanBits::AVIC));
     vcpu.flush();
-    // Defensive: the unpublish belongs to the exit and the park boundaries,
-    // and a demotion arriving anywhere else must not leave the bit behind.
-    let _ = unpublish_running();
     transitioned(
         vlapic,
         Report::Unaccelerated,
@@ -898,7 +971,9 @@ fn disable(
     );
     if standing.life.carried() {
         sync_into_model(activation, vlapic)?;
-        activation.rebuilt_at[vlapic.index().get()].store(standing.epoch, Ordering::Relaxed);
+        activation
+            .rebuilt_at(vlapic.index().get())?
+            .store(standing.epoch, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -961,7 +1036,7 @@ fn switch(
     if let Some(invalid) = vcpu.avic_refusal(to == Face::X2Avic, limit) {
         return Err(VlapicError::AvicRefused(invalid));
     }
-    mirror_logical(vlapic, Some(to))?;
+    mirror_logical(activation, vlapic, Some(to))?;
     rewrite_identifier(activation, vlapic)?;
     // The face being moved to is the whole of what the permission map owes:
     // the same face twice is the steady state and [`move_for`] does not call
@@ -975,7 +1050,7 @@ fn switch(
         // the defensive one, written anyway because a block found in it must
         // come out of it guarded.
         Face::XAvic => {
-            vcpu.intercept_msrs(activation.window, crate::intercepted())?;
+            vcpu.intercept_msrs(activation.window, crate::face::msr::reintercepted())?;
         }
     }
     let control = vcpu.control_mut();
@@ -983,13 +1058,11 @@ fn switch(
     control.interrupt_control = control
         .interrupt_control
         .with_x2avic_enable(to == Face::X2Avic);
-    // The enable word moved and so did the permission map, and a translation
+    // The enable word moved and the table's extent with it, and a translation
     // cached under the old face's redirection is one the flush alone retires.
-    vcpu.soil(
-        CleanBits::INTERRUPT
-            .union(CleanBits::AVIC)
-            .union(CleanBits::PERMISSION_MAPS),
-    );
+    // The permission map moved too, and whichever arm above moved it soiled its
+    // group there, for the reason [`enable`] gives.
+    vcpu.soil(CleanBits::INTERRUPT.union(CleanBits::AVIC));
     vcpu.flush();
     transitioned(
         vlapic,
@@ -1081,7 +1154,7 @@ pub(crate) fn publish_running() -> Result<(), VlapicError> {
         return Ok(());
     }
     let vlapic = current()?;
-    let Some(face) = active_face(vlapic) else {
+    let Some(face) = active_face(activation, vlapic) else {
         return Ok(());
     };
     if vlapic.apic_id().get() > u32::from(face_limit(face, activation.max_index)) {
@@ -1118,6 +1191,17 @@ pub(crate) fn publish_running() -> Result<(), VlapicError> {
 /// and a withdrawal that declined on that account would leave the bit standing,
 /// which is a sender told this processor is in the guest for the rest of the
 /// machine's life.
+///
+/// # Once per exit, and once is enough
+///
+/// The exit boundary is the only place this is called from, and nothing between
+/// there and the next entry sets the bit again — [`publish_running`] is the one
+/// thing that does, and it runs after everything the entry prepared. So the
+/// park path does not withdraw the bit a second time before its rescan, and a
+/// deactivation does not withdraw it either: both are downstream of an exit
+/// that has already cleared it, on the same processor, in program order. A
+/// second withdrawal would be a locked read-modify-write on a line every
+/// sender's hardware reads, bought for nothing.
 ///
 /// # Errors
 ///
@@ -1229,11 +1313,16 @@ pub(crate) fn physical_entry(index: u16) -> Result<PhysicalApicEntry, VlapicErro
 /// mode the hardware classifies it by: the device path's delivery under
 /// hardware-driven mode.
 ///
-/// Both are Release and the request is published second, so that a processor
-/// which observes the request bit cannot then read a trigger mode from before
-/// it was set. The request is idempotent, so an arrival that races itself
-/// coalesces exactly as the software path's does; answers whether the bit was
-/// newly set.
+/// Both are Release and the request is published second, because the request is
+/// the bit that makes the hardware act: everything that decides what the
+/// guest's acknowledgement of it will owe has to be in place before it. Two
+/// things are — the trigger-mode bit the hardware classifies the
+/// acknowledgement by, written just above, and the ledger debt the caller
+/// records before calling at all, which is what that acknowledgement's exit is
+/// paid from. Nothing follows the request: this page is its own processor's, so
+/// there is no announcement to send. The request is idempotent, so an arrival
+/// that races itself coalesces exactly as the software path's does; answers
+/// whether the bit was newly set.
 ///
 /// What the trigger mode is for, and why the bank is written rather than added
 /// to, is [`publish_request`]'s — which is also what keeps this and
@@ -1420,12 +1509,16 @@ pub(crate) fn complete_command(command_bits: u64) -> Result<(), VlapicError> {
 ///
 /// As [`crate::read_msr`].
 pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<(), VlapicError> {
+    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
     let vlapic = current()?;
+    let page = activation.page(vlapic.index().get())?;
     match register {
         // The one trap whose value is not in the page: what the guest wrote is
         // not a value at all, and what is owed is the release of whatever real
         // hardware is holding for the vector the hardware named.
-        Register::END_OF_INTERRUPT => end_of_interrupt(vlapic, Acknowledged::Trapped(exit_vector)),
+        Register::END_OF_INTERRUPT => {
+            end_of_interrupt(activation, page, vlapic, Acknowledged::Trapped(exit_vector))
+        }
         // A command reported through this exit is a command the hardware did
         // *not* accelerate — the trap is raised where the acceleration ran out —
         // so the delivery is the software path's whole business and there is no
@@ -1438,8 +1531,6 @@ pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<
         // delivery-status bit alone drops the interrupt outright, and clearing
         // that bit is what stops the guest even waiting for it.
         Register::COMMAND_LOW => {
-            let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-            let page = activation.page(vlapic.index().get())?;
             let half = |register: Register| -> Result<u32, VlapicError> {
                 Ok(activation
                     .word(page, register.offset())?
@@ -1450,8 +1541,6 @@ pub(crate) fn trap_write(register: Register, exit_vector: Option<u8>) -> Result<
             complete_command(command.bits())
         }
         other => {
-            let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-            let page = activation.page(vlapic.index().get())?;
             let value = activation
                 .word(page, other.offset())?
                 .load(Ordering::Acquire);
@@ -1553,12 +1642,23 @@ pub(crate) fn backing_write_task_priority(value: u32) -> Result<(), VlapicError>
 /// without one: the priorities, the vector banks, and the command the
 /// hardware carries out between the page's two halves.
 ///
+/// # The state and the controller are the caller's
+///
+/// [`driving`] is where both come from, and it is what makes them one reading
+/// rather than two: the authority an access was authorised against and the page
+/// it is served out of are answered together, so nothing here asks a second
+/// time which processor is executing or whether the hardware is driving it. The
+/// page is looked up once for the whole access, which is what a sixty-four-bit
+/// register read needs — it is two slots of one frame.
+///
 /// # Errors
 ///
 /// As [`crate::read_msr`].
-pub(crate) fn msr_read(register: Register) -> Result<Option<u64>, VlapicError> {
-    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-    let vlapic = current()?;
+pub(crate) fn msr_read(
+    activation: &Activation,
+    vlapic: &Vlapic,
+    register: Register,
+) -> Result<Option<u64>, VlapicError> {
     let page = activation.page(vlapic.index().get())?;
     let word = |slot: Register| -> Result<u32, VlapicError> {
         Ok(activation
@@ -1589,12 +1689,18 @@ pub(crate) fn msr_read(register: Register) -> Result<Option<u64>, VlapicError> {
 /// model's path: the acknowledgement an end-of-interrupt owes real hardware,
 /// the delivery a command asks for, the request a self-interrupt names.
 ///
+/// The state and the controller are the caller's, for the reason [`msr_read`]
+/// gives.
+///
 /// # Errors
 ///
 /// As [`crate::read_msr`].
-pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, VlapicError> {
-    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-    let vlapic = current()?;
+pub(crate) fn msr_write(
+    activation: &Activation,
+    vlapic: &Vlapic,
+    register: Register,
+    value: u64,
+) -> Result<Written, VlapicError> {
     let page = activation.page(vlapic.index().get())?;
     match register {
         // The hardware reads the task priority out of the page while it
@@ -1615,7 +1721,7 @@ pub(crate) fn msr_write(register: Register, value: u64) -> Result<Written, Vlapi
         // what is owed is the acknowledgement whole: the in-service bit the
         // page holds and the release of whatever real hardware is holding.
         Register::END_OF_INTERRUPT => {
-            end_of_interrupt(vlapic, Acknowledged::Intercepted)?;
+            end_of_interrupt(activation, page, vlapic, Acknowledged::Intercepted)?;
             Ok(Written::Nothing)
         }
         Register::ERROR_STATUS => {
@@ -1722,11 +1828,7 @@ pub(crate) fn hand_back(vlapic: &Vlapic) -> Result<(), VlapicError> {
         .get()
         .ok_or(VlapicError::NotProvisioned)
         .and_then(|activation| {
-            let standing = Standing::of(
-                activation.rebuilt_at[vlapic.index().get()].load(Ordering::Relaxed),
-                vlapic.epoch(),
-            );
-            if standing.life.carried() {
+            if Standing::read(activation, vlapic)?.life.carried() {
                 sync_into_model(activation, vlapic)?;
             }
             Ok(())
@@ -1761,6 +1863,26 @@ impl Activation {
             .copied()
             .flatten()
             .ok_or(VlapicError::NoLapic)
+    }
+
+    /// The reset count the backing page of the processor at roster position
+    /// `index` was last rebuilt against.
+    ///
+    /// Fallible for the reason [`Activation::page`] is, and answered the same
+    /// way: these are one cell per roster position, so an index the roster does
+    /// not describe has no cell — and [`reconcile`] runs on every entry, where
+    /// an operation that could not answer must report rather than stop the
+    /// machine.
+    fn rebuilt_at(&self, index: usize) -> Result<&AtomicU64, VlapicError> {
+        self.rebuilt_at.get(index).ok_or(VlapicError::NoLapic)
+    }
+
+    /// Where the logical-table slot of the processor at roster position `index`
+    /// is recorded.
+    ///
+    /// Fallible for the reason [`Activation::rebuilt_at`] is.
+    fn logical_record(&self, index: usize) -> Result<&AtomicU16, VlapicError> {
+        self.logical_slots.get(index).ok_or(VlapicError::NoLapic)
     }
 
     /// One register slot of a backing page, as an atomic word.
@@ -1889,7 +2011,9 @@ fn rebuild_backing(
             }
         },
     )?;
-    activation.rebuilt_at[vlapic.index().get()].store(standing.epoch, Ordering::Relaxed);
+    activation
+        .rebuilt_at(vlapic.index().get())?
+        .store(standing.epoch, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2009,10 +2133,10 @@ pub(crate) fn sync_task_priority(vlapic: &Vlapic) -> Result<(), VlapicError> {
 ///
 /// As [`crate::read_msr`].
 pub(crate) fn observe_logical_identity(vlapic: &Vlapic) -> Result<(), VlapicError> {
-    if !provisioned() {
+    let Some(activation) = ACTIVATED.get() else {
         return Ok(());
-    }
-    mirror_logical(vlapic, active_face(vlapic))
+    };
+    mirror_logical(activation, vlapic, active_face(activation, vlapic))
 }
 
 /// Rewrites the one slot of the backing page whose shape a face change moves.
@@ -2067,9 +2191,16 @@ pub(crate) fn clear_command_busy(vlapic: &Vlapic) -> Result<(), VlapicError> {
 /// The in-service bit itself is cleared idempotently: whichever of the hardware
 /// and this cleared it first, the second clear is a no-op, and nothing here
 /// retires anything twice.
-fn end_of_interrupt(vlapic: &Vlapic, acknowledged: Acknowledged) -> Result<(), VlapicError> {
-    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-    let page = activation.page(vlapic.index().get())?;
+///
+/// The state, the page and the controller are the caller's, for the reason
+/// [`msr_read`] gives: both doors an acknowledgement reaches this through have
+/// already resolved all three.
+fn end_of_interrupt(
+    activation: &Activation,
+    page: PhysAddr,
+    vlapic: &Vlapic,
+    acknowledged: Acknowledged,
+) -> Result<(), VlapicError> {
     let top = activation.highest(page, Register::IN_SERVICE, Ordering::Acquire)?;
     let owed = top.is_some_and(|vector| vlapic.ledger().owes(vector));
     let Some(vector) = eoi_vector(top, acknowledged, owed) else {
@@ -2191,12 +2322,15 @@ fn eoi_vector(
 ///
 /// # Errors
 ///
-/// [`VlapicError::NotProvisioned`] before provisioning,
-/// [`VlapicError::NotInstalled`] before the controllers exist, or
+/// [`VlapicError::NoLapic`] if the roster does not describe the processor
+/// asking, [`VlapicError::NotInstalled`] before the controllers exist, or
 /// [`VlapicError::Paging`] if the window does not reach the table.
-fn mirror_logical(vlapic: &Vlapic, face: Option<Face>) -> Result<(), VlapicError> {
-    let activation = ACTIVATED.get().ok_or(VlapicError::NotProvisioned)?;
-    let record = &activation.logical_slots[vlapic.index().get()];
+fn mirror_logical(
+    activation: &Activation,
+    vlapic: &Vlapic,
+    face: Option<Face>,
+) -> Result<(), VlapicError> {
+    let record = activation.logical_record(vlapic.index().get())?;
     let wanted = entry_slot(
         face,
         vlapic.logical_destination(Mode::XApic),
@@ -2208,7 +2342,7 @@ fn mirror_logical(vlapic: &Vlapic, face: Option<Face>) -> Result<(), VlapicError
     // that could be interrupted is every spinner stalled for as long as the
     // handler runs, and one of those spinners is inside an entry callback and
     // answering nothing. What the section may contain for that to be safe is
-    // three rules, and they are stated where the lock is declared.
+    // four rules, and they are stated where the lock is declared.
     let settled = interrupts::without_interrupts(
         || -> Result<(Publish, Option<&'static Vlapic>), VlapicError> {
             let _guard = activation.logical_lock.lock();

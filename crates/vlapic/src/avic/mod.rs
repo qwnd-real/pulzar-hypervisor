@@ -254,7 +254,8 @@ pub fn wider_face(vcpu: &Vcpu) -> bool {
 /// IPI may ring it rather than exit.
 ///
 /// The entry half of the publication protocol; [`unpublish_running`] is the
-/// exit half, and the park path clears before it waits and looks again.
+/// exit half, and the park's look at what has been left behind stands on that
+/// one rather than clearing again.
 ///
 /// # Errors
 ///
@@ -264,6 +265,10 @@ pub fn publish_running() -> Result<(), VlapicError> {
 }
 
 /// Says this processor is no longer in the guest.
+///
+/// Called once, at the exit boundary, before anything consults what was left
+/// for this processor — which is the pairing the park protocol needs and the
+/// reason nothing else calls it.
 ///
 /// # Errors
 ///
@@ -309,8 +314,9 @@ pub fn deliverable() -> Result<bool, VlapicError> {
 /// The whole of the exit's meaning lives here, keyed by the failure the
 /// hardware reported — see [`crate::delivery::avic`] for what each one
 /// becomes. Always resumes: every arm either completes the interrupt in
-/// software or wakes whoever the hardware already delivered to, and neither
-/// can fail in a way the guest should stop for.
+/// software, wakes whoever the hardware already delivered to, or discards a
+/// command the architecture refuses outright, and none of the three can fail in
+/// a way the guest should stop for.
 ///
 /// # Errors
 ///
@@ -331,11 +337,16 @@ pub fn incomplete_ipi(exit: IncompleteIpiExit) -> Result<(), VlapicError> {
 /// As [`crate::read_msr`].
 pub fn unaccelerated_trap(exit: UnacceleratedAccessExit) -> Result<(), VlapicError> {
     let Some(register) = face_register(exit.offset()) else {
-        // An offset the register table does not name cannot be a trap the
-        // hardware completed: it is an exit nothing here can describe, and
-        // the processor's own inhibition is the honest answer.
-        let vlapic = current()?;
-        vlapic.inhibit_avic();
+        // Nothing owed, because nothing can arrive here. The exit's offset field
+        // is masked to a sixteen-byte-aligned offset inside the page — which is
+        // every place the architecture puts a register — so an offset the table
+        // cannot name is not one this exit carries; and the bookkeeping is asked
+        // for only where [`trap_access`] classified this very offset as a trap,
+        // which needs the same table to have named a register at it. So the arm
+        // is the two answers disagreeing, which would be a decode fault of this
+        // hypervisor's own rather than anything the hardware did — and taking a
+        // guest's controller away for one would be answering a mistake here by
+        // punishing the guest.
         return Ok(());
     };
     activation::trap_write(register, exit.eoi_vector())

@@ -193,12 +193,13 @@ impl Census {
             }
             self.clear(code);
         }
-        // The acceleration's own account, which the exit codes cannot give:
-        // why deliveries between the guest's processors stopped, which
-        // registers it still touches by hand, and how many targets this
-        // processor had to interrupt to make them look at what had been left
-        // for them — which between them are the measure of how much of the work
-        // the acceleration is really taking.
+        // The acceleration's own account, which the exit codes cannot give.
+        // Every number below is work the acceleration did not do for itself: a
+        // delivery between the guest's processors that stopped, a register the
+        // guest still touches by hand, and a target that had to be interrupted
+        // because no hardware announcement could reach it. What the acceleration
+        // *did* raises no exit and is counted nowhere at all, so these are read
+        // against the exit total above rather than against a total of their own.
         for (bucket, count) in self.incomplete_ipi.iter().enumerate() {
             if *count == 0 {
                 continue;

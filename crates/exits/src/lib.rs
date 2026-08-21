@@ -262,7 +262,10 @@ impl<'a> Exits<'a> {
         // Withdrawn beside the away flag and for the same reason: a sender
         // that reads the running bit from here on takes the kick path, and
         // the rescan every park and every entry performs is what finds what
-        // the kick is for.
+        // the kick is for. This is the only withdrawal there is — nothing
+        // between here and the next entry's publication sets the bit again, so
+        // the park below and a deactivation on the way back in both stand on
+        // this one.
         let _ = vlapic::avic_unpublish_running();
         self.interrupts.complete_iret(vcpu);
         let next_rip = if Pending::needs_next_rip(vcpu) {
@@ -501,17 +504,18 @@ impl<'a> Exits<'a> {
     /// one that has stopped watching, and without the flag it would leave a
     /// request bit in a controller whose processor is asleep and set nothing to
     /// wake it.
+    ///
+    /// The running bit was withdrawn by [`Exits::exit`] and is not withdrawn
+    /// again here. That withdrawal is the half the park protocol pairs with the
+    /// rescan below: it precedes it on this processor in program order, nothing
+    /// between the two publishes the bit — the only thing that does runs after
+    /// everything an entry prepares — and a request that landed either side of
+    /// it is one the rescan finds. Withdrawing a second time would be a locked
+    /// read-modify-write on a line every sender's hardware reads, bought for
+    /// nothing; `vlapic` states the ordering both halves need where the bit is
+    /// withdrawn.
     fn halted(&mut self, vcpu: &mut Vcpu) -> Flow {
         advance(vcpu, HLT_LENGTH);
-        // Unpublished before the first look below, and the look is the point:
-        // a request that lands between the withdrawal and the rescan is one
-        // the rescan finds, and one that landed before it was answered by
-        // the exit itself. The rescan inside [`Exits::wakeable`] reads the
-        // backing page wherever the control block still has the acceleration
-        // armed, which is where the request bits live. What makes that pairing
-        // an argument rather than a hope is the ordering on both of its halves,
-        // which `vlapic` states where the bit is withdrawn.
-        let _ = vlapic::avic_unpublish_running();
         let vcpu = &*vcpu;
         if self.wakeable(vcpu) {
             return Flow::Resume;

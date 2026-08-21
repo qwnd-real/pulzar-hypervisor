@@ -378,6 +378,11 @@ const ACCESS_IS_WRITE: u64 = 1 << 32;
 
 /// Bits of the first exit-information field of an unaccelerated access that
 /// name a register offset.
+///
+/// Eight bits starting at the fifth, which is what makes every offset this exit
+/// can report a sixteen-byte-aligned offset inside the register page — exactly
+/// the places the architecture puts a register. So a handler that decodes the
+/// offset into a register has no unaligned and no out-of-page case to answer.
 const OFFSET_MASK: u64 = 0xFF0;
 
 /// The end-of-interrupt register's offset in the controller's page.

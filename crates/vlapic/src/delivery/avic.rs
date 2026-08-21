@@ -5,9 +5,12 @@
 //! reaches here is everything else — the modes the hardware does not
 //! implement, the targets it could not reach, the failures it reports. Each
 //! of those is answered by the failure's own rule, and the one invariant all
-//! of them keep is that exactly one of the hardware and the software delivers
-//! each interrupt: the hardware reports which of them already acted before it
-//! exited, and nothing here acts twice.
+//! of them keep is that no interrupt is delivered twice and none is delivered
+//! by an authority that was not asked to: the hardware reports which of them
+//! already acted before it exited, and every rule here either finishes what the
+//! hardware started, delivers what it never attempted, or records the refusal
+//! for the one command the architecture refuses outright — never two of the
+//! three.
 //!
 //! # The cause is the only thing that says which of them acted
 //!

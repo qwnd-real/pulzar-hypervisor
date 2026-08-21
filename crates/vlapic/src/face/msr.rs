@@ -138,26 +138,44 @@ pub fn intercepted() -> impl Iterator<Item = u32> {
 /// The complement of [`intercepted`]'s hold on the same range: interception
 /// has priority over the acceleration — an access this set does not name
 /// exits even while the hardware drives — so everything not named here stays
-/// guarded. What is named is the set the silicon answers in the directions it
-/// answers them: the task priority either way, and three writes it performs
-/// itself — the acknowledgement, the interrupt command and the self-interrupt.
-/// The command's read is kept for the host deliberately: it answers live state,
-/// and the exit is the only place the host sees one.
+/// guarded. Four entries, and the reason for each is its own:
 ///
-/// Two of those three writes are answered whole only for part of what a guest
-/// may write, and the acknowledgement is the one this hypervisor depends on:
-/// the hardware performs it without an exit for an edge-triggered interrupt and
-/// traps it where the vector being retired is level triggered, which is the
-/// exit a withheld physical acknowledgement is released from. The trap is
-/// therefore load-bearing rather than incidental, and what makes it fire is the
-/// trigger-mode bank of the backing page, which
-/// [`crate::avic::activation::request`] maintains — with a test pinning the two
-/// moving together, because passing this register through without that bank is
-/// the acceleration swallowing every acknowledgement the ledger is waiting for.
+/// - **The task priority, both directions.** The one register the architecture
+///   has the hardware perform whole. A write updates the backing page and the
+///   control block's own priority field with no exit at all, and a read answers
+///   out of the page, so nothing is left for the host to do either way. This is
+///   the entry the acceleration is worth most for: an operating system moves
+///   this register constantly.
+/// - **The acknowledgement, writes.** Performed without an exit for an
+///   edge-triggered interrupt and *trapped* where the vector being retired is
+///   level triggered, which is not a shortcoming here but the mechanism a
+///   withheld physical acknowledgement is released from. So the entry buys the
+///   exitless case — nearly every interrupt a guest finishes — and the trap it
+///   does not buy is one this hypervisor needs. What makes the trap fire is the
+///   trigger-mode bank of the backing page, which
+///   [`crate::avic::activation::request`] maintains, with a test pinning the
+///   two moving together: passing this register through without that bank is
+///   the acceleration swallowing every acknowledgement the ledger is waiting
+///   for.
+/// - **The interrupt command, writes.** Accelerated only for a fixed delivery
+///   with an edge trigger, and for the destination shorthands and both
+///   destination models under it. Everything else exits — the lowest-priority
+///   mode, and the initialization and start-up messages every guest sends to
+///   bring a second processor up — so this entry buys the steady-state
+///   interprocessor interrupt and not the bring-up. Those exits are the
+///   incomplete-delivery exit rather than an intercepted register write, and
+///   [`crate::delivery::avic`] is what answers them.
+/// - **The self-interrupt, writes.** The architecture allows the write in this
+///   face, and there is no offset in the memory-mapped page it could arrive at
+///   instead, so it is the one register of the set that exists here and nowhere
+///   else.
+///
+/// The command's *read* is deliberately not in the set: it answers live state,
+/// and the exit is the only place the host sees one.
 ///
 /// One symbol holds the whole of the policy, which is what lets a machine's
 /// measurement widen or narrow it without touching the transitions that
-/// grant and withdraw it.
+/// grant and withdraw it — and [`reintercepted`] is what takes it back.
 pub(crate) fn passthrough() -> impl Iterator<Item = MsrPassthrough> {
     [
         MsrPassthrough::both(Register::TASK_PRIORITY.msr()),
@@ -166,6 +184,21 @@ pub(crate) fn passthrough() -> impl Iterator<Item = MsrPassthrough> {
         MsrPassthrough::writes(Register::SELF_IPI.msr()),
     ]
     .into_iter()
+}
+
+/// The indices a transition out of that face has to take back.
+///
+/// Exactly the set [`passthrough`] gave away, derived from it rather than
+/// restated: a widening there has to be a widening here, and restoring an index
+/// nothing granted would be this crate claiming to know the map better than the
+/// one symbol that holds the policy.
+///
+/// The whole range [`intercepted`] names would reach the same map — setting a
+/// permission bit already set changes nothing — but it is a thousand and two
+/// indices on the most expensive step of a face transition, performed with both
+/// interrupt flags clear inside an entry callback, to take back four.
+pub(crate) fn reintercepted() -> impl Iterator<Item = u32> {
+    passthrough().map(|access| access.index)
 }
 
 /// Whether an index is one this crate answers for.
@@ -316,11 +349,15 @@ pub(crate) fn write(
 /// be reached — in which case the demotion below is the honest answer, and the
 /// model has just been given whatever the page still held, so that it really is
 /// the nearest true state while the control block catches up at the next entry.
+///
+/// One reading of the authority per access, which is what
+/// [`crate::avic::activation::driving`] is for: the controller was resolved by
+/// the entry point above and the state the access is performed against is
+/// resolved here, so the authority this access was authorised under and the
+/// page it lands in cannot be two answers.
 fn avic_value(vlapic: &Vlapic, register: Register) -> Option<u64> {
-    if !crate::avic::activation::active_for(vlapic) {
-        return None;
-    }
-    match crate::avic::activation::msr_read(register) {
+    let activation = crate::avic::activation::driving(vlapic)?;
+    match crate::avic::activation::msr_read(activation, vlapic, register) {
         Ok(value) => value,
         Err(error) => {
             demote(vlapic, register, error);
@@ -333,12 +370,10 @@ fn avic_value(vlapic: &Vlapic, register: Register) -> Option<u64> {
 /// not what the model's path does.
 ///
 /// `None` leaves the write to the model's path, for the same two reasons as
-/// [`avic_value`].
+/// [`avic_value`], and resolves the authority once for the same reason.
 fn avic_write(vlapic: &Vlapic, register: Register, value: u64) -> Option<Written> {
-    if !crate::avic::activation::active_for(vlapic) {
-        return None;
-    }
-    match crate::avic::activation::msr_write(register, value) {
+    let activation = crate::avic::activation::driving(vlapic)?;
+    match crate::avic::activation::msr_write(activation, vlapic, register, value) {
         Ok(written) => Some(written),
         Err(error) => {
             demote(vlapic, register, error);
@@ -534,7 +569,7 @@ mod tests {
 
     use super::{
         Access, ApicBase, Command, Fault, addressable, claims, guest_deadline, intercepted,
-        passthrough, physical_deadline, reserved,
+        passthrough, physical_deadline, reintercepted, reserved,
     };
     use crate::{
         hardware::model,
@@ -564,7 +599,8 @@ mod tests {
     fn the_passthrough_set_is_the_accelerated_accesses_and_nothing_else() {
         // Written out as literals so that an access moving fails a test rather
         // than moving with it: the task priority in both directions, and the
-        // three writes the hardware performs itself. The command's read is
+        // three writes the architecture has the hardware perform — two of them
+        // only for part of what a guest may write. The command's read is
         // deliberately absent — it answers live state, and the exit is where
         // the host sees one.
         //
@@ -579,6 +615,16 @@ mod tests {
             MsrPassthrough::writes(0x830),
             MsrPassthrough::writes(0x83F),
         ]));
+    }
+
+    #[test]
+    fn what_a_transition_takes_back_is_what_it_gave_away() {
+        // Derived from the one set rather than restated, which is what makes a
+        // widening of the grant a widening of the restoration: an index granted
+        // and not taken back is a register of the *host's* controller the guest
+        // reaches with no exit once the acceleration is off.
+        assert!(reintercepted().eq(passthrough().map(|access| access.index)));
+        assert!(reintercepted().eq([0x808, 0x80B, 0x830, 0x83F]));
     }
 
     #[test]
