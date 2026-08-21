@@ -252,6 +252,15 @@ pub(crate) fn x2avic_permitted() -> bool {
 /// demotion may have fired, and the face the guest is in must be one the
 /// acceleration drives.
 ///
+/// # This is the want, and [`accelerated`] is the have
+///
+/// Every term here is a statement about what the acceleration is *permitted* to
+/// do, and none of them says whether the control block was brought to it. So a
+/// decision about the run that is happening — what the entry prepared, which
+/// authority answered a register access, which of the two copies of the task
+/// priority the guest was running under — is [`accelerated`]'s to make, and
+/// this one belongs to decisions about what should happen next.
+///
 /// # The software-enable bit is not one of the terms
 ///
 /// A controller its guest has software-disabled goes on being driven by the
@@ -424,9 +433,12 @@ fn face_limit(face: Face, provisioned: u16) -> u16 {
 /// [`VlapicError::AvicRefused`] is a transition the entry rules would not have
 /// survived, reported with the acceleration left exactly as it was. Anything
 /// else names a frame the window does not reach or a processor the roster does
-/// not describe. In every case the caller degrades rather than refusing the
-/// entry, and what the guest is entered with is what the control block says
-/// rather than what the model asked for.
+/// not describe, and takes the acceleration off this controller as it is
+/// reported — see [`degraded`].
+///
+/// In every case the caller degrades rather than refusing the entry, and what
+/// the guest is entered with is what the control block says rather than what
+/// the model asked for: [`accelerated`] is the predicate that makes that true.
 pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
     let Some(activation) = ACTIVATED.get() else {
         return Ok(());
@@ -443,8 +455,14 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
         activation.rebuilt_at[vlapic.index().get()].load(Ordering::Relaxed),
         vlapic.epoch(),
     );
-    match move_for(have, want) {
-        Move::Idle => Ok(()),
+    let performed = match move_for(have, want) {
+        // Both sides agree the software delivers, so nothing is owed but the one
+        // encoding of the enable bits the architecture rejects — which this is
+        // the only arm that can be left holding.
+        Move::Idle => {
+            normalize(vcpu, vlapic);
+            Ok(())
+        }
         Move::Enable(face) => enable(activation, vcpu, vlapic, face, standing),
         Move::Disable(face) => disable(activation, vcpu, vlapic, face, standing),
         Move::Switch { from, to } => switch(activation, vcpu, vlapic, from, to),
@@ -461,13 +479,82 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
         // exit instead — see [`TaskPriority`] — because the model is consulted
         // between the two, and an entry is what that consultation decides on.
         Move::Steady => {
-            if !standing.life.carried() {
-                rebuild_backing(activation, vlapic, standing)?;
-                mirror_logical(vlapic, want)?;
+            if standing.life.carried() {
+                Ok(())
+            } else {
+                rebuild_backing(activation, vlapic, standing)
+                    .and_then(|()| mirror_logical(vlapic, want))
             }
-            Ok(())
         }
+    };
+    degraded(vlapic, performed)
+}
+
+/// Takes the acceleration off this controller where a transition could not be
+/// performed, so that a failure degrades rather than being attempted again on
+/// every entry for the rest of the guest's life.
+///
+/// The entry itself is already correct without this, because what the processor
+/// is entered with is what the block carries and a transition that failed left
+/// it carrying the software path. What this adds is that the *model* stops
+/// asking for a transition nothing can perform. Every failure it acts on names
+/// hypervisor state a guest cannot move — a frame the window does not reach, a
+/// processor the roster does not describe, a permission map the block refused —
+/// so the next entry would attempt the same transition, fail the same way, and
+/// say so again, once per entry, through a serial port taken with a
+/// machine-wide lock. One demotion is one attempt and one line.
+///
+/// The cost is that a failure whose cause goes away costs this controller its
+/// acceleration until the guest's own next change of face, which is where
+/// [`Vlapic::permit_avic`] remakes the decision, or until a reset. None of the
+/// causes announces when it has gone away, which is why the sticky answer is
+/// the honest one.
+///
+/// A refusal is deliberately not one of them. [`VlapicError::AvicRefused`] is
+/// reported with nothing edited — the block is exactly as the processor has
+/// been entering it all along — and the rules behind it are re-asked at the
+/// next entry for the price of reading fields that are already in cache.
+fn degraded(vlapic: &Vlapic, performed: Result<(), VlapicError>) -> Result<(), VlapicError> {
+    match performed {
+        Ok(()) | Err(VlapicError::AvicRefused(_)) => {}
+        Err(_) => vlapic.inhibit_avic(),
     }
+    performed
+}
+
+/// Takes away the one encoding of the enable bits the architecture defines no
+/// meaning for, at the entry that found a block holding it.
+///
+/// The base bit turns the acceleration on and the wider bit only selects
+/// between the faces, so a block carrying the wider bit alone describes no
+/// state: the processor refuses it outright, with no guest instruction executed
+/// and nothing to resume from. Nothing here produces one — every transition
+/// that writes those bits writes both — so this is defence against a block
+/// written from somewhere else, and it belongs on this arm because this is the
+/// only arm that would not repair it anyway. A controller whose acceleration is
+/// wanted reaches [`enable`], which rewrites both bits; one whose acceleration
+/// is not wanted used to reach an arm that did nothing at all, and the entry
+/// after it was refused, revalidated, reported, and the guest stopped. So the
+/// only architecturally invalid encoding was also the only state this state
+/// machine could not leave.
+///
+/// One branch on a word the caller has already loaded is the whole cost, and
+/// the arm it sits on is the one every entry of an unaccelerated guest takes.
+fn normalize(vcpu: &mut Vcpu, vlapic: &Vlapic) {
+    if !vcpu.control().interrupt_control.x2avic_enable() {
+        return;
+    }
+    let control = vcpu.control_mut();
+    control.interrupt_control = control.interrupt_control.with_x2avic_enable(false);
+    vcpu.soil(CleanBits::INTERRUPT);
+    // Unlatched deliberately, and it cannot repeat: the store above is what the
+    // line reports, so a second one means a second writer of that field, which
+    // is the thing worth hearing about every time it happens.
+    warn!(
+        "vlapic: {}'s control block carried the wider face's enable bit without the base bit, \
+         which is not a state the architecture defines; the bit is taken away",
+        vlapic.index()
+    );
 }
 
 /// What an entry's transition stands on: the model's reset count, and what that
@@ -509,13 +596,65 @@ impl Standing {
 /// clear.
 fn face_of(vcpu: &Vcpu) -> Option<Face> {
     let interrupts = vcpu.control().interrupt_control;
-    interrupts.avic_enable().then(|| {
-        if interrupts.x2avic_enable() {
-            Face::X2Avic
-        } else {
-            Face::XAvic
-        }
+    face_bits(interrupts.avic_enable(), interrupts.x2avic_enable())
+}
+
+/// The same, out of the two bits themselves.
+///
+/// Pure rather than folded into [`face_of`], because these two bits are what
+/// every decision about whether the hardware *is* driving is made from — the
+/// shape of an entry, the trap-or-fault classification of an unaccelerated
+/// access, the transition a reconciliation owes — and one of their four
+/// encodings is one the architecture defines no meaning for.
+///
+/// The base bit is the whole of the answer and the wider bit only chooses
+/// between the faces, so a block carrying the wider bit alone is driven in
+/// neither: the processor refuses such a block outright, so it names no face
+/// this could honestly report. [`normalize`] is what takes the stray bit away.
+const fn face_bits(avic_enable: bool, x2avic_enable: bool) -> Option<Face> {
+    if !avic_enable {
+        return None;
+    }
+    Some(if x2avic_enable {
+        Face::X2Avic
+    } else {
+        Face::XAvic
     })
+}
+
+/// Whether the control block this processor was entered with, or is about to be
+/// entered with, carries hardware-driven delivery.
+///
+/// The *have* rather than the want, and that difference is the whole of what
+/// this exists for. [`active_for`] answers whether the acceleration is
+/// permitted — the policy, the guest's face, the two inhibits — which is what
+/// [`reconcile`] tries to bring the block to and says nothing about whether it
+/// got there. The block's enable bits are what the processor is entered with,
+/// so every decision about which authority delivers for the run that is
+/// *happening* is made from them: whether the model's interrupts crossed into
+/// the backing page, whether the task priority the processor honours was
+/// mirrored, whether an interrupt window was armed, whether the running bit was
+/// published, and whether an access the hardware reported was one it completed.
+///
+/// The two can differ without anything having failed — a machine-wide demotion
+/// is a store any processor may make, and the boot processor reaches its first
+/// entry with the activation state already published and no block naming a page
+/// yet — and they differ until the next entry wherever a transition could not
+/// be performed.
+pub(crate) fn accelerated(vcpu: &Vcpu) -> bool {
+    face_of(vcpu).is_some()
+}
+
+/// Whether the block carries that acceleration in the face a guest reaches its
+/// controller through model-specific registers.
+///
+/// Which face the block carries decides what an unaccelerated access
+/// *describes* rather than merely which registers it covers: the exit reports a
+/// register offset either way, and under this face no memory access took place
+/// at all — the guest executed `RDMSR` or `WRMSR`, and the offset is the one
+/// the architecture derives that register's index from.
+pub(crate) fn wider_face(vcpu: &Vcpu) -> bool {
+    matches!(face_of(vcpu), Some(Face::X2Avic))
 }
 
 /// Turns the acceleration on for this processor, at the entry that asked.
@@ -528,18 +667,30 @@ fn face_of(vcpu: &Vcpu) -> Option<Face> {
 /// refusal is reported.
 ///
 /// The permission map's pass-through goes first wherever the wider face is
-/// what turns on: granting an access after its enable bit is set would leave
-/// the guest a window of unguarded registers, and the order that cannot be
-/// wrong is the order that cannot be observed.
+/// what turns on, and the table entry is published last of the steps that can
+/// fail and before the enable bit, so that no failure leaves a peer's hardware
+/// delivering into a page this processor is not driving: whichever step reports
+/// one, the acceleration is left off and the entry invalid, and the next entry
+/// performs the whole transition again.
 ///
-/// The table entry is published last of the steps that can fail and before the
-/// enable bit, so that no failure leaves a peer's hardware delivering into a
-/// page this processor is not driving: whichever step reports one, the
-/// acceleration is left off and the entry invalid, and the next entry performs
-/// the whole transition again.
+/// # The pass-through and the enable bit are one fact
 ///
-/// The logical table is published before it, and may survive a failure that the
-/// physical entry does not, which costs nothing: a logically addressed
+/// The registers the wider face hands the guest reach the *host's* controller
+/// with no exit at all, and what makes that safe is the hardware answering them
+/// out of this processor's backing page — which it does only while the block
+/// carries the acceleration. So the grant and the bit move together: the grant
+/// goes first, because granting an access after its enable bit is set would
+/// leave the guest a window of unguarded registers, and it is taken back on a
+/// failure between the two, because a grant left standing with the bit never
+/// set is that window with nothing at all behind it.
+///
+/// Restoring is all-or-nothing and reaches the same map the grant just reached,
+/// so the only way it can fail is a window that stopped reaching a page it
+/// reached a moment ago; that failure is reported rather than swallowed, being
+/// strictly worse news than the one it was answering.
+///
+/// The logical table is published before both, and may survive a failure that
+/// the physical entry does not, which costs nothing: a logically addressed
 /// interrupt resolves through it into a physical entry that is still invalid,
 /// which is an exit the software path completes.
 fn enable(
@@ -560,7 +711,14 @@ fn enable(
         vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
         soil = soil.union(CleanBits::PERMISSION_MAPS);
     }
-    publish_entry(activation, vlapic)?;
+    if let Err(error) = publish_entry(activation, vlapic) {
+        // The grant goes back with the failure: the enable bit below is the whole
+        // of what justifies it, and it is not going to be set.
+        if face == Face::X2Avic {
+            vcpu.intercept_msrs(activation.window, crate::intercepted())?;
+        }
+        return Err(error);
+    }
     let control = vcpu.control_mut();
     // The table's extent is published with the enable bits rather than at
     // provisioning: how far the hardware may walk it is the face's answer, and
@@ -586,8 +744,8 @@ fn enable(
     Ok(())
 }
 
-/// Turns the acceleration off for this processor, carrying the hardware's
-/// state back into the model first.
+/// Turns the acceleration off for this processor, giving the hardware's state
+/// back to the model as the last thing it does.
 ///
 /// Where the wider face is what turns off, full interception comes back
 /// before the enable bit goes: the one state the architecture must never
@@ -631,6 +789,25 @@ fn enable(
 /// empties the page: a page still holding a dead guest's requests is one the
 /// activation that next rebuilds it must still reconcile, and recording here
 /// would tell that activation the page was this life's.
+///
+/// # The enable bits go before the carry-back, which is the fallible half
+///
+/// Everything that can fail is either before the bits or after them, and the
+/// division is what makes a failure describable. Up to and including the
+/// interception, a failure leaves the block exactly as the processor has been
+/// entering it — accelerated, with the pass-through the face it is in justifies
+/// — and the next entry performs the whole transition again. From the bits
+/// onward the block is guarded and unaccelerated, and stays so whatever the
+/// carry-back reports. There is no third state, and in particular not the one
+/// this ordering replaces: full interception restored with the enable bits
+/// still set, where the guest runs accelerated with every register of the wider
+/// face trapping and the intercepted handlers answer out of the model while the
+/// hardware owns the page.
+///
+/// Moving the bits earlier costs the carry-back nothing. This processor's guest
+/// is stopped, its own hardware is reading nothing, and a bit of the control
+/// block takes effect at the next `VMRUN` — so what the page holds and what
+/// [`Projection::take`] makes of it are the same either way.
 fn disable(
     activation: &Activation,
     vcpu: &mut Vcpu,
@@ -649,11 +826,11 @@ fn disable(
         vcpu.intercept_msrs(activation.window, crate::intercepted())?;
         soil = soil.union(CleanBits::PERMISSION_MAPS);
     }
-    if standing.life.carried() {
-        sync_into_model(activation, vlapic)?;
-        activation.rebuilt_at[vlapic.index().get()].store(standing.epoch, Ordering::Relaxed);
-    }
     let control = vcpu.control_mut();
+    // Everything that can fail is on one side of this or the other, which is what
+    // makes each failure describable: before it the block is still the one the
+    // processor has been entering, and from here on it is guarded and
+    // unaccelerated whatever the carry-back below reports.
     control.interrupt_control = control
         .interrupt_control
         .with_avic_enable(false)
@@ -667,6 +844,10 @@ fn disable(
         "vlapic: {} turned hardware delivery off for its guest",
         vlapic.index()
     );
+    if standing.life.carried() {
+        sync_into_model(activation, vlapic)?;
+        activation.rebuilt_at[vlapic.index().get()].store(standing.epoch, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -705,6 +886,18 @@ fn disable(
 /// page has not caught up with is one the next entry's steady arm sees and
 /// answers. Recording the count would be this arm claiming a rebuild it did not
 /// perform.
+///
+/// # The permission map is the last thing that can fail
+///
+/// Which is what makes this arm need no undo of its own, where [`enable`] does.
+/// The map moves all or not at all — the one failure it has is a window that
+/// cannot reach it, discovered before a bit of it is touched — so a failure
+/// here leaves the block in the face it arrived in, with the pass-through that
+/// face justifies, and the next entry performs the whole move again. Every step
+/// before it moves a structure rather than a permission, and a failure in one
+/// of those leaves the acceleration where it was: an identity withdrawn from
+/// the logical table costs one exit per interrupt addressed there, which the
+/// software path completes for both.
 fn switch(
     activation: &Activation,
     vcpu: &mut Vcpu,
@@ -2130,7 +2323,8 @@ fn logical_slot(ldr: u32, dfr: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     //! The decisions here that need no machine: which face the acceleration
-    //! drives a controller in, how far it reaches in each, which vector an
+    //! drives a controller in, which face a control block's own enable bits say
+    //! it is driving, how far it reaches in each, which vector an
     //! acknowledgement retires and which of the two doors it came through,
     //! which logical destinations name a table entry, whether a controller has
     //! one at all and what a slot two of them claim becomes, which move an
@@ -2162,7 +2356,8 @@ mod tests {
         Acknowledged, ApicId, Entry, FLAT_DESTINATION_FORMAT, Face, IS_RUNNING, IS_VALID,
         LOGICAL_ENTRIES, LOGICAL_VALID, Life, Mode, Move, NO_SLOT, Publish, Register, Standing,
         TaskPriority, VlapicError, Written, disclaim, driven_face, entry_slot, eoi_vector,
-        face_limit, logical_slot, mirrored, move_for, publication, publish_logical, withdraw,
+        face_bits, face_limit, logical_slot, mirrored, move_for, publication, publish_logical,
+        withdraw,
     };
 
     /// Every mode a controller can be in, which is the one term of the
@@ -2481,6 +2676,39 @@ mod tests {
         assert_eq!(move_for(None, None), Move::Idle);
         for face in [Face::XAvic, Face::X2Avic] {
             assert_eq!(move_for(Some(face), Some(face)), Move::Steady);
+        }
+    }
+
+    #[test]
+    fn a_blocks_two_enable_bits_name_the_face_the_hardware_is_driving() {
+        // The *have* predicate, which every decision about the run that is
+        // happening is made from: what the entry prepared, which authority
+        // answered a register access, which copy of the task priority the guest
+        // was running under. The base bit is the whole of the answer and the wider
+        // bit only selects between the faces.
+        assert_eq!(face_bits(true, false), Some(Face::XAvic));
+        assert_eq!(face_bits(true, true), Some(Face::X2Avic));
+        assert_eq!(face_bits(false, false), None);
+    }
+
+    #[test]
+    fn the_one_encoding_the_architecture_rejects_is_driven_in_neither_face() {
+        // The wider bit without the base bit: a block the processor refuses
+        // outright, with no guest instruction executed and nothing to resume from.
+        // Reported as no face, because that is what it is — and the move it
+        // composes into against a controller whose acceleration is not wanted is
+        // the idle one, which is why that arm is where the bit is taken away. An
+        // arm that did nothing at all left this the one state the state machine
+        // could not leave.
+        assert_eq!(face_bits(false, true), None);
+        assert_eq!(move_for(face_bits(false, true), None), Move::Idle);
+        // And where the acceleration *is* wanted the transition rewrites both
+        // bits, so the encoding is repaired by the arm that arms it.
+        for face in [Face::XAvic, Face::X2Avic] {
+            assert_eq!(
+                move_for(face_bits(false, true), Some(face)),
+                Move::Enable(face)
+            );
         }
     }
 

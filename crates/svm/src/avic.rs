@@ -303,6 +303,19 @@ impl IncompleteIpiExit {
 /// its direction, the register's offset in the controller's page, and — only
 /// for the one write where it is part of the request — the vector being
 /// retired.
+///
+/// # The offset is the register's name, not necessarily a place anything was
+/// accessed
+///
+/// The field is a byte offset into the memory-mapped register page, and under
+/// the older face it is also where the guest's access went. Under the face a
+/// guest reaches its controller through model-specific registers it is neither:
+/// the guest executed `RDMSR` or `WRMSR`, nothing was moved to or from memory,
+/// and the offset is the one the architecture derives that register's *index*
+/// from. Nothing in the exit says which of the two happened — the control
+/// block's own enable bits are the only thing that does — so a handler that
+/// treats the field as an address it can emulate an instruction against is
+/// right in one face and wrong in the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnacceleratedAccessExit {
     write: bool,
@@ -339,7 +352,9 @@ impl UnacceleratedAccessExit {
         self.write
     }
 
-    /// The register's offset in the controller's page.
+    /// The register's offset in the controller's page, which names the register
+    /// in both faces and locates the access in only one of them: see this
+    /// type's own documentation.
     #[must_use]
     pub const fn offset(&self) -> u16 {
         self.offset
@@ -389,10 +404,32 @@ pub const AVIC_DOORBELL: u32 = 0xC001_011B;
 /// what it finds. Write-only — reading it faults — and unlike most writes to a
 /// model-specific register, this one is not fully serializing, precisely
 /// because it sits on a path that has to be fast.
+///
+/// # The identifier field is twelve bits by decision, not by transcription
+///
+/// The architecture's figure for this register draws eight and leaves the rest
+/// must-be-zero, which no machine with more than 256 physical processors could
+/// be poked through — while the physical-table entry beside it names the same
+/// processor in twelve, and every such machine's identifiers need them. So the
+/// field is twelve here: a narrower one would silently poke the wrong processor
+/// on a machine this hypervisor is expected to run, and a wider one would set a
+/// bit the architecture reserves.
+///
+/// What that costs is a value a caller may not be able to express, and this
+/// type makes that the caller's decision rather than a surprise. An identifier
+/// above the field is one this register cannot name: truncating it pokes some
+/// *other* physical processor, which is the failure the width was widened to
+/// avoid reintroduced by the narrowing in front of it, and
+/// [`Doorbell::with_host_apic_id`] panics on it — which no delivery path may
+/// do. So a caller on one narrows through
+/// [`Doorbell::with_host_apic_id_checked`] and reaches a target it refuses by
+/// another transport: the host interrupt, which this crate's users send for
+/// every target the doorbell cannot reach anyway.
 #[bitfield_struct::bitfield(u64)]
 #[derive(PartialEq, Eq)]
 pub struct Doorbell {
-    /// Which physical processor to poke.
+    /// Which physical processor to poke. Twelve bits, for the reason this
+    /// type's own documentation gives.
     #[bits(12)]
     pub host_apic_id: u16,
     #[bits(52)]
@@ -606,5 +643,29 @@ mod tests {
         assert_eq!(Doorbell::new().with_host_apic_id(0xFFF).into_bits(), 0xFFF);
         assert_eq!(Doorbell::new().with_host_apic_id(1).into_bits(), 1);
         assert_eq!(Doorbell::new().into_bits(), 0);
+    }
+
+    /// And an identifier the field cannot hold is refused rather than
+    /// truncated.
+    ///
+    /// The two answers either side of the boundary, because the failure a
+    /// truncation produces is the one thing this register can do that nothing
+    /// on the machine reports: the write succeeds, some other physical
+    /// processor is poked, and the target is never told. The checked setter is
+    /// what a delivery path narrows through — the plain one panics, which is
+    /// the other thing a delivery path may not do.
+    #[test]
+    fn a_doorbell_refuses_an_identifier_wider_than_its_field() {
+        assert_eq!(
+            Doorbell::new().with_host_apic_id_checked(0xFFF),
+            Ok(Doorbell::new().with_host_apic_id(0xFFF))
+        );
+        for wider in [0x1000_u16, 0x1001, u16::MAX] {
+            assert_eq!(
+                Doorbell::new().with_host_apic_id_checked(wider),
+                Err(()),
+                "{wider:#x}"
+            );
+        }
     }
 }

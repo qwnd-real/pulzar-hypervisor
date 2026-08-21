@@ -408,6 +408,29 @@ mod tests {
     }
 
     #[test]
+    fn a_processor_with_no_x2apic_refuses_it_by_its_own_rule() {
+        // Named as the missing feature rather than as a reserved bit: the write
+        // had no reserved bit set, and the two rules that refuse this move — a
+        // processor without the mode, and a machine whose delivery policy will
+        // not drive it — are what an operator reading the line has to tell apart.
+        assert_eq!(
+            state(Mode::XApic).written(bits(Mode::X2Apic), model::tests::SPARSE),
+            Err(BaseFault::X2ApicUnsupported)
+        );
+        // And the same processor takes every other move, so the refusal is about
+        // the mode and not about the register.
+        for to in [Mode::XApic, Mode::Disabled] {
+            assert_eq!(
+                state(Mode::XApic)
+                    .written(bits(to), model::tests::SPARSE)
+                    .map(ApicBase::mode),
+                Ok(to),
+                "{to}"
+            );
+        }
+    }
+
+    #[test]
     fn the_bootstrap_flag_survives_a_write_clearing_it() {
         let written = ApicBase::reset(true)
             .written(bits(Mode::X2Apic), MODEL)

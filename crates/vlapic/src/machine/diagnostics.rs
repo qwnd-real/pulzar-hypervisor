@@ -282,6 +282,12 @@ pub(crate) enum Report {
     /// An exit only hardware delivery raises, taken while the software is the
     /// authority for this controller.
     OutOfStep,
+    /// An access the hardware reported as one it did not perform, at a moment
+    /// when nothing could perform it where it was reported.
+    UnperformableAccess,
+    /// The backing page could not be reached while the hardware was said to be
+    /// driving this controller, so it was demoted.
+    Demoted,
     /// An `INIT` another processor sent this one.
     InitSent,
     /// An `INIT` this processor applied to itself.
@@ -319,7 +325,7 @@ pub(crate) enum Report {
 impl Report {
     /// Every one of them, so that the word they are latched in can be shown to
     /// be wide enough and each of them shown to have a bit of its own.
-    const ALL: [Self; 25] = [
+    const ALL: [Self; 27] = [
         Self::RefusedRead,
         Self::RefusedWrite,
         Self::IllegalRegister,
@@ -331,6 +337,8 @@ impl Report {
         Self::Resetting,
         Self::Undelivered,
         Self::OutOfStep,
+        Self::UnperformableAccess,
+        Self::Demoted,
         Self::InitSent,
         Self::Initialized,
         Self::StartupSent,

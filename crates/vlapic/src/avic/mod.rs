@@ -45,6 +45,7 @@ mod tables;
 
 use alloc::{vec, vec::Vec};
 
+use log::{trace, warn};
 use svm::avic::{IncompleteIpiExit, MAX_PHYSICAL_ID, UnacceleratedAccessExit};
 use vcpu::Vcpu;
 use x86_64::PhysAddr;
@@ -53,7 +54,7 @@ use crate::{
     VlapicError,
     avic::{backing::ResetImage, tables::PhysicalTable},
     face,
-    machine::{current, registry},
+    machine::{current, diagnostics::Report, registry},
     registers::base::ApicBase,
 };
 
@@ -215,18 +216,38 @@ pub fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
     activation::reconcile(vcpu)
 }
 
-/// Whether this processor's controller is being driven in hardware at this
-/// moment.
+/// Whether the control block this processor was entered with, or is about to be
+/// entered with, carries hardware-driven delivery.
 ///
-/// The question the exit loop asks to decide what the entry may carry: a
-/// processor whose controller the hardware drives takes no pending-interrupt
-/// fields, and mirrors no task priority.
+/// The one question every decision about the run that is *happening* is made
+/// from, and the one this crate's callers must ask rather than asking the
+/// controller whether the acceleration is permitted. The two answers are
+/// different questions: the controller says what the next reconciliation will
+/// try to do, and the block says what the processor is entered with. They
+/// differ wherever a transition could not be performed, and they differ for a
+/// moment wherever another processor demoted the machine while this one was
+/// inside the guest.
 ///
-/// # Errors
+/// So the entry's whole shape comes from this — whether the model's interrupts
+/// cross into the backing page, whether the task priority the processor honours
+/// is mirrored, whether an interrupt window is armed, whether the running bit
+/// is published — and so does whether an access the hardware reported was one
+/// it completed before it exited.
+#[must_use]
+pub fn accelerated(vcpu: &Vcpu) -> bool {
+    activation::accelerated(vcpu)
+}
+
+/// Whether the block carries that acceleration in the face a guest reaches its
+/// controller through model-specific registers.
 ///
-/// As [`crate::read_msr`].
-pub fn active() -> Result<bool, VlapicError> {
-    current().map(activation::active_for)
+/// What an unaccelerated access *describes* rather than which registers it
+/// covers: the exit reports a register offset either way, and under this face
+/// the guest executed `RDMSR` or `WRMSR` — so no memory access took place, and
+/// an offset inside the register page names nothing that was accessed.
+#[must_use]
+pub fn wider_face(vcpu: &Vcpu) -> bool {
+    activation::wider_face(vcpu)
 }
 
 /// Says this processor is in the guest, so another processor delivering an
@@ -318,6 +339,60 @@ pub fn unaccelerated_trap(exit: UnacceleratedAccessExit) -> Result<(), VlapicErr
         return Ok(());
     };
     activation::trap_write(register, exit.eoi_vector())
+}
+
+/// Refuses an access the hardware reported and neither authority can perform
+/// where it was reported, and takes the acceleration off this processor so that
+/// the guest's own retry is served by the software path.
+///
+/// The one access that reaches here is one the hardware performed no part of
+/// while the block was driving the controller in the face a guest reaches it
+/// through model-specific registers. The exit reports the register's *page*
+/// offset there, because that is the offset the architecture derives its index
+/// from — but the guest executed `RDMSR` or `WRMSR`, so nothing was moved to or
+/// from memory and there is no instruction the register page's device could be
+/// asked to perform.
+///
+/// The demotion is what performs the access. It takes the page's state into the
+/// model and stops this controller claiming the hardware, so the next entry
+/// restores full interception of the controller's registers and the guest —
+/// whose instruction pointer nothing here moves — executes the same access
+/// again, this time as the intercepted register access [`crate::write_msr`] and
+/// [`crate::read_msr`] answer in full: the operand out of the save area, the
+/// reserved-bit rules, and the general protection fault the architecture owes a
+/// bad one.
+///
+/// Nothing should reach here at all. Every register of that face the table
+/// classifies as one the hardware refuses is intercepted, and interception has
+/// priority over the acceleration's own permission checks — so an access here
+/// is the pass-through set and the register table disagreeing about one
+/// register, which is worth a line naming it rather than a silent route through
+/// either answer.
+///
+/// # Errors
+///
+/// As [`crate::read_msr`], from the carry-back alone: the demotion itself
+/// happens either way.
+pub fn unaccelerated_refused(exit: UnacceleratedAccessExit) -> Result<(), VlapicError> {
+    let vlapic = current()?;
+    let direction = if exit.is_write() { "write" } else { "read" };
+    if vlapic.diagnostics().say(Report::UnperformableAccess) {
+        warn!(
+            "vlapic: {} reached a controller register the hardware does not accelerate through a \
+             model-specific register — a {direction} at derived offset {:#x}, which no access to \
+             the register page performed; the processor returns to software delivery and the \
+             access is retried there",
+            vlapic.index(),
+            exit.offset()
+        );
+    } else {
+        trace!(
+            "vlapic: {} reached {:#x} as a {direction} the hardware did not accelerate",
+            vlapic.index(),
+            exit.offset()
+        );
+    }
+    activation::hand_back(vlapic)
 }
 
 /// Wakes every target of a command the hardware already delivered to but

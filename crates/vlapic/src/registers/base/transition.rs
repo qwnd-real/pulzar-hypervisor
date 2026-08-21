@@ -91,8 +91,10 @@ impl Vlapic {
     ///
     /// # Errors
     ///
-    /// Whatever the transition refused: a reserved bit, or a state that cannot
-    /// be reached from this one.
+    /// Whatever the transition refused: a reserved bit, a state that cannot
+    /// be reached from this one, or the wider face on a machine that has none
+    /// to give — see [`BaseFault`], which names which of the two rules
+    /// about that face refused it.
     pub(crate) fn write_base(&self, value: u64) -> Result<Transition, BaseFault> {
         let current = self.base();
         let next = current.written(value, self.model)?;
@@ -104,8 +106,8 @@ impl Vlapic {
         // its own architecture gives for reaching for a feature it has none
         // of. The check the processor's own report provides sits in
         // [`ApicBase::written`]; this one is the policy's.
-        if from != to && to == Mode::X2Apic && !crate::avic::activation::x2avic_permitted() {
-            return Err(BaseFault::Reserved);
+        if let Some(refused) = offered(from, to, crate::avic::activation::x2avic_permitted()) {
+            return Err(refused);
         }
         if from == to {
             // Not a transition. Software that reads the register, changes a
@@ -158,6 +160,24 @@ impl Vlapic {
         });
         Transition::Changed { quiet, debts }
     }
+}
+
+/// Whether this hypervisor's own delivery policy refuses a face change the
+/// architecture allows, and why.
+///
+/// Pure rather than a condition inside [`Vlapic::write_base`], because it is a
+/// rule of this hypervisor's rather than of the architecture and the one line
+/// an operator gets out of a refused mode entry has to name it as such.
+///
+/// Only a move that goes somewhere is judged. A write naming the face the
+/// controller is already in has asked for nothing, and refusing one would fault
+/// a guest already in a face this machine cannot drive for reading its own
+/// register and writing it back.
+const fn offered(from: Mode, to: Mode, permitted: bool) -> Option<BaseFault> {
+    if !matches!(to, Mode::X2Apic) || matches!(from, Mode::X2Apic) || permitted {
+        return None;
+    }
+    Some(BaseFault::X2ApicNotOffered)
 }
 
 /// Whether moving between these two faces leaves the register file as reset
@@ -225,8 +245,10 @@ impl ApicBase {
     /// # Errors
     ///
     /// [`BaseFault::Reserved`] if any bit the architecture reserves was written
-    /// non-zero, or [`BaseFault::IllegalTransition`] if the two enable bits
-    /// name a state this one cannot go to.
+    /// non-zero, [`BaseFault::IllegalTransition`] if the two enable bits
+    /// name a state this one cannot go to, or
+    /// [`BaseFault::X2ApicUnsupported`] if the wider face was asked for on a
+    /// processor that reports none.
     pub(crate) fn written(self, value: u64, model: Model) -> Result<Self, BaseFault> {
         if value & reserved() != 0 {
             return Err(BaseFault::Reserved);
@@ -253,7 +275,7 @@ impl ApicBase {
         // processor's answer, and a guest allowed to enter a mode its own
         // feature test denies would be one whose feature tests mean nothing.
         if value & X2APIC_ENABLE != 0 && !model.x2apic() {
-            return Err(BaseFault::Reserved);
+            return Err(BaseFault::X2ApicUnsupported);
         }
         if !permitted(self.mode(), next.mode()) {
             return Err(BaseFault::IllegalTransition);
@@ -263,6 +285,14 @@ impl ApicBase {
 }
 
 /// Why a write to `IA32_APIC_BASE` did not take.
+///
+/// Every variant is the same exception as far as the guest is concerned — a
+/// general protection fault — and they are kept apart because the one line an
+/// operator gets out of a refused write is this name. Two of them are the
+/// reasons the *wider face* is refused, and they are two rather than one
+/// because two different rules refuse the same write for reasons an operator
+/// would act on differently: a machine that has no such face at all, and a
+/// machine that has one this hypervisor's delivery policy will not drive.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub(crate) enum BaseFault {
     /// A bit the architecture reserves was written non-zero: one of the eight
@@ -274,6 +304,25 @@ pub(crate) enum BaseFault {
     /// controller is in, or a combination that is not a state at all.
     #[error("the apic base register cannot go to that mode from this one")]
     IllegalTransition,
+    /// The guest asked to enter the wider face on a processor whose own `CPUID`
+    /// says it has none.
+    ///
+    /// The architecture's rule rather than this hypervisor's: `CPUID` is passed
+    /// through, so this is the real processor's answer, and a guest allowed to
+    /// enter a mode its own feature test denies would be one whose feature
+    /// tests mean nothing.
+    #[error("this processor reports no x2apic mode for the apic base register to enter")]
+    X2ApicUnsupported,
+    /// The guest asked to enter the wider face on a machine whose delivery
+    /// policy will not drive it.
+    ///
+    /// This hypervisor's rule. The machine has the mode and the guest was never
+    /// told it does — the feature bit is withheld from the same answer —
+    /// because a controller offered a face the acceleration cannot follow
+    /// is one the guest believes accelerated at exactly the moments it is
+    /// not.
+    #[error("this machine's interrupt delivery policy does not offer the guest x2apic mode")]
+    X2ApicNotOffered,
 }
 
 /// Whether the architecture allows a controller in `from` to be written into
@@ -315,8 +364,14 @@ mod tests {
     //! Which transition throws the register file away is the one decision in
     //! this file that can be checked without a controller, and it is the one
     //! that costs a guest state it is entitled to keep if it is wrong.
+    //!
+    //! Beside it is the rule that is this hypervisor's rather than the
+    //! architecture's: whether the wider face is on offer at all. Two different
+    //! rules refuse the same write, and the whole of what refusing them
+    //! differently buys is the one line an operator gets — so the variants are
+    //! asserted apart.
 
-    use super::{Mode, resets};
+    use super::{BaseFault, Mode, offered, resets};
 
     /// Every state, so that a mode cannot be added without a decision here.
     const STATES: [Mode; 3] = [Mode::Disabled, Mode::XApic, Mode::X2Apic];
@@ -342,5 +397,37 @@ mod tests {
         // against it, neither of which a controller has to be enabled to be
         // given.
         assert!(!resets(Mode::Disabled, Mode::XApic));
+    }
+
+    #[test]
+    fn the_wider_face_is_refused_by_its_own_rule_where_the_policy_withholds_it() {
+        // Named as the policy's refusal rather than as a reserved bit, because a
+        // write that had no reserved bit set reported as one sends whoever reads
+        // the line looking at the value the guest wrote instead of at this
+        // machine's delivery policy.
+        for from in [Mode::Disabled, Mode::XApic] {
+            assert_eq!(
+                offered(from, Mode::X2Apic, false),
+                Some(BaseFault::X2ApicNotOffered),
+                "{from}"
+            );
+            assert_eq!(offered(from, Mode::X2Apic, true), None, "{from}");
+        }
+    }
+
+    #[test]
+    fn the_policy_refuses_nothing_but_entering_the_wider_face() {
+        // Every other move, under both answers. In particular a controller
+        // already in the wider face may write the register it is in: a machine
+        // that cannot drive that face still has to let a guest already there read
+        // its own register and write it back, and it still has to let it leave.
+        for permitted in [false, true] {
+            for from in STATES {
+                for to in [Mode::Disabled, Mode::XApic] {
+                    assert_eq!(offered(from, to, permitted), None, "{from} to {to}");
+                }
+            }
+            assert_eq!(offered(Mode::X2Apic, Mode::X2Apic, permitted), None);
+        }
     }
 }

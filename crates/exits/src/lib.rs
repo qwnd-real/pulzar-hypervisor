@@ -23,7 +23,8 @@
 //!   inter-processor delivery the hardware could not finish, completed by the
 //!   rule its failure names, and a register access it does not implement,
 //!   either bookkept — the hardware finished it before it exited — or performed
-//!   against the register page's device.
+//!   at whichever of the controller's two faces the guest reached the register
+//!   through.
 //! - Nested page faults, which are how a guest's memory comes to be described
 //!   at all, and how a write to hypervisor memory is stepped over.
 //! - The two notifications the [`portal`] makes, which are the only two things
@@ -79,7 +80,7 @@ use portal::Portal;
 use svm::{CleanBits, Reason};
 use thiserror::Error;
 use vcpu::{Flow, RunPhase, Vcpu, VcpuError};
-use vlapic::{Nomination, Resumption, VlapicError};
+use vlapic::{Resumption, VlapicError};
 use x86_64::instructions::interrupts;
 
 pub use crate::firmware::Boot;
@@ -246,8 +247,14 @@ impl<'a> Exits<'a> {
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
         let reason = vcpu.reason();
         self.census.record(vcpu);
-        let interrupts = vcpu.control().interrupt_control;
-        vlapic::observe_task_priority(interrupts.avic_enable(), interrupts.virtual_tpr());
+        // Read out of the control block rather than out of the controller: which
+        // authority owned the guest's task priority for the run that has just
+        // ended is whatever the processor was entered with, and the controller
+        // answers what the next entry will try to arrange.
+        vlapic::observe_task_priority(
+            vlapic::avic_accelerated(vcpu),
+            vcpu.control().interrupt_control.virtual_tpr(),
+        );
         // This processor is out of the guest and consults its controller below
         // before going back in, so nothing needs to interrupt it to make it
         // look.
@@ -382,11 +389,8 @@ impl<'a> Exits<'a> {
         // controller still asks for the hardware and the block was deliberately
         // left unarmed, and everything below has to serve the entry that is
         // actually going to happen.
-        let accelerated = vcpu.control().interrupt_control.avic_enable();
-        // Which of these two runs is which authority owns this processor's
-        // controller for the run about to happen, and they are exclusive by
-        // construction: one register, one writer, in each direction.
-        if accelerated {
+        let driving = Driving::of(vlapic::avic_accelerated(vcpu));
+        if driving.hands_over() {
             // Everything the model is still holding that the hardware can
             // deliver goes into the backing page, so that the hardware both
             // delivers each vector and retires it. Nothing is injected below but
@@ -397,7 +401,8 @@ impl<'a> Exits<'a> {
                     "exits: the controller could not hand its interrupts to the hardware: {error}"
                 );
             }
-        } else {
+        }
+        if driving.mirrors_task_priority() {
             // Before anything below reads the controller, because the interrupt
             // window one of them arms is judged by the processor against exactly
             // this field.
@@ -440,14 +445,10 @@ impl<'a> Exits<'a> {
         // brought in, which no controller holds in service — and it is injected
         // outright the moment the guest is willing, which is all the software
         // path owes it.
-        let nomination = if accelerated {
-            Nomination {
-                deliverable: vlapic::nominate().unwrap_or_default().deliverable,
-                blocked: None,
-            }
-        } else {
-            vlapic::nominate().unwrap_or_default()
-        };
+        let mut nomination = vlapic::nominate().unwrap_or_default();
+        if !driving.arms_a_window() {
+            nomination.blocked = None;
+        }
         let (candidate, blocked) = (nomination.deliverable, nomination.blocked);
         let injected = self.interrupts.commit(vcpu, candidate, blocked);
         // Only when there was something to decide about. Every exit reaches
@@ -473,7 +474,7 @@ impl<'a> Exits<'a> {
         // Published last, when everything the entry prepared is in place and
         // the guest is about to run: from here until the exit, another
         // processor delivering an IPI may ring this one rather than exit.
-        if accelerated {
+        if driving.publishes_running() {
             let _ = vlapic::avic_publish_running();
         }
         Flow::Resume
@@ -550,7 +551,7 @@ impl<'a> Exits<'a> {
             || !vlapic::running().unwrap_or(true)
             || (inject::interrupts_unmasked(vcpu)
                 && (vlapic::nominate().unwrap_or_default().deliverable.is_some()
-                    || (vcpu.control().interrupt_control.avic_enable()
+                    || (vlapic::avic_accelerated(vcpu)
                         && vlapic::avic_deliverable().unwrap_or(false))))
     }
 
@@ -600,6 +601,79 @@ impl<'a> Exits<'a> {
     }
 }
 
+/// Which authority delivers this processor's interrupts for the run about to
+/// happen, and therefore what the entry does about them.
+///
+/// One term, taken from the control block, and the four questions below are all
+/// of what an entry asks it. Written as a value because the term is the one
+/// this loop had wrong. It used to ask the *controller* whether the
+/// acceleration was permitted, which is what [`vlapic::avic_reconcile`] tries
+/// to bring the block to and not what the block ends up carrying — and the two
+/// disagree wherever a transition could not be performed, wherever another
+/// processor demoted the machine a microsecond earlier, and on the boot
+/// processor's first entry, where the activation state is published before any
+/// block names a page.
+///
+/// What that produced was an entry that was half of each: the task priority the
+/// processor really does honour left holding a stale value, so a wrong `CR8`
+/// and an interrupt window judged against the wrong number; the window itself
+/// withdrawn, so a vector the guest's own priority is holding back is armed
+/// nowhere and the guest lowering that priority produces no exit; and the
+/// running bit published for a block with the acceleration off, so a peer's
+/// hardware deposits an interrupt in a page nothing on the software path reads.
+/// One transient failure lost an interrupt and stranded another, and the next
+/// entry did it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Driving {
+    /// The hardware, which delivers out of the backing page and evaluates the
+    /// priorities there without an exit.
+    Hardware,
+    /// The software, which delivers by injecting into the control block what
+    /// the emulated controller nominates.
+    Software,
+}
+
+impl Driving {
+    /// Which of them the control block leaves driving.
+    ///
+    /// One term is enough because the two authorities own the same registers,
+    /// one at a time: each question below belongs to exactly one of them,
+    /// so every answer is this term or its complement and none of them may
+    /// be decided from anything else.
+    const fn of(accelerated: bool) -> Self {
+        if accelerated {
+            Self::Hardware
+        } else {
+            Self::Software
+        }
+    }
+
+    /// Whether what the model is still holding crosses into the backing page,
+    /// so that the hardware both delivers each vector and retires it.
+    const fn hands_over(self) -> bool {
+        matches!(self, Self::Hardware)
+    }
+
+    /// Whether the control block's own task-priority field is written from the
+    /// emulated register, it being what the processor answers a `CR8` access
+    /// from and compares an armed interrupt window against.
+    const fn mirrors_task_priority(self) -> bool {
+        matches!(self, Self::Software)
+    }
+
+    /// Whether the vector the guest's own priority is holding back is armed, so
+    /// that the guest lowering that priority produces an exit.
+    const fn arms_a_window(self) -> bool {
+        matches!(self, Self::Software)
+    }
+
+    /// Whether this processor says it is in the guest, so that a peer's
+    /// hardware may deliver to it without an exit.
+    const fn publishes_running(self) -> bool {
+        matches!(self, Self::Hardware)
+    }
+}
+
 /// Why the exit loop stopped entering the guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Left {
@@ -645,4 +719,48 @@ fn advance(vcpu: &mut Vcpu, fallback: u64) {
     } else {
         next
     };
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one decision this loop makes that needs no guest: what an entry does
+    //! about this processor's interrupts. Everything else here runs a control
+    //! block, and a control block cannot be built on a host.
+
+    use super::Driving;
+
+    #[test]
+    fn the_shape_of_an_entry_is_whatever_the_control_block_carries() {
+        // Both rows, question by question, against the block's own answer.
+        let hardware = Driving::of(true);
+        assert_eq!(hardware, Driving::Hardware);
+        assert!(hardware.hands_over());
+        assert!(!hardware.mirrors_task_priority());
+        assert!(!hardware.arms_a_window());
+        assert!(hardware.publishes_running());
+
+        let software = Driving::of(false);
+        assert_eq!(software, Driving::Software);
+        assert!(!software.hands_over());
+        assert!(software.mirrors_task_priority());
+        assert!(software.arms_a_window());
+        assert!(!software.publishes_running());
+    }
+
+    #[test]
+    fn every_decision_an_entry_makes_follows_the_one_term() {
+        // The property that keeps the want and the have from being confused
+        // again: not one of these four may be answered from anything but which
+        // authority the block leaves driving, so each of them differs between the
+        // two. One that stopped differing would be one decided elsewhere, and the
+        // entry would once more be able to be half of each.
+        let (hardware, software) = (Driving::Hardware, Driving::Software);
+        assert_ne!(hardware.hands_over(), software.hands_over());
+        assert_ne!(
+            hardware.mirrors_task_priority(),
+            software.mirrors_task_priority()
+        );
+        assert_ne!(hardware.arms_a_window(), software.arms_a_window());
+        assert_ne!(hardware.publishes_running(), software.publishes_running());
+    }
 }

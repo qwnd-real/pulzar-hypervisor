@@ -362,20 +362,35 @@ fn avic_write(vlapic: &Vlapic, register: Register, value: u64) -> Option<Written
 /// out of an in-service bank that stopped tracking its interrupts when the
 /// acceleration was turned on. [`crate::avic::activation::hand_back`] is both
 /// halves of that.
+///
+/// Said once per controller and traced afterwards, exactly as [`refused`] next
+/// door is and for the same reason: the guest chooses how often this is
+/// reached, every line leaves through a polled serial register taken with a
+/// machine-wide lock and interrupts off, and what the line reports needs no
+/// repeating to stay true. The demotion itself is not latched — it is
+/// idempotent, and a controller that has been demoted stays demoted.
 fn demote(vlapic: &Vlapic, register: Register, error: VlapicError) {
     let carried = crate::avic::activation::hand_back(vlapic);
-    warn!(
-        "vlapic: {} could not reach its backing page for {register:?}: {error}; the processor \
-         returns to software delivery",
-        vlapic.index()
-    );
-    if let Err(carried) = carried {
+    if vlapic.diagnostics().say(Report::Demoted) {
         warn!(
-            "vlapic: {} could not carry its backing page into the model as it stepped back: \
-             {carried}; the model answers with what it last held",
+            "vlapic: {} could not reach its backing page for {register:?}: {error}; the processor \
+             returns to software delivery, and later failures on this controller are traced rather \
+             than reported",
             vlapic.index()
         );
+        if let Err(carried) = carried {
+            warn!(
+                "vlapic: {} could not carry its backing page into the model as it stepped back: \
+                 {carried}; the model answers with what it last held",
+                vlapic.index()
+            );
+        }
+        return;
     }
+    trace!(
+        "vlapic: {} could not reach its backing page for {register:?}: {error}, carried {carried:?}",
+        vlapic.index()
+    );
 }
 
 /// Translates a physical deadline into the timestamp domain the guest reads.

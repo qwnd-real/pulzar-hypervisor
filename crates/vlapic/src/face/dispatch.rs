@@ -468,24 +468,7 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
             mirror_logical_destination(vlapic);
             settle_logical_table(vlapic);
         }
-        Written::ModeChanged(transition) => {
-            // A face change is one of the two boundaries a demotion is
-            // reconsidered at: the acceleration's state follows the guest's
-            // mode at the next entry either way, and the reasons it was
-            // taken away belong to the mode that was.
-            vlapic.permit_avic();
-            entered(vlapic, transition);
-            // And the face is what decides whether the table hardware delivery
-            // resolves a logical destination through names this controller at
-            // all, only the older face being resolved through it. Settled here
-            // rather than left to the next entry, so that no peer resolves to an
-            // identity the guest has just given up — and only where the face
-            // really moved, because that table is machine-wide and a write
-            // naming the face already held has asked for nothing.
-            if !matches!(transition, Transition::Unchanged) {
-                settle_logical_table(vlapic);
-            }
-        }
+        Written::ModeChanged(transition) => face_changed(vlapic, transition),
         Written::Command(command) => match lapics() {
             Ok(page) => delivery::send(vlapic, page.all(), command),
             Err(error) => warn!("vlapic: a command could not be delivered: {error}"),
@@ -495,6 +478,36 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
         // receiver's — even though the two are the same controller here.
         Written::SelfIpi(vector) => self_ipi(vlapic, vector),
     }
+}
+
+/// Answers a guest's write of the register that decides which face it reaches
+/// its controller through.
+///
+/// Three things follow a face change, and every one of them is owed to the
+/// change rather than to the write: real hardware has to be brought across, the
+/// table hardware delivery resolves a logical destination through has to be
+/// settled because only the older face is resolved through it, and the decision
+/// to demote this controller has to be remade — the acceleration's state
+/// follows the guest's mode at the next entry either way, and the reasons it
+/// was taken away belong to the mode that was.
+///
+/// So a write that changed nothing is answered with nothing. The architecture
+/// explicitly allows one: software that reads this register, changes a field it
+/// is entitled to and writes it back has made no transition, and
+/// [`Vlapic::write_base`] is careful to say so. Acting anyway made the shortest
+/// loop a guest can write into a demotion undone, a backing page rebuilt and a
+/// translation flushed per iteration — because none of the four reasons a
+/// controller is demoted is a statement about the guest at all, and none of
+/// them is re-established by a guest register write.
+fn face_changed(vlapic: &Vlapic, transition: Transition) {
+    if matches!(transition, Transition::Unchanged) {
+        return;
+    }
+    vlapic.permit_avic();
+    entered(vlapic, transition);
+    // Settled here rather than left to the next entry, so that no peer resolves
+    // to an identity the guest has just given up.
+    settle_logical_table(vlapic);
 }
 
 /// Brings the table hardware delivery resolves a logical destination through
