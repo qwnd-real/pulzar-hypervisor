@@ -29,7 +29,7 @@ pub const QEMU_INSTALL_HINT: &str = "install QEMU (it provides qemu-system-x86_6
 /// hardware shares, so it is the one topology a guest has to be run on before
 /// the emulation is believed. A flat `-smp 16` gives sixteen single-threaded
 /// cores and never exercises it.
-const TOPOLOGY: &str = "16,sockets=1,cores=8,threads=2";
+const TOPOLOGY: &str = "8,sockets=1,cores=4,threads=2";
 
 /// The processor the guest is shown.
 ///
@@ -155,7 +155,12 @@ pub fn run(
 pub fn launch(spec: &Spec) -> Result<()> {
     let (code, vars) = firmware(spec.label)?;
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu.args(["-machine", "q35,accel=kvm", "-cpu", PROCESSOR]);
+    qemu.args([
+        "-machine",
+        "q35,accel=kvm,kernel-irqchip=on",
+        "-cpu",
+        PROCESSOR,
+    ]);
     qemu.args(["-smp", TOPOLOGY, "-m", MEMORY]);
     qemu.args(["-no-shutdown", "-no-reboot"]);
     qemu.args(["-overcommit", "cpu-pm=on"]);

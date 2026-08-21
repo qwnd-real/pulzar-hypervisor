@@ -151,13 +151,16 @@ extern "efiapi" fn efi_main(argument: *const c_void) -> Status {
 /// retried: a half-adopted address space cannot be handed back to firmware, and
 /// the caller halts.
 fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
-    announce(handoff);
-
     // SAFETY: the loader built this address space, activated it and jumped here,
     // so it is the live one; its direct map covers the chunk because the loader
     // sized it from the whole physical address space; and no other
     // `AddressSpace` exists in this image.
     let mut space = unsafe { AddressSpace::adopt(&adopted(handoff)?) }?;
+    // Before anything logs, so that what follows lands on the screen where one
+    // was offered and taken.
+    attach_screen(&mut space, &handoff.framebuffer);
+    announce(handoff);
+
     space.describe("core");
 
     let heap = Heap::establish(&mut space)?;
@@ -318,6 +321,59 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     run_guest(&mut vcpu, partition, portal, handoff)
 }
 
+/// Maps the handoff's frame buffer and offers it to the logging backend.
+///
+/// The aperture is device memory, which is why this mapping exists at all: the
+/// direct map covers RAM only. It is mapped `UncachedMinus`, which lets
+/// firmware's MTRRs keep the type they chose for this range — write-combining
+/// where firmware wanted scanout performance, uncached where it did not — and
+/// the translation stands for as long as the machine does, because the writer
+/// on the other side of [`serial::offer_screen`] holds no reference to it that
+/// could go stale.
+///
+/// A machine with no usable screen in its handoff, or one whose aperture will
+/// not map, keeps logging through whatever port answered; neither is worth a
+/// boot.
+fn attach_screen(space: &mut AddressSpace, screen: &handoff::Framebuffer) {
+    #[cfg(feature = "efifb")]
+    {
+        use paging::{CacheType, Protection};
+
+        if !screen.usable() {
+            info!("core: no usable screen in the handoff; logging stays on the ports");
+            return;
+        }
+        let span = u64::from(screen.pitch) * u64::from(screen.height);
+        // SAFETY: the range is device memory firmware itself drew through as a
+        // linear frame buffer, described by firmware's own console mode and
+        // carried verbatim in the handoff; nothing else maps or writes this
+        // aperture; read-write non-executable is what drawing needs; and the
+        // returned handle is dropped without unmapping, which is deliberate —
+        // the translation must outlive every log line.
+        match unsafe {
+            space.map_physical(
+                PhysAddr::new(screen.base),
+                span,
+                Protection::ReadWrite,
+                CacheType::UncachedMinus,
+            )
+        } {
+            Ok(mapping) => {
+                let address = mapping.addr().as_u64();
+                drop(mapping);
+                if serial::offer_screen(screen, address) {
+                    info!("core: logging attached to the frame buffer at {address:#x}");
+                }
+            }
+            Err(error) => warn!("core: the frame buffer would not map: {error}"),
+        }
+    }
+    #[cfg(not(feature = "efifb"))]
+    {
+        let _ = (space, screen);
+    }
+}
+
 /// Enters the guest on the boot processor and stays in its exits until one of
 /// them ends the guest.
 ///
@@ -331,6 +387,11 @@ fn run_guest(
     portal: Portal,
     handoff: &Handoff,
 ) -> Result<Infallible, CoreError> {
+    // The display stops being ours the moment this guest draws on it, which
+    // it does as soon as it runs: every record after this point is discarded
+    // rather than written under whatever the guest puts there. Ports are not
+    // touched — nothing owns them but us.
+    serial::retire_screen();
     let mut exits = Exits::new(
         partition,
         portal,

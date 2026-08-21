@@ -414,6 +414,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -474,6 +480,7 @@ dependencies = [
  "pci",
  "portal",
  "probe",
+ "processor",
  "serial",
  "snapshot",
  "spin 0.12.2",
@@ -704,6 +711,7 @@ dependencies = [
  "svm",
  "thiserror",
  "vcpu",
+ "vlapic",
  "x86_64",
 ]
 
@@ -895,6 +903,8 @@ name = "serial"
 version = "0.1.0"
 dependencies = [
  "clock",
+ "font8x8",
+ "handoff",
  "log",
  "spin 0.12.2",
  "thiserror",
@@ -1172,11 +1182,14 @@ dependencies = [
  "emulate",
  "ipi",
  "log",
+ "paging",
  "probe",
  "processor",
  "snapshot",
  "spin 0.12.2",
+ "svm",
  "thiserror",
+ "vcpu",
  "x86_64",
 ]
 

@@ -40,5 +40,11 @@ x86_64 = { workspace = true }
 # unaffected and still readable from a debugger.
 quiet = ["serial/quiet"]
 
+# The logging screen backend, for machines with neither a debug console nor a
+# UART header. Compiles the backend and its glyph tables into this image; off
+# by default because a screen is a guest-facing device once the firmware guest
+# starts drawing.
+efifb = ["serial/efifb"]
+
 [lints]
 workspace = true

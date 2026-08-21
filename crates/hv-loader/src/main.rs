@@ -132,9 +132,24 @@ fn main() -> Status {
     // one that must not boot. Every record below is discarded while no logger is
     // installed, and the loader's work does not depend on any of them.
     let _ = serial::init();
+    // Before the first record, deliberately: with the screen backend compiled
+    // in this is what puts every line that follows on the display, and a boot
+    // that freezes anywhere later is a boot whose last painted line says where
+    // it stopped. The identity map still stands, so the bytes are reachable at
+    // their physical address and need no mapping of ours.
+    let screen = firmware::framebuffer();
+    serial::offer_screen(&screen, screen.base);
     info!("loader: pulzar hv-loader starting");
+    if screen.usable() {
+        info!(
+            "loader: console frame buffer at {:#x}, {}x{}, logging attached",
+            screen.base, screen.width, screen.height
+        );
+    } else {
+        warn!("loader: no usable console screen; logging stays on the ports");
+    }
     firmware.describe("loader");
-    match boot(&firmware) {
+    match boot(&firmware, screen) {
         // `boot` only ever returns by failing; its success type is uninhabited.
         Ok(never) => match never {},
         Err(error) => {
@@ -151,7 +166,10 @@ fn main() -> Status {
 /// The first failure of any step, which ends the boot. Nothing is rolled back:
 /// the reserved chunk stays reserved and firmware is left as it was found,
 /// which is what firmware expects of an application that returns an error.
-fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
+fn boot(
+    firmware: &FirmwareContext,
+    screen: handoff::Framebuffer,
+) -> Result<Infallible, LoaderError> {
     // Read before anything slow, so the gap between this reading and the
     // hypervisor's own clock coming up is as small as the loader can make it.
     let boot_wall = firmware::wall_clock();
@@ -230,6 +248,7 @@ fn boot(firmware: &FirmwareContext) -> Result<Infallible, LoaderError> {
         hypervisor,
         placement,
         boot_wall,
+        screen,
     };
     let handoff = publish(&space, inputs, firmware)?;
     let entry = VirtAddr::new(image.entry(placement.image_base.as_u64()));
@@ -328,6 +347,7 @@ struct HandoffInputs {
     hypervisor: Hypervisor,
     placement: Placement,
     boot_wall: Option<Wall>,
+    screen: handoff::Framebuffer,
 }
 
 /// Places the hypervisor image and its stack in the new address space.
@@ -500,6 +520,7 @@ fn publish(
         hypervisor,
         placement,
         boot_wall,
+        screen,
     } = inputs;
     let chunk_base = reserved.chunk;
     let context = chunk_base + chunk::FIRMWARE_CONTEXT_OFFSET;
@@ -535,6 +556,7 @@ fn publish(
         boot_wall_nanos: boot_wall.map_or(0, Wall::nanos),
         ap_trampoline_base: reserved.trampoline.as_u64(),
         firmware_context: direct(space, context)?.as_u64(),
+        framebuffer: screen,
     };
 
     let pointer = identity_ptr::<FirmwareContext>(context)?;

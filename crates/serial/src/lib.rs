@@ -4,30 +4,48 @@
 //! [`init`] picks a backend, installs a [`log`] logger that writes
 //! `[HH:MM:SS mmm] [LEVEL module_path] message` lines to it, and never changes
 //! its mind afterwards. The timestamp is uptime from the installed clock, or
-//! zero before that clock exists. Two backends exist and the choice between
+//! zero before that clock exists. Three backends exist and the choice between
 //! them is not a preference:
 //!
 //! - QEMU's **debug console**, a single write-only I/O port with no line rate,
 //!   no holding register to poll and no divisor to program. A byte costs one
 //!   port write.
 //! - A **16550 UART** at one of the standard COM ports, which is what a real
-//!   machine has, and which clocks a byte out in about 260 µs.
+//!   machine with a header has, and which clocks a byte out in about 260 µs.
+//! - The **UEFI frame buffer** firmware drew its console through, drawn to as
+//!   pixels. It exists behind the `efifb` feature, because a screen is not
+//!   always there to take and is a guest-facing device once it is: where the
+//!   feature put a backend in the image, the screen has first priority —
+//!   [`offer_screen`] takes the output away from whichever port answered first
+//!   — and [`retire_screen`] gives it up before anything else draws.
 //!
-//! The debug console wins wherever it answers, by four orders of magnitude per
-//! byte. That gap is the difference between a hypervisor that can describe its
-//! own interrupt path and one whose guest starves while it tries: a UART line
-//! long enough to be useful takes longer to send than the guest gets to run
-//! between two exits.
+//! Ports are chosen by probing and the screen by being offered, so their
+//! precedence is temporal: `init` answers with the best port it can find,
+//! and a compiled-in screen displaces it the moment its description arrives.
+//! What never happens is a port keeping output that a usable screen was
+//! offered for.
+//!
+//! The costs are three orders of magnitude apart, and that gap is the
+//! difference between a hypervisor that can describe its own interrupt path
+//! and one whose guest starves while it tries: a UART line long enough to be
+//! useful takes longer to send than the guest gets to run between two exits,
+//! and a scrolled framebuffer line costs thousands of uncached stores. Which
+//! is why the screen retires before the guest runs rather than fighting it
+//! for the display, and why `quiet` exists for machines whose log nobody reads.
 //!
 //! # Machines with no output, and machines that must not spend time on it
 //!
 //! Both are ordinary and neither is a failure.
 //!
-//! A machine with no port at all is one nothing can be reported from, which is
-//! a reason to run it silently rather than a reason not to run it: [`init`]
-//! answers [`InitError::NoUartFound`] and callers carry on, after which [`log`]
-//! discards every record because no logger was installed and [`emergency`]
-//! writes nowhere because no backend was chosen.
+//! A machine with no port at all is one nothing can be reported from at the
+//! moment [`init`] runs — which is a reason to run it silently rather than a
+//! reason not to run it: [`init`] answers [`InitError::NoUartFound`] and
+//! callers carry on, after which [`log`] discards every record until a
+//! backend appears. With the `efifb` feature compiled in, that is what
+//! [`offer_screen`] is for: called with the handoff's screen description once
+//! its bytes are reachable, it takes the empty output slot, installs the
+//! logger if [`init`] never got that far, and every record after it lands on
+//! the display.
 //!
 //! A machine with a port is the harder case, because *having* one is not the
 //! same as anybody listening to it. Every desktop board with a serial header
@@ -59,8 +77,12 @@
 #![no_std]
 
 mod debugcon;
+#[cfg(feature = "efifb")]
+mod efifb;
 mod uart;
 
+#[cfg(feature = "efifb")]
+use core::sync::atomic::AtomicU64;
 use core::{
     fmt::{Arguments, Display, Formatter, Write},
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
@@ -69,9 +91,13 @@ use core::{
 
 use log::{LevelFilter, Log, Metadata, Record};
 use spin::Mutex;
+#[cfg(feature = "efifb")]
+use spin::Once;
 use thiserror::Error;
 use x86_64::instructions::interrupts;
 
+#[cfg(feature = "efifb")]
+use crate::efifb::{Canvas, Cursor, Efifb};
 use crate::{debugcon::Debugcon, uart::Uart};
 
 /// Most verbose level that gets logged.
@@ -136,6 +162,29 @@ const NONE_CHOSEN: u16 = 0;
 /// the two backends apart on its own.
 const DEBUGCON_CHOSEN: u16 = 0xE9;
 
+/// What [`CHOSEN`] holds when the frame buffer was chosen.
+///
+/// No port number is free to mean this, so it is a marker: no COM base and
+/// not the debug console's, in a range nothing decodes.
+const SCREEN_CHOSEN: u16 = u16::MAX;
+
+/// Where the screen backend writes, once [`offer_screen`] has attached it.
+///
+/// The address is whatever the attaching side mapped — or identified, under
+/// the loader — and never changes while it stands.
+#[cfg(feature = "efifb")]
+static SCREEN_ADDRESS: AtomicU64 = AtomicU64::new(0);
+
+/// The attached screen's geometry, published last of the parts an emergency
+/// reader needs.
+///
+/// A `Some` here answers for [`SCREEN_ADDRESS`] too: both are written before
+/// this one fills, and the reading path comes through it first. On x86 the
+/// stores cannot pass each other anyway; the ordering through the `Once` is
+/// what makes that argument true rather than merely true on this machine.
+#[cfg(feature = "efifb")]
+static SCREEN_CANVAS: Once<Canvas> = Once::new();
+
 /// Seconds in one minute.
 const SECONDS_PER_MINUTE: u64 = 60;
 
@@ -154,6 +203,9 @@ enum Output {
     Debugcon(Debugcon),
     /// A 16550 UART at one of the standard COM ports.
     Uart(Uart),
+    /// The frame buffer firmware drew its console through.
+    #[cfg(feature = "efifb")]
+    Screen(Efifb),
 }
 
 impl Write for Output {
@@ -161,6 +213,8 @@ impl Write for Output {
         match self {
             Self::Debugcon(debugcon) => debugcon.write_str(s),
             Self::Uart(uart) => uart.write_str(s),
+            #[cfg(feature = "efifb")]
+            Self::Screen(screen) => screen.write_str(s),
         }
     }
 }
@@ -173,7 +227,9 @@ pub enum InitError {
     /// configuration it has; nothing is torn down or reprogrammed.
     #[error("serial logging is already initialized")]
     AlreadyInitialized,
-    /// Neither the debug console nor a 16550-compatible UART answered.
+    /// Neither the debug console nor a 16550-compatible UART answered. With
+    /// the `efifb` feature compiled in this is not final: a screen attached
+    /// afterwards through [`offer_screen`] takes the empty slot.
     #[error("no debug console and no 16550-compatible UART found")]
     NoUartFound,
 }
@@ -241,9 +297,102 @@ pub fn emergency(args: Arguments<'_>) {
         DEBUGCON_CHOSEN => {
             let _ = writeln!(Debugcon::adopt(), "{args}");
         }
+        base if base == SCREEN_CHOSEN => {
+            // From the top-left corner rather than from wherever the locked
+            // half got to: the cursor is not published per line, and an
+            // emergency line over the oldest one is worth exactly as much as
+            // one interleaved into a fresh position.
+            #[cfg(feature = "efifb")]
+            if let Some(canvas) = SCREEN_CANVAS.get() {
+                let mut screen = Efifb {
+                    address: SCREEN_ADDRESS.load(Ordering::Relaxed),
+                    canvas: *canvas,
+                    cursor: Cursor::default(),
+                };
+                let _ = writeln!(screen, "{args}");
+            }
+        }
         base => {
             let _ = writeln!(Uart::adopt(base), "{args}");
         }
+    }
+}
+
+/// Offers the frame buffer the output, displacing whichever port answered
+/// first.
+///
+/// Called with the handoff's screen description and an address its bytes are
+/// reachable through — under the loader that is the physical base itself,
+/// firmware's identity map still standing; under the hypervisor image it is
+/// whatever the caller mapped the aperture at. The description decides
+/// whether there is anything to take: an unusable or absent screen changes
+/// nothing and answers `false`.
+///
+/// While the `efifb` feature is compiled in, the screen has first priority,
+/// always. `init` runs before any screen description exists, so a port wins
+/// the output at that moment by default — but many boards decode a COM
+/// address whether or not anything is wired to the header, so "a port
+/// answered" does not mean "somebody can read it". This call takes the output
+/// back from whatever port holds it, permanently for this boot;
+/// [`retire_screen`] does not give it back.
+///
+/// Answers `false` when nothing was taken: the description names no usable
+/// screen, or this screen was already attached. Without the `efifb` feature
+/// it compiles to that answer and nothing else.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "a declined offer is a documented ordinary outcome, not something callers must handle"
+)]
+pub fn offer_screen(screen: &handoff::Framebuffer, address: u64) -> bool {
+    #[cfg(feature = "efifb")]
+    {
+        let Some(candidate) = Efifb::describe(screen, address) else {
+            return false;
+        };
+        interrupts::without_interrupts(|| {
+            let mut output = OUTPUT.lock();
+            // A second offer changes nothing; anything else that answered
+            // first is displaced. Priority here is temporal rather than
+            // probed: `init` runs before the screen description exists, so
+            // the ports take the output first and give it up the moment a
+            // usable screen is offered — which is what an opt-in screen
+            // backend means.
+            if matches!(*output, Some(Output::Screen(_))) {
+                return false;
+            }
+            // The logger first, because records start flowing the moment the
+            // output is published; then the parts the emergency path reads,
+            // canvas last, since a reader that finds it finds everything.
+            let _ = log::set_logger(&LOGGER);
+            log::set_max_level(MAX_LEVEL);
+            SCREEN_ADDRESS.store(candidate.address, Ordering::Relaxed);
+            let canvas = candidate.canvas;
+            SCREEN_CANVAS.call_once(|| canvas);
+            *output = Some(Output::Screen(candidate));
+            CHOSEN.store(SCREEN_CHOSEN, Ordering::Relaxed);
+            true
+        })
+    }
+    #[cfg(not(feature = "efifb"))]
+    {
+        let _ = (screen, address);
+        false
+    }
+}
+
+/// Takes the screen back out of the output, for the moment it stops being
+/// ours.
+///
+/// After this every record is discarded again, which is the point: the guest
+/// that starts drawing owns the display, and a line of host text written
+/// underneath it is neither visible to anyone nor free to produce. Ports are
+/// not touched — they cost nothing while idle and never belong to the guest.
+/// A screen that was never attached, or already retired, changes nothing;
+/// without the `efifb` feature there is nothing to do and no way to ask.
+pub fn retire_screen() {
+    #[cfg(feature = "efifb")]
+    if CHOSEN.swap(NONE_CHOSEN, Ordering::Relaxed) == SCREEN_CHOSEN {
+        interrupts::without_interrupts(|| *OUTPUT.lock() = None);
     }
 }
 

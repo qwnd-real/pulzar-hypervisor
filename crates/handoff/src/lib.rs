@@ -153,6 +153,69 @@ pub struct Handoff {
     /// A direct-map address, like [`Handoff::memory_map`], so it survives the
     /// firmware half of the address space being dropped.
     pub firmware_context: u64,
+
+    /// The linear frame buffer firmware's console was drawing to, or the
+    /// default (all fields zero) when firmware had none.
+    ///
+    /// The address is physical and the aperture is device memory: it is outside
+    /// the direct map by the rule stated on [`Handoff::top_of_ram`] and must be
+    /// mapped explicitly before a single pixel is written. The description is
+    /// taken while boot services are alive because the mode it describes is
+    /// firmware's choice and is not guaranteed to survive anything firmware
+    /// does afterwards.
+    pub framebuffer: Framebuffer,
+}
+
+/// A linear frame buffer's geometry, as firmware's console described it.
+///
+/// All-zero means there is nothing to draw on. A non-zero description can
+/// still turn out unusable — the format field names what the bytes mean, and
+/// only the two byte orders below are carried — so [`Framebuffer::usable`]
+/// answers the whole question in one call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct Framebuffer {
+    /// Physical base of the linear frame buffer. Frame-aligned on real
+    /// firmware, but nothing here relies on that: the mapping rounds down and
+    /// indexes from the offset within its first page.
+    pub base: u64,
+    /// Bytes from the first pixel of one scan line to the first pixel of the
+    /// next, which is at least `width * 4` and can be more.
+    pub pitch: u32,
+    /// Visible pixels per scan line.
+    pub width: u32,
+    /// Visible scan lines.
+    pub height: u32,
+    /// One of the format values above.
+    pub format: u32,
+}
+
+impl Framebuffer {
+    /// Bytes per pixel of every carried format; all of them are 32-bit.
+    pub const BYTES_PER_PIXEL: u32 = 4;
+
+    /// Red, green, blue, then one ignored byte, in that memory order —
+    /// UEFI's `PixelRedGreenBlueReserved8BitPerColor`.
+    pub const RGBX: u32 = 0;
+    /// Blue, green, red, then one ignored byte, in that memory order —
+    /// UEFI's `PixelBlueGreenRedReserved8BitPerColor`.
+    pub const BGRX: u32 = 1;
+
+    /// Whether this describes a screen bytes can be drawn on.
+    ///
+    /// The base being zero is how "firmware had no console" is spelled, and
+    /// every other refusal is about geometry or format a drawing side cannot
+    /// interpret. The pitch check is the whole of the bounds question: if each
+    /// scan line holds at least one row of pixels, every visible pixel lies
+    /// inside `pitch * height` bytes from the base.
+    #[must_use]
+    pub fn usable(self) -> bool {
+        self.base != 0
+            && self.width > 0
+            && self.height > 0
+            && self.pitch >= self.width * Self::BYTES_PER_PIXEL
+            && matches!(self.format, Self::RGBX | Self::BGRX)
+    }
 }
 
 impl Handoff {
@@ -163,7 +226,7 @@ impl Handoff {
     pub const MAGIC: u64 = u64::from_le_bytes(*b"PULZARH1");
 
     /// Current protocol version.
-    pub const VERSION: u32 = 7;
+    pub const VERSION: u32 = 8;
 
     /// Validates `ptr` and borrows the handoff behind it.
     ///

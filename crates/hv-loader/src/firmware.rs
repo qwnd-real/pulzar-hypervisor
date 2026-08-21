@@ -27,6 +27,7 @@ use uefi::{
     mem::memory_map::{MemoryMap, MemoryMapMut},
     proto::{
         BootPolicy,
+        console::gop::{GraphicsOutput, PixelFormat},
         device_path::{DevicePath, build},
         loaded_image::LoadedImage,
         media::{
@@ -481,6 +482,81 @@ pub fn wall_clock() -> Option<Wall> {
         None => warn!("loader: firmware reported {time}, which is not a time"),
     }
     wall
+}
+
+/// The linear frame buffer firmware's console is drawing to.
+///
+/// This is the description that travels in the handoff and, where the logging
+/// screen backend is compiled in, the one its writer draws through: under the
+/// loader the bytes are reachable at their physical address, because firmware
+/// runs this phase on an identity map. It has to be asked here rather than
+/// reconstructed later — the mode is firmware's choice, and nothing promises it
+/// survives firmware doing anything else.
+///
+/// A machine with no console, or one whose current mode is not a linear frame
+/// buffer of a carried byte order, is reported as absent rather than refused:
+/// a screen is a debugging nicety, and no failure here is worth a boot. The
+/// same answer covers every firmware error on the way, each of which is noted
+/// once.
+pub fn framebuffer() -> handoff::Framebuffer {
+    let default = || handoff::Framebuffer::default();
+    let Ok(handle) = boot::get_handle_for_protocol::<GraphicsOutput>() else {
+        return default();
+    };
+    // SAFETY: as in `contains_guest`: the handle publishes `GraphicsOutput`
+    // for the whole boot-services phase, a `GetProtocol` open is untracked,
+    // and nothing uninstalls or reopens it while the `ScopedProtocol` lives.
+    let mut gop = match unsafe {
+        boot::open_protocol::<GraphicsOutput>(
+            OpenProtocolParams {
+                handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    } {
+        Ok(gop) => gop,
+        Err(error) => {
+            warn!("loader: firmware would not open its console: {error}");
+            return default();
+        }
+    };
+
+    let info = gop.current_mode_info();
+    let format = match info.pixel_format() {
+        PixelFormat::Rgb => handoff::Framebuffer::RGBX,
+        PixelFormat::Bgr => handoff::Framebuffer::BGRX,
+        // No carried byte order describes these modes' layouts, so bytes
+        // written blind would draw noise; report no screen instead.
+        PixelFormat::Bitmask | PixelFormat::BltOnly => {
+            info!("loader: firmware's console mode names no carried pixel order");
+            return default();
+        }
+    };
+    let (width, height) = info.resolution();
+    // Widening: the constant is `u32`, and `usize` carries no lossless
+    // conversion from it on this target.
+    let stride_bytes = info.stride() * handoff::Framebuffer::BYTES_PER_PIXEL as usize;
+    let pitch = u32::try_from(stride_bytes).unwrap_or(0);
+    let base = {
+        // Refused above for the modes where this asserts, which is why it
+        // cannot fire.
+        let mut pixels = gop.frame_buffer();
+        pixels.as_mut_ptr() as u64
+    };
+    let described = handoff::Framebuffer {
+        base,
+        pitch,
+        width: u32::try_from(width).unwrap_or(0),
+        height: u32::try_from(height).unwrap_or(0),
+        format,
+    };
+    if !described.usable() {
+        warn!("loader: firmware's console mode is not one bytes can be drawn in");
+        return default();
+    }
+    described
 }
 
 /// What firmware's memory map told the loader.

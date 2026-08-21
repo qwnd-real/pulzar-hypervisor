@@ -1,16 +1,21 @@
 [package]
 name = "serial"
-description = "16550 UART serial logging for the firmware-side pulzar binaries"
+description = "Logging backends for the firmware-side pulzar binaries: debugcon, 16550 UART, UEFI frame buffer"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
 clock = { workspace = true }
+handoff = { workspace = true }
 log = { workspace = true }
 spin = { workspace = true }
 thiserror = { workspace = true }
 x86_64 = { workspace = true }
+
+# The glyph tables are only compiled when the screen backend is, and the
+# feature is what pulls them in.
+font8x8 = { workspace = true, optional = true }
 
 [features]
 # Compiles every log record out of the whole image.
@@ -26,6 +31,12 @@ x86_64 = { workspace = true }
 # held off, and the machine has a header whether or not anything is plugged
 # into it.
 quiet = ["log/max_level_off"]
+
+# The UEFI frame-buffer backend: log lines drawn as pixels onto the screen
+# firmware left behind, for machines with neither a debug console nor a UART
+# header. Off by default, because a screen is a guest-facing device here —
+# once the firmware guest starts drawing, the display belongs to it.
+efifb = ["dep:font8x8"]
 
 [lints]
 workspace = true
