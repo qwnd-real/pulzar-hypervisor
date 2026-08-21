@@ -12,10 +12,12 @@
 //!
 //! That is what replaces the locks a migrating hypervisor would need:
 //!
-//! - Entry *i* of the physical table is written only by pCPU *i*, and is
-//!   toggled with a read-modify-write: Release on the set that publishes it,
-//!   Release on the clear that withdraws it, and an Acquire load is what every
-//!   decision made from it reads.
+//! - Entry *i* of the physical table is written only by pCPU *i*, and its two
+//!   mutable bits — whether the processor is in the guest, and whether a peer's
+//!   hardware may resolve an interrupt to it at all — are each toggled with a
+//!   read-modify-write: Release on the set that publishes one, Release on the
+//!   clear that withdraws it, and an Acquire load is what every decision made
+//!   from it reads.
 //! - A backing page is written by its own processor alone — by these functions
 //!   at transition boundaries and at the exits its own guest's register writes
 //!   raise, and by the hardware while the guest runs — except for the
@@ -88,8 +90,14 @@ use crate::{
     },
 };
 
-/// The bit of a physical-table entry the owning processor toggles.
+/// The bit of a physical-table entry that says the processor it describes is in
+/// the guest.
 const IS_RUNNING: u64 = PhysicalApicEntry::new().with_is_running(true).into_bits();
+
+/// The bit of a physical-table entry that says an interrupt may resolve to it,
+/// which is whether the hardware is the authority for the controller it
+/// describes.
+const IS_VALID: u64 = PhysicalApicEntry::new().with_valid(true).into_bits();
 
 /// The bit of a logical-table entry that says it names a processor.
 const LOGICAL_VALID: u32 = LogicalApicEntry::new().with_valid(true).into_bits();
@@ -502,6 +510,12 @@ fn face_of(vcpu: &Vcpu) -> Option<Face> {
 /// what turns on: granting an access after its enable bit is set would leave
 /// the guest a window of unguarded registers, and the order that cannot be
 /// wrong is the order that cannot be observed.
+///
+/// The table entry is published last of the steps that can fail and before the
+/// enable bit, so that no failure leaves a peer's hardware delivering into a
+/// page this processor is not driving: whichever step reports one, the
+/// acceleration is left off and the entry invalid, and the next entry performs
+/// the whole transition again.
 fn enable(
     activation: &Activation,
     vcpu: &mut Vcpu,
@@ -519,6 +533,7 @@ fn enable(
         vcpu.passthrough_msrs(activation.window, crate::face::msr::passthrough())?;
         soil = soil.union(CleanBits::PERMISSION_MAPS);
     }
+    publish_entry(activation, vlapic)?;
     let control = vcpu.control_mut();
     // The table's extent is published with the enable bits rather than at
     // provisioning: how far the hardware may walk it is the face's answer, and
@@ -553,6 +568,13 @@ fn enable(
 /// nothing guards them, and restoring first is the order that cannot make
 /// one.
 ///
+/// The table entry is withdrawn before both, and before the carry-back below,
+/// which is what makes the carry-back the end of the page's authority rather
+/// than a moment in the middle of it: an entry still valid is a peer's hardware
+/// still resolving interrupts into a page whose state has already been given
+/// back to the model, where a request would wait for the next activation to
+/// notice it.
+///
 /// # A page of a life that has ended is not carried
 ///
 /// The carry-back runs only where the model is still the one the page was built
@@ -582,6 +604,7 @@ fn disable(
     face: Face,
     standing: Standing,
 ) -> Result<(), VlapicError> {
+    unpublish_entry(activation, vlapic)?;
     let mut soil = CleanBits::INTERRUPT.union(CleanBits::AVIC);
     if face == Face::X2Avic {
         // Setting a permission bit already set changes nothing, so the whole
@@ -621,7 +644,9 @@ fn disable(
 /// deactivation and an activation. The slot is the identifier, whose shape the
 /// face decides: see [`rewrite_identifier`]. The logical table is likewise left
 /// alone: the wider face does not consult it, and the narrower one never stops
-/// finding it populated.
+/// finding it populated. So is this processor's entry in the physical table,
+/// which says a peer's hardware may deliver here — true across the move, and in
+/// both faces.
 ///
 /// What does not survive the move is how far the table may be walked, because
 /// that is the one thing about the acceleration the two faces disagree on. The
@@ -723,11 +748,14 @@ pub(crate) fn publish_running() -> Result<(), VlapicError> {
 
 /// Says this processor is no longer in the guest, at the exit boundary.
 ///
-/// The clear precedes every consultation of what has been left for it: a
-/// sender that still reads the bit set rings a doorbell the processor
-/// answers in host code, which is harmless; a sender that reads it clear
-/// takes the kick path, and the rescan after this is what finds whatever
-/// the kick is for.
+/// The clear precedes every consultation of what has been left for it. A sender
+/// whose hardware still reads the bit set deposits the request in this
+/// processor's backing page and announces it to the physical processor named
+/// beside it, which is no longer in a guest the acceleration is armed for: the
+/// announcement is dropped there, the request bit survives in the page, and the
+/// entry after this exit re-evaluates it. A sender that reads it clear has the
+/// target reported as not running instead, and the rescan after this is what
+/// finds whatever the kick that follows is for.
 ///
 /// Judged against the table's own extent rather than the face's limit, which is
 /// the asymmetry with [`publish_running`] and is deliberate: a bit is only ever
@@ -750,6 +778,55 @@ pub(crate) fn unpublish_running() -> Result<(), VlapicError> {
     activation
         .entry(vlapic.apic_id())?
         .fetch_and(!IS_RUNNING, Ordering::Release);
+    Ok(())
+}
+
+/// Says a peer's hardware may resolve an interrupt to this processor, at the
+/// transition that made the hardware the authority for its controller.
+///
+/// Delivery between the guest's processors is performed by the *sender's*
+/// hardware: it indexes this table by the destination's guest identifier, and a
+/// valid entry is what it deposits the request in the page named beside.
+/// Nothing of the destination's own is consulted in that decision — so while
+/// this processor's controller is the software's, an interrupt addressed to it
+/// must not resolve here at all, and the bit follows the acceleration rather
+/// than the table's construction. A sender's hardware then reports the
+/// destination as invalid, which is the exit the software path completes the
+/// command from, and no request is left in a page nothing reads.
+///
+/// Not gated on how far this processor's own face may walk the table, which is
+/// the asymmetry with [`publish_running`]: the extent is the *sender's* control
+/// block's, so a processor whose identifier its own face could not address is
+/// still one a peer driven in the wider face resolves — and where the entry is
+/// beyond every face's reach, a valid bit in it is read by nobody.
+///
+/// # Errors
+///
+/// [`VlapicError::Paging`] if the window does not reach the table, or
+/// [`VlapicError::IdBeyondTable`] for an identifier the table does not hold —
+/// which no processor with a backing page has, since describing one refused it.
+fn publish_entry(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
+    activation
+        .entry(vlapic.apic_id())?
+        .fetch_or(IS_VALID, Ordering::Release);
+    Ok(())
+}
+
+/// Says a peer's hardware may no longer resolve an interrupt to this processor,
+/// at the transition that took the acceleration off its controller.
+///
+/// The withdrawal half of [`publish_entry`], which is where what the bit
+/// promises is argued. Never gated on anything, for the reason
+/// [`unpublish_running`] is not: a promise must be retractable wherever it may
+/// have been made.
+///
+/// # Errors
+///
+/// As [`publish_entry`].
+fn unpublish_entry(activation: &Activation, vlapic: &Vlapic) -> Result<(), VlapicError> {
+    activation
+        .entry(vlapic.apic_id())?
+        .fetch_and(!IS_VALID, Ordering::Release);
     Ok(())
 }
 
@@ -1269,11 +1346,6 @@ pub(crate) fn inhibit_machine(reason: &str) {
     }
 }
 
-/// How many hardware doorbells this machine has rung, for the exit census.
-pub(crate) fn doorbell_count() -> u64 {
-    crate::delivery::avic::rings()
-}
-
 /// How many host-interrupt kicks the AVIC paths have sent, for the exit
 /// census.
 pub(crate) fn kick_count() -> u64 {
@@ -1692,18 +1764,21 @@ mod tests {
     //! drives a controller in, how far it reaches in each, which vector an EOI
     //! retired, which logical destinations name a table entry, which move an
     //! entry owes the acceleration, which life the page it holds belongs to,
-    //! which of its slots a trapped write leaves owing the model's answer, and
-    //! which authority an exit owes the guest's task priority to.
+    //! which of its slots a trapped write leaves owing the model's answer,
+    //! which authority an exit owes the guest's task priority to, and what
+    //! the two read-modify-writes over a physical-table entry leave of the
+    //! rest of it.
 
     use alloc::vec::Vec;
     use core::iter::once;
 
     use descriptors::Vector;
-    use svm::avic::MAX_PHYSICAL_ID;
+    use svm::avic::{MAX_PHYSICAL_ID, PhysicalApicEntry};
+    use x86_64::PhysAddr;
 
     use super::{
-        Entry, Face, Life, Mode, Move, Register, Standing, TaskPriority, Written, driven_face,
-        eoi_vector, face_limit, logical_slot, mirrored, move_for,
+        Entry, Face, IS_RUNNING, IS_VALID, Life, Mode, Move, Register, Standing, TaskPriority,
+        Written, driven_face, eoi_vector, face_limit, logical_slot, mirrored, move_for,
     };
 
     /// Every mode a controller can be in, which is the one term of the
@@ -1986,5 +2061,29 @@ mod tests {
         assert_eq!(TaskPriority::owner(false), TaskPriority::Block);
         assert_eq!(TaskPriority::owner(true), TaskPriority::Backing);
         assert_ne!(TaskPriority::owner(true), TaskPriority::owner(false));
+    }
+
+    #[test]
+    fn a_physical_entry_keeps_its_page_and_host_identifier_through_both_bits() {
+        // An entry is described once, with a page and a host identifier, and
+        // every write to it afterwards is one of these four read-modify-writes.
+        // Each state they can leave it in is asserted as a whole value, because a
+        // mask that reached a field beside its own bit would point a peer's
+        // hardware at another processor's page, or at another physical processor,
+        // and nothing on the machine would report either.
+        let described = PhysicalApicEntry::new()
+            .with_backing_page_address(PhysAddr::new(0x0012_3000))
+            .with_host_apic_id(0x123);
+        let driven = described.into_bits() | IS_VALID;
+        let running = driven | IS_RUNNING;
+        for (bits, expected) in [
+            (driven, described.with_valid(true)),
+            (running, described.with_valid(true).with_is_running(true)),
+            (running & !IS_RUNNING, described.with_valid(true)),
+            (running & !IS_VALID, described.with_is_running(true)),
+            (running & !IS_VALID & !IS_RUNNING, described),
+        ] {
+            assert_eq!(PhysicalApicEntry::from_bits(bits), expected, "{bits:#018x}");
+        }
     }
 }

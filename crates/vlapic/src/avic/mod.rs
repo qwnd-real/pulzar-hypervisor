@@ -324,7 +324,9 @@ pub fn unaccelerated_trap(exit: UnacceleratedAccessExit) -> Result<(), VlapicErr
 /// could not finish, because the targets were not running.
 ///
 /// The request bits are the hardware's already; what the targets need is
-/// only to be told, which is a host interrupt each.
+/// only to be told, which is a host interrupt each — except the sending
+/// processor, which a broadcast names as well and which is outside the guest
+/// already, consulting its own controller on the way back in.
 ///
 /// # Errors
 ///
@@ -333,17 +335,13 @@ pub fn wake_targets(command_bits: u64) -> Result<(), VlapicError> {
     crate::delivery::avic::wake_targets(command_bits)
 }
 
-/// How many hardware doorbells the machine has rung, cumulative.
-///
-/// One of the census's two numbers for how interrupts reached running
-/// processors; the other is [`kicks`].
-#[must_use]
-pub fn doorbells() -> u64 {
-    activation::doorbell_count()
-}
-
 /// How many host-interrupt kicks the acceleration's paths have sent,
 /// cumulative.
+///
+/// The census's account of how often hardware delivery between the guest's
+/// processors could not finish on its own: each of these is a target the
+/// hardware deposited an interrupt for and could not tell, so the host had to
+/// force it out of the guest to make it look.
 #[must_use]
 pub fn kicks() -> u64 {
     activation::kick_count()

@@ -12,6 +12,13 @@
 //! target may not be looking at its controller. [`doorbell`] is that half, and
 //! the ordering that stops a wakeup being lost is stated there.
 //!
+//! The bit goes into the target's own register file even where the hardware is
+//! driving that controller, so the second half is the same signal in both
+//! cases: what the hardware delivers from is a backing page this crate writes
+//! only on the processor it belongs to, and the exit a host interrupt forces is
+//! what carries the request into it. [`avic`] is where that is argued, along
+//! with everything else the acceleration leaves for the software to finish.
+//!
 //! # Nothing here fails in a way the guest can see
 //!
 //! A command naming a mode the architecture reserves, or a processor that does
@@ -211,9 +218,12 @@ fn accept(from: &Vlapic, target: &Vlapic, delivery: Delivery, command: Command) 
     let vector = command.vector();
     match target.accept(vector, command.trigger()) {
         // It is in the target's register file now, and the target may not be
-        // looking at it.
+        // looking at it. The host interrupt is what tells it whether or not the
+        // hardware is driving that controller: the vector is in the model, which
+        // the hardware does not read, and the exit this forces is what carries it
+        // into the page the hardware does.
         Accepted::Requested | Accepted::Coalesced => {
-            avic::wake(from, target);
+            nudge(from, target);
             true
         }
         // A vector no controller may deliver is the receiver's to report, and is

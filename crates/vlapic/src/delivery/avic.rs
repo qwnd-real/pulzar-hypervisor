@@ -9,17 +9,35 @@
 //! each interrupt: the hardware reports which of them already acted before it
 //! exited, and nothing here acts twice.
 //!
-//! The running half of wakeup is the hardware doorbell, a write of the
-//! target's physical identifier to a register of this processor; the
-//! not-running half is the host interrupt [`super::doorbell`] has always
-//! been. The two are counted apart, because the proportion of one to the
-//! other is the measure of whether the acceleration is doing its job.
+//! # A request and the signal that announces it name one authority
+//!
+//! Two authorities can be holding an interrupt for a guest, and each has a
+//! signal of its own. A request in the software model is announced with the
+//! host interrupt [`super::doorbell`] sends, which makes the target leave the
+//! guest and consult that model on its way back in. A request in a backing page
+//! would be announced with the hardware doorbell, a write of the target's
+//! physical identifier that makes its processor re-evaluate the page without
+//! leaving the guest at all.
+//!
+//! Only the first of the two is ever sent from here, and that is not a
+//! preference: nothing on the host side writes another processor's page. What
+//! the software path accepts, it accepts into the target's model, and a backing
+//! page is written by the processor it belongs to — at the entry that hands
+//! that model's interrupts to the hardware. A doorbell rung for one of those
+//! requests would name a page the vector is not in: the target's hardware would
+//! answer it by finding nothing, no exit would be raised, and nothing would be
+//! left that could raise one.
+//!
+//! What the *hardware* deposits in a page it announces itself, and the one case
+//! it cannot — a target that was not in the guest — is the only wake these
+//! paths owe: a host interrupt each, counted, because how many of them a guest
+//! costs is the measure of how often the acceleration cannot finish what it
+//! started.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use log::{error, trace, warn};
-use svm::avic::{AVIC_DOORBELL, Doorbell, IncompleteIpiExit, IpiFailure};
-use x86_64::registers::model_specific::Msr;
+use svm::avic::{IncompleteIpiExit, IpiFailure};
 
 use crate::{
     VlapicError,
@@ -29,16 +47,8 @@ use crate::{
     registers::{Vlapic, icr::Command},
 };
 
-/// Hardware doorbells rung by these paths, cumulative.
-static RINGS: AtomicU64 = AtomicU64::new(0);
-
 /// Host-interrupt kicks sent by these paths, cumulative.
 static KICKS: AtomicU64 = AtomicU64::new(0);
-
-/// How many hardware doorbells the machine has rung through these paths.
-pub(crate) fn rings() -> u64 {
-    RINGS.load(Ordering::Relaxed)
-}
 
 /// How many host-interrupt kicks these paths have sent.
 pub(crate) fn kicks() -> u64 {
@@ -145,7 +155,8 @@ pub(crate) fn incomplete_ipi(exit: IncompleteIpiExit) -> Result<(), VlapicError>
     Ok(())
 }
 
-/// Wakes every target of the command that is not in the guest.
+/// Wakes every target of the command the hardware could not announce a delivery
+/// to.
 ///
 /// The request bits are the hardware's already; a kick is a wakeup and not a
 /// delivery, so a redundant one is only an exit, never a duplicate interrupt.
@@ -161,74 +172,51 @@ pub(crate) fn wake_targets(command_bits: u64) -> Result<(), VlapicError> {
     let page = registry::lapics()?;
     let command = Command::from_bits(command_bits);
     for target in targets(from, page.all(), command) {
-        if !ownership::owns(target) {
-            continue;
+        if owed(
+            target.index() == from.index(),
+            ownership::owns(target),
+            activation::is_running(target.apic_id()).unwrap_or(false),
+        ) {
+            kick(from, target);
         }
-        // A target the hardware reports as running was woken by the doorbell
-        // it never needed; everything else is owed the host interrupt.
-        if activation::is_running(target.apic_id()).unwrap_or(false) {
-            continue;
-        }
-        kick(from, target);
     }
     Ok(())
 }
 
-/// Rings the hardware doorbell of the processor a target runs on.
+/// Whether a target the hardware delivered to is owed the host interrupt that
+/// makes it look at what was left in its backing page.
 ///
-/// The write tells this processor to deliver an interrupt to the physical
-/// processor named in it — which is the target's, because a virtual
-/// processor here runs on the physical processor that owns it. The request
-/// the ring announces was stored before it, with the ordering the protocol
-/// states; and a ring is never read back, because the register faults a read.
+/// Three facts, and each excludes the wake for a reason of its own. Written as
+/// a decision over values because a wake this refuses is a request bit standing
+/// in a page with nothing left to make its processor read it, and because two
+/// of the three are answers about a machine that can change underneath the
+/// walk.
 ///
-/// Never rung at the processor doing the ringing: it is outside the guest
-/// already, and whatever it left for itself its own next entry evaluates.
-pub(crate) fn ring(target: &Vlapic) {
-    let Ok(self_vlapic) = current() else {
-        return;
-    };
-    if target.index() == self_vlapic.index() {
-        return;
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the policy accepts no machine whose identifiers do not fit the doorbell's field"
-    )]
-    let doorbell = Doorbell::new().with_host_apic_id(target.apic_id().get() as u16);
-    // SAFETY: the register exists on every processor the policy accepted the
-    // acceleration for — its feature bit was checked at boot — and writing it
-    // does nothing but interrupt the named physical processor, which is the
-    // machine's own and owes the target a look. The write is serializing in
-    // the sense the protocol needs: the request it announces was published
-    // before it, in program order, by the caller.
-    unsafe { Msr::new(AVIC_DOORBELL).write(doorbell.into_bits()) };
-    RINGS.fetch_add(1, Ordering::Relaxed);
+/// - The sender is not one of them, whatever the command named. It is outside
+///   the guest — it is executing this — and consults its own controller on the
+///   way back in, so an interrupt sent here would be one this processor answers
+///   with an empty handler and nothing else. Both the all-inclusive shorthand
+///   and a broadcast destination name it, which is how a great deal of firmware
+///   and some kernels send.
+/// - A processor this hypervisor does not run has no guest to be woken into.
+///   The software path reports such a message as one no processor accepted, and
+///   there is nothing here to add to that.
+/// - A target that is in the guest now entered it after the hardware set the
+///   request bit, and an entry re-evaluates the page it is entered with — so
+///   the look this would ask for has already happened. Its own away flag is
+///   deliberately not consulted, unlike [`doorbell::nudge`]'s: the hardware has
+///   just reported the target as not running, and reading the flag would only
+///   race that answer.
+const fn owed(sender: bool, owned: bool, running: bool) -> bool {
+    !sender && owned && !running
 }
 
-/// Makes a target notice an interrupt a software delivery left for it,
-/// under whichever transport its state calls for.
+/// Wakes a target with the host doorbell interrupt, whether or not it said it
+/// was away.
 ///
-/// While the acceleration drives the target's controller and the target is
-/// in the guest, that is the hardware doorbell: one write, and the
-/// processor evaluates its backing state. Otherwise it is the host
-/// interrupt [`super::doorbell`] has always been — for a target not in the
-/// guest is one the doorbell would ring to no purpose.
-pub(crate) fn wake(from: &Vlapic, target: &Vlapic) {
-    if activation::active_for(target) && activation::is_running(target.apic_id()).unwrap_or(false) {
-        ring(target);
-    } else {
-        doorbell::nudge(from, target);
-    }
-}
-
-/// Wakes a target with the host doorbell interrupt, whether or not it said
-/// it was away.
-///
-/// What the kick paths add to [`doorbell::nudge`]: the nudge is for a target
-/// whose state the sender consulted, and a kick is for one the hardware has
-/// already said is not running — where consulting the flag again would only
-/// race the answer the exit just gave.
+/// What this adds to [`doorbell::nudge`] is the count; what it leaves out is
+/// the away flag, and [`owed`] is where that and every other term of the
+/// decision are argued. Nothing is re-examined here.
 fn kick(from: &Vlapic, target: &Vlapic) {
     doorbell::interrupt(from, target);
     KICKS.fetch_add(1, Ordering::Relaxed);
@@ -303,3 +291,50 @@ pub(crate) fn warn_external_once() {
 
 /// Whether the external-arrival warning has been said.
 static WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod tests {
+    //! Which of a command's targets a delivery the hardware could not finish
+    //! owes a wake to, which is the whole of what these paths decide and the
+    //! one part of them that needs no machine. What performing it does — a
+    //! host interrupt, retried the once a retry can cure — belongs to the
+    //! doorbell module and is argued there.
+
+    use super::owed;
+
+    #[test]
+    fn a_target_that_is_not_in_the_guest_is_owed_the_wake() {
+        // The case the exit exists for: the hardware set the request bit in a
+        // page whose processor is not looking at it, and nothing but this makes
+        // it look.
+        assert!(owed(false, true, false));
+    }
+
+    #[test]
+    fn the_sender_is_never_woken_by_its_own_command() {
+        // Every state the rest of the machine can be in, against the one fact
+        // that decides it: a broadcast and the all-inclusive shorthand both name
+        // the sender, and the sender is out of the guest and about to consult its
+        // own controller. Its running bit reads clear at this point — the exit
+        // withdrew it — so nothing but this excludes it.
+        for owned in [false, true] {
+            for running in [false, true] {
+                assert!(
+                    !owed(true, owned, running),
+                    "owned {owned}, running {running}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_owed_a_target_the_hardware_told_or_a_processor_nothing_runs() {
+        // In the guest: its own entry re-evaluated the page after the request bit
+        // was set. Not this hypervisor's: there is no guest on it to wake, and
+        // the software path has already reported the message as accepted by
+        // nobody.
+        assert!(!owed(false, true, true));
+        assert!(!owed(false, false, false));
+        assert!(!owed(false, false, true));
+    }
+}

@@ -2,11 +2,13 @@
 //! name.
 //!
 //! An interrupt addressed to a processor is an index into this table, and the
-//! entry answers two questions the hardware cannot ask anybody: where that
-//! processor's controller registers are backed, and whether it is running
-//! anywhere at the moment. The second is the one that changes — the table is
-//! built with every entry not running, and nothing here ever sets the bit;
-//! turning a processor's entry to running belongs to whoever puts it on one.
+//! entry says where that processor's controller registers are backed. That is
+//! the whole of what is built here: the two bits beside the address — whether
+//! the processor is running on a physical one, and whether an interrupt may
+//! resolve to the entry at all — are promises about an instant rather than
+//! facts about the machine, so the table is written with both clear and neither
+//! is ever set here. Making one of them belongs to whoever puts the processor
+//! on a physical core and to whoever hands its controller to the hardware.
 //!
 //! The table is a run of whole pages, because the pointer a control block
 //! carries names its first page and the architecture gives it no length but
@@ -66,12 +68,16 @@ impl PhysicalTable {
         })
     }
 
-    /// Describes the processor `id` as one an interrupt may reach, with its
-    /// registers backed by `page`.
+    /// Describes the processor `id` as one whose controller registers are
+    /// backed by `page`.
     ///
-    /// Written not running: nothing is on any physical processor yet, and a
-    /// set running bit before the first entry would hand the hardware a
-    /// promise that does not hold.
+    /// Written neither running nor valid. Nothing is on a physical processor
+    /// yet, and nothing is driving any controller in hardware yet, so either
+    /// bit set here would be a promise that does not hold: the running bit
+    /// would send an interrupt to a physical processor executing something
+    /// else, and the valid bit would let a sender's hardware resolve an
+    /// interrupt into a page the software model, and not that page, is the
+    /// authority for.
     ///
     /// A slot may be described once. Two processors answering to one identifier
     /// have one entry between them, and the second description would name the
@@ -92,11 +98,15 @@ impl PhysicalTable {
                 max_index: self.max_index,
             });
         };
-        if slot.valid() {
+        // The whole entry is the record of having been described, rather than
+        // one bit of it standing for that: an undescribed slot is the zero entry
+        // the table was built with, and a described one names a backing page,
+        // which is never physical page zero — every one of them comes out of the
+        // reserved chunk.
+        if *slot != PhysicalApicEntry::new() {
             return Err(VlapicError::IdDescribedTwice { id: id.get() });
         }
         *slot = PhysicalApicEntry::new()
-            .with_valid(true)
             .with_backing_page_address(page)
             .with_host_apic_id(host_identifier(id));
         Ok(())
@@ -157,7 +167,9 @@ mod tests {
     //! refusals and the shape of an entry are all tested without a machine.
 
     use cpu::ApicId;
-    use svm::avic::{MAX_PHYSICAL_ID, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID};
+    use svm::avic::{
+        MAX_PHYSICAL_ID, PhysicalApicEntry, X2_EXTENDED_MAX_PHYSICAL_ID, X2_MAX_PHYSICAL_ID,
+    };
     use x86_64::PhysAddr;
 
     use super::PhysicalTable;
@@ -227,17 +239,21 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_names_the_processors_page_and_starts_not_running() {
+    fn an_entry_names_the_processors_page_and_promises_nothing_beside_it() {
         let mut table = PhysicalTable::new(0xFF, WIDEST).expect("a table the mode can name");
         let page = PhysAddr::new(0x0012_3000);
         table.describe(ApicId::new(7), page).unwrap();
         let entry = table.entries[7];
-        assert!(entry.valid());
-        assert!(!entry.is_running());
         assert_eq!(entry.backing_page_address(), page);
         assert_eq!(entry.host_apic_id(), 7);
-        // An entry nobody described names nothing.
-        assert!(!table.entries[6].valid());
+        // Both promises are the activation's to make: an interrupt may resolve
+        // here only while the hardware is the authority for this controller, and
+        // may be sent to a physical processor only while this one is on it.
+        assert!(!entry.valid());
+        assert!(!entry.is_running());
+        // An entry nobody described names nothing at all, which is what the
+        // description is recognised by.
+        assert_eq!(table.entries[6], PhysicalApicEntry::new());
     }
 
     #[test]

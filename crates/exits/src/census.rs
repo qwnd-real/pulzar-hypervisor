@@ -44,10 +44,8 @@ pub(crate) struct Census {
     /// page they named: which register a guest cannot touch accelerated is
     /// the question this half answers.
     noaccel: [u32; Self::NOACCEL_SLOTS],
-    /// Hardware doorbells rung since the last summary, as the vlapic crate
+    /// Host-interrupt kicks sent since the last summary, as the vlapic crate
     /// counts them cumulatively.
-    last_doorbells: u64,
-    /// Host-interrupt kicks sent since the last summary, likewise.
     last_kicks: u64,
     /// Exits counted since the last summary.
     counted: u64,
@@ -88,7 +86,6 @@ impl Census {
             sparse_used: 0,
             incomplete_ipi: [0; Self::IPI_FAILURES],
             noaccel: [0; Self::NOACCEL_SLOTS],
-            last_doorbells: 0,
             last_kicks: 0,
             counted: 0,
             lifetime: 0,
@@ -174,9 +171,9 @@ impl Census {
         }
         // The acceleration's own account, which the exit codes cannot give:
         // why deliveries between the guest's processors stopped, which
-        // registers it still touches by hand, and how the running targets
-        // were woken — the measure of whether the acceleration is doing its
-        // job.
+        // registers it still touches by hand, and how many of its targets the
+        // hardware could not tell on its own — which is the measure of how much
+        // of the work the acceleration is really taking.
         for (id, count) in self.incomplete_ipi.iter().enumerate() {
             if *count > 0 {
                 #[expect(
@@ -195,12 +192,10 @@ impl Census {
                 );
             }
         }
-        let doorbells = vlapic::avic_doorbells().wrapping_sub(self.last_doorbells);
         let kicks = vlapic::avic_kicks().wrapping_sub(self.last_kicks);
-        if doorbells > 0 || kicks > 0 {
-            info!("exits:   {doorbells} hardware doorbells rung, {kicks} host-interrupt kicks");
+        if kicks > 0 {
+            info!("exits:   {kicks} host-interrupt kicks to wake targets it could not announce to");
         }
-        self.last_doorbells = vlapic::avic_doorbells();
         self.last_kicks = vlapic::avic_kicks();
         self.dense.fill(0);
         self.sparse_used = 0;

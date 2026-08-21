@@ -105,9 +105,8 @@ use thiserror::Error;
 pub use crate::{
     avic::{
         active as avic_active, apic_page, backing_page, deliverable as avic_deliverable,
-        doorbells as avic_doorbells, hand_over as avic_hand_over,
-        incomplete_ipi as avic_incomplete_ipi, kicks as avic_kicks, provision,
-        publish_running as avic_publish_running, reconcile as avic_reconcile,
+        hand_over as avic_hand_over, incomplete_ipi as avic_incomplete_ipi, kicks as avic_kicks,
+        provision, publish_running as avic_publish_running, reconcile as avic_reconcile,
         trap_access as avic_trap_access, unaccelerated_trap as avic_unaccelerated_trap,
         unpublish_running as avic_unpublish_running, wake_targets as avic_wake_targets,
         x2apic_offered,
