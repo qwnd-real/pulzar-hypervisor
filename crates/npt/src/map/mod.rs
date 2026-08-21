@@ -65,8 +65,6 @@ use crate::map::regions::Regions;
 pub(crate) struct Map {
     /// The memory that is the hypervisor's own.
     chunk: Range,
-    /// The one frame of zeroes every page of the chunk reads as.
-    zero: PhysAddr,
     /// One past the highest address this processor can reach.
     limit: u64,
     /// The regions something other than the hardware answers for.
@@ -88,7 +86,7 @@ impl Map {
     /// unused. More than the entry format has room for is taken as that
     /// maximum: an address the tables cannot hold is not one this map can
     /// answer for either.
-    pub(crate) const fn new(chunk: Range, zero: PhysAddr, bits: u8) -> Self {
+    pub(crate) const fn new(chunk: Range, bits: u8) -> Self {
         let bits = if bits < ADDRESS_BITS {
             bits
         } else {
@@ -96,7 +94,6 @@ impl Map {
         };
         Self {
             chunk,
-            zero,
             limit: 1 << bits,
             regions: Regions::new(),
             sinks: Regions::new(),
@@ -171,11 +168,6 @@ impl Map {
     /// The memory that is the hypervisor's own.
     pub(crate) const fn chunk(&self) -> Range {
         self.chunk
-    }
-
-    /// The frame every page of the hypervisor's own memory reads as.
-    pub(crate) const fn zero(&self) -> PhysAddr {
-        self.zero
     }
 
     /// Records a region something other than the hardware answers for, and
@@ -285,10 +277,9 @@ impl Map {
             self.limit,
         );
         info!(
-            "{who}: npt shadows physical {:#x}..{:#x} onto {:#x}, read only",
+            "{who}: npt shadows physical {:#x}..{:#x}, read only",
             self.chunk.first(),
             self.chunk.end(),
-            self.zero,
         );
         for region in self.regions.iter() {
             info!(
@@ -463,7 +454,7 @@ pub enum Trap {
 /// is only ever held by one region at a time, and a name is free to be handed
 /// out again once the region holding it has gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RegionTag(u16);
+pub struct RegionTag(pub(crate) u16);
 
 impl RegionTag {
     /// The name, as a number something else can index by.
@@ -739,9 +730,6 @@ mod tests {
 
     /// How long it is: whole 2 MiB regions, as a real chunk is.
     const CHUNK_BYTES: u64 = 64 << 20;
-
-    /// The one frame every page of it reads as.
-    const ZERO: u64 = CHUNK + PAGE;
 
     /// A device aperture below the chunk, where a real machine's is.
     const DEVICE: u64 = 0xFEE0_0000;
@@ -1101,7 +1089,7 @@ mod tests {
 
     /// A map of a machine with the hypervisor's own memory in the middle of it.
     fn map() -> Map {
-        Map::new(range(CHUNK, CHUNK_BYTES), PhysAddr::new(ZERO), BITS)
+        Map::new(range(CHUNK, CHUNK_BYTES), BITS)
     }
 
     /// A range the map will accept, which is what every test here names.

@@ -1,4 +1,5 @@
-//! Descending a guest physical address through four levels of table.
+//! Reaching one entry of one nested page table, and the four levels a guest
+//! physical address is walked down through.
 //!
 //! The entries are ordinary long-mode page table entries — the second
 //! translation uses whatever paging mode the hypervisor was running in when it
@@ -14,47 +15,35 @@
 //! touching a high address, so the descent is written here instead — a few
 //! dozen lines that index tables straight out of the address.
 //!
-//! # A large page is split only when it is asked for
+//! # An entry is not this crate's to own
 //!
-//! A descent says what it wants done with a large page it meets where it
-//! expected a table, and the two answers exist for two different callers.
+//! The processor writes the accessed and dirty bits into these entries itself:
+//! the architecture says so of every nested entry touched while walking a
+//! guest's own page tables. Software is therefore not the only writer of one,
+//! and the shape of this file follows from that.
 //!
-//! [`Meeting::Refuse`] reports [`NptError::LargePage`]. The fill rule this
-//! crate follows never asks for a granularity finer than the one it already
-//! described a region with, so a filling descent that meets one means the rule
-//! was broken — which is worth hearing about, and is not something to paper
-//! over by rewriting a mapping the guest may already be running on.
+//! An entry is an [`AtomicU64`], read only by [`load`] and written only by
+//! [`store`]. Reading or writing one through an ordinary reference would be a
+//! data race with the hardware, and a read-modify-write through one could lose
+//! what the hardware recorded between the read and the write — so no operation
+//! here is one.
 //!
-//! [`Meeting::Split`] breaks it into a table of the next level down describing
-//! the same memory the same way, which is what trapping part of a region
-//! requires: a 4 KiB entry cannot be given different permissions from its
-//! neighbours while a single entry above them describes all five hundred and
-//! twelve. Nothing about the translation changes, only how finely it is written
-//! down.
+//! One aligned eight-byte store is also what the hardware page walker reads
+//! atomically, so a walk in progress sees the whole of the old entry or the
+//! whole of the new one and never half of each. That is what lets a leaf be
+//! replaced, and a table be published, without stopping anything.
+//!
+//! Nothing here takes an exclusive reference to a table, and a shared one is
+//! enough to write an entry, precisely because every entry is an atomic. What
+//! the hardware's two bits do cost is that no comparison of two entries may
+//! include them.
 
-use core::{
-    ptr::NonNull,
-    sync::atomic::{Ordering, compiler_fence},
-};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use paging::{DirectMap, Frames};
-use x86_64::{
-    PhysAddr,
-    structures::paging::{PageTable, PageTableFlags, PageTableIndex, page_table::PageTableEntry},
-};
+use paging::{DirectMap, as_usize, chunk};
+use x86_64::{PhysAddr, structures::paging::PageTableIndex};
 
 use crate::NptError;
-
-/// Flags every table above a leaf carries.
-///
-/// User access is not a choice: a guest's own page-table walks are performed as
-/// *user writes* at the nested level, so a table that is not both
-/// user-accessible and writable turns every such walk into a fault. Nothing
-/// here is ever marked no-execute, because the host has `EFER.NXE` set and the
-/// bit would then deny the guest execution of everything below it.
-pub(crate) const PARENT: PageTableFlags = PageTableFlags::PRESENT
-    .union(PageTableFlags::WRITABLE)
-    .union(PageTableFlags::USER_ACCESSIBLE);
 
 /// One of the four levels a guest physical address is walked through.
 ///
@@ -63,7 +52,7 @@ pub(crate) const PARENT: PageTableFlags = PageTableFlags::PRESENT
 /// shift and the span are derived from the level rather than written out once
 /// per level, so the three can never disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Level {
+pub enum Level {
     /// The page table. Each entry describes 4 KiB, and no entry of one is ever
     /// a large page.
     Page = 1,
@@ -76,9 +65,13 @@ pub(crate) enum Level {
 }
 
 impl Level {
-    /// Every level, from the root downwards, which is the order a walk visits
-    /// them in.
-    const ALL: [Self; 4] = [Self::Root, Self::Pointer, Self::Directory, Self::Page];
+    /// Every level whose entries can name a table, from the root downwards,
+    /// which is the order a walk visits them in.
+    ///
+    /// The page table is the one that cannot: its entries describe memory
+    /// whether or not they carry the bit that says so, which is why a walk
+    /// reaching one has arrived rather than having somewhere further to go.
+    pub(crate) const TABLES: [Self; 3] = [Self::Root, Self::Pointer, Self::Directory];
 
     /// Bits of a guest physical address below this level's index.
     const fn shift(self) -> u32 {
@@ -102,7 +95,7 @@ impl Level {
     /// has no large page at all. Both answers mean the same thing to a
     /// caller holding an entry it believed was one — that the entry is not
     /// something this crate wrote.
-    const fn below(self) -> Option<Self> {
+    pub(crate) const fn below(self) -> Option<Self> {
         Some(match self {
             Self::Pointer => Self::Directory,
             Self::Directory => Self::Page,
@@ -121,252 +114,90 @@ impl Level {
     }
 }
 
-/// Describes the `level`-sized region containing `gpa` as `frame`, building
-/// every table above it that does not exist yet.
+/// What one entry of the table at `at` says.
 ///
-/// `flags` is the leaf's own; the large-page bit is added here rather than by
-/// the caller, because whether an entry is a leaf is what `level` already says
-/// and stating it twice is how the two come to disagree.
-pub(crate) fn map(
+/// Acquiring, so that a walk which follows this entry to a table also sees
+/// every entry of that table: the ordering pairs with the release store that
+/// published it.
+pub(crate) fn load(
     window: DirectMap,
-    root: PhysAddr,
-    gpa: PhysAddr,
-    level: Level,
-    frame: PhysAddr,
-    flags: PageTableFlags,
-    frames: &mut Frames,
+    at: PhysAddr,
+    index: PageTableIndex,
+) -> Result<u64, NptError> {
+    Ok(reach(window, at)?.entries[usize::from(index)].load(Ordering::Acquire))
+}
+
+/// Makes one entry of the table at `at` say `value`.
+///
+/// Releasing, so that whatever was written before it — the entries of a table
+/// this one is about to name — is visible to any walk that follows it.
+pub(crate) fn store(
+    window: DirectMap,
+    at: PhysAddr,
+    index: PageTableIndex,
+    value: u64,
 ) -> Result<(), NptError> {
-    let leaf = if level == Level::Page {
-        flags
-    } else {
-        flags.union(PageTableFlags::HUGE_PAGE)
-    };
-    let mut table = descend(window, root, gpa, level, frames, Meeting::Refuse)?;
-    // SAFETY: `descend` returns a table of these nested tables, reached through
-    // the window, and the caller holds the only handle to them.
-    let table = unsafe { table.as_mut() };
-    table[level.index(gpa)].set_addr(frame, leaf);
+    reach(window, at)?.entries[usize::from(index)].store(value, Ordering::Release);
     Ok(())
 }
 
-/// What a descent does with a large page it meets where it wanted a table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Meeting {
-    /// Report it, because meeting one means the fill rule was broken.
-    Refuse,
-    /// Break it into a table of the next level down describing the same memory.
-    Split,
-}
-
-/// The entry that describes a guest physical address.
+/// Makes each entry of the table at `at` say what `value` answers for its slot,
+/// leaving the entries it declines to answer for as they are.
 ///
-/// The level is part of the answer rather than an implementation detail: it is
-/// what says how much of physical memory this one entry speaks for, and so how
-/// far past the address the same translation continues.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Leaf {
-    /// Where the region this entry describes begins in system physical memory.
-    pub(crate) frame: PhysAddr,
-    /// What the entry permits.
-    pub(crate) flags: PageTableFlags,
-    /// The level the entry was found at.
-    pub(crate) level: Level,
-}
-
-/// The entry describing `gpa`, or `None` if nothing does.
-///
-/// A guest physical address can fault while a translation exists — a write to a
-/// read-only page is exactly that — so this answers what describes the address,
-/// not whether the access that faulted would now succeed.
-pub(crate) fn lookup(
+/// One reach through the window for a whole table rather than five hundred and
+/// twelve of them, which is what the two callers that describe a table at a
+/// time need: the shadow over the hypervisor's own memory, and the table a
+/// split fills before it publishes it. The slot a value is asked for is the
+/// index of the entry, so a caller can turn it into the addresses that entry
+/// describes.
+pub(crate) fn store_each(
     window: DirectMap,
-    root: PhysAddr,
-    gpa: PhysAddr,
-) -> Result<Option<Leaf>, NptError> {
-    let mut table = root;
-    let mut found = None;
-    for level in Level::ALL {
-        let (flags, frame) = read(window, table, level.index(gpa))?;
-        if !flags.contains(PageTableFlags::PRESENT) {
-            return Ok(None);
+    at: PhysAddr,
+    value: impl Fn(u64) -> Option<u64>,
+) -> Result<(), NptError> {
+    for (entry, slot) in reach(window, at)?.entries.iter().zip(0u64..) {
+        if let Some(value) = value(slot) {
+            entry.store(value, Ordering::Release);
         }
-        // A large page is a leaf wherever it appears, and every entry of the
-        // bottom table is one whether or not it carries the bit that says so.
-        if flags.contains(PageTableFlags::HUGE_PAGE) || level == Level::Page {
-            found = Some(Leaf {
-                frame,
-                flags,
-                level,
-            });
-            break;
-        }
-        table = frame;
     }
-    Ok(found)
+    Ok(())
 }
 
-/// The table whose entries describe `level`-sized regions on the path to `gpa`,
-/// or `None` if no such table exists.
+/// One nested page table.
 ///
-/// The counterpart of [`descend`] for undoing rather than building: it
-/// allocates nothing, splits nothing, and answers `None` where `descend` would
-/// have made a table. That is what makes it usable on a path that is giving
-/// something back — there is nothing to give back where nothing was ever built,
-/// and a call that allocated in order to clear an entry could fail for want of
-/// memory while releasing memory.
-///
-/// A large page on the way down is reported as `None` for the same reason: this
-/// crate only ever traps at 4 KiB, so an address covered by a large page was
-/// never trapped page by page, and splitting one here would be building rather
-/// than undoing.
-pub(crate) fn table_of(
-    window: DirectMap,
-    root: PhysAddr,
-    gpa: PhysAddr,
-    level: Level,
-) -> Result<Option<NonNull<PageTable>>, NptError> {
-    let mut table = root;
-    for above in Level::ALL {
-        if above <= level {
-            break;
-        }
-        let (flags, frame) = read(window, table, above.index(gpa))?;
-        if !flags.contains(PageTableFlags::PRESENT) || flags.contains(PageTableFlags::HUGE_PAGE) {
-            return Ok(None);
-        }
-        table = frame;
-    }
-    reach(window, table).map(Some)
+/// Page aligned and page sized, as the frame it occupies is and as the hardware
+/// requires: the alignment is what the window checks before it hands out a
+/// pointer to one, so a table reached through the window is a table the
+/// processor could have reached itself.
+#[repr(C, align(4096))]
+struct Table {
+    /// The entries, indexed by the nine bits of an address that name one.
+    entries: [AtomicU64; ENTRIES],
 }
 
-/// The table whose entries describe `level`-sized regions on the path to `gpa`,
-/// building every table above it that does not exist yet.
-///
-/// Every table this creates is zeroed by the allocator that handed out its
-/// frame, so an entry nothing has written yet reads as not present rather than
-/// as whatever the frame last held.
-pub(crate) fn descend(
-    window: DirectMap,
-    root: PhysAddr,
-    gpa: PhysAddr,
-    level: Level,
-    frames: &mut Frames,
-    meeting: Meeting,
-) -> Result<NonNull<PageTable>, NptError> {
-    let mut table = root;
-    for above in Level::ALL {
-        if above <= level {
-            break;
-        }
-        table = child(window, table, above, gpa, frames, meeting)?;
-    }
-    reach(window, table)
-}
+/// Entries in one table, which is what nine bits of an address can name.
+pub(crate) const ENTRIES: usize = 512;
 
-/// The table below the entry `gpa` indexes at this level, allocating and
-/// linking one if the entry is empty and splitting it if it is a large page.
-fn child(
-    window: DirectMap,
-    table: PhysAddr,
-    level: Level,
-    gpa: PhysAddr,
-    frames: &mut Frames,
-    meeting: Meeting,
-) -> Result<PhysAddr, NptError> {
-    let mut table = reach(window, table)?;
-    // SAFETY: `reach` returns a table of these nested tables, reached through
-    // the window, and the caller holds the only handle to them.
-    let entry = &mut unsafe { table.as_mut() }[level.index(gpa)];
-    if entry.flags().contains(PageTableFlags::PRESENT) {
-        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return match meeting {
-                Meeting::Refuse => Err(NptError::LargePage { gpa: gpa.as_u64() }),
-                Meeting::Split => split(window, entry, level, gpa, frames),
-            };
-        }
-        return Ok(entry.addr());
-    }
-    let frame = frames
-        .allocate(0)
-        .map_err(|_| NptError::OutOfFrames)?
-        .start_address();
-    entry.set_addr(frame, PARENT);
-    Ok(frame)
-}
-
-/// Replaces a large page with a table of the next level down describing the
-/// same memory, and answers where that table is.
+/// The table at `at`, through the window onto physical memory.
 ///
-/// Nothing about the translation changes. Every entry of the new table
-/// describes its slice of what the one entry described, with the same
-/// permissions and the same memory type, so an address translated before the
-/// split translates to the same place after it.
-///
-/// # Why a walk in progress cannot see this half done
-///
-/// The new table is filled completely before the entry above it is touched, and
-/// that entry is then replaced by a single store of an aligned quadword, which
-/// the hardware page walker reads atomically. So another processor walking this
-/// path sees either the large page or the finished table and never a table with
-/// entries still to be written. The fence is what stops the compiler from
-/// hoisting that store above the fill; the processor will not reorder the two
-/// on its own, because stores here become visible in the order they are made.
-fn split(
-    window: DirectMap,
-    entry: &mut PageTableEntry,
-    level: Level,
-    gpa: PhysAddr,
-    frames: &mut Frames,
-) -> Result<PhysAddr, NptError> {
-    let Some(below) = level.below() else {
-        // A large page at a level the architecture has none at is not something
-        // this crate wrote, and is reported as what it is rather than split.
-        return Err(NptError::LargePage { gpa: gpa.as_u64() });
-    };
-    let leaf = if below == Level::Page {
-        entry.flags().difference(PageTableFlags::HUGE_PAGE)
-    } else {
-        entry.flags()
-    };
-    let frame = frames
-        .allocate(0)
-        .map_err(|_| NptError::OutOfFrames)?
-        .start_address();
-    let mut table = reach(window, frame)?;
-    // SAFETY: the frame was just handed out by the chunk's allocator, so nothing
-    // else holds it, and `reach` proved the window describes it.
-    let table = unsafe { table.as_mut() };
-    let mut describes = entry.addr();
-    for slot in table.iter_mut() {
-        slot.set_addr(describes, leaf);
-        describes += below.span();
-    }
-    compiler_fence(Ordering::Release);
-    entry.set_addr(frame, PARENT);
-    Ok(frame)
-}
-
-/// The flags and address of one entry.
-fn read(
-    window: DirectMap,
-    table: PhysAddr,
-    index: PageTableIndex,
-) -> Result<(PageTableFlags, PhysAddr), NptError> {
-    let table = reach(window, table)?;
-    // SAFETY: as in `child`. Reading an entry cannot observe a partly written
-    // one: an entry is an aligned eight-byte value and every writer here stores
-    // it in a single instruction.
-    let entry = &unsafe { table.as_ref() }[index];
-    Ok((entry.flags(), entry.addr()))
-}
-
-/// Where a table is readable, through the window onto physical memory.
-fn reach(window: DirectMap, table: PhysAddr) -> Result<NonNull<PageTable>, NptError> {
-    window
-        .ptr::<PageTable>(table)
-        .map_err(|_| NptError::Unreachable {
-            phys: table.as_u64(),
-        })
+/// Shared rather than exclusive even where an entry is about to be written,
+/// because the processor writes into the same quadwords: an exclusive reference
+/// would be a claim that nothing else touches them, and that claim is false of
+/// every table here.
+fn reach<'a>(window: DirectMap, at: PhysAddr) -> Result<&'a Table, NptError> {
+    let table = window
+        .ptr::<Table>(at)
+        .map_err(|_| NptError::Unreachable { phys: at.as_u64() })?;
+    // SAFETY: `ptr` proved that the window reaches all four kilobytes of the
+    // table and that `at` is aligned for one, so the pointer is valid for a
+    // whole `Table`. The frame behind it was handed out zeroed by the chunk's
+    // allocator and has held nothing but entries since, so every quadword is
+    // initialised. The other writer of those quadwords is the processor's own
+    // page walker recording accessed and dirty bits, which a shared reference
+    // tolerates precisely because each entry is an `AtomicU64` — and the
+    // reference outlives nothing, every caller being in this module and done
+    // with it before it returns.
+    Ok(unsafe { table.as_ref() })
 }
 
 const _: () = assert!(
@@ -378,4 +209,14 @@ const _: () = assert!(
 const _: () = assert!(
     Level::Root.span() == 512 << 30,
     "the root table's entries must each describe five hundred and twelve gigabytes",
+);
+const _: () = assert!(
+    ENTRIES == as_usize(Level::Directory.span() / Level::Page.span()),
+    "a table must hold one entry per region of the level below that its own \
+     entries describe",
+);
+const _: () = assert!(
+    size_of::<Table>() == as_usize(chunk::FRAME_SIZE),
+    "a table must be exactly the frame it occupies, which is what makes the \
+     window's own alignment check the hardware's requirement",
 );

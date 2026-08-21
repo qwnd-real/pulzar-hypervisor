@@ -17,9 +17,10 @@
 //!
 //! What an address *means* and how that meaning is written into four levels of
 //! hardware table are separate. [`map`] answers the first, for a *run* of
-//! addresses at a time — the largest run the same answer covers — and this file
+//! addresses at a time — the largest run the same answer covers — and [`tree`]
 //! answers the second, taking the granularity to describe a region at from the
-//! run rather than probing for it.
+//! run rather than probing for it. What is left here is the handle the two are
+//! reached through and the operations that need both.
 //!
 //! # Built as it is asked for
 //!
@@ -124,20 +125,17 @@ extern crate alloc;
 mod map;
 mod tree;
 
-use log::{error, info};
+use log::error;
 use paging::{DirectMap, Frames, chunk};
 use processor::Features;
 use svm::exit::NestedPageFault;
 use thiserror::Error;
-use x86_64::{
-    PhysAddr,
-    structures::paging::{PageTableFlags, PhysFrame},
-};
+use x86_64::{PhysAddr, structures::paging::PhysFrame};
 
-pub use crate::map::{Access, Kind, MapError, Range, RegionTag, Trap, Verdict};
-use crate::{
-    map::Map,
-    tree::walk::{self, Level, Meeting, PARENT},
+use crate::{map::Map, tree::Tree};
+pub use crate::{
+    map::{Access, Kind, MapError, Range, RegionTag, Trap, Verdict},
+    tree::walk::Level,
 };
 
 /// One guest's nested page tables.
@@ -148,10 +146,10 @@ use crate::{
 /// memory.
 #[derive(Debug)]
 pub struct Npt {
-    root: PhysAddr,
+    /// What each of the guest's physical addresses means.
     map: Map,
-    window: DirectMap,
-    large: bool,
+    /// Where those meanings are written for the hardware to walk.
+    tree: Tree,
 }
 
 impl Npt {
@@ -182,14 +180,16 @@ impl Npt {
         let root = frame(frames, window)?;
         let zero = frame(frames, window)?;
         Ok(Self {
-            root,
             map: Map::new(
                 Range::new(frames.chunk_base(), chunk::CHUNK_SIZE)?,
-                zero,
                 processor::physical_address_bits(),
             ),
-            window,
-            large: processor::features().contains(Features::GIB_PAGES),
+            tree: Tree::new(
+                root,
+                zero,
+                window,
+                processor::features().contains(Features::GIB_PAGES),
+            ),
         })
     }
 
@@ -197,7 +197,7 @@ impl Npt {
     /// table root field.
     #[must_use]
     pub const fn root(&self) -> PhysAddr {
-        self.root
+        self.tree.root()
     }
 
     /// The window these tables are reached through, which is the same window
@@ -209,7 +209,7 @@ impl Npt {
     /// reachable.
     #[must_use]
     pub const fn window(&self) -> DirectMap {
-        self.window
+        self.tree.window()
     }
 
     /// Describes the region containing a guest physical address that had no
@@ -227,7 +227,7 @@ impl Npt {
     /// [`NptError::Map`] carrying [`MapError::Unaddressable`] if the address is
     /// above the processor's physical address width, [`NptError::OutOfFrames`]
     /// if the chunk cannot spare a table, [`NptError::Unreachable`] if the
-    /// window does not reach one, or [`NptError::LargePage`] if a large page
+    /// window does not reach one, or [`NptError::Coarser`] if a larger page
     /// already covers the address, which means something described this region
     /// at a granularity the fill rule never produces.
     pub fn fault(
@@ -246,33 +246,17 @@ impl Npt {
             // narrowing one into an address that exists would describe the
             // wrong page.
             Kind::Unaddressable => Err(MapError::Unaddressable { gpa: gpa.as_u64() }.into()),
-            Kind::Ram { spa, .. } => {
-                if self.undescribed(gpa)? {
-                    self.memory(frames, verdict, gpa, spa)?;
-                }
+            Kind::Ram { .. } | Kind::Sink { .. } => {
+                self.tree.fill(frames, verdict, gpa)?;
                 Ok(Resolution::Mapped)
             }
-            Kind::Shadow => {
-                if self.undescribed(gpa)? {
-                    self.shadow(frames, verdict, gpa)?;
-                }
-                Ok(hypervisors(cause))
-            }
-            // Described when it was recorded, and described again here rather
-            // than taken on trust: reporting a translation that is not there
-            // would leave the guest faulting on the same instruction for ever.
-            Kind::Sink { spa } => {
-                if self.undescribed(gpa)? {
-                    self.given(frames, verdict.base, spa, LEAF)?;
-                }
-                Ok(Resolution::Mapped)
-            }
-            Kind::Exposed { spa, access } => {
-                if self.undescribed(gpa)? {
-                    self.given(frames, verdict.base, spa, shown(access))?;
-                }
-                // Never writable, so a fault that is a write is one no page here
-                // will ever take.
+            // A write to either faults however it is described — no page behind
+            // them can take one — so what the caller is owed is what the access
+            // came to rather than whether anything was built. The fill is asked
+            // for all the same: an entry that already says this is left alone,
+            // and a page the guest has not touched before is described.
+            Kind::Shadow | Kind::Exposed { .. } => {
+                self.tree.fill(frames, verdict, gpa)?;
                 Ok(hypervisors(cause))
             }
         }
@@ -295,17 +279,7 @@ impl Npt {
     /// [`NptError::Unreachable`] if the window does not reach one of these
     /// tables, which is a broken window rather than anything about `gpa`.
     pub fn translate(&self, gpa: PhysAddr) -> Result<Option<Translation>, NptError> {
-        let Some(leaf) = walk::lookup(self.window, self.root, gpa)? else {
-            return Ok(None);
-        };
-        // How far into the region the address falls, which is both how far into
-        // the frame it lands and how much of the region is behind it.
-        let offset = gpa.as_u64() - gpa.align_down(leaf.level.span()).as_u64();
-        Ok(Some(Translation {
-            spa: leaf.frame + offset,
-            writable: leaf.flags.contains(PageTableFlags::WRITABLE),
-            span: leaf.level.span() - offset,
-        }))
+        self.tree.translate(gpa)
     }
 
     /// Marks a range as one whose accesses are not the hardware's to answer.
@@ -336,8 +310,8 @@ impl Npt {
     /// address, something already describes part of it another way, or
     /// there is no room for another — [`NptError::OutOfFrames`] if the
     /// chunk cannot spare a table, [`NptError::Unreachable`] if the window
-    /// does not reach one, or [`NptError::LargePage`] if a large page turns
-    /// up at a level the architecture has none at.
+    /// does not reach one, or [`NptError::Coarser`] if a leaf turns up at a
+    /// level the architecture has no large page at.
     pub fn protect(
         &mut self,
         frames: &mut Frames,
@@ -354,7 +328,7 @@ impl Npt {
         self.map.interpose(range, trap)?;
         let described = range
             .pages()
-            .try_for_each(|page| self.interpose(frames, page.base(), trap));
+            .try_for_each(|page| self.interpose(frames, page.base()));
         if described.is_err() {
             // The region is not described and so must not go on being recorded:
             // a record naming pages that were never trapped would refuse to let
@@ -407,7 +381,9 @@ impl Npt {
         // `fault` is willing to describe rather than pages it refuses to touch
         // and nothing answers for.
         self.map.release(range)?;
-        range.pages().try_for_each(|page| self.abandon(page.base()))
+        range
+            .pages()
+            .try_for_each(|page| self.tree.abandon(page.base()))
     }
 
     /// Maps immutable pages of the owned chunk for guest access before first
@@ -435,7 +411,7 @@ impl Npt {
     ) -> Result<(), NptError> {
         let range = self.owned(gpa, bytes)?;
         self.map.expose(range, exposure.access())?;
-        self.overlay(frames, range, Some(exposure))
+        self.overlay(frames, range)
     }
 
     /// Takes an exposed range back, leaving it as every other page of the
@@ -469,7 +445,7 @@ impl Npt {
     ) -> Result<(), NptError> {
         let range = self.owned(gpa, bytes)?;
         self.map.conceal(range)?;
-        self.overlay(frames, range, None)
+        self.overlay(frames, range)
     }
 
     /// Describes one page as a place the guest may touch without anything
@@ -498,7 +474,7 @@ impl Npt {
     /// page already sunk included, or there is no room for another — or an
     /// error from allocating or reaching the frame behind it.
     pub fn sink(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
-        let frame = frame(frames, self.window)?;
+        let frame = frame(frames, self.window())?;
         // Recorded before it is described, because the map is what `fault`
         // consults: a page the map calls sunk is described that way whenever it
         // is next touched, while a page described as a sink that the map did not
@@ -511,17 +487,13 @@ impl Npt {
             }
             return Err(refused.into());
         }
-        self.given(frames, gpa, frame, LEAF)
+        self.describe_page(frames, gpa)
     }
 
     /// Logs the shape of the translation, which is the whole of what a guest's
     /// view of memory is.
     pub fn describe(&self, who: &str) {
-        info!(
-            "{who}: npt rooted at {:#x}, identity mapped in {} pages",
-            self.root,
-            if self.large { "1 GiB" } else { "2 MiB" },
-        );
+        self.tree.describe(who);
         self.map.describe(who);
     }
 
@@ -544,181 +516,44 @@ impl Npt {
         }
     }
 
-    /// Describes a range of the hypervisor's own memory one page at a time,
-    /// either as itself or as the shared page of zeroes.
-    fn overlay(
-        &mut self,
-        frames: &mut Frames,
-        range: Range,
-        exposure: Option<Exposure>,
-    ) -> Result<(), NptError> {
-        range.pages().try_for_each(|page| {
-            let (frame, flags) = match exposure {
-                Some(exposure) => (page.base(), exposure.flags()),
-                None => (self.map.zero(), SHADOW),
-            };
-            self.given(frames, page.base(), frame, flags)
-        })
+    /// Describes every page of a range of the hypervisor's own memory as the
+    /// map now says it is.
+    ///
+    /// One helper for both directions of showing a range to the guest, because
+    /// once the map has been told, what those pages are is the map's to say:
+    /// shown on purpose, or the shared page of zeroes every other page of the
+    /// chunk reads as.
+    fn overlay(&mut self, frames: &mut Frames, range: Range) -> Result<(), NptError> {
+        range
+            .pages()
+            .try_for_each(|page| self.describe_page(frames, page.base()))
     }
 
-    /// Describes one page as one frame.
+    /// Describes one page of a trapped region as the map now says it is.
     ///
-    /// The floor of every description here, and the only granularity anything
-    /// but ordinary memory is ever written down in: the hypervisor's own memory
-    /// reads as a single shared frame, and a page given a frame of its own or
-    /// shown to the guest is one page by construction.
-    fn given(
-        &self,
-        frames: &mut Frames,
-        gpa: PhysAddr,
-        frame: PhysAddr,
-        flags: PageTableFlags,
-    ) -> Result<(), NptError> {
-        walk::map(
-            self.window,
-            self.root,
-            gpa,
-            Level::Page,
-            frame,
-            flags,
-            frames,
-        )
+    /// A write-trapped page is described as the memory really there and
+    /// read-only, so that reads reach the hardware without an exit. A page
+    /// where every access is trapped is described as nothing at all: a
+    /// present entry has no bit that denies a read, so not present is the
+    /// only encoding that faults on one.
+    fn interpose(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+        // Broken up first, because the page has to say something its neighbours
+        // do not and permissions belong to an entry. This is the one place that
+        // needs finer granularity than the fill rule would otherwise produce,
+        // and it is why answering a fault never has to.
+        self.tree.split(frames, gpa)?;
+        self.describe_page(frames, gpa)
     }
 
-    /// Whether nothing describes this address yet.
-    fn undescribed(&self, gpa: PhysAddr) -> Result<bool, NptError> {
-        Ok(walk::lookup(self.window, self.root, gpa)?.is_none())
-    }
-
-    /// Describes the coarsest page containing `gpa` whose whole extent the
-    /// verdict covers, as the memory the verdict says is behind it.
+    /// Describes the one page at `gpa` as the map says it is.
     ///
-    /// The granularity comes out of the answer rather than out of a search: a
-    /// run reaching a gigabyte past the address in both directions is written
-    /// down as one 1 GiB entry, and one that stops a page away is written down
-    /// as one page. The floor is one page and reaching it is always right,
-    /// because a verdict covers at least the page containing the address it
-    /// answered for.
-    fn memory(
-        &mut self,
-        frames: &mut Frames,
-        verdict: Verdict,
-        gpa: PhysAddr,
-        spa: PhysAddr,
-    ) -> Result<(), NptError> {
-        let level = [Level::Pointer, Level::Directory]
-            .into_iter()
-            // The coarser of the two exists only on a processor that reports it.
-            .skip(usize::from(!self.large))
-            .find(|level| verdict.covers(gpa.align_down(level.span()), level.span()))
-            .unwrap_or(Level::Page);
-        let base = gpa.align_down(level.span());
-        // The run is described from `spa` onwards, so the page being described
-        // begins that far into whatever is behind it.
-        walk::map(
-            self.window,
-            self.root,
-            base,
-            level,
-            spa + (base - verdict.base),
-            LEAF,
-            frames,
-        )
-    }
-
-    /// Points the pages of the 2 MiB region containing `gpa` that the verdict
-    /// covers at the shared page of zeroes.
-    ///
-    /// A whole page table's worth at once, because by the geometry
-    /// [`Npt::create`] checked, all of that region is the hypervisor's:
-    /// describing it page by page as each one is touched would cost a fault per
-    /// page and arrive at the same table. The pages the verdict does not cover
-    /// are the few of the chunk that are described some other way — shown to
-    /// the guest on purpose, or handed to something else to answer for —
-    /// and putting zeroes over one of those would take back what it was
-    /// given.
-    fn shadow(
-        &mut self,
-        frames: &mut Frames,
-        verdict: Verdict,
-        gpa: PhysAddr,
-    ) -> Result<(), NptError> {
-        let zero = self.map.zero();
-        let first = gpa.align_down(Level::Directory.span());
-        let mut table = walk::descend(
-            self.window,
-            self.root,
-            first,
-            Level::Page,
-            frames,
-            Meeting::Refuse,
-        )?;
-        // SAFETY: `descend` returns a table of these nested tables, reached
-        // through the window, and `&mut self` is the only handle to them.
-        let table = unsafe { table.as_mut() };
-        let page = Level::Page.span();
-        for index in 0..Level::Directory.span() / page {
-            let at = first + index * page;
-            if verdict.covers(at, page) {
-                table[Level::Page.index(at)].set_addr(zero, SHADOW);
-            }
-        }
-        Ok(())
-    }
-
-    /// Describes one page of a trapped region.
-    ///
-    /// A write-trapped page is still described, as itself and read-only, so
-    /// that reads reach the hardware without an exit. A page where every
-    /// access is trapped is described as nothing at all: a present entry
-    /// has no bit that denies a read, so not present is the only encoding
-    /// that faults on one.
-    fn interpose(
-        &mut self,
-        frames: &mut Frames,
-        gpa: PhysAddr,
-        trap: Trap,
-    ) -> Result<(), NptError> {
-        let mut table = walk::descend(
-            self.window,
-            self.root,
-            gpa,
-            Level::Page,
-            frames,
-            Meeting::Split,
-        )?;
-        // SAFETY: `descend` returns a table of these nested tables, reached
-        // through the window, and `&mut self` is the only handle to them.
-        let table = unsafe { table.as_mut() };
-        let entry = &mut table[Level::Page.index(gpa)];
-        match trap {
-            Trap::Writes => entry.set_addr(gpa, TRAPPED),
-            Trap::Everything => entry.set_unused(),
-        }
-        Ok(())
-    }
-
-    /// Leaves one page of a released region with no translation at all.
-    ///
-    /// The opposite of [`Npt::interpose`], and deliberately not its mirror
-    /// image: it does not put back whatever the page was described as
-    /// before, because that is not knowable here and is not worth
-    /// remembering. A page with no entry is where every page of a guest
-    /// starts, and the first access to one goes through [`Npt::fault`],
-    /// which decides correctly whether it is the guest's memory or the
-    /// hypervisor's.
-    ///
-    /// A page that has no table under it needs nothing done: there is no entry
-    /// to clear, which is already the state this is trying to reach.
-    fn abandon(&mut self, gpa: PhysAddr) -> Result<(), NptError> {
-        let Some(mut table) = walk::table_of(self.window, self.root, gpa, Level::Page)? else {
-            return Ok(());
-        };
-        // SAFETY: `table_of` returns a table of these nested tables, reached
-        // through the window, and `&mut self` is the only handle to them.
-        let table = unsafe { table.as_mut() };
-        table[Level::Page.index(gpa)].set_unused();
-        Ok(())
+    /// Every mutation here works a page at a time — a page shown to the guest,
+    /// a page sunk, a page of a trapped region — so each of them asks the map
+    /// afresh rather than saying for itself what it just recorded. Two accounts
+    /// of one page could disagree; one cannot.
+    fn describe_page(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+        let verdict = self.map.resolve(gpa);
+        self.tree.fill(frames, verdict, gpa)
     }
 }
 
@@ -775,30 +610,6 @@ impl Exposure {
             Self::ReadExecute => Access::EXECUTE,
         }
     }
-
-    /// Nested page-table flags implementing this access.
-    ///
-    /// Derived from [`Exposure::access`] rather than written out beside it, so
-    /// that what the map records about an exposed page and what its entry says
-    /// cannot come apart.
-    const fn flags(self) -> PageTableFlags {
-        shown(self.access())
-    }
-}
-
-/// Flags on a leaf of the hypervisor's own memory the guest is shown.
-///
-/// Present and user-accessible, so that a guest may read it; never writable,
-/// because a page shown to the guest is a way of handing it something and not
-/// memory it owns; and executable only where the access asks, because the code
-/// a guest is entered at has to run and that code's parameters must not.
-const fn shown(access: Access) -> PageTableFlags {
-    let readable = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
-    if access.contains(Access::EXECUTE) {
-        readable
-    } else {
-        readable.union(PageTableFlags::NO_EXECUTE)
-    }
 }
 
 /// Where a guest physical address really is.
@@ -833,11 +644,18 @@ pub enum NptError {
         /// The table that could not be reached.
         phys: u64,
     },
-    /// A large page already covers the address, and nothing here splits one.
-    #[error("guest physical {gpa:#x} is already covered by a large page")]
-    LargePage {
+    /// A leaf describes the address at a coarser level than the map now allows,
+    /// which no fill produces and no fault repairs.
+    #[error(
+        "guest physical {gpa:#x} is described by one entry spanning {:#x} bytes, coarser than the \
+         memory map allows",
+        level.span()
+    )]
+    Coarser {
         /// The address in question.
         gpa: u64,
+        /// The level the leaf was found at.
+        level: Level,
     },
     /// The reserved chunk is not aligned or sized as the shadow requires.
     #[error(
@@ -862,26 +680,6 @@ pub enum NptError {
     Map(#[from] MapError),
 }
 
-/// Flags on a leaf that describes real memory the guest may use freely.
-///
-/// Write-back, which is the absence of both cache bits rather than a bit of its
-/// own: it is what leaves the guest's own memory type in force.
-const LEAF: PageTableFlags = PARENT;
-
-/// Flags on a leaf that stands in for the hypervisor's own memory: readable and
-/// executable so that a guest walking memory is not surprised, and not writable
-/// so that the shared page of zeroes stays zero.
-const SHADOW: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
-
-/// Flags on a leaf of a region whose writes are trapped: describing the memory
-/// that is really there, readable and executable, and not writable — so a read
-/// costs nothing and a write faults.
-///
-/// The same bits as [`SHADOW`] and for an entirely different reason. They are
-/// named apart so that changing what one of them means cannot quietly change
-/// the other.
-const TRAPPED: PageTableFlags = PageTableFlags::PRESENT.union(PageTableFlags::USER_ACCESSIBLE);
-
 /// A zeroed frame of the chunk, and proof that the window reaches it.
 ///
 /// Reaching it is checked here rather than at first use because a frame the
@@ -905,11 +703,6 @@ const _: () = assert!(
     "the shadow describes the chunk in whole 2 MiB regions",
 );
 const _: () = assert!(
-    !shown(Access::all()).contains(PageTableFlags::WRITABLE),
-    "guest-callable portal pages must remain immutable, whatever access is asked \
-     for them",
-);
-const _: () = assert!(
     chunk::CHUNK_ALIGN.is_multiple_of(Level::Directory.span()),
     "a 2 MiB region overlapping the chunk must lie entirely inside it",
 );
@@ -917,28 +710,12 @@ const _: () = assert!(
     chunk::FRAME_SIZE == Level::Page.span(),
     "the page a range is measured in must be the page an entry describes",
 );
-const _: () = assert!(
-    !SHADOW.contains(PageTableFlags::WRITABLE),
-    "the page of zeroes standing in for the hypervisor must not be writable",
-);
-const _: () = assert!(
-    TRAPPED.contains(PageTableFlags::PRESENT) && !TRAPPED.contains(PageTableFlags::WRITABLE),
-    "a write-trapped page must be present, so that reads cost nothing, and not \
-     writable, so that writes fault",
-);
-const _: () = assert!(
-    LEAF.contains(PageTableFlags::USER_ACCESSIBLE)
-        && !LEAF.contains(PageTableFlags::NO_EXECUTE)
-        && !LEAF.contains(PageTableFlags::WRITE_THROUGH)
-        && !LEAF.contains(PageTableFlags::NO_CACHE),
-    "a guest reaches nested memory only through a user page, executes only \
-     without no-execute, and keeps its own memory type only under write-back",
-);
 
 #[cfg(test)]
-mod tests {
-    //! The two ways one page of a guest can be described, over a run of host
-    //! memory standing in for the reserved chunk.
+pub(crate) mod tests {
+    //! The two ways one page of a guest can be described, what describing one
+    //! that way costs its neighbours, and a run of host memory standing in for
+    //! the reserved chunk for the rest of the crate to build tables in.
     //!
     //! Only the chunk has to be real. Every table these tables build is a frame
     //! of it, reached through the window, and nothing here ever dereferences a
@@ -956,6 +733,11 @@ mod tests {
     /// Where the interrupt controllers' register page is, which is the one page
     /// a boot chooses between these two descriptions for.
     const REGISTER_PAGE: u64 = 0xFEE0_0000;
+
+    /// What one entry of the level above a page describes, which is the
+    /// granularity ordinary memory is described in wherever nothing is in the
+    /// way.
+    const LARGE: u64 = 2 << 20;
 
     #[test]
     fn a_trapped_page_has_no_translation_and_every_access_to_it_is_reported() {
@@ -1046,6 +828,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_trapped_page_narrows_its_own_two_megabytes_and_nothing_further() {
+        let (mut frames, window) = reserved();
+        let mut npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        // A page inside a 2 MiB region of ordinary memory, so that the region
+        // holding it has to be described more finely than the fill rule would
+        // otherwise choose and the regions around it do not.
+        let trapped = PhysAddr::new(REGISTER_PAGE + FRAME_SIZE);
+
+        npt.protect(&mut frames, trapped, FRAME_SIZE, Trap::Everything)
+            .expect("the page can be trapped before a guest runs");
+
+        for (gpa, span) in [
+            (PhysAddr::new(REGISTER_PAGE), FRAME_SIZE),
+            (PhysAddr::new(REGISTER_PAGE + LARGE), LARGE),
+        ] {
+            assert_eq!(
+                npt.fault(&mut frames, gpa, fault(false))
+                    .expect("the fault can be answered"),
+                Resolution::Mapped,
+                "ordinary memory around a trapped page is still the guest's"
+            );
+            let translation = npt
+                .translate(gpa)
+                .expect("the tables can be walked")
+                .expect("the address is described");
+            assert_eq!(
+                translation.spa, gpa,
+                "and is the machine's own memory at the same address"
+            );
+            assert_eq!(
+                translation.span, span,
+                "how far one entry reaches from {gpa:#x}"
+            );
+        }
+        assert_eq!(
+            npt.translate(trapped).expect("the tables can be walked"),
+            None,
+            "while the trapped page itself is described by neither of them"
+        );
+    }
+
     /// A nested page fault of the direction alone, which is all [`Npt::fault`]
     /// reads of one.
     fn fault(write: bool) -> NestedPageFault {
@@ -1064,7 +888,7 @@ mod tests {
     /// raw pointer with no lifetime attached — a run that could be dropped
     /// while a window still named it would differ from the machine in the
     /// direction that hides mistakes.
-    fn reserved() -> (Frames, DirectMap) {
+    pub(crate) fn reserved() -> (Frames, DirectMap) {
         let size = usize::try_from(chunk::CHUNK_SIZE).expect("a test chunk fits a host pointer");
         let align =
             usize::try_from(chunk::CHUNK_ALIGN).expect("a chunk's alignment fits a host pointer");
