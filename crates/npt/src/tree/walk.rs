@@ -22,11 +22,12 @@
 //! guest's own page tables. Software is therefore not the only writer of one,
 //! and the shape of this file follows from that.
 //!
-//! An entry is an [`AtomicU64`], read only by [`load`] and written only by
-//! [`store`]. Reading or writing one through an ordinary reference would be a
-//! data race with the hardware, and a read-modify-write through one could lose
-//! what the hardware recorded between the read and the write — so no operation
-//! here is one.
+//! An entry is an [`AtomicU64`]: read by [`load`], written by [`store`], and
+//! replaced-if-unchanged by [`exchange`]. Reading or writing one through an
+//! ordinary reference would be a data race with the hardware, and a
+//! read-modify-write through one could lose what the hardware recorded between
+//! the read and the write — which is why the only operation here that both
+//! reads and writes is one the processor performs indivisibly.
 //!
 //! One aligned eight-byte store is also what the hardware page walker reads
 //! atomically, so a walk in progress sees the whole of the old entry or the
@@ -139,6 +140,30 @@ pub(crate) fn store(
 ) -> Result<(), NptError> {
     reach(window, at)?.entries[usize::from(index)].store(value, Ordering::Release);
     Ok(())
+}
+
+/// Makes one entry of the table at `at` say `value`, but only while it still
+/// says `was`.
+///
+/// Answers with what the entry says instead, or `None` if the exchange was
+/// made. This is the one operation two processors can be performing on one
+/// entry at once — both describing an address whose region has no table yet —
+/// and it is what tells the loser that the table it built is not the one below
+/// this entry.
+///
+/// Acquiring on failure and releasing on success, for the reasons [`load`] and
+/// [`store`] have: the loser goes on to read the winner's table, and the winner
+/// has already written its own.
+pub(crate) fn exchange(
+    window: DirectMap,
+    at: PhysAddr,
+    index: PageTableIndex,
+    was: u64,
+    value: u64,
+) -> Result<Option<u64>, NptError> {
+    Ok(reach(window, at)?.entries[usize::from(index)]
+        .compare_exchange(was, value, Ordering::AcqRel, Ordering::Acquire)
+        .err())
 }
 
 /// Makes each entry of the table at `at` say what `value` answers for its slot,

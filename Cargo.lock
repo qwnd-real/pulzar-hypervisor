@@ -645,9 +645,12 @@ dependencies = [
 name = "npt"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
+ "cpu",
  "log",
  "paging",
  "processor",
+ "spin 0.12.2",
  "svm",
  "thiserror",
  "x86_64",

@@ -7,9 +7,13 @@ publish.workspace = true
 
 [dependencies]
 bitflags = { workspace = true }
+# Which processor is asking, so that the table frames a fill takes are the ones
+# that processor set aside rather than a list every one of them contends for.
+cpu = { workspace = true }
 log = { workspace = true }
 paging = { workspace = true }
 processor = { workspace = true }
+spin = { workspace = true }
 svm = { workspace = true }
 thiserror = { workspace = true }
 x86_64 = { workspace = true }

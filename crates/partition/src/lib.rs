@@ -20,15 +20,6 @@
 //! creates its own and owns it, and nothing yet enumerates them — a table
 //! nothing reads is a table that can quietly disagree with reality.
 //!
-//! # Two locks, in one order
-//!
-//! Resolving a nested page fault needs the nested tables and the chunk's frame
-//! allocator, which live behind different locks. [`Partition::resolve`] takes
-//! the address space's lock first and the tables' second, and nothing anywhere
-//! takes them the other way round. That is the whole of the ordering, and it is
-//! stated here because it is the only place in the crate where two are held at
-//! once.
-//!
 //! # The devices belong to the guest, not to a processor
 //!
 //! Which regions of a guest's memory the hypervisor answers for is a property
@@ -58,7 +49,7 @@ use log::info;
 pub use memory::Addressing;
 use memory::{Linear, Physical};
 use npt::{Exposure, Npt, NptError, Resolution};
-use paging::{AddressSpace, PagingError};
+use paging::AddressSpace;
 use spin::{Mutex, Once};
 use svm::exit::NestedPageFault;
 use thiserror::Error;
@@ -240,32 +231,26 @@ impl Partition {
     ///
     /// # Errors
     ///
-    /// [`PartitionError::Paging`] if the address space is not yet the
-    /// machine's, or [`PartitionError::Npt`] if the region cannot be
-    /// described.
+    /// [`PartitionError::Npt`] if the region cannot be described.
     pub fn resolve(
         &self,
         gpa: PhysAddr,
         cause: NestedPageFault,
     ) -> Result<Resolution, PartitionError> {
-        // The address space first and the tables second, everywhere, so that two
-        // processors faulting at once cannot each hold what the other wants.
-        Ok(paging::with(|space| {
-            self.npt.lock().fault(space.frames(), gpa, cause)
-        })??)
+        Ok(self.npt.lock().fault(gpa, cause)?)
     }
 
     /// Makes immutable hypervisor-owned entry code or data visible to the
     /// guest.
     ///
     /// This may be called only while the guest has not run, for the same cache
-    /// coherency reason as [`Npt::expose`]. The partition owns both locks
-    /// required to update the nested tables and allocate any tables needed.
+    /// coherency reason as [`Npt::expose`]. The allocator the tables it needs
+    /// come from is the caller's, which is what the address space is while the
+    /// guest is being built.
     ///
     /// # Errors
     ///
-    /// [`PartitionError::Paging`] if the machine address space is unavailable,
-    /// or [`PartitionError::Npt`] if the requested range cannot be exposed.
+    /// [`PartitionError::Npt`] if the requested range cannot be exposed.
     pub fn expose(
         &self,
         space: &mut AddressSpace,
@@ -290,14 +275,9 @@ impl Partition {
     ///
     /// # Errors
     ///
-    /// [`PartitionError::Paging`] if the address space is not yet the
-    /// machine's, or [`PartitionError::Npt`] if the range cannot be concealed.
+    /// [`PartitionError::Npt`] if the range cannot be concealed.
     pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<(), PartitionError> {
-        // The address space first and the tables second, as everywhere else
-        // here.
-        Ok(paging::with(|space| {
-            self.npt.lock().conceal(space.frames(), gpa, bytes)
-        })??)
+        Ok(self.npt.lock().conceal(gpa, bytes)?)
     }
 
     /// Borrows this guest's memory translated the way one virtual processor
@@ -400,7 +380,4 @@ pub enum PartitionError {
     /// The guest's interrupt structures could not be reached.
     #[error(transparent)]
     Vlapic(#[from] VlapicError),
-    /// The address space the tables are allocated from could not be reached.
-    #[error(transparent)]
-    Paging(#[from] PagingError),
 }

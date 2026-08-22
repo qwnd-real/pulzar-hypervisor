@@ -26,16 +26,33 @@
 //! kept. It is reported as [`NptError::Coarser`] and never repaired:
 //! [`Tree::split`] is the operation that narrows the tree, and answering a
 //! fault is not allowed to perform one.
+//!
+//! # Two processors filling at once need no lock, and only for that reason
+//!
+//! Every entry is an atomic and a table is installed with a compare-exchange,
+//! so the loser of a race is told so and follows the winner's table instead of
+//! writing over it. That is sound *because* the level a fill chooses is a
+//! function of the map and the address and of nothing else: two processors
+//! describing the same region compute the same level, so they never disagree
+//! about whether an entry is to be a table or a leaf, and the leaves they then
+//! store are the same quadword. Take away the level rule and nothing here would
+//! be safe to run twice at once.
+//!
+//! Nothing in this module takes an exclusive reference to anything, and what
+//! keeps the operations that *narrow* the tree from racing a fill is the map's
+//! lock, one layer up: a fill reads the map and a mutation writes it, so the
+//! two cannot overlap.
 
 mod entry;
 pub(crate) mod walk;
 
 use log::info;
-use paging::{DirectMap, Frames, as_usize};
+use paging::{DirectMap, as_usize};
 use x86_64::{PhysAddr, structures::paging::PageTableIndex};
 
 use crate::{
     NptError, Translation,
+    frames::FrameCache,
     map::{Kind, Verdict},
     tree::{
         entry::{Entry, encode},
@@ -45,9 +62,9 @@ use crate::{
 
 /// One guest's nested page tables, as the hardware walks them.
 ///
-/// Holds no allocator: frames for the tables are handed in per call by whoever
-/// owns the chunk's, which keeps this a description of a translation rather
-/// than a second owner of the machine's memory.
+/// Holds no allocator and no lock. Table frames come from the cache handed in
+/// per call, whose frames belong to the processor asking, and every entry is an
+/// atomic — so describing a region needs nothing to be exclusive.
 #[derive(Debug)]
 pub(crate) struct Tree {
     /// The table `nCR3` names.
@@ -103,12 +120,12 @@ impl Tree {
     /// # Errors
     ///
     /// [`NptError::Coarser`] if a leaf already covers the address at a coarser
-    /// level than the verdict allows, [`NptError::OutOfFrames`] if the chunk
-    /// cannot spare a table, or [`NptError::Unreachable`] if the window does
-    /// not reach one.
+    /// level than the verdict allows, [`NptError::OutOfFrames`] if this
+    /// processor has no frame left for a table, or [`NptError::Unreachable`] if
+    /// the window does not reach one.
     pub(crate) fn fill(
-        &mut self,
-        frames: &mut Frames,
+        &self,
+        frames: &FrameCache,
         verdict: Verdict,
         gpa: PhysAddr,
     ) -> Result<(), NptError> {
@@ -169,11 +186,11 @@ impl Tree {
     ///
     /// # Errors
     ///
-    /// [`NptError::OutOfFrames`] if the chunk cannot spare a table,
-    /// [`NptError::Unreachable`] if the window does not reach one, or
+    /// [`NptError::OutOfFrames`] if this processor has no frame left for a
+    /// table, [`NptError::Unreachable`] if the window does not reach one, or
     /// [`NptError::Coarser`] if a leaf turns up at a level the architecture has
     /// no large page at, which is an entry this crate did not write.
-    pub(crate) fn split(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+    pub(crate) fn split(&self, frames: &FrameCache, gpa: PhysAddr) -> Result<(), NptError> {
         let mut table = self.root;
         for level in Level::TABLES {
             let index = level.index(gpa);
@@ -213,7 +230,7 @@ impl Tree {
     ///
     /// [`NptError::Unreachable`] if the window does not reach one of these
     /// tables.
-    pub(crate) fn abandon(&mut self, gpa: PhysAddr) -> Result<(), NptError> {
+    pub(crate) fn abandon(&self, gpa: PhysAddr) -> Result<(), NptError> {
         let at = self.find(gpa)?;
         if !matches!(at.level, Level::Page) {
             return Ok(());
@@ -242,12 +259,7 @@ impl Tree {
     /// — shown to the guest on purpose, or handed to something else to answer
     /// for — and putting zeroes over one of those would take back what it was
     /// given.
-    fn shadow(
-        &mut self,
-        frames: &mut Frames,
-        verdict: Verdict,
-        gpa: PhysAddr,
-    ) -> Result<(), NptError> {
+    fn shadow(&self, frames: &FrameCache, verdict: Verdict, gpa: PhysAddr) -> Result<(), NptError> {
         let at = self.descend(frames, gpa, SHADOW)?;
         // One entry serves every page of the region, all of them reading as the
         // same frame. So the entry for the page this fault was for already
@@ -346,23 +358,28 @@ impl Tree {
     ///
     /// *At or below*, because a table already on the path is a region something
     /// narrowed deliberately: the descent follows it and answers with the finer
-    /// entry rather than writing over it.
+    /// entry rather than writing over it. A table another processor installs
+    /// while this descent is on its way down is followed for the same reason
+    /// and is not distinguishable from one that was always there.
     ///
     /// # Errors
     ///
     /// [`NptError::Coarser`] if a leaf covers the address above `level`,
-    /// [`NptError::OutOfFrames`] if the chunk cannot spare a table, or
-    /// [`NptError::Unreachable`] if the window does not reach one.
+    /// [`NptError::OutOfFrames`] if this processor has no frame left for a
+    /// table, or [`NptError::Unreachable`] if the window does not reach one.
     fn descend(
         &self,
-        frames: &mut Frames,
+        frames: &FrameCache,
         gpa: PhysAddr,
         level: Level,
     ) -> Result<Reached, NptError> {
         let mut table = self.root;
         for above in Level::TABLES {
             let index = above.index(gpa);
-            let value = walk::load(self.window, table, index)?;
+            let mut value = walk::load(self.window, table, index)?;
+            if !entry::present(value) && above > level {
+                value = self.link(frames, table, index, value)?;
+            }
             if entry::present(value) && !entry::leaf(value, above) {
                 table = entry::frame(value);
                 continue;
@@ -375,13 +392,13 @@ impl Tree {
                     value,
                 });
             }
-            if entry::present(value) {
-                return Err(NptError::Coarser {
-                    gpa: gpa.as_u64(),
-                    level: above,
-                });
-            }
-            table = self.link(frames, table, index)?;
+            // A leaf where the descent asked for a table, which is either an
+            // entry this crate did not write or a region narrowed without being
+            // broken up first. Both are reported rather than repaired.
+            return Err(NptError::Coarser {
+                gpa: gpa.as_u64(),
+                level: above,
+            });
         }
         // Every entry of a page table describes memory, so a descent that got
         // this far has arrived.
@@ -431,20 +448,33 @@ impl Tree {
         })
     }
 
-    /// The table below an entry that had none, allocated and linked.
+    /// The entry naming the table below one that named none.
+    ///
+    /// One of this processor's frames if the exchange is made, and whatever
+    /// another processor put there if it got in first — in which case ours goes
+    /// back to the list it came from and the descent follows the winner's
+    /// table. Neither processor can tell afterwards which of them it was,
+    /// and neither has to.
     ///
     /// Every table this creates is zeroed by the allocator that handed out its
     /// frame, so an entry nothing has written yet reads as not present rather
     /// than as whatever the frame last held.
     fn link(
         &self,
-        frames: &mut Frames,
+        frames: &FrameCache,
         table: PhysAddr,
         index: PageTableIndex,
-    ) -> Result<PhysAddr, NptError> {
-        let frame = taken(frames)?;
-        walk::store(self.window, table, index, encode(Entry::Table { frame }))?;
-        Ok(frame)
+        absent: u64,
+    ) -> Result<u64, NptError> {
+        let frame = frames.take()?;
+        let wanted = encode(Entry::Table { frame });
+        match walk::exchange(self.window, table, index, absent, wanted)? {
+            None => Ok(wanted),
+            Some(installed) => {
+                frames.give(frame);
+                Ok(installed)
+            }
+        }
     }
 
     /// Replaces a leaf with a table of the level below describing the same
@@ -460,9 +490,13 @@ impl Tree {
     /// is a releasing one, which is what keeps the fill from being
     /// reordered after it, and stores here become visible in the order they
     /// are made in any case.
+    ///
+    /// A store rather than an exchange, unlike the tables a fill installs: this
+    /// replaces an entry that says something, and the only operations that
+    /// replace one hold the map exclusively, so nothing else is writing it.
     fn divide(
         &self,
-        frames: &mut Frames,
+        frames: &FrameCache,
         at: Reached,
         gpa: PhysAddr,
     ) -> Result<PhysAddr, NptError> {
@@ -474,7 +508,7 @@ impl Tree {
                 level: at.level,
             });
         };
-        let frame = taken(frames)?;
+        let frame = frames.take()?;
         walk::store_each(self.window, frame, |slot| {
             Some(entry::narrowed(at.value, below, slot))
         })?;
@@ -500,12 +534,6 @@ struct Reached {
     level: Level,
     /// What it said when the walk read it.
     value: u64,
-}
-
-/// One frame of the chunk, for a table.
-fn taken(frames: &mut Frames) -> Result<PhysAddr, NptError> {
-    let frame = frames.allocate(0).map_err(|_| NptError::OutOfFrames)?;
-    Ok(frame.start_address())
 }
 
 /// The level every page of the hypervisor's own memory is described at.
@@ -545,7 +573,7 @@ mod tests {
     use paging::{Frames, chunk};
     use x86_64::PhysAddr;
 
-    use super::{SHADOWED, Tree};
+    use super::{FrameCache, SHADOWED, Tree};
     use crate::{Access, Kind, Level, NptError, Translation, Verdict};
 
     /// One page, which is the floor of every description here.
@@ -563,10 +591,10 @@ mod tests {
 
     #[test]
     fn a_run_of_gigabytes_is_one_entry_where_the_processor_has_pages_that_large() {
-        let (mut tree, mut frames, _) = empty(true);
+        let (tree, cache, ..) = empty(true);
         let gpa = PhysAddr::new(RAM + LARGE);
 
-        tree.fill(&mut frames, open(RAM, 4 * HUGE), gpa)
+        tree.fill(&cache, open(RAM, 4 * HUGE), gpa)
             .expect("a run of gigabytes can be described");
 
         let translation = described(&tree, gpa);
@@ -584,10 +612,10 @@ mod tests {
 
     #[test]
     fn without_pages_that_large_the_same_run_is_described_two_megabytes_at_a_time() {
-        let (mut tree, mut frames, _) = empty(false);
+        let (tree, cache, ..) = empty(false);
         let gpa = PhysAddr::new(RAM + LARGE);
 
-        tree.fill(&mut frames, open(RAM, 4 * HUGE), gpa)
+        tree.fill(&cache, open(RAM, 4 * HUGE), gpa)
             .expect("a run of gigabytes can be described");
 
         assert_eq!(
@@ -599,7 +627,7 @@ mod tests {
 
     #[test]
     fn the_granularity_follows_the_run_rather_than_the_address() {
-        let (mut tree, mut frames, _) = empty(true);
+        let (tree, cache, ..) = empty(true);
         // A run ending one page into the second 2 MiB of a gigabyte, which is the
         // shape of the map's answer either side of a page something else answers
         // for.
@@ -607,9 +635,9 @@ mod tests {
         let whole = PhysAddr::new(RAM + PAGE);
         let part = PhysAddr::new(RAM + LARGE);
 
-        tree.fill(&mut frames, run, whole)
+        tree.fill(&cache, run, whole)
             .expect("the 2 MiB the run covers is described at once");
-        tree.fill(&mut frames, run, part)
+        tree.fill(&cache, run, part)
             .expect("and the page past it on its own");
 
         assert_eq!(
@@ -632,9 +660,9 @@ mod tests {
 
     #[test]
     fn splitting_a_large_page_changes_no_translation_it_replaces() {
-        let (mut tree, mut frames, _) = empty(true);
+        let (tree, cache, ..) = empty(true);
         let inside = PhysAddr::new(RAM + LARGE + PAGE);
-        tree.fill(&mut frames, open(RAM, HUGE), inside)
+        tree.fill(&cache, open(RAM, HUGE), inside)
             .expect("a gigabyte of ordinary memory is one entry");
         let probes = [
             PhysAddr::new(RAM),
@@ -644,7 +672,7 @@ mod tests {
         ];
         let before = probes.map(|gpa| described(&tree, gpa));
 
-        tree.split(&mut frames, inside)
+        tree.split(&cache, inside)
             .expect("the page can be broken out of the gigabyte");
 
         for (gpa, was) in probes.into_iter().zip(before) {
@@ -673,15 +701,15 @@ mod tests {
 
     #[test]
     fn a_fill_meeting_a_coarser_leaf_reports_it_rather_than_narrowing_the_tree() {
-        let (mut tree, mut frames, _) = empty(true);
+        let (tree, cache, mut frames, _) = empty(true);
         let gpa = PhysAddr::new(RAM + PAGE);
-        tree.fill(&mut frames, open(RAM, HUGE), gpa)
+        tree.fill(&cache, open(RAM, HUGE), gpa)
             .expect("a gigabyte of ordinary memory is one entry");
         let frame = spare(&mut frames);
 
         assert_eq!(
             tree.fill(
-                &mut frames,
+                &cache,
                 Verdict {
                     base: gpa,
                     span: PAGE,
@@ -700,19 +728,19 @@ mod tests {
 
     #[test]
     fn filling_the_same_address_twice_writes_the_same_entry_and_allocates_nothing() {
-        let (mut tree, mut frames, _) = empty(true);
+        let (tree, cache, ..) = empty(true);
         let gpa = PhysAddr::new(RAM);
         let run = open(RAM, HUGE);
-        tree.fill(&mut frames, run, gpa)
+        tree.fill(&cache, run, gpa)
             .expect("a gigabyte of ordinary memory is one entry");
-        let (was, free) = (described(&tree, gpa), frames.free());
+        let (was, held) = (described(&tree, gpa), cache.held());
 
-        tree.fill(&mut frames, run, gpa)
+        tree.fill(&cache, run, gpa)
             .expect("and describing it again is allowed");
 
         assert_eq!(
-            frames.free(),
-            free,
+            cache.held(),
+            held,
             "a fill that changes nothing allocates nothing"
         );
         assert_eq!(
@@ -724,7 +752,7 @@ mod tests {
 
     #[test]
     fn the_hypervisors_own_memory_is_described_a_whole_table_at_a_time() {
-        let (mut tree, mut frames, zero) = empty(true);
+        let (tree, cache, _, zero) = empty(true);
         // The run standing in for the chunk begins at physical zero, so an
         // address inside it is an address of the hypervisor's own memory.
         let own = Verdict {
@@ -733,7 +761,7 @@ mod tests {
             kind: Kind::Shadow,
         };
 
-        tree.fill(&mut frames, own, PhysAddr::new(SHADOWED + PAGE))
+        tree.fill(&cache, own, PhysAddr::new(SHADOWED + PAGE))
             .expect("the hypervisor's own memory can be described");
 
         for page in [SHADOWED, SHADOWED + PAGE, 2 * SHADOWED - PAGE] {
@@ -755,24 +783,24 @@ mod tests {
             "and only the region the fault was in was described"
         );
 
-        let free = frames.free();
-        tree.fill(&mut frames, own, PhysAddr::new(SHADOWED + 2 * PAGE))
+        let held = cache.held();
+        tree.fill(&cache, own, PhysAddr::new(SHADOWED + 2 * PAGE))
             .expect("a second fault in the same region can be answered");
         assert_eq!(
-            frames.free(),
-            free,
+            cache.held(),
+            held,
             "which costs nothing, the region being described already"
         );
     }
 
     #[test]
     fn a_page_given_a_frame_of_its_own_is_described_alone() {
-        let (mut tree, mut frames, _) = empty(true);
+        let (tree, cache, mut frames, _) = empty(true);
         let page = PhysAddr::new(RAM + LARGE);
         let frame = spare(&mut frames);
 
         tree.fill(
-            &mut frames,
+            &cache,
             Verdict {
                 base: page,
                 span: PAGE,
@@ -797,18 +825,27 @@ mod tests {
     }
 
     /// An empty tree over a run of host memory standing in for the chunk, the
-    /// allocator its tables come from, and the frame the hypervisor's own
-    /// memory reads as.
-    fn empty(large: bool) -> (Tree, Frames, PhysAddr) {
+    /// frames its tables come from, the allocator behind those, and the frame
+    /// the hypervisor's own memory reads as.
+    ///
+    /// One list, which is what a machine nothing has surveyed has — and what
+    /// makes every list here reachable without asking the processor which of
+    /// them is its own.
+    fn empty(large: bool) -> (Tree, FrameCache, Frames, PhysAddr) {
         let (mut frames, window) = crate::tests::reserved();
         let root = spare(&mut frames);
         let zero = spare(&mut frames);
-        (Tree::new(root, zero, window, large), frames, zero)
+        let cache = FrameCache::new(1);
+        cache.stock(&mut frames);
+        (Tree::new(root, zero, window, large), cache, frames, zero)
     }
 
     /// One frame of the run standing in for the chunk.
     fn spare(frames: &mut Frames) -> PhysAddr {
-        super::taken(frames).expect("the run standing in for the chunk has frames")
+        frames
+            .allocate(0)
+            .expect("the run standing in for the chunk has frames")
+            .start_address()
     }
 
     /// The verdict for a run of the machine's own memory, which a guest sees at

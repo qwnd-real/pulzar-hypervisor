@@ -19,8 +19,38 @@
 //! hardware table are separate. [`map`] answers the first, for a *run* of
 //! addresses at a time — the largest run the same answer covers — and [`tree`]
 //! answers the second, taking the granularity to describe a region at from the
-//! run rather than probing for it. What is left here is the handle the two are
-//! reached through and the operations that need both.
+//! run rather than probing for it. [`frames`] is where the tables themselves
+//! come from. What is left here is the handle the three are reached through and
+//! the operations that need more than one of them.
+//!
+//! # More than one processor, at the same time
+//!
+//! Describing a page a guest has just touched happens on every processor of the
+//! machine at once, so [`Npt::fault`] takes a shared reference and nothing it
+//! does serializes one processor against another doing the same. Two different
+//! things make that safe.
+//!
+//! The tree needs no lock at all. Every entry is an atomic, a table is
+//! installed with a compare-exchange, and the loser of that exchange follows
+//! the winner's table — which is sound *because* the granularity a fill chooses
+//! is a function of the map and the address and of nothing else, so two
+//! processors describing one region compute the same entry.
+//!
+//! The map needs one, because the operations that change what an address means
+//! rewrite it. Faults share it, and those operations take it exclusively and
+//! hold it across the tree as well, so a fault can never describe a region the
+//! map has stopped agreeing with.
+//!
+//! Table frames come from a list per processor, so the chunk's allocator is off
+//! the path too. What is left of a fault on memory the guest has touched before
+//! is one read-lock acquisition, one search of the map and a walk down three
+//! entries: no allocation, and no lock outside these tables.
+//!
+//! Filling one of those lists is the one thing here that reaches outside these
+//! tables, for the allocator the address space owns, and it is done before the
+//! map is taken and never under it. So no processor ever holds one of these two
+//! locks while it waits for the other, and there is no ordering between them to
+//! state.
 //!
 //! # Built as it is asked for
 //!
@@ -119,20 +149,20 @@
 
 #![no_std]
 
-#[cfg(test)]
 extern crate alloc;
 
+mod frames;
 mod map;
 mod tree;
 
-use log::error;
 use paging::{DirectMap, Frames, chunk};
 use processor::Features;
+use spin::RwLock;
 use svm::exit::NestedPageFault;
 use thiserror::Error;
-use x86_64::{PhysAddr, structures::paging::PhysFrame};
+use x86_64::PhysAddr;
 
-use crate::{map::Map, tree::Tree};
+use crate::{frames::FrameCache, map::Map, tree::Tree};
 pub use crate::{
     map::{Access, Kind, MapError, Range, RegionTag, Trap, Verdict},
     tree::walk::Level,
@@ -140,16 +170,20 @@ pub use crate::{
 
 /// One guest's nested page tables.
 ///
-/// Holds no allocator and no lock. Frames are handed in per call by whoever
-/// owns the chunk's allocator, and exclusion is the caller's — which keeps this
-/// a description of a translation rather than a second owner of the machine's
-/// memory.
+/// Holds no allocator of its own: the frames its tables are built out of are
+/// kept aside per processor, taken from the chunk in batches by whoever has the
+/// chunk's allocator in hand or through the address space every processor
+/// shares. The one lock is the map's, and it is inside here rather than around
+/// the whole of it — describing a page is shared work, and only changing what
+/// an address means is exclusive.
 #[derive(Debug)]
 pub struct Npt {
     /// What each of the guest's physical addresses means.
-    map: Map,
+    map: RwLock<Map>,
     /// Where those meanings are written for the hardware to walk.
     tree: Tree,
+    /// The frames the tables are built out of, a list per processor.
+    frames: FrameCache,
 }
 
 impl Npt {
@@ -159,6 +193,11 @@ impl Npt {
     /// Empty is the correct starting point rather than a stub: with no entry
     /// present, the guest's first access to any address faults, and
     /// [`Npt::fault`] is what turns that into a translation.
+    ///
+    /// The processor doing this takes its own table frames here, out of the
+    /// allocator it already holds, so describing the guest's memory during
+    /// bring-up needs nothing further. Every other processor's list is filled
+    /// the first time that processor describes anything.
     ///
     /// # Errors
     ///
@@ -179,17 +218,20 @@ impl Npt {
         }
         let root = frame(frames, window)?;
         let zero = frame(frames, window)?;
+        let cache = FrameCache::new(cpu::roster().map_or(1, cpu::Roster::count));
+        cache.stock(frames);
         Ok(Self {
-            map: Map::new(
+            map: RwLock::new(Map::new(
                 Range::new(frames.chunk_base(), chunk::CHUNK_SIZE)?,
                 processor::physical_address_bits(),
-            ),
+            )),
             tree: Tree::new(
                 root,
                 zero,
                 window,
                 processor::features().contains(Features::GIB_PAGES),
             ),
+            frames: cache,
         })
     }
 
@@ -222,21 +264,28 @@ impl Npt {
     /// One question is asked of the map and its answer serves twice — for what
     /// the address is, and for how much of memory around it is the same thing.
     ///
+    /// Runs on every processor at once. The map is read rather than held
+    /// exclusively, so faults do not serialize against each other, and the
+    /// answer is acted on while that read is still held — an answer let go of
+    /// first could be written into the tables after something had changed it.
+    ///
     /// # Errors
     ///
     /// [`NptError::Map`] carrying [`MapError::Unaddressable`] if the address is
     /// above the processor's physical address width, [`NptError::OutOfFrames`]
-    /// if the chunk cannot spare a table, [`NptError::Unreachable`] if the
-    /// window does not reach one, or [`NptError::Coarser`] if a larger page
-    /// already covers the address, which means something described this region
-    /// at a granularity the fill rule never produces.
-    pub fn fault(
-        &mut self,
-        frames: &mut Frames,
-        gpa: PhysAddr,
-        cause: NestedPageFault,
-    ) -> Result<Resolution, NptError> {
-        let verdict = self.map.resolve(gpa);
+    /// if this processor has no frame left for a table,
+    /// [`NptError::Unreachable`] if the window does not reach one, or
+    /// [`NptError::Coarser`] if a larger page already covers the address, which
+    /// means something described this region at a granularity the fill rule
+    /// never produces.
+    pub fn fault(&self, gpa: PhysAddr, cause: NestedPageFault) -> Result<Resolution, NptError> {
+        // Before the map is read, because filling this processor's list reaches
+        // for the address space the chunk's allocator lives in, and nothing here
+        // may hold one lock while it takes another. Nothing is asked of it in the
+        // steady state, a list that still holds frames being left alone.
+        self.frames.replenish();
+        let map = self.map.read();
+        let verdict = map.resolve(gpa);
         match verdict.kind {
             // Before the tables are touched at all, because an address inside
             // one of these faults on purpose and describing it is exactly what
@@ -247,7 +296,7 @@ impl Npt {
             // wrong page.
             Kind::Unaddressable => Err(MapError::Unaddressable { gpa: gpa.as_u64() }.into()),
             Kind::Ram { .. } | Kind::Sink { .. } => {
-                self.tree.fill(frames, verdict, gpa)?;
+                self.tree.fill(&self.frames, verdict, gpa)?;
                 Ok(Resolution::Mapped)
             }
             // A write to either faults however it is described — no page behind
@@ -256,7 +305,7 @@ impl Npt {
             // for all the same: an entry that already says this is left alone,
             // and a page the guest has not touched before is described.
             Kind::Shadow | Kind::Exposed { .. } => {
-                self.tree.fill(frames, verdict, gpa)?;
+                self.tree.fill(&self.frames, verdict, gpa)?;
                 Ok(hypervisors(cause))
             }
         }
@@ -309,26 +358,31 @@ impl Npt {
     /// not a whole number of pages on a page boundary the processor can
     /// address, something already describes part of it another way, or
     /// there is no room for another — [`NptError::OutOfFrames`] if the
-    /// chunk cannot spare a table, [`NptError::Unreachable`] if the window
-    /// does not reach one, or [`NptError::Coarser`] if a leaf turns up at a
-    /// level the architecture has no large page at.
+    /// chunk cannot spare the tables it takes, [`NptError::Unreachable`] if the
+    /// window does not reach one, or [`NptError::Coarser`] if a leaf turns up
+    /// at a level the architecture has no large page at.
     pub fn protect(
-        &mut self,
+        &self,
         frames: &mut Frames,
         gpa: PhysAddr,
         bytes: u64,
         trap: Trap,
     ) -> Result<(), NptError> {
         let range = Range::new(gpa, bytes)?;
+        // The map exclusively, and held across the tree as well, so that a fault
+        // on another processor sees either all of this or none of it: one that
+        // read the map before the region was recorded and described a page after
+        // it was would describe a page nothing may describe.
+        let mut map = self.map.write();
         // Recorded before it is described, so that a failure part-way through
         // leaves a region that still traps everything it should. The reverse
         // order would leave pages described as untouchable that nothing knows to
         // trap, which is a guest faulting for ever on an address the tables have
         // no answer for.
-        self.map.interpose(range, trap)?;
+        map.interpose(range, trap)?;
         let described = range
             .pages()
-            .try_for_each(|page| self.interpose(frames, page.base()));
+            .try_for_each(|page| self.interpose(&map, frames, page.base()));
         if described.is_err() {
             // The region is not described and so must not go on being recorded:
             // a record naming pages that were never trapped would refuse to let
@@ -338,7 +392,7 @@ impl Npt {
             // this registration removes them. The region was recorded a moment
             // ago, so nothing can refuse to give it back, and what the caller
             // needs to hear about is the failure to describe it.
-            let _ = self.map.release(range);
+            let _ = map.release(range);
         }
         described
     }
@@ -375,12 +429,13 @@ impl Npt {
     /// boundary or no region was recorded at exactly that range, or
     /// [`NptError::Unreachable`] if the window does not reach one of these
     /// tables.
-    pub fn release(&mut self, gpa: PhysAddr, bytes: u64) -> Result<(), NptError> {
+    pub fn release(&self, gpa: PhysAddr, bytes: u64) -> Result<(), NptError> {
         let range = Range::new(gpa, bytes)?;
+        let mut map = self.map.write();
         // Forgotten first, so that a failure part-way through leaves pages that
         // `fault` is willing to describe rather than pages it refuses to touch
         // and nothing answers for.
-        self.map.release(range)?;
+        map.release(range)?;
         range
             .pages()
             .try_for_each(|page| self.tree.abandon(page.base()))
@@ -403,15 +458,18 @@ impl Npt {
     /// part of it another way, or there is no room for another — or an error
     /// from building the required nested tables.
     pub fn expose(
-        &mut self,
+        &self,
         frames: &mut Frames,
         gpa: PhysAddr,
         bytes: u64,
         exposure: Exposure,
     ) -> Result<(), NptError> {
-        let range = self.owned(gpa, bytes)?;
-        self.map.expose(range, exposure.access())?;
-        self.overlay(frames, range)
+        let mut map = self.map.write();
+        let range = owned(&map, gpa, bytes)?;
+        map.expose(range, exposure.access())?;
+        range
+            .pages()
+            .try_for_each(|page| self.describe_page(&map, frames, page.base()))
     }
 
     /// Takes an exposed range back, leaving it as every other page of the
@@ -431,21 +489,33 @@ impl Npt {
     /// caller that knows which processors have run the guest and it is the
     /// caller that makes the next entry.
     ///
+    /// # Where its tables come from
+    ///
+    /// From this processor's own list, the way a fault's do, and not from an
+    /// allocator handed in — which is the one thing that distinguishes this
+    /// from [`Npt::expose`] and it follows from when the two are called.
+    /// Everything that describes a guest's memory before it has run does so
+    /// with the address space still one function's value, so it has the
+    /// chunk's allocator in hand; this runs afterwards, when reaching that
+    /// allocator means the lock every processor shares, and the list is
+    /// what keeps that lock from ever being wanted by a processor already
+    /// holding one of these tables' own.
+    ///
     /// # Errors
     ///
     /// [`NptError::OutsideOwned`] if the range leaves the chunk,
     /// [`NptError::Map`] if the range is not a whole number of pages on a page
     /// boundary or a page of it was not being shown to the guest, or an error
     /// from building the required nested tables.
-    pub fn conceal(
-        &mut self,
-        frames: &mut Frames,
-        gpa: PhysAddr,
-        bytes: u64,
-    ) -> Result<(), NptError> {
-        let range = self.owned(gpa, bytes)?;
-        self.map.conceal(range)?;
-        self.overlay(frames, range)
+    pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<(), NptError> {
+        // Before the map is taken, for the reason `fault` does it there.
+        self.frames.replenish();
+        let mut map = self.map.write();
+        let range = owned(&map, gpa, bytes)?;
+        map.conceal(range)?;
+        range
+            .pages()
+            .try_for_each(|page| self.fill_page(&map, page.base()))
     }
 
     /// Describes one page as a place the guest may touch without anything
@@ -473,60 +543,28 @@ impl Npt {
     /// aligned or addressable, something already describes it another way, a
     /// page already sunk included, or there is no room for another — or an
     /// error from allocating or reaching the frame behind it.
-    pub fn sink(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+    pub fn sink(&self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
         let frame = frame(frames, self.window())?;
+        let mut map = self.map.write();
         // Recorded before it is described, because the map is what `fault`
         // consults: a page the map calls sunk is described that way whenever it
         // is next touched, while a page described as a sink that the map did not
         // record would be filled back over as ordinary memory.
-        if let Err(refused) = self.map.sink(gpa, frame) {
+        if let Err(refused) = map.sink(gpa, frame) {
             // The frame was handed out for a page the map will not describe that
             // way, so it goes back rather than being held by nothing.
-            if let Err(cause) = frames.release(PhysFrame::containing_address(frame), 0) {
-                error!("npt: the frame at {frame:#x} could not be handed back: {cause}");
-            }
+            frames::release(frames, frame);
             return Err(refused.into());
         }
-        self.describe_page(frames, gpa)
+        self.describe_page(&map, frames, gpa)
     }
 
     /// Logs the shape of the translation, which is the whole of what a guest's
     /// view of memory is.
     pub fn describe(&self, who: &str) {
         self.tree.describe(who);
-        self.map.describe(who);
-    }
-
-    /// The range `bytes` from `gpa` names, refused unless every page of it is
-    /// the hypervisor's own memory.
-    ///
-    /// One check for both directions of a guest-visible chunk mapping, because
-    /// what the two have to ask is identical and a range that could be exposed
-    /// but not concealed — or the reverse — would be a way for the two to
-    /// disagree about what a valid range is.
-    fn owned(&self, gpa: PhysAddr, bytes: u64) -> Result<Range, NptError> {
-        let range = Range::new(gpa, bytes)?;
-        if self.map.chunk().covers(range) {
-            Ok(range)
-        } else {
-            Err(NptError::OutsideOwned {
-                gpa: gpa.as_u64(),
-                bytes,
-            })
-        }
-    }
-
-    /// Describes every page of a range of the hypervisor's own memory as the
-    /// map now says it is.
-    ///
-    /// One helper for both directions of showing a range to the guest, because
-    /// once the map has been told, what those pages are is the map's to say:
-    /// shown on purpose, or the shared page of zeroes every other page of the
-    /// chunk reads as.
-    fn overlay(&mut self, frames: &mut Frames, range: Range) -> Result<(), NptError> {
-        range
-            .pages()
-            .try_for_each(|page| self.describe_page(frames, page.base()))
+        self.map.read().describe(who);
+        self.frames.describe(who);
     }
 
     /// Describes one page of a trapped region as the map now says it is.
@@ -536,24 +574,58 @@ impl Npt {
     /// where every access is trapped is described as nothing at all: a
     /// present entry has no bit that denies a read, so not present is the
     /// only encoding that faults on one.
-    fn interpose(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+    fn interpose(&self, map: &Map, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
         // Broken up first, because the page has to say something its neighbours
         // do not and permissions belong to an entry. This is the one place that
         // needs finer granularity than the fill rule would otherwise produce,
         // and it is why answering a fault never has to.
-        self.tree.split(frames, gpa)?;
-        self.describe_page(frames, gpa)
+        self.frames.stock(frames);
+        self.tree.split(&self.frames, gpa)?;
+        self.describe_page(map, frames, gpa)
     }
 
-    /// Describes the one page at `gpa` as the map says it is.
+    /// As [`Npt::fill_page`], with this processor's list brought up out of an
+    /// allocator the caller holds rather than through the address space every
+    /// processor shares.
+    ///
+    /// Which is what every operation that describes a page before the guest has
+    /// run wants: the address space is still one function's value at that
+    /// point, so the caller has its allocator, and taking the lock instead
+    /// would be taking it while the map is held.
+    fn describe_page(&self, map: &Map, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+        self.frames.stock(frames);
+        self.fill_page(map, gpa)
+    }
+
+    /// Describes the one page at `gpa` as the map says it is, out of the frames
+    /// this processor has already set aside.
     ///
     /// Every mutation here works a page at a time — a page shown to the guest,
     /// a page sunk, a page of a trapped region — so each of them asks the map
     /// afresh rather than saying for itself what it just recorded. Two accounts
     /// of one page could disagree; one cannot.
-    fn describe_page(&mut self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
-        let verdict = self.map.resolve(gpa);
-        self.tree.fill(frames, verdict, gpa)
+    fn fill_page(&self, map: &Map, gpa: PhysAddr) -> Result<(), NptError> {
+        let verdict = map.resolve(gpa);
+        self.tree.fill(&self.frames, verdict, gpa)
+    }
+}
+
+/// The range `bytes` from `gpa` names, refused unless every page of it is the
+/// hypervisor's own memory.
+///
+/// One check for both directions of a guest-visible chunk mapping, because what
+/// the two have to ask is identical and a range that could be exposed but not
+/// concealed — or the reverse — would be a way for the two to disagree about
+/// what a valid range is.
+fn owned(map: &Map, gpa: PhysAddr, bytes: u64) -> Result<Range, NptError> {
+    let range = Range::new(gpa, bytes)?;
+    if map.chunk().covers(range) {
+        Ok(range)
+    } else {
+        Err(NptError::OutsideOwned {
+            gpa: gpa.as_u64(),
+            bytes,
+        })
     }
 }
 
@@ -710,19 +782,41 @@ const _: () = assert!(
     chunk::FRAME_SIZE == Level::Page.span(),
     "the page a range is measured in must be the page an entry describes",
 );
+const _: () = {
+    /// Refuses a type that more than one processor cannot share.
+    const fn shared<T: Send + Sync>() {}
+    // Derived, never asserted: what makes these tables safe to describe a page
+    // through from every processor at once is that every field of them is, so a
+    // field that stopped being one has to fail the build rather than be noticed.
+    shared::<Npt>();
+};
 
 #[cfg(test)]
 pub(crate) mod tests {
     //! The two ways one page of a guest can be described, what describing one
-    //! that way costs its neighbours, and a run of host memory standing in for
-    //! the reserved chunk for the rest of the crate to build tables in.
+    //! that way costs its neighbours, what two processors describing memory at
+    //! the same moment cost between them, and a run of host memory standing in
+    //! for the reserved chunk for the rest of the crate to build tables in.
     //!
     //! Only the chunk has to be real. Every table these tables build is a frame
     //! of it, reached through the window, and nothing here ever dereferences a
     //! guest physical address — so a run of memory with a window pointed at it
     //! is the whole of the machine this needs.
+    //!
+    //! Two host threads stand in for two processors, and they share one list of
+    //! table frames because nothing has surveyed a roster here. That is the
+    //! harder case rather than an easier one: on a machine each processor has a
+    //! list of its own and nothing contends for one.
+    //!
+    //! A list is also all the frames a test has. Nothing here can refill one —
+    //! the frames for that come through the address space every processor
+    //! shares, and there is no address space in a test — so the racing tests
+    //! describe as much memory as one list of frames can describe and no more.
+
+    extern crate std;
 
     use alloc::alloc::{Layout, alloc_zeroed};
+    use std::{sync::Barrier, vec::Vec};
 
     use paging::{DirectMap, Frames, chunk::FRAME_SIZE};
     use svm::exit::NestedPageFault;
@@ -739,10 +833,33 @@ pub(crate) mod tests {
     /// way.
     const LARGE: u64 = 2 << 20;
 
+    /// Where the machine's memory begins for the tests that race two threads at
+    /// it: far above the run standing in for the chunk, so that nothing else is
+    /// described anywhere near it.
+    const RAM: u64 = 8 << 30;
+
+    /// Regions of the hypervisor's own memory the racing threads describe.
+    ///
+    /// The hypervisor's own memory is described one page at a time whatever
+    /// page sizes the processor reports, so each of these regions is a page
+    /// table to be built and five hundred and twelve entries to write —
+    /// which is what gives two threads long enough at it to arrive at one
+    /// entry together. Twelve of them, so that the tables above them fit in
+    /// one list of frames as well.
+    const REGIONS: u64 = 12;
+
+    /// Trees the racing test describes memory in.
+    ///
+    /// One round is a tree with nothing in it, because a race can only be run
+    /// against tables that do not exist yet. Enough of them that a fill which
+    /// stopped telling the loser of a race that it lost fails this rather than
+    /// passing most of the time.
+    const ROUNDS: usize = 64;
+
     #[test]
     fn a_trapped_page_has_no_translation_and_every_access_to_it_is_reported() {
         let (mut frames, window) = reserved();
-        let mut npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
         let page = PhysAddr::new(REGISTER_PAGE);
 
         npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
@@ -755,7 +872,7 @@ pub(crate) mod tests {
         );
         for write in [false, true] {
             assert_eq!(
-                npt.fault(&mut frames, page, fault(write))
+                npt.fault(page, fault(write))
                     .expect("the fault can be answered"),
                 Resolution::Trapped,
                 "a {} of a trapped page belongs to whatever answers for it",
@@ -772,7 +889,7 @@ pub(crate) mod tests {
     #[test]
     fn a_sunk_page_translates_to_a_frame_of_its_own_the_guest_may_write() {
         let (mut frames, window) = reserved();
-        let mut npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
         let page = PhysAddr::new(REGISTER_PAGE);
 
         npt.sink(&mut frames, page)
@@ -791,7 +908,7 @@ pub(crate) mod tests {
             "the sink is a frame of the chunk and never the hardware behind the page"
         );
         assert_eq!(
-            npt.fault(&mut frames, page, fault(true))
+            npt.fault(page, fault(true))
                 .expect("the fault can be answered"),
             Resolution::Mapped,
             "a described page that faults anyway is described rather than reported"
@@ -803,7 +920,7 @@ pub(crate) mod tests {
         let (mut frames, window) = reserved();
         let page = PhysAddr::new(REGISTER_PAGE);
 
-        let mut trapped = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let trapped = Npt::create(&mut frames, window).expect("tables over the chunk");
         trapped
             .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
             .expect("the page can be trapped");
@@ -816,7 +933,7 @@ pub(crate) mod tests {
             "trapping leaves the page undescribed, so sinking it would untrap it"
         );
 
-        let mut sunk = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let sunk = Npt::create(&mut frames, window).expect("tables over the chunk");
         sunk.sink(&mut frames, page).expect("the page can be sunk");
         assert_eq!(
             sunk.release(page, FRAME_SIZE),
@@ -831,7 +948,7 @@ pub(crate) mod tests {
     #[test]
     fn a_trapped_page_narrows_its_own_two_megabytes_and_nothing_further() {
         let (mut frames, window) = reserved();
-        let mut npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
         // A page inside a 2 MiB region of ordinary memory, so that the region
         // holding it has to be described more finely than the fill rule would
         // otherwise choose and the regions around it do not.
@@ -845,7 +962,7 @@ pub(crate) mod tests {
             (PhysAddr::new(REGISTER_PAGE + LARGE), LARGE),
         ] {
             assert_eq!(
-                npt.fault(&mut frames, gpa, fault(false))
+                npt.fault(gpa, fault(false))
                     .expect("the fault can be answered"),
                 Resolution::Mapped,
                 "ordinary memory around a trapped page is still the guest's"
@@ -870,6 +987,170 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn two_processors_describing_memory_at_once_build_one_set_of_tables() {
+        let (mut frames, window) = reserved();
+        // The same addresses, which race on the entry describing a page, and
+        // addresses one page apart, which race on the table above them.
+        for apart in [0, FRAME_SIZE] {
+            let (mine, theirs) = (described(0), described(apart));
+            let cost = alone(&mut frames, window, &[&mine, &theirs]);
+            let trees = (0..ROUNDS)
+                .map(|_| Npt::create(&mut frames, window).expect("tables over the chunk"))
+                .collect::<Vec<_>>();
+            let held = trees
+                .iter()
+                .map(|npt| npt.frames.held())
+                .collect::<Vec<_>>();
+            let (raced, together) = (&trees, &Barrier::new(2));
+
+            std::thread::scope(|threads| {
+                for addresses in [&mine, &theirs] {
+                    threads.spawn(move || {
+                        for npt in raced {
+                            // Both threads start each round together, so that
+                            // the two are inside one tree at the same moment
+                            // rather than one of them having finished before the
+                            // other began.
+                            together.wait();
+                            for at in addresses {
+                                npt.fault(*at, fault(false))
+                                    .expect("a fault answered while another is being answered");
+                            }
+                        }
+                    });
+                }
+            });
+
+            for (npt, held) in trees.iter().zip(held) {
+                assert_eq!(
+                    held - npt.frames.held(),
+                    cost,
+                    "two processors describing addresses {apart:#x} apart must build \
+                     the tables one of them would have built alone, the loser of \
+                     every race putting its frame back"
+                );
+                // Every page of the hypervisor's own memory reads as one frame,
+                // and which frame that is belongs to the tree rather than to the
+                // page — so the first of them says what all of them must say.
+                let zero = behind(npt, PhysAddr::new(0));
+                for at in mine.iter().chain(&theirs) {
+                    let translation = npt
+                        .translate(*at)
+                        .expect("the tables can be walked")
+                        .expect("the address is described");
+                    let expected = if at.as_u64() < chunk::CHUNK_SIZE {
+                        (zero, false)
+                    } else {
+                        (*at, true)
+                    };
+                    assert_eq!(
+                        (translation.spa, translation.writable),
+                        expected,
+                        "and {at:#x} means what one processor describing it alone \
+                         would have meant by it"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn describing_a_page_a_second_time_costs_no_frame_at_all() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let gpa = PhysAddr::new(RAM);
+        npt.fault(gpa, fault(false))
+            .expect("the fault can be answered");
+        let (held, free) = (npt.frames.held(), frames.free());
+
+        npt.fault(gpa, fault(false))
+            .expect("and answering it again is allowed");
+
+        assert_eq!(
+            (npt.frames.held(), frames.free()),
+            (held, free),
+            "the steady state takes no frame from this processor's list and \
+             nothing at all from the chunk"
+        );
+    }
+
+    #[test]
+    fn a_region_taken_over_while_a_guest_faults_is_never_described_as_memory() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        // A page in the middle of a 2 MiB region of ordinary memory, so that
+        // taking it over has to break up whatever describes the region and the
+        // faults racing it are ones that would otherwise describe all of it.
+        let inside = PhysAddr::new(RAM + LARGE + 8 * FRAME_SIZE);
+        let together = Barrier::new(2);
+
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                together.wait();
+                for page in 0..LARGE / FRAME_SIZE {
+                    let at = PhysAddr::new(RAM + LARGE + page * FRAME_SIZE);
+                    npt.fault(at, fault(false))
+                        .expect("a fault answered while a region is taken over");
+                    let described = npt.translate(inside).expect("the tables can be walked");
+                    assert!(
+                        described.is_none_or(|translation| translation.spa == inside),
+                        "a page being taken over is either the memory behind it or \
+                         nothing at all, and never something else"
+                    );
+                }
+            });
+            together.wait();
+            npt.protect(&mut frames, inside, FRAME_SIZE, Trap::Everything)
+                .expect("the page can be taken over while another processor faults");
+        });
+
+        assert_eq!(
+            npt.translate(inside).expect("the tables can be walked"),
+            None,
+            "a page every access to which faults must end up described by nothing"
+        );
+        assert_eq!(
+            npt.fault(inside, fault(false))
+                .expect("the fault can be answered"),
+            Resolution::Trapped,
+            "and stay that way however often the guest touches it"
+        );
+    }
+
+    /// The addresses one racing thread describes: a page of ordinary memory
+    /// with nothing near it, and one page in each of the first [`REGIONS`]
+    /// regions of the hypervisor's own memory, all offset by `apart`.
+    fn described(apart: u64) -> Vec<PhysAddr> {
+        core::iter::once(RAM)
+            .chain((0..REGIONS).map(|region| region * LARGE))
+            .map(|base| PhysAddr::new(base + apart))
+            .collect()
+    }
+
+    /// What describing every one of those addresses costs on a tree of its own,
+    /// with nothing racing it.
+    ///
+    /// The yardstick the racing test measures against, so that what a fill
+    /// costs is not written out here: it depends on the page sizes the
+    /// processor running the test reports.
+    fn alone(frames: &mut Frames, window: DirectMap, threads: &[&[PhysAddr]]) -> usize {
+        let npt = Npt::create(frames, window).expect("tables over the chunk");
+        let held = npt.frames.held();
+        for at in threads.iter().flat_map(|addresses| addresses.iter()) {
+            npt.fault(*at, fault(false))
+                .expect("the fault can be answered");
+        }
+        held - npt.frames.held()
+    }
+
+    /// Where an address one of the racing trees describes really is.
+    fn behind(npt: &Npt, gpa: PhysAddr) -> PhysAddr {
+        npt.translate(gpa)
+            .expect("the tables can be walked")
+            .expect("the address is described")
+            .spa
+    }
     /// A nested page fault of the direction alone, which is all [`Npt::fault`]
     /// reads of one.
     fn fault(write: bool) -> NestedPageFault {
