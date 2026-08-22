@@ -39,7 +39,10 @@
 //! The map needs one, because the operations that change what an address means
 //! rewrite it. Faults share it, and those operations take it exclusively and
 //! hold it across the tree as well, so a fault can never describe a region the
-//! map has stopped agreeing with.
+//! map has stopped agreeing with. Reading a translation shares it too, for a
+//! second reason: a mutation that gives a table back takes part of the tree out
+//! from under a walk, and the lock is what keeps that from happening between
+//! one entry of a walk and the next.
 //!
 //! Table frames come from a list per processor, so the chunk's allocator is off
 //! the path too. What is left of a fault on memory the guest has touched before
@@ -129,40 +132,54 @@
 //! cacheable; it is the identity element that lets a guest mark its own device
 //! apertures uncacheable and be obeyed.
 //!
-//! # Nothing here invalidates a translation
+//! # Changing what an address means while a guest is running
 //!
 //! Filling only ever turns a not-present entry present, and the architecture
 //! requires no invalidation for that — the walker detects a constraint being
 //! removed on its own. Splitting replaces one entry with a table describing the
-//! same memory the same way, which removes no constraint either.
+//! same memory the same way, which removes no constraint either. So answering a
+//! fault owes nothing to anybody, on any processor.
 //!
-//! Three operations here change what a processor may already have cached, and
-//! none of them flushes anything itself. [`Npt::protect`] takes permission away
-//! and [`Npt::sink`] moves where a page translates to; both may only be called
-//! before the guest has ever run, so nothing has walked these tables at that
-//! point and no processor holds a translation they have stopped justifying.
-//! [`Npt::conceal`] is the one that may be called while a guest is running, and
-//! it states in as many words that discarding what the guest cached is the
-//! caller's — the caller is what knows which processors ran the guest and what
-//! makes the next entry, and `TLB_CONTROL` is a field of a control block this
-//! crate does not have.
+//! Every other operation here answers with what it did to what a processor may
+//! already believe, as a [`Change`], and a [`Change::Tightened`] is discharged
+//! by handing it to [`Npt::barrier`]. That is the whole of the contract: every
+//! operation is legal at any time, whatever the guest is doing on whichever
+//! processor, and the barrier is what stops every processor using what the
+//! operation invalidated. It works by making a processor leave the guest and
+//! making its next entry discard this guest's translations, which is why
+//! [`Npt::before_entry`] and [`Npt::after_exit`] sit on the world switch.
+//! [`coherence`] carries the ordering argument that makes it sound.
+//!
+//! Two things a barrier does not do, because a caller has to reason about both.
+//! It does not stop an access already in flight, so memory taken back may not
+//! be repurposed until the barrier has returned. And it does not reach
+//! backwards, so a trap just armed has a bounded tail of accesses that were not
+//! trapped.
 
 #![no_std]
 
 extern crate alloc;
 
+pub mod coherence;
 mod frames;
 mod map;
 mod tree;
 
+use cpu::CpuIndex;
 use paging::{DirectMap, Frames, chunk};
 use processor::Features;
 use spin::RwLock;
 use svm::exit::NestedPageFault;
 use thiserror::Error;
+use vcpu::Vcpu;
 use x86_64::PhysAddr;
 
-use crate::{frames::FrameCache, map::Map, tree::Tree};
+use crate::{
+    coherence::Coherence,
+    frames::FrameCache,
+    map::Map,
+    tree::{Tree, Written},
+};
 pub use crate::{
     map::{Access, Kind, MapError, Range, RegionTag, Trap, Verdict},
     tree::walk::Level,
@@ -184,6 +201,8 @@ pub struct Npt {
     tree: Tree,
     /// The frames the tables are built out of, a list per processor.
     frames: FrameCache,
+    /// What makes a change to any of it safe while a guest is running on it.
+    coherence: Coherence,
 }
 
 impl Npt {
@@ -218,7 +237,8 @@ impl Npt {
         }
         let root = frame(frames, window)?;
         let zero = frame(frames, window)?;
-        let cache = FrameCache::new(cpu::roster().map_or(1, cpu::Roster::count));
+        let roster = cpu::roster().ok();
+        let cache = FrameCache::new(roster.map_or(1, cpu::Roster::count));
         cache.stock(frames);
         Ok(Self {
             map: RwLock::new(Map::new(
@@ -232,6 +252,7 @@ impl Npt {
                 processor::features().contains(Features::GIB_PAGES),
             ),
             frames: cache,
+            coherence: Coherence::new(roster.map_or(&[][..], |roster| roster.entries())),
         })
     }
 
@@ -268,6 +289,11 @@ impl Npt {
     /// exclusively, so faults do not serialize against each other, and the
     /// answer is acted on while that read is still held — an answer let go of
     /// first could be written into the tables after something had changed it.
+    ///
+    /// What the fill made of an entry is not read here. Describing a region the
+    /// guest has just touched either fills an entry that said nothing or leaves
+    /// one that already said this, and neither is anything another processor
+    /// has to be told about.
     ///
     /// # Errors
     ///
@@ -323,12 +349,75 @@ impl Npt {
     /// describe it — which needs the frame allocator, and so belongs to whoever
     /// owns that rather than here.
     ///
+    /// The map is read for the length of the walk without being asked anything.
+    /// What that buys is the tree standing still: a mutation that gives a table
+    /// back holds the map exclusively, so it cannot take one out from under
+    /// this walk between one entry of it and the next.
+    ///
     /// # Errors
     ///
     /// [`NptError::Unreachable`] if the window does not reach one of these
     /// tables, which is a broken window rather than anything about `gpa`.
     pub fn translate(&self, gpa: PhysAddr) -> Result<Option<Translation>, NptError> {
+        let _held = self.map.read();
         self.tree.translate(gpa)
+    }
+
+    /// Discharges what a mutation made stricter, so that no processor can begin
+    /// a guest access with a translation the mutation invalidated.
+    ///
+    /// The only way to be rid of a [`Change::Tightened`], and nothing at all
+    /// for the other two: neither granting permission nor writing what was
+    /// already written leaves a processor holding anything these tables
+    /// have stopped justifying.
+    ///
+    /// What it guarantees, and the two things it deliberately does not, are
+    /// [`coherence`]'s to state. The short of it is that a caller may repurpose
+    /// memory once this has returned and not before.
+    ///
+    /// # Not while the address space is held
+    ///
+    /// A table a compaction gave back goes into this processor's own list of
+    /// frames, and to the chunk where that list is full — which means the lock
+    /// every processor's mapping work shares. So a barrier is taken with that
+    /// lock let go, exactly as filling a list of frames is.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::BarrierIncomplete`] if a processor that had to leave the
+    /// guest did not answer in the time it was given, or if there is no way
+    /// to reach one at all on a machine where others are running. The
+    /// mutation has already happened either way; what the caller is being
+    /// told is that some processor may still be acting on what it replaced.
+    pub fn barrier(&self, change: Change) -> Result<(), NptError> {
+        let Change::Tightened { first, bytes } = change else {
+            return Ok(());
+        };
+        self.coherence.barrier(first, bytes)?;
+        // Only now, and only where the barrier finished: a table the tree gave up
+        // could have been handed out for something else while a walk in progress
+        // was still reading it.
+        self.frames.restore();
+        Ok(())
+    }
+
+    /// Publishes that this processor is entering the guest, and arms the
+    /// discard of this guest's translations where a mutation has happened
+    /// since its last entry.
+    ///
+    /// One relaxed store, one fence, one relaxed load and a comparison, on the
+    /// world switch. That is the whole price of being able to change a guest's
+    /// memory while it runs, and it is noise against the switch itself.
+    pub fn before_entry(&self, vcpu: &mut Vcpu, who: CpuIndex) {
+        if self.coherence.entering(who) {
+            vcpu.flush();
+        }
+    }
+
+    /// Publishes that this processor has left the guest, so that a barrier
+    /// stops having to make it leave.
+    pub fn after_exit(&self, who: CpuIndex) {
+        self.coherence.left(who);
     }
 
     /// Marks a range as one whose accesses are not the hardware's to answer.
@@ -343,14 +432,11 @@ impl Npt {
     /// back in the first time the guest touched it, and would describe a 2 MiB
     /// region straight over one.
     ///
-    /// # Only before a guest has run
-    ///
-    /// This reduces what an entry permits, and it may only be called before
-    /// these tables have ever been entered. Every processor's cached
-    /// translations would otherwise have to be discarded, and nothing here does
-    /// that — precisely because nothing can have cached one yet. Trapping a
-    /// region while a guest is running would need that machinery first, and
-    /// would need it before this call rather than after.
+    /// Answers with what it made stricter, which is [`Npt::barrier`]'s to
+    /// discharge. A region the map already records by exactly this range and
+    /// exactly this trap is [`Change::None`] — nothing was written, and a
+    /// caller driving the description of a page back and forth pays nothing
+    /// for the transition it is already in.
     ///
     /// # Errors
     ///
@@ -367,23 +453,28 @@ impl Npt {
         gpa: PhysAddr,
         bytes: u64,
         trap: Trap,
-    ) -> Result<(), NptError> {
+    ) -> Result<Change, NptError> {
         let range = Range::new(gpa, bytes)?;
         // The map exclusively, and held across the tree as well, so that a fault
         // on another processor sees either all of this or none of it: one that
         // read the map before the region was recorded and described a page after
         // it was would describe a page nothing may describe.
         let mut map = self.map.write();
+        if map.interposed(range, trap) {
+            return Ok(Change::None);
+        }
         // Recorded before it is described, so that a failure part-way through
         // leaves a region that still traps everything it should. The reverse
         // order would leave pages described as untouchable that nothing knows to
         // trap, which is a guest faulting for ever on an address the tables have
         // no answer for.
         map.interpose(range, trap)?;
-        let described = range
-            .pages()
-            .try_for_each(|page| self.interpose(&map, frames, page.base()));
-        if described.is_err() {
+        let described = range.pages().try_fold(Written::Same, |written, page| {
+            self.interpose(&map, frames, page.base())
+                .map(|entry| written.and(entry))
+        });
+        match described {
+            Ok(written) => Ok(owed(written, range)),
             // The region is not described and so must not go on being recorded:
             // a record naming pages that were never trapped would refuse to let
             // `fault` describe them, and the guest would fault on them for ever
@@ -392,9 +483,11 @@ impl Npt {
             // this registration removes them. The region was recorded a moment
             // ago, so nothing can refuse to give it back, and what the caller
             // needs to hear about is the failure to describe it.
-            let _ = map.release(range);
+            Err(refused) => {
+                let _ = map.release(range);
+                Err(refused)
+            }
         }
-        described
     }
 
     /// Stops trapping a region, leaving its pages to be described on demand
@@ -412,16 +505,15 @@ impl Npt {
     /// with no translation, which is where every page of a guest starts, and
     /// the first access to one describes it correctly.
     ///
-    /// # The caller discards what the guest cached
-    ///
-    /// This grants permission rather than reducing it, so no processor can hold
-    /// a translation that these tables no longer justify — a page with no
-    /// entry had nothing to cache. A processor may hold the *trapping*
-    /// description, which is more restrictive than what replaces it, so the
-    /// guest merely faults once more than it needs to and is then
-    /// described. Removing a region while a guest runs is still the
-    /// caller's to make safe, which is why nothing here may be called at
-    /// that point.
+    /// This is also where the tree shrinks. A region that stops needing to be
+    /// described a page at a time leaves the larger page containing it
+    /// describable by one entry again, and the tables it no longer needs
+    /// are handed back — which is what a [`Change::Tightened`] from here is
+    /// for, however little the entries themselves changed. Untrapping
+    /// grants permission rather than reducing it, and a processor still
+    /// holding the trapping description merely faults once more than it has
+    /// to; a table given back while a walk is still reading it is another
+    /// matter entirely.
     ///
     /// # Errors
     ///
@@ -429,26 +521,30 @@ impl Npt {
     /// boundary or no region was recorded at exactly that range, or
     /// [`NptError::Unreachable`] if the window does not reach one of these
     /// tables.
-    pub fn release(&self, gpa: PhysAddr, bytes: u64) -> Result<(), NptError> {
+    pub fn release(&self, gpa: PhysAddr, bytes: u64) -> Result<Change, NptError> {
         let range = Range::new(gpa, bytes)?;
         let mut map = self.map.write();
         // Forgotten first, so that a failure part-way through leaves pages that
         // `fault` is willing to describe rather than pages it refuses to touch
         // and nothing answers for.
         map.release(range)?;
-        range
-            .pages()
-            .try_for_each(|page| self.tree.abandon(page.base()))
+        for page in range.pages() {
+            self.tree.abandon(page.base())?;
+        }
+        Ok(Change::Loosened.and(self.coarsen(&map, range)?))
     }
 
-    /// Maps immutable pages of the owned chunk for guest access before first
-    /// entry.
+    /// Maps immutable pages of the owned chunk for guest access.
     ///
     /// The regular owned-memory rule maps every chunk page to shared zeroes.
     /// This is the narrow exception for immutable entry code and its
     /// parameters, whose only job is to transfer from the captured firmware
     /// state into the preloaded guest. The range remains read-only, so it
     /// cannot become writable guest-controlled hypervisor memory.
+    ///
+    /// Answers with what it made stricter, which for a page nothing had
+    /// described is nothing at all: filling an absent entry takes nothing
+    /// away.
     ///
     /// # Errors
     ///
@@ -463,13 +559,15 @@ impl Npt {
         gpa: PhysAddr,
         bytes: u64,
         exposure: Exposure,
-    ) -> Result<(), NptError> {
+    ) -> Result<Change, NptError> {
         let mut map = self.map.write();
         let range = owned(&map, gpa, bytes)?;
         map.expose(range, exposure.access())?;
-        range
-            .pages()
-            .try_for_each(|page| self.describe_page(&map, frames, page.base()))
+        let written = range.pages().try_fold(Written::Same, |written, page| {
+            self.describe_page(&map, frames, page.base())
+                .map(|entry| written.and(entry))
+        })?;
+        Ok(owed(written, range))
     }
 
     /// Takes an exposed range back, leaving it as every other page of the
@@ -480,14 +578,14 @@ impl Npt {
     /// guest reading it sees zeroes, and a guest writing it is reported as
     /// [`Resolution::Shadowed`] like any other write to hypervisor memory.
     ///
-    /// # The caller discards what the guest cached
+    /// # What it makes stricter
     ///
-    /// This is the one operation here that may be called after a guest has run,
-    /// and it takes permission away rather than granting it — so a processor
-    /// that has entered this guest may hold a translation these tables no
-    /// longer justify. Getting rid of it is the caller's, because it is the
-    /// caller that knows which processors have run the guest and it is the
-    /// caller that makes the next entry.
+    /// Where the range was described, this replaces a page of the chunk the
+    /// guest could read with the shared frame of zeroes, so a processor
+    /// that entered this guest may hold a translation that no longer says
+    /// what it says now. That is a [`Change::Tightened`], and
+    /// [`Npt::barrier`] is what discharges it — a caller that means to
+    /// reuse the pages must wait for it to return.
     ///
     /// # Where its tables come from
     ///
@@ -507,15 +605,20 @@ impl Npt {
     /// [`NptError::Map`] if the range is not a whole number of pages on a page
     /// boundary or a page of it was not being shown to the guest, or an error
     /// from building the required nested tables.
-    pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<(), NptError> {
+    pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<Change, NptError> {
         // Before the map is taken, for the reason `fault` does it there.
         self.frames.replenish();
         let mut map = self.map.write();
         let range = owned(&map, gpa, bytes)?;
         map.conceal(range)?;
-        range
-            .pages()
-            .try_for_each(|page| self.fill_page(&map, page.base()))
+        let written = range.pages().try_fold(Written::Same, |written, page| {
+            self.fill_page(&map, page.base())
+                .map(|entry| written.and(entry))
+        })?;
+        // Nothing to coarsen: this range is the hypervisor's own memory, which is
+        // described one page at a time whatever else is true of it, so the region
+        // holding it needed a table of its own before this and needs one still.
+        Ok(owed(written, range))
     }
 
     /// Describes one page as a place the guest may touch without anything
@@ -531,11 +634,10 @@ impl Npt {
     /// region is: [`Npt::fault`] would otherwise describe a large page straight
     /// over it the first time the guest touched a neighbour.
     ///
-    /// # Only before a guest has run
-    ///
-    /// Like [`Npt::protect`], this changes what an entry says while there must
-    /// be no cached translation to disagree with: no processor may have walked
-    /// these tables yet.
+    /// Answers with what it made stricter, which for a page nothing described
+    /// is nothing at all — filling an absent entry is the cheap direction,
+    /// and it is the direction this goes in whenever the page was trapped a
+    /// moment ago.
     ///
     /// # Errors
     ///
@@ -543,7 +645,10 @@ impl Npt {
     /// aligned or addressable, something already describes it another way, a
     /// page already sunk included, or there is no room for another — or an
     /// error from allocating or reaching the frame behind it.
-    pub fn sink(&self, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+    pub fn sink(&self, frames: &mut Frames, gpa: PhysAddr) -> Result<Change, NptError> {
+        // Refused before a frame is taken for it, so that a page the map would
+        // not describe this way costs the chunk nothing.
+        let page = Range::new(gpa, chunk::FRAME_SIZE)?;
         let frame = frame(frames, self.window())?;
         let mut map = self.map.write();
         // Recorded before it is described, because the map is what `fault`
@@ -556,7 +661,8 @@ impl Npt {
             frames::release(frames, frame);
             return Err(refused.into());
         }
-        self.describe_page(&map, frames, gpa)
+        let written = self.describe_page(&map, frames, gpa)?;
+        Ok(owed(written, page))
     }
 
     /// Logs the shape of the translation, which is the whole of what a guest's
@@ -565,6 +671,44 @@ impl Npt {
         self.tree.describe(who);
         self.map.read().describe(who);
         self.frames.describe(who);
+        self.coherence.describe(who);
+    }
+
+    /// Describes every region of `range` that has stopped needing to be written
+    /// down finely with one entry again, and holds back the tables they no
+    /// longer need until a barrier has passed.
+    ///
+    /// The only reason the tree ever shrinks. Under the map's write lock and
+    /// never on the fault path: what decides whether a region may be
+    /// described coarsely is the map, and the answer is only stable while
+    /// nothing is changing it.
+    ///
+    /// Finest level first, because coarsening a 2 MiB region is what leaves the
+    /// gigabyte holding it describable by one entry — the two levels in the
+    /// other order would coarsen the smaller regions of a gigabyte that had
+    /// just stopped being coarsenable.
+    fn coarsen(&self, map: &Map, range: Range) -> Result<Change, NptError> {
+        let mut change = Change::None;
+        for level in [Level::Directory, Level::Pointer] {
+            for base in range.aligned(level.span()) {
+                // A frame the tree gives up may not be handed out again until a
+                // barrier has passed, so a compaction with nowhere to keep one
+                // stops instead of freeing it early. What it leaves behind is a
+                // region described more finely than it has to be, which is
+                // correct and costs a table.
+                if !self.frames.detainable() {
+                    return Ok(change);
+                }
+                if let Some(frame) = self.tree.compact(map.resolve(base), level, base)? {
+                    self.frames.detain(frame);
+                    change = change.and(Change::Tightened {
+                        first: base,
+                        bytes: level.span(),
+                    });
+                }
+            }
+        }
+        Ok(change)
     }
 
     /// Describes one page of a trapped region as the map now says it is.
@@ -574,7 +718,12 @@ impl Npt {
     /// where every access is trapped is described as nothing at all: a
     /// present entry has no bit that denies a read, so not present is the
     /// only encoding that faults on one.
-    fn interpose(&self, map: &Map, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+    fn interpose(
+        &self,
+        map: &Map,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+    ) -> Result<Written, NptError> {
         // Broken up first, because the page has to say something its neighbours
         // do not and permissions belong to an entry. This is the one place that
         // needs finer granularity than the fill rule would otherwise produce,
@@ -588,11 +737,16 @@ impl Npt {
     /// allocator the caller holds rather than through the address space every
     /// processor shares.
     ///
-    /// Which is what every operation that describes a page before the guest has
-    /// run wants: the address space is still one function's value at that
-    /// point, so the caller has its allocator, and taking the lock instead
-    /// would be taking it while the map is held.
-    fn describe_page(&self, map: &Map, frames: &mut Frames, gpa: PhysAddr) -> Result<(), NptError> {
+    /// Which is what every operation handed one wants: a caller that has the
+    /// chunk's allocator has it because the address space is still one
+    /// function's value, and taking the lock instead would be taking it
+    /// while the map is held.
+    fn describe_page(
+        &self,
+        map: &Map,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+    ) -> Result<Written, NptError> {
         self.frames.stock(frames);
         self.fill_page(map, gpa)
     }
@@ -604,9 +758,25 @@ impl Npt {
     /// a page sunk, a page of a trapped region — so each of them asks the map
     /// afresh rather than saying for itself what it just recorded. Two accounts
     /// of one page could disagree; one cannot.
-    fn fill_page(&self, map: &Map, gpa: PhysAddr) -> Result<(), NptError> {
+    fn fill_page(&self, map: &Map, gpa: PhysAddr) -> Result<Written, NptError> {
         let verdict = map.resolve(gpa);
         self.tree.fill(&self.frames, verdict, gpa)
+    }
+}
+
+/// What a mutation over `range` owes, given what writing its entries came to.
+///
+/// The range travels only so that a barrier can say what it was for and
+/// coalesce several of them; there is no instruction it could be an argument
+/// to.
+fn owed(written: Written, range: Range) -> Change {
+    match written {
+        Written::Same => Change::None,
+        Written::Filled => Change::Loosened,
+        Written::Replaced => Change::Tightened {
+            first: range.base(),
+            bytes: range.bytes(),
+        },
     }
 }
 
@@ -660,6 +830,77 @@ pub enum Resolution {
     /// caller's to decide, and stepping the guest past it is the caller's to
     /// do.
     Trapped,
+}
+
+/// What a mutation did to what a processor may already believe.
+///
+/// Every operation that changes these tables answers with one, and the only way
+/// to be rid of a [`Change::Tightened`] is to hand it to [`Npt::barrier`] — so
+/// a caller cannot forget, and the compiler says so.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// The tables already said this. Nothing was written and nothing is owed.
+    ///
+    /// A distinct answer rather than a successful no-op, because it is what
+    /// keeps a description a guest can drive from sending interprocessor
+    /// interrupts for a transition that did not happen.
+    None,
+    /// Something was written, and only to grant permission or to describe what
+    /// nothing described. Nothing is owed: no processor can hold a translation
+    /// these tables have stopped justifying, and the walker notices a
+    /// constraint being lifted by itself.
+    Loosened,
+    /// Something a processor may hold is no longer justified. A barrier is owed
+    /// before the memory behind it may be repurposed or the trap relied on.
+    ///
+    /// The range is *not* a hardware argument. There is no way to invalidate a
+    /// nested translation by guest physical address — the instruction that
+    /// invalidates by an alternate address space identifier takes a guest
+    /// *virtual* address, and the manual says outright that it cannot do this —
+    /// so the unit is the identifier, and this is what a barrier coalesces
+    /// and what a barrier that could not finish names.
+    Tightened {
+        /// The first address made stricter.
+        first: PhysAddr,
+        /// How many bytes from there.
+        bytes: u64,
+    },
+}
+
+impl Change {
+    /// The one change that answers for both, which is whichever owes more.
+    ///
+    /// What a mutation touching several regions comes to. Two tightenings
+    /// become the run that spans both, which claims more than either did
+    /// and never less — the direction an error here has to fall, and free,
+    /// the range being for the record rather than for the hardware.
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                Self::Tightened { first, bytes },
+                Self::Tightened {
+                    first: other,
+                    bytes: others,
+                },
+            ) => {
+                let base = first.as_u64().min(other.as_u64());
+                let end = first
+                    .as_u64()
+                    .saturating_add(bytes)
+                    .max(other.as_u64().saturating_add(others));
+                Self::Tightened {
+                    first: PhysAddr::new_truncate(base),
+                    bytes: end - base,
+                }
+            }
+            (tightened @ Self::Tightened { .. }, _) | (_, tightened @ Self::Tightened { .. }) => {
+                tightened
+            }
+            (Self::Loosened, _) | (_, Self::Loosened) => Self::Loosened,
+            (Self::None, Self::None) => Self::None,
+        }
+    }
 }
 
 /// Access permitted to a guest-visible page owned by the hypervisor.
@@ -747,6 +988,21 @@ pub enum NptError {
         /// Bytes requested.
         bytes: u64,
     },
+    /// A processor inside the guest was not made to leave it, so it may still
+    /// be acting on a translation the mutation invalidated.
+    ///
+    /// The mutation itself has happened. What has not is every processor being
+    /// made to stop using what it replaced, which is why a caller repurposing
+    /// memory may not go on and a caller arming a trap may not rely on it.
+    #[error("{unanswered} processors did not leave the guest when they were asked to")]
+    BarrierIncomplete {
+        /// How many were asked and not confirmed to have left.
+        ///
+        /// The whole batch, because what crosses the slot to the subsystem that
+        /// owns interprocessor interrupts is whether every one of them
+        /// answered.
+        unanswered: usize,
+    },
     /// What an address means could not be recorded or answered for.
     #[error(transparent)]
     Map(#[from] MapError),
@@ -794,9 +1050,10 @@ const _: () = {
 #[cfg(test)]
 pub(crate) mod tests {
     //! The two ways one page of a guest can be described, what describing one
-    //! that way costs its neighbours, what two processors describing memory at
-    //! the same moment cost between them, and a run of host memory standing in
-    //! for the reserved chunk for the rest of the crate to build tables in.
+    //! that way costs its neighbours, what a description that stops being
+    //! needed gives back, what two processors describing memory at the same
+    //! moment cost between them, and a run of host memory standing in for
+    //! the reserved chunk for the rest of the crate to build tables in.
     //!
     //! Only the chunk has to be real. Every table these tables build is a frame
     //! of it, reached through the window, and nothing here ever dereferences a
@@ -812,6 +1069,12 @@ pub(crate) mod tests {
     //! the frames for that come through the address space every processor
     //! shares, and there is no address space in a test — so the racing tests
     //! describe as much memory as one list of frames can describe and no more.
+    //!
+    //! Nothing has a station here either, for the same reason: a processor
+    //! publishes what it is doing at the position the roster gave it. So a
+    //! barrier finds nobody inside the guest and answers for everybody, which
+    //! is what a boot describing a guest's memory sees — and what a barrier
+    //! does when it finds somebody is [`crate::coherence`]'s to establish.
 
     extern crate std;
 
@@ -822,7 +1085,7 @@ pub(crate) mod tests {
     use svm::exit::NestedPageFault;
     use x86_64::{PhysAddr, VirtAddr};
 
-    use super::{MapError, Npt, NptError, Resolution, Trap, chunk};
+    use super::{Change, MapError, Npt, NptError, Resolution, Translation, Trap, chunk};
 
     /// Where the interrupt controllers' register page is, which is the one page
     /// a boot chooses between these two descriptions for.
@@ -863,7 +1126,8 @@ pub(crate) mod tests {
         let page = PhysAddr::new(REGISTER_PAGE);
 
         npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
-            .expect("the page can be trapped before a guest runs");
+            .map(|change| discharge(&npt, change))
+            .expect("the page can be trapped");
 
         assert_eq!(
             npt.translate(page).expect("the tables can be walked"),
@@ -893,7 +1157,8 @@ pub(crate) mod tests {
         let page = PhysAddr::new(REGISTER_PAGE);
 
         npt.sink(&mut frames, page)
-            .expect("the page can be sunk before a guest runs");
+            .map(|change| discharge(&npt, change))
+            .expect("the page can be sunk");
 
         let translation = npt
             .translate(page)
@@ -923,6 +1188,7 @@ pub(crate) mod tests {
         let trapped = Npt::create(&mut frames, window).expect("tables over the chunk");
         trapped
             .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .map(|change| discharge(&trapped, change))
             .expect("the page can be trapped");
         assert_eq!(
             trapped.sink(&mut frames, page),
@@ -934,7 +1200,9 @@ pub(crate) mod tests {
         );
 
         let sunk = Npt::create(&mut frames, window).expect("tables over the chunk");
-        sunk.sink(&mut frames, page).expect("the page can be sunk");
+        sunk.sink(&mut frames, page)
+            .map(|change| discharge(&sunk, change))
+            .expect("the page can be sunk");
         assert_eq!(
             sunk.release(page, FRAME_SIZE),
             Err(NptError::Map(MapError::NoRegion {
@@ -955,7 +1223,8 @@ pub(crate) mod tests {
         let trapped = PhysAddr::new(REGISTER_PAGE + FRAME_SIZE);
 
         npt.protect(&mut frames, trapped, FRAME_SIZE, Trap::Everything)
-            .expect("the page can be trapped before a guest runs");
+            .map(|change| discharge(&npt, change))
+            .expect("the page can be trapped");
 
         for (gpa, span) in [
             (PhysAddr::new(REGISTER_PAGE), FRAME_SIZE),
@@ -985,6 +1254,151 @@ pub(crate) mod tests {
             None,
             "while the trapped page itself is described by neither of them"
         );
+    }
+
+    #[test]
+    fn describing_a_region_the_map_already_holds_writes_nothing_and_owes_nothing() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+        npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .map(|change| discharge(&npt, change))
+            .expect("the page can be trapped");
+
+        assert_eq!(
+            npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything),
+            Ok(Change::None),
+            "a description the map already holds is a transition that did not \
+             happen, and nothing is told about one"
+        );
+    }
+
+    #[test]
+    fn trapping_a_page_the_guest_has_had_described_owes_a_barrier_over_that_page() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+        npt.fault(page, fault(false))
+            .expect("the fault can be answered");
+
+        let change = npt
+            .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .expect("the page can be trapped while a guest is running");
+
+        assert_eq!(
+            change,
+            Change::Tightened {
+                first: page,
+                bytes: FRAME_SIZE,
+            },
+            "an entry that described the hardware and now describes nothing is one \
+             a processor may still be acting on"
+        );
+        discharge(&npt, change);
+    }
+
+    #[test]
+    fn describing_a_page_nothing_described_owes_nothing() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+
+        let change = npt
+            .sink(&mut frames, PhysAddr::new(REGISTER_PAGE))
+            .expect("the page can be sunk");
+
+        assert_eq!(
+            change,
+            Change::Loosened,
+            "filling an absent entry takes nothing away, and a not-present entry \
+             left nothing cached that could disagree"
+        );
+        discharge(&npt, change);
+    }
+
+    #[test]
+    fn a_barrier_is_owed_for_a_tightening_and_for_nothing_else() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let quiet = npt.coherence.epoch();
+
+        for change in [Change::None, Change::Loosened] {
+            npt.barrier(change).expect("neither owes anything");
+        }
+
+        assert_eq!(
+            npt.coherence.epoch(),
+            quiet,
+            "neither is a change any processor has to be told about, so neither \
+             advances what an entry compares against"
+        );
+        npt.barrier(Change::Tightened {
+            first: PhysAddr::new(REGISTER_PAGE),
+            bytes: FRAME_SIZE,
+        })
+        .expect("a barrier with nobody inside the guest has nobody to make leave");
+        assert_ne!(
+            npt.coherence.epoch(),
+            quiet,
+            "while a tightening is exactly what one is for"
+        );
+    }
+
+    #[test]
+    fn a_region_that_stops_needing_pages_is_described_by_one_entry_again() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        // A page inside a 2 MiB region of ordinary memory, so that trapping it has
+        // to break up whatever describes the region — and giving it back leaves
+        // that region uniform again.
+        let page = PhysAddr::new(RAM + LARGE + 8 * FRAME_SIZE);
+        let probes = [
+            PhysAddr::new(RAM + LARGE),
+            page,
+            PhysAddr::new(RAM + 2 * LARGE - FRAME_SIZE),
+        ];
+        npt.fault(page, fault(false))
+            .expect("the fault can be answered");
+        let before = probes.map(|gpa| translated(&npt, gpa));
+        npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .map(|change| discharge(&npt, change))
+            .expect("the page can be trapped");
+
+        let change = npt
+            .release(page, FRAME_SIZE)
+            .expect("the region can be given back");
+
+        let detained = npt.frames.detained();
+        assert!(
+            detained > 0,
+            "a region that has stopped needing to be written down finely gives up \
+             the tables that wrote it down that way"
+        );
+        // Room for them to come back to: a fill takes frames out of this list and
+        // a barrier puts them back into it, reaching the chunk only for what the
+        // list will not hold — and there is no address space to reach a chunk
+        // through here.
+        for _ in 0..detained {
+            npt.frames
+                .take()
+                .expect("a stocked list has frames to spare");
+        }
+        let held = npt.frames.held();
+
+        discharge(&npt, change);
+
+        assert_eq!(
+            (npt.frames.held(), npt.frames.detained()),
+            (held + detained, 0),
+            "and the barrier is what hands them back, never the compaction itself: \
+             a processor caches the entries above a leaf as well"
+        );
+        for (gpa, was) in probes.into_iter().zip(before) {
+            assert_eq!(
+                translated(&npt, gpa),
+                was,
+                "{gpa:#x} means exactly what it meant before the page was ever trapped"
+            );
+        }
     }
 
     #[test]
@@ -1102,6 +1516,7 @@ pub(crate) mod tests {
             });
             together.wait();
             npt.protect(&mut frames, inside, FRAME_SIZE, Trap::Everything)
+                .map(|change| discharge(&npt, change))
                 .expect("the page can be taken over while another processor faults");
         });
 
@@ -1146,11 +1561,22 @@ pub(crate) mod tests {
 
     /// Where an address one of the racing trees describes really is.
     fn behind(npt: &Npt, gpa: PhysAddr) -> PhysAddr {
+        translated(npt, gpa).spa
+    }
+
+    /// What the tables say about an address they must already describe.
+    fn translated(npt: &Npt, gpa: PhysAddr) -> Translation {
         npt.translate(gpa)
             .expect("the tables can be walked")
             .expect("the address is described")
-            .spa
     }
+
+    /// Discharges what a mutation reported, the way every caller of one does.
+    fn discharge(npt: &Npt, change: Change) {
+        npt.barrier(change)
+            .expect("a barrier with nobody inside the guest has nobody to make leave");
+    }
+
     /// A nested page fault of the direction alone, which is all [`Npt::fault`]
     /// reads of one.
     fn fault(write: bool) -> NestedPageFault {

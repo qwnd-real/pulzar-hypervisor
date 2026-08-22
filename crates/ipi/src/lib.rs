@@ -50,11 +50,21 @@
 //! In particular it never asks for the address space lock, which is what keeps
 //! a processor waiting for that lock from deadlocking against the processor
 //! holding it and waiting for this acknowledgement.
+//!
+//! # Leaving a guest
+//!
+//! [`install`] sets up a second one, for the subsystem underneath this that
+//! describes a guest's memory, for the same reason and through the same shape
+//! of slot. Changing what those tables permit while processors are inside the
+//! guest needs those processors out of it, and a physical interrupt is what
+//! does that; the handler itself does nothing at all, which [`coherence`]
+//! explains.
 
 #![no_std]
 
 extern crate alloc;
 
+mod coherence;
 mod mailbox;
 mod shootdown;
 
@@ -214,17 +224,45 @@ impl Ipi {
     /// Sends this to every attached processor but the one sending, and waits
     /// until all of them have run the handler.
     ///
-    /// Every one is sent before any is waited for. Waiting for each in turn
-    /// would serialize what the machine is perfectly able to do at once, and
-    /// the point of this call is usually that all of it has to finish.
+    /// Every one is sent before any is waited for.
     ///
     /// # Errors
     ///
     /// [`IpiError::Timeout`] if any did not answer in time, or whatever sending
     /// reported. Returns how many answered.
     pub fn broadcast_and_wait(&self, payload: NonZeroU64, micros: u64) -> Result<usize, IpiError> {
-        let sent = self.broadcast(payload)?;
-        for target in others() {
+        self.each_and_wait(others, payload, micros)
+    }
+
+    /// Sends this to every processor `targets` names and waits until all of
+    /// them have run the handler.
+    ///
+    /// Every one is sent before any is waited for. Waiting for each in turn
+    /// would serialize what the machine is perfectly able to do at once,
+    /// and the point of waiting at all is usually that all of it has to
+    /// finish.
+    ///
+    /// The set is asked for twice rather than kept, because keeping it would
+    /// mean either a copy of it or a bound on what it is: a broadcast's set
+    /// is whoever is online at the moment it looks, and a set the caller
+    /// already holds is a slice.
+    ///
+    /// # Errors
+    ///
+    /// [`IpiError::Timeout`] if any did not answer in time, or whatever sending
+    /// reported. Returns how many were sent.
+    pub(crate) fn each_and_wait<Targets: Iterator<Item = CpuIndex>>(
+        &self,
+        targets: impl Fn() -> Targets,
+        payload: NonZeroU64,
+        micros: u64,
+    ) -> Result<usize, IpiError> {
+        let mut sent = 0;
+        for target in targets() {
+            self.send(target, payload)?;
+            sent += 1;
+        }
+        for target in targets() {
             self.wait(target, micros)?;
         }
         Ok(sent)
@@ -295,7 +333,8 @@ pub fn register(handler: Handler, merge: Merge) -> Result<Ipi, IpiError> {
 }
 
 /// Sets up the tables every interprocessor interrupt shares, and gives the
-/// address space subsystem a way to reach the other processors.
+/// address space subsystem and the nested page tables a way to reach the other
+/// processors.
 ///
 /// Called once, on the boot processor, after the processor roster is taken —
 /// the tables have one entry per processor — and before any processor is
@@ -305,7 +344,8 @@ pub fn register(handler: Handler, merge: Merge) -> Result<Ipi, IpiError> {
 /// # Errors
 ///
 /// [`IpiError::AlreadyInstalled`] for a second call, [`IpiError::Cpu`] if the
-/// roster has not been taken, or whatever registering the shootdown reported.
+/// roster has not been taken, or whatever registering either interrupt
+/// reported.
 pub fn install() -> Result<(), IpiError> {
     let processors = cpu::roster()?.count();
     // The cell runs the closure for the one caller that fills it and for no
@@ -322,7 +362,8 @@ pub fn install() -> Result<(), IpiError> {
     if !built {
         return Err(IpiError::AlreadyInstalled);
     }
-    shootdown::install()
+    shootdown::install()?;
+    coherence::install()
 }
 
 /// Logs what has been sent and what has arrived.
@@ -492,4 +533,9 @@ pub enum IpiError {
     /// one.
     #[error(transparent)]
     Shootdown(#[from] paging::shootdown::AlreadyInstalled),
+    /// The nested page tables already have a way to reach the processors inside
+    /// a guest, which can only mean something other than this crate gave
+    /// them one.
+    #[error(transparent)]
+    Coherence(#[from] npt::coherence::AlreadyInstalled),
 }

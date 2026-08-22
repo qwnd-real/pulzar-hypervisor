@@ -188,6 +188,23 @@ pub(crate) fn store_each(
     Ok(())
 }
 
+/// Whether any entry of the table at `at` says what `wanted` is looking for.
+///
+/// One reach through the window for a whole table, as [`store_each`] is for
+/// writing one, and for the one question that is about a table rather than
+/// about an entry: whether replacing it with a single leaf would abandon
+/// anything.
+pub(crate) fn any(
+    window: DirectMap,
+    at: PhysAddr,
+    wanted: impl Fn(u64) -> bool,
+) -> Result<bool, NptError> {
+    Ok(reach(window, at)?
+        .entries
+        .iter()
+        .any(|entry| wanted(entry.load(Ordering::Acquire))))
+}
+
 /// One nested page table.
 ///
 /// Page aligned and page sized, as the frame it occupies is and as the hardware

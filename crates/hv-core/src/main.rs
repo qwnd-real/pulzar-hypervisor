@@ -202,8 +202,11 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     cpu::survey(acpi.madt().processors())?;
     // From here on, "nobody has been told" stops being a safe assumption the
     // address space may make for itself: it can ask how many processors are
-    // running instead.
+    // running instead. The nested page tables answer the same question for
+    // themselves, and for the same reason — a change to a guest's memory that
+    // reached nobody is complete only while there is nobody to reach.
     paging::shootdown::watch(cpu::online_count)?;
+    npt::coherence::watch(cpu::online_count)?;
     // Brought up in the face firmware was using rather than the best one this
     // processor offers. The guest is that same firmware, and it goes on
     // addressing passed-through interrupts the way it already had — so the real
@@ -267,9 +270,10 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
         chunk::FRAME_SIZE,
         Exposure::ReadOnly,
     )?;
-    // Before the guest has ever run, which is what taking a region over
-    // requires: reducing what the nested tables permit while a guest is running
-    // would mean discarding every processor's cached translations first.
+    // Before the guest has ever run, because the first access it makes to one of
+    // these regions has to arrive where the region is answered for. The tables no
+    // longer require it: they report what taking a region over made stricter, and
+    // discharging that is what makes every processor stop using what it replaced.
     //
     // What the policy decides is only how the guest's own accesses to the
     // register page arrive. Where the processor drives the controller itself

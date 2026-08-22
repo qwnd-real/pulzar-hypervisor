@@ -34,6 +34,10 @@ pub enum CoreError {
     /// twice how to count them.
     #[error(transparent)]
     Shootdown(#[from] paging::shootdown::AlreadyInstalled),
+    /// The nested page tables were told twice how to reach the processors
+    /// inside a guest, or twice how to count them.
+    #[error(transparent)]
+    Coherence(#[from] npt::coherence::AlreadyInstalled),
     /// The firmware tables could not be read.
     #[error(transparent)]
     Acpi(#[from] AcpiError),

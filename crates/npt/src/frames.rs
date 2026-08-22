@@ -46,6 +46,15 @@ pub(crate) struct FrameCache {
     /// One list per processor the roster describes, or one list where no roster
     /// had been taken when these tables were built.
     lists: Box<[List]>,
+    /// Frames the tree has given up, which may not be handed out again until a
+    /// barrier has passed.
+    ///
+    /// A processor caches the entries above a leaf as well as the leaf, so a
+    /// frame that stopped being a table could still be under a walk in
+    /// progress. Held here rather than in the list a fill takes from,
+    /// because those are exactly the same thing to a fill and it must not
+    /// take one of these.
+    detached: List,
 }
 
 impl FrameCache {
@@ -58,6 +67,7 @@ impl FrameCache {
     pub(crate) fn new(processors: usize) -> Self {
         Self {
             lists: (0..processors.max(1)).map(|_| List::new()).collect(),
+            detached: List::new(),
         }
     }
 
@@ -129,14 +139,66 @@ impl FrameCache {
         self.lists.iter().map(List::held).sum()
     }
 
+    /// Whether there is room to hold back another frame the tree has given up.
+    ///
+    /// Asked before a compaction detaches anything, because a frame with
+    /// nowhere to wait would have to be either handed out early or lost.
+    /// Added to only under the map's write lock, so a vacancy seen here is
+    /// a vacancy still there when the frame arrives — and taken from only
+    /// by a barrier, which makes room and never uses it.
+    pub(crate) fn detainable(&self) -> bool {
+        self.detained() < DEPTH
+    }
+
+    /// How many frames the tree has given up that no barrier has passed for
+    /// yet.
+    pub(crate) fn detained(&self) -> usize {
+        self.detached.held()
+    }
+
+    /// Holds back a frame the tree has stopped naming, until a barrier has
+    /// passed.
+    pub(crate) fn detain(&self, frame: PhysAddr) {
+        if !self.detached.give(frame) {
+            error!("npt: the detached table frame at {frame:#x} has nowhere to wait and is lost");
+        }
+    }
+
+    /// Hands back every frame the tree gave up, now that a barrier has passed
+    /// and no walk can still be reading one.
+    ///
+    /// Into this processor's own list where it fits, because a frame that was a
+    /// table is a frame for a table and the list is where a fill looks for one;
+    /// to the chunk otherwise, so that a full list does not turn a frame the
+    /// tree released into a frame nothing holds.
+    pub(crate) fn restore(&self) {
+        let list = self.mine();
+        while let Some(frame) = self.detached.take() {
+            if list.give(frame) {
+                continue;
+            }
+            if let Err(cause) = paging::with(|space| release(space.frames(), frame)) {
+                // Nowhere to put it: this processor's list is full and there is no
+                // address space to reach the chunk through. Held where it was, for
+                // whichever barrier comes next, rather than lost.
+                error!(
+                    "npt: the detached table frame at {frame:#x} could not be handed back: {cause}"
+                );
+                self.detain(frame);
+                return;
+            }
+        }
+    }
+
     /// Logs what the cache is keeping, which is the part of these tables'
     /// footprint that is not in the tree.
     pub(crate) fn describe(&self, who: &str) {
         info!(
-            "{who}: npt holds {} table frames of {} across {} processors",
+            "{who}: npt holds {} table frames of {} across {} processors, {} waiting for a barrier",
             self.held(),
             self.lists.len() * DEPTH,
             self.lists.len(),
+            self.detained(),
         );
     }
 
@@ -180,7 +242,12 @@ pub(crate) fn release(frames: &mut Frames, frame: PhysAddr) {
     }
 }
 
-/// The frames one processor may fill tables from without asking the chunk.
+/// A fixed set of table frames, reachable and changeable through a shared
+/// reference.
+///
+/// What one processor may fill tables from without asking the chunk, and — for
+/// the one set that is not a processor's — what the tree has given up and may
+/// not hand out yet.
 ///
 /// Cache-line aligned, so that two processors taking frames at the same moment
 /// never contend for one line.

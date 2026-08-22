@@ -16,6 +16,10 @@ processor = { workspace = true }
 spin = { workspace = true }
 svm = { workspace = true }
 thiserror = { workspace = true }
+# The one thing a processor entering a guest has to be told, which is that what
+# it cached of these tables is stale: the field that says so belongs to a control
+# block, and arming it is the entry hook's whole job.
+vcpu = { workspace = true }
 x86_64 = { workspace = true }
 
 [lints]

@@ -112,6 +112,11 @@ impl Tree {
     /// Describes the coarsest region containing `gpa` whose whole extent the
     /// verdict covers, as the memory the verdict says is behind it.
     ///
+    /// Answers with what writing the entry came to, which is what a mutation
+    /// needs to know whether it owes anything: an entry that already said this,
+    /// or that described nothing at all, leaves no processor holding a
+    /// translation these tables have stopped justifying.
+    ///
     /// Idempotent, and cheaply so: an entry already saying this is left alone,
     /// which is what answering a fault on an address that is already described
     /// comes to — a write to memory the guest may only read faults every time
@@ -128,7 +133,7 @@ impl Tree {
         frames: &FrameCache,
         verdict: Verdict,
         gpa: PhysAddr,
-    ) -> Result<(), NptError> {
+    ) -> Result<Written, NptError> {
         match verdict.kind {
             // The hypervisor's own memory is described a whole table at a time.
             // Every page of it reads as the same frame, so there is one entry to
@@ -230,12 +235,68 @@ impl Tree {
     ///
     /// [`NptError::Unreachable`] if the window does not reach one of these
     /// tables.
-    pub(crate) fn abandon(&self, gpa: PhysAddr) -> Result<(), NptError> {
+    pub(crate) fn abandon(&self, gpa: PhysAddr) -> Result<Written, NptError> {
         let at = self.find(gpa)?;
         if !matches!(at.level, Level::Page) {
-            return Ok(());
+            return Ok(Written::Same);
         }
         self.install(at, encode(Entry::Absent))
+    }
+
+    /// Describes the `level` region containing `base` with one entry again,
+    /// where the map has stopped asking for anything finer, and answers with
+    /// the table that region no longer needs.
+    ///
+    /// `None` where nothing was done: the answer does not reach across the
+    /// whole region, or the level is one the tree may not hold a leaf at
+    /// here, or the region is already one entry, or a table below the one
+    /// that would go still describes a region of its own more finely than a
+    /// single leaf could.
+    ///
+    /// The leaf is stored and the table is only answered with — it is not
+    /// freed. A processor caches the entries above a leaf as well as the
+    /// leaf, so a frame handed back before the barrier this owes could be
+    /// handed out for something else while a walk in progress is still
+    /// reading it.
+    ///
+    /// One aligned quadword replaces the entry, which the hardware page walker
+    /// reads atomically, so a walk sees either the table or the leaf — and both
+    /// describe the same memory the same way, which is what makes the moment
+    /// between them uninteresting.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::Unreachable`] if the window does not reach one of these
+    /// tables.
+    pub(crate) fn compact(
+        &self,
+        verdict: Verdict,
+        level: Level,
+        base: PhysAddr,
+    ) -> Result<Option<PhysAddr>, NptError> {
+        // The level rule is the authority on how coarsely a region may be
+        // described, and a region it would describe more finely than this is one
+        // whose table is still doing something.
+        if level > self.coarsest(verdict, base) {
+            return Ok(None);
+        }
+        let Some(at) = self.reached(level, base)? else {
+            return Ok(None);
+        };
+        if !entry::present(at.value) || entry::leaf(at.value, level) {
+            return Ok(None);
+        }
+        let table = entry::frame(at.value);
+        if self.branching(table, level)? {
+            return Ok(None);
+        }
+        walk::store(
+            self.window,
+            at.table,
+            at.index,
+            self.describes(verdict, level, base),
+        )?;
+        Ok(Some(table))
     }
 
     /// Logs the shape of the translation, which is the whole of what a guest's
@@ -259,7 +320,12 @@ impl Tree {
     /// — shown to the guest on purpose, or handed to something else to answer
     /// for — and putting zeroes over one of those would take back what it was
     /// given.
-    fn shadow(&self, frames: &FrameCache, verdict: Verdict, gpa: PhysAddr) -> Result<(), NptError> {
+    fn shadow(
+        &self,
+        frames: &FrameCache,
+        verdict: Verdict,
+        gpa: PhysAddr,
+    ) -> Result<Written, NptError> {
         let at = self.descend(frames, gpa, SHADOW)?;
         // One entry serves every page of the region, all of them reading as the
         // same frame. So the entry for the page this fault was for already
@@ -268,14 +334,15 @@ impl Tree {
         // must not rewrite five hundred and twelve entries each time.
         let wanted = self.describes(verdict, SHADOW, gpa);
         if entry::unchanged(at.value, wanted) {
-            return Ok(());
+            return Ok(Written::Same);
         }
         let first = gpa.align_down(SHADOWED);
         walk::store_each(self.window, at.table, |slot| {
             verdict
                 .covers(first + slot * SHADOW.span(), SHADOW.span())
                 .then_some(wanted)
-        })
+        })?;
+        Ok(written(at.value, wanted))
     }
 
     /// The coarsest level whose region containing `gpa` the verdict covers
@@ -339,17 +406,39 @@ impl Tree {
         }
     }
 
-    /// Writes an entry unless it already says exactly this.
+    /// Writes an entry unless it already says exactly this, and answers with
+    /// what that came to.
     ///
-    /// Which is not merely an economy: storing an identical value would discard
-    /// the accessed and dirty bits the processor has recorded there since, and
-    /// answering a fault on a page something already described is exactly when
-    /// that would happen.
-    fn install(&self, at: Reached, wanted: u64) -> Result<(), NptError> {
+    /// Leaving an identical value alone is not merely an economy: storing one
+    /// would discard the accessed and dirty bits the processor has recorded
+    /// there since, and answering a fault on a page something already
+    /// described is exactly when that would happen.
+    fn install(&self, at: Reached, wanted: u64) -> Result<Written, NptError> {
         if entry::unchanged(at.value, wanted) {
-            return Ok(());
+            return Ok(Written::Same);
         }
-        walk::store(self.window, at.table, at.index, wanted)
+        walk::store(self.window, at.table, at.index, wanted)?;
+        Ok(written(at.value, wanted))
+    }
+
+    /// Whether any entry of `table` names a table of its own rather than
+    /// describing memory.
+    ///
+    /// What a compaction has to ask before it detaches a table: an entry naming
+    /// another table below would be a whole subtree left behind, held by
+    /// nothing and describing nothing. A page table can never contain one —
+    /// every entry of one describes memory — so this only ever has anything
+    /// to find one level up.
+    fn branching(&self, table: PhysAddr, level: Level) -> Result<bool, NptError> {
+        let Some(below) = level.below() else {
+            // A level the architecture has no large page at is one this never
+            // reaches: nothing above asks to describe a region at the root, and
+            // the page table is where a walk arrives rather than descends from.
+            return Ok(true);
+        };
+        walk::any(self.window, table, |value| {
+            entry::present(value) && !entry::leaf(value, below)
+        })
     }
 
     /// The entry that describes `gpa` at the coarsest level at or below `level`
@@ -448,6 +537,42 @@ impl Tree {
         })
     }
 
+    /// The entry that describes the `level` region containing `gpa`, building
+    /// nothing and descending no further.
+    ///
+    /// `None` where the walk cannot get that far, which is one answer for two
+    /// shapes: an absent entry above `level`, and a leaf above it. Both mean
+    /// the tree holds no table at `level` for this address, and so that
+    /// there is nothing there to be replaced by one entry.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::Unreachable`] if the window does not reach one of these
+    /// tables.
+    fn reached(&self, level: Level, gpa: PhysAddr) -> Result<Option<Reached>, NptError> {
+        let mut table = self.root;
+        for above in Level::TABLES {
+            let index = above.index(gpa);
+            let value = walk::load(self.window, table, index)?;
+            if above == level {
+                return Ok(Some(Reached {
+                    table,
+                    index,
+                    level: above,
+                    value,
+                }));
+            }
+            if !entry::present(value) || entry::leaf(value, above) {
+                return Ok(None);
+            }
+            table = entry::frame(value);
+        }
+        // Every level a leaf may be coarsened to is one a table can name, so a
+        // walk that got past all of them was asked about the page table, which no
+        // entry names a table of.
+        Ok(None)
+    }
+
     /// The entry naming the table below one that named none.
     ///
     /// One of this processor's frames if the exchange is made, and whatever
@@ -519,6 +644,45 @@ impl Tree {
             encode(Entry::Table { frame }),
         )?;
         Ok(frame)
+    }
+}
+
+/// What writing one entry came to.
+///
+/// The whole of what a mutation needs in order to know what it owes: only an
+/// entry that described something else can have left a processor holding a
+/// translation these tables have stopped justifying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Written {
+    /// The entry already said this, so nothing was stored.
+    Same,
+    /// It described nothing, so nothing was cached that could disagree with
+    /// what it says now.
+    Filled,
+    /// It described something else, which a processor may still be acting on.
+    Replaced,
+}
+
+impl Written {
+    /// The one answer for both, which is whichever owes more.
+    ///
+    /// What a mutation over a run of pages comes to: the run owes whatever its
+    /// most demanding page owes, and the order the variants are declared in is
+    /// that ranking.
+    pub(crate) fn and(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+/// What replacing `was` with `wanted` came to, for an entry that is about to be
+/// or has just been stored.
+fn written(was: u64, wanted: u64) -> Written {
+    if entry::unchanged(was, wanted) {
+        Written::Same
+    } else if entry::present(was) {
+        Written::Replaced
+    } else {
+        Written::Filled
     }
 }
 

@@ -29,9 +29,8 @@
 //! read through a shared reference by all of them afterwards.
 //!
 //! The registrar never escapes that call. It is built, filled and sealed inside
-//! it, which is what keeps [`emulate`]'s guarantee intact — there is no moment
-//! at which something able to trap a region coexists with a guest that could
-//! have cached a translation of one.
+//! it, which is what makes the set something every processor can read without a
+//! lock: nothing that could add to it exists once a guest can run.
 
 #![no_std]
 
@@ -41,6 +40,7 @@ mod asid;
 
 use alloc::vec::Vec;
 
+use cpu::CpuIndex;
 use emulate::{Mmio, MmioError, Region, Registrar};
 use log::info;
 /// How a guest translates its addresses, which is what
@@ -106,10 +106,12 @@ impl Partition {
     /// Takes over the regions the hypervisor answers for instead of the
     /// hardware behind them.
     ///
-    /// Called once, on the boot processor, before any processor has entered the
-    /// guest — which is what trapping a region requires, since reducing what
-    /// the nested tables permit while a guest is running would mean
-    /// discarding every processor's cached translations first.
+    /// Called once, on the boot processor: the set of devices is sealed by the
+    /// registrar that filled it, which is what makes it safe to read from every
+    /// processor afterwards. Trapping the regions is no longer what constrains
+    /// when this happens — the nested tables report what they made stricter and
+    /// discharge it — but the set itself is still filled once and then only
+    /// read.
     ///
     /// Room for every region is reserved before any of them is taken over, so
     /// that running out of memory is a failure that has changed nothing rather
@@ -201,9 +203,7 @@ impl Partition {
     ///
     /// What the interrupt controllers' register page becomes when the
     /// processor serves the controller itself: a read that no longer exits
-    /// must still land somewhere. Called once, before any processor has
-    /// entered the guest, for the same cache coherency reason as
-    /// [`Partition::expose`].
+    /// must still land somewhere.
     ///
     /// The page it leaves behind is the one exception to the rest of the chunk
     /// being an immutable page of zeroes to the guest, and it is an exception
@@ -214,13 +214,18 @@ impl Partition {
     /// frame is allocated for this page alone, never released, and read
     /// back by nothing.
     ///
+    /// Whatever this made stricter is discharged before it returns.
+    ///
     /// # Errors
     ///
     /// [`PartitionError::Npt`] if the page cannot be sunk — because it is
     /// already sunk, because it is one the hypervisor has taken over, or
-    /// because the chunk cannot spare the frame behind it.
+    /// because the chunk cannot spare the frame behind it — or if a processor
+    /// inside the guest could not be made to leave it.
     pub fn sink(&self, space: &mut AddressSpace, gpa: PhysAddr) -> Result<(), PartitionError> {
-        Ok(self.npt.lock().sink(space.frames(), gpa)?)
+        let npt = self.npt.lock();
+        let change = npt.sink(space.frames(), gpa)?;
+        Ok(npt.barrier(change)?)
     }
 
     /// Describes the region containing a guest physical address the guest could
@@ -243,14 +248,15 @@ impl Partition {
     /// Makes immutable hypervisor-owned entry code or data visible to the
     /// guest.
     ///
-    /// This may be called only while the guest has not run, for the same cache
-    /// coherency reason as [`Npt::expose`]. The allocator the tables it needs
-    /// come from is the caller's, which is what the address space is while the
-    /// guest is being built.
+    /// The allocator the tables it needs come from is the caller's, which is
+    /// what the address space is while the guest is being built. Whatever this
+    /// made stricter is discharged before it returns, which for a page nothing
+    /// had described is nothing at all.
     ///
     /// # Errors
     ///
-    /// [`PartitionError::Npt`] if the requested range cannot be exposed.
+    /// [`PartitionError::Npt`] if the requested range cannot be exposed, or if
+    /// a processor inside the guest could not be made to leave it.
     pub fn expose(
         &self,
         space: &mut AddressSpace,
@@ -258,26 +264,44 @@ impl Partition {
         bytes: u64,
         exposure: Exposure,
     ) -> Result<(), PartitionError> {
-        Ok(self
-            .npt
-            .lock()
-            .expose(space.frames(), gpa, bytes, exposure)?)
+        let npt = self.npt.lock();
+        let change = npt.expose(space.frames(), gpa, bytes, exposure)?;
+        Ok(npt.barrier(change)?)
     }
 
     /// Takes back what [`Partition::expose`] made visible, leaving the range
     /// reading as zeroes like the rest of the hypervisor's memory.
     ///
-    /// Unlike exposing, this may be called while the guest is running — it is
-    /// how entry code is retired once the guest is past it. It takes permission
-    /// away, so every processor that has run this guest must discard what it
-    /// cached from these tables before entering it again; with one processor
-    /// running the guest, that is one flush on its next entry.
+    /// How entry code is retired once the guest is past it. It takes permission
+    /// away, so a processor that has run this guest may hold a translation
+    /// these tables no longer justify; the barrier that answers for it is
+    /// taken before this returns, and the processor making the next entry
+    /// discards what it cached on the way in.
     ///
     /// # Errors
     ///
-    /// [`PartitionError::Npt`] if the range cannot be concealed.
+    /// [`PartitionError::Npt`] if the range cannot be concealed, or if a
+    /// processor inside the guest could not be made to leave it.
     pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<(), PartitionError> {
-        Ok(self.npt.lock().conceal(gpa, bytes)?)
+        let npt = self.npt.lock();
+        let change = npt.conceal(gpa, bytes)?;
+        Ok(npt.barrier(change)?)
+    }
+
+    /// Publishes that this processor is entering the guest, and arms the
+    /// discard of what it cached of the guest's memory where that memory
+    /// has changed since its last entry.
+    ///
+    /// What the tables need on the way in, and the whole of what being able to
+    /// change a guest's memory while it runs costs a world switch.
+    pub fn before_entry(&self, vcpu: &mut Vcpu, who: CpuIndex) {
+        self.npt.lock().before_entry(vcpu, who);
+    }
+
+    /// Publishes that this processor has left the guest, so that a change to
+    /// the guest's memory stops having to make it leave.
+    pub fn after_exit(&self, who: CpuIndex) {
+        self.npt.lock().after_exit(who);
     }
 
     /// Borrows this guest's memory translated the way one virtual processor

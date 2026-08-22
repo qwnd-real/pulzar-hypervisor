@@ -170,6 +170,19 @@ impl Map {
         self.chunk
     }
 
+    /// Whether the map already says exactly this: a region taken over by
+    /// exactly this range, letting exactly these accesses through.
+    ///
+    /// What tells a mutation with nothing to do from one with something to
+    /// change. Exactly, and by the same geometry a region is given back by,
+    /// because a request covering part of a region is not that region — and is
+    /// refused when it is recorded rather than answered for here.
+    pub(crate) fn interposed(&self, range: Range, trap: Trap) -> bool {
+        self.regions
+            .find(range.first())
+            .is_some_and(|region| region.range == range && region.what.trap == trap)
+    }
+
     /// Records a region something other than the hardware answers for, and
     /// answers by what name.
     ///
@@ -559,6 +572,17 @@ impl Range {
             base: self.base + index * chunk::FRAME_SIZE,
             bytes: chunk::FRAME_SIZE,
         })
+    }
+
+    /// The first address of every `span`-aligned region of the address space
+    /// that any part of this run falls in.
+    ///
+    /// `span` is what one entry of some level describes, so this is exactly the
+    /// set of regions at that level whose granularity a mutation over this run
+    /// could have changed the need for.
+    pub(crate) fn aligned(self, span: u64) -> impl Iterator<Item = PhysAddr> {
+        (self.first() / span..=(self.end() - 1) / span)
+            .map(move |region| PhysAddr::new_truncate(region * span))
     }
 }
 

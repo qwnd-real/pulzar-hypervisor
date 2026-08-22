@@ -3,11 +3,12 @@
 //!
 //! # Registering is a different phase from dispatching, on purpose
 //!
-//! Trapping a region reduces what the nested tables permit, and reducing that
-//! while a guest is running would mean discarding every processor's cached
-//! translations before the guest could be let go again. Nothing here does that,
-//! because nothing here has to: regions are registered before the guest has
-//! ever run, when no translation can have been cached.
+//! Trapping a region reduces what the nested tables permit, so every processor
+//! that may have cached a translation of one has to be made to stop using it.
+//! The tables report what a trap made stricter and registering discharges that
+//! before it returns — which costs nothing at all here, because regions are
+//! registered before the guest has ever run, when no translation can have been
+//! cached.
 //!
 //! That is not a comment asking to be obeyed. [`Registrar`] is the only thing
 //! with a `register`, it borrows the nested tables for as long as it exists,
@@ -552,7 +553,10 @@ impl<'a> Registrar<'a> {
         // on: the tables already send them somewhere, and this device answers
         // only what is reported to it.
         if let Some(trap) = region.trap
-            && let Err(error) = self.npt.protect(self.space.frames(), gpa, bytes, trap)
+            && let Err(error) = self
+                .npt
+                .protect(self.space.frames(), gpa, bytes, trap)
+                .and_then(|change| self.npt.barrier(change))
         {
             // The aperture was made one statement ago, nothing has been handed its
             // address, and the region is not in the list — so nothing derived from
@@ -691,7 +695,9 @@ impl Mmio {
         let mut failure = None;
         for region in self.regions {
             if region.trap.is_some()
-                && let Err(error) = npt.release(region.gpa, region.end - region.gpa.as_u64())
+                && let Err(error) = npt
+                    .release(region.gpa, region.end - region.gpa.as_u64())
+                    .and_then(|change| npt.barrier(change))
             {
                 failure = failure.or(Some(MmioError::Npt(error)));
             }
