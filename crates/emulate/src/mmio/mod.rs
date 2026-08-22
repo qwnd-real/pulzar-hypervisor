@@ -461,13 +461,13 @@ impl Write<'_> {
 /// registrar is alive, and a registrar cannot outlive [`Registrar::seal`].
 pub struct Registrar<'a> {
     space: &'a mut AddressSpace,
-    npt: &'a mut Npt,
+    npt: &'a Npt,
     regions: Vec<Interposed>,
 }
 
 impl<'a> Registrar<'a> {
     /// Nothing trapped yet, with the tables to trap regions in.
-    pub fn new(space: &'a mut AddressSpace, npt: &'a mut Npt) -> Self {
+    pub fn new(space: &'a mut AddressSpace, npt: &'a Npt) -> Self {
         Self {
             space,
             npt,
@@ -556,7 +556,7 @@ impl<'a> Registrar<'a> {
             && let Err(error) = self
                 .npt
                 .protect(self.space.frames(), gpa, bytes, trap)
-                .and_then(|change| self.npt.barrier(change))
+                .and_then(|(_, change)| self.npt.barrier(change))
         {
             // The aperture was made one statement ago, nothing has been handed its
             // address, and the region is not in the list — so nothing derived from
@@ -690,7 +690,7 @@ impl Mmio {
     ///
     /// No processor may be running the guest these regions belong to, and
     /// nothing derived from any window may still be in use.
-    pub unsafe fn teardown(self, space: &mut AddressSpace, npt: &mut Npt) -> Teardown {
+    pub unsafe fn teardown(self, space: &mut AddressSpace, npt: &Npt) -> Teardown {
         let mut devices = Vec::new();
         let mut failure = None;
         for region in self.regions {

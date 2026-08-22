@@ -122,6 +122,19 @@
 //! redirecting every access away from it: an exit is no longer the expected
 //! shape of an access, and the page still has to translate to something.
 //!
+//! # Every region has a name, whichever way it is described
+//!
+//! Both operations hand out a [`RegionTag`], and [`Npt::region`] answers with
+//! the name and extent of the region containing an address. That is how
+//! something above these tables keeps a device per region without keeping a
+//! second copy of where the region is — and there is a reason the two
+//! descriptions share one set of names rather than only the trapped one having
+//! them. A processor serving a sunk page itself still reports back the accesses
+//! it declines to serve, and performing one of those means performing it
+//! against whatever answers for the page. So which description a region is in
+//! says how an access arrives and nothing about what answers for it, and the
+//! name is what stays the same across the two.
+//!
 //! # Why the memory type is write-back everywhere
 //!
 //! Under nested paging the effective memory type of a guest access is the
@@ -181,7 +194,7 @@ use crate::{
     tree::{Tree, Written},
 };
 pub use crate::{
-    map::{Access, Kind, MapError, Range, RegionTag, Trap, Verdict},
+    map::{Access, Answered, Kind, MapError, Range, RegionTag, Trap, Verdict},
     tree::walk::Level,
 };
 
@@ -420,7 +433,8 @@ impl Npt {
         self.coherence.left(who);
     }
 
-    /// Marks a range as one whose accesses are not the hardware's to answer.
+    /// Marks a range as one whose accesses are not the hardware's to answer,
+    /// and answers by what name.
     ///
     /// The range is described one page at a time, splitting whatever larger
     /// page covers it, because permissions belong to an entry and
@@ -431,6 +445,11 @@ impl Npt {
     /// enough on its own: [`Npt::fault`] would otherwise fill a trapped page
     /// back in the first time the guest touched it, and would describe a 2 MiB
     /// region straight over one.
+    ///
+    /// The name is what something else keys whatever answers for the region by.
+    /// It is handed out here rather than taken in because these tables are the
+    /// one record of where a region is, so they are also the only place that
+    /// can say which names are free.
     ///
     /// Answers with what it made stricter, which is [`Npt::barrier`]'s to
     /// discharge. A region the map already records by exactly this range and
@@ -453,28 +472,28 @@ impl Npt {
         gpa: PhysAddr,
         bytes: u64,
         trap: Trap,
-    ) -> Result<Change, NptError> {
+    ) -> Result<(RegionTag, Change), NptError> {
         let range = Range::new(gpa, bytes)?;
         // The map exclusively, and held across the tree as well, so that a fault
         // on another processor sees either all of this or none of it: one that
         // read the map before the region was recorded and described a page after
         // it was would describe a page nothing may describe.
         let mut map = self.map.write();
-        if map.interposed(range, trap) {
-            return Ok(Change::None);
+        if let Some(tag) = map.interposed(range, trap) {
+            return Ok((tag, Change::None));
         }
         // Recorded before it is described, so that a failure part-way through
         // leaves a region that still traps everything it should. The reverse
         // order would leave pages described as untouchable that nothing knows to
         // trap, which is a guest faulting for ever on an address the tables have
         // no answer for.
-        map.interpose(range, trap)?;
+        let tag = map.interpose(range, trap)?;
         let described = range.pages().try_fold(Written::Same, |written, page| {
             self.interpose(&map, frames, page.base())
                 .map(|entry| written.and(entry))
         });
         match described {
-            Ok(written) => Ok(owed(written, range)),
+            Ok(written) => Ok((tag, owed(written, range))),
             // The region is not described and so must not go on being recorded:
             // a record naming pages that were never trapped would refuse to let
             // `fault` describe them, and the guest would fault on them for ever
@@ -623,7 +642,7 @@ impl Npt {
 
     /// Describes one page as a place the guest may touch without anything
     /// answering: reads see what the frame holds and writes are kept by it,
-    /// but nothing reads it back.
+    /// but nothing reads it back. Answers by what name.
     ///
     /// The page gets a frame of its own rather than the shared page of zeroes
     /// the hypervisor's memory shadows onto, because that one is read-only for
@@ -633,6 +652,12 @@ impl Npt {
     /// The page is recorded as well as described, for the reason a trapped
     /// region is: [`Npt::fault`] would otherwise describe a large page straight
     /// over it the first time the guest touched a neighbour.
+    ///
+    /// It is named for the reason a trapped region is, too. A page given this
+    /// way is one whose accesses a processor performs itself and reports back
+    /// the ones it declines, and performing one of those means performing it
+    /// against whatever answers for the page — which is found by name, the same
+    /// name a trapped region would have been found by.
     ///
     /// Answers with what it made stricter, which for a page nothing described
     /// is nothing at all — filling an absent entry is the cheap direction,
@@ -645,7 +670,11 @@ impl Npt {
     /// aligned or addressable, something already describes it another way, a
     /// page already sunk included, or there is no room for another — or an
     /// error from allocating or reaching the frame behind it.
-    pub fn sink(&self, frames: &mut Frames, gpa: PhysAddr) -> Result<Change, NptError> {
+    pub fn sink(
+        &self,
+        frames: &mut Frames,
+        gpa: PhysAddr,
+    ) -> Result<(RegionTag, Change), NptError> {
         // Refused before a frame is taken for it, so that a page the map would
         // not describe this way costs the chunk nothing.
         let page = Range::new(gpa, chunk::FRAME_SIZE)?;
@@ -655,14 +684,75 @@ impl Npt {
         // consults: a page the map calls sunk is described that way whenever it
         // is next touched, while a page described as a sink that the map did not
         // record would be filled back over as ordinary memory.
-        if let Err(refused) = map.sink(gpa, frame) {
+        let tag = match map.sink(gpa, frame) {
+            Ok(tag) => tag,
             // The frame was handed out for a page the map will not describe that
             // way, so it goes back rather than being held by nothing.
-            frames::release(frames, frame);
-            return Err(refused.into());
-        }
+            Err(refused) => {
+                frames::release(frames, frame);
+                return Err(refused.into());
+            }
+        };
         let written = self.describe_page(&map, frames, gpa)?;
-        Ok(owed(written, page))
+        Ok((tag, owed(written, page)))
+    }
+
+    /// Stops giving one page to the guest, leaving it with no translation and
+    /// its frame to be handed back once a barrier has passed.
+    ///
+    /// The counterpart of [`Npt::sink`], for a page whose accesses stop being
+    /// somebody else's to perform. The entry is cleared rather than replaced,
+    /// for the reason [`Npt::release`] clears one: what the page *should* be
+    /// once it is no longer sunk is the question [`Npt::fault`] already
+    /// answers, and a page with no translation is where every page of a guest
+    /// starts.
+    ///
+    /// Always owes a barrier, and the frame is what owes it rather than the
+    /// entry. A processor that has entered this guest may hold a translation of
+    /// the page to a frame this hands back, so the frame is held aside until a
+    /// barrier has passed exactly as a table a compaction gave up is — and
+    /// unlike a trapped region, there is no state this is already in for the
+    /// transition to be free from, a page that is not sunk being refused
+    /// outright.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::Map`] if the page is not page aligned or was not being sunk,
+    /// or [`NptError::Unreachable`] if the window does not reach one of these
+    /// tables.
+    pub fn unsink(&self, gpa: PhysAddr) -> Result<Change, NptError> {
+        let page = Range::new(gpa, chunk::FRAME_SIZE)?;
+        let mut map = self.map.write();
+        // Forgotten first, so that a failure part-way through leaves a page that
+        // `fault` is willing to describe rather than one it describes as a sink
+        // the map no longer holds a frame for.
+        let frame = map.unsink(gpa)?;
+        // Before the compaction below, which stops detaining tables once there is
+        // nowhere left to keep one: the frame this page was given must be the
+        // first thing to get a place, since handing it out again while a
+        // processor still writes to it is the one failure that corrupts memory
+        // rather than costing a table.
+        self.frames.detain(frame);
+        self.tree.abandon(gpa)?;
+        Ok(Change::Tightened {
+            first: page.base(),
+            bytes: page.bytes(),
+        }
+        .and(self.coarsen(&map, page)?))
+    }
+
+    /// The region something other than the hardware answers for that `gpa` is
+    /// in, or `None` if the hardware answers for it.
+    ///
+    /// How anything above these tables finds what answers for an address
+    /// without keeping its own copy of where the region is. Both
+    /// descriptions of a region answer: one whose accesses fault, and one
+    /// given to the guest over a frame nothing reads because a processor
+    /// performs them itself. Which of the two says how an access arrives,
+    /// not what answers for it.
+    #[must_use]
+    pub fn region(&self, gpa: PhysAddr) -> Option<Answered> {
+        self.map.read().region(gpa)
     }
 
     /// Logs the shape of the translation, which is the whole of what a guest's
@@ -1085,7 +1175,9 @@ pub(crate) mod tests {
     use svm::exit::NestedPageFault;
     use x86_64::{PhysAddr, VirtAddr};
 
-    use super::{Change, MapError, Npt, NptError, Resolution, Translation, Trap, chunk};
+    use super::{
+        Answered, Change, MapError, Npt, NptError, Range, Resolution, Translation, Trap, chunk,
+    };
 
     /// Where the interrupt controllers' register page is, which is the one page
     /// a boot chooses between these two descriptions for.
@@ -1126,7 +1218,7 @@ pub(crate) mod tests {
         let page = PhysAddr::new(REGISTER_PAGE);
 
         npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
-            .map(|change| discharge(&npt, change))
+            .map(|(_, change)| discharge(&npt, change))
             .expect("the page can be trapped");
 
         assert_eq!(
@@ -1157,7 +1249,7 @@ pub(crate) mod tests {
         let page = PhysAddr::new(REGISTER_PAGE);
 
         npt.sink(&mut frames, page)
-            .map(|change| discharge(&npt, change))
+            .map(|(_, change)| discharge(&npt, change))
             .expect("the page can be sunk");
 
         let translation = npt
@@ -1188,7 +1280,7 @@ pub(crate) mod tests {
         let trapped = Npt::create(&mut frames, window).expect("tables over the chunk");
         trapped
             .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
-            .map(|change| discharge(&trapped, change))
+            .map(|(_, change)| discharge(&trapped, change))
             .expect("the page can be trapped");
         assert_eq!(
             trapped.sink(&mut frames, page),
@@ -1201,7 +1293,7 @@ pub(crate) mod tests {
 
         let sunk = Npt::create(&mut frames, window).expect("tables over the chunk");
         sunk.sink(&mut frames, page)
-            .map(|change| discharge(&sunk, change))
+            .map(|(_, change)| discharge(&sunk, change))
             .expect("the page can be sunk");
         assert_eq!(
             sunk.release(page, FRAME_SIZE),
@@ -1214,6 +1306,119 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn either_description_of_a_page_gives_it_a_name_something_else_can_find_it_by() {
+        let (mut frames, window) = reserved();
+        let page = PhysAddr::new(REGISTER_PAGE);
+        let whole = Range::new(page, FRAME_SIZE).expect("one page is a range");
+
+        let trapped = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let named = trapped
+            .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .map(|(tag, change)| {
+                discharge(&trapped, change);
+                tag
+            })
+            .expect("the page can be trapped");
+        assert_eq!(
+            trapped.region(page),
+            Some(Answered {
+                tag: named,
+                range: whole,
+            }),
+            "a trapped region is found by the name the tables handed out"
+        );
+
+        let sunk = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let given = sunk
+            .sink(&mut frames, page)
+            .map(|(tag, change)| {
+                discharge(&sunk, change);
+                tag
+            })
+            .expect("the page can be sunk");
+        assert_eq!(
+            sunk.region(page),
+            Some(Answered {
+                tag: given,
+                range: whole,
+            }),
+            "and so is a page given to the guest instead, because what answers for a \
+             region does not depend on how its accesses arrive"
+        );
+        assert_eq!(
+            sunk.region(page + FRAME_SIZE),
+            None,
+            "while the page beside it is the hardware's to answer for"
+        );
+    }
+
+    #[test]
+    fn giving_a_sunk_page_up_holds_its_frame_back_until_a_barrier_has_passed() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+        npt.sink(&mut frames, page)
+            .map(|(_, change)| discharge(&npt, change))
+            .expect("the page can be sunk");
+        assert_ne!(
+            translated(&npt, page).spa,
+            page,
+            "a sunk page translates to a frame of the chunk rather than to itself"
+        );
+
+        let change = npt.unsink(page).expect("the page can be given up");
+
+        assert!(
+            matches!(
+                change,
+                Change::Tightened { first, bytes }
+                    if first.as_u64() <= REGISTER_PAGE
+                        && REGISTER_PAGE + FRAME_SIZE <= first.as_u64() + bytes
+            ),
+            "a processor may hold a translation to the frame this hands back, and \
+             there is no state a page that was not sunk could be coming from — the \
+             run is wider than the page because the region around it stopped \
+             needing to be written down finely at the same moment"
+        );
+        let detained = npt.frames.detained();
+        assert!(
+            detained > 0,
+            "so the frame waits for the barrier rather than being handed out again"
+        );
+        // Room for them to come back to, as the compaction test needs: a barrier
+        // hands detained frames to this processor's list, and reaches the chunk
+        // only for what the list will not hold.
+        for _ in 0..detained {
+            npt.frames
+                .take()
+                .expect("a stocked list has frames to spare");
+        }
+        let held = npt.frames.held();
+
+        discharge(&npt, change);
+
+        assert_eq!(
+            (npt.frames.held(), npt.frames.detained()),
+            (held + detained, 0),
+            "and the barrier is what hands it back"
+        );
+        assert_eq!(
+            translated(&npt, page).spa,
+            page,
+            "after which the page is the machine's own memory at the same address"
+        );
+        assert_eq!(
+            npt.unsink(page),
+            Err(NptError::Map(MapError::NoRegion {
+                base: REGISTER_PAGE,
+                bytes: FRAME_SIZE,
+            })),
+            "with nothing left to give up and no name still held for it"
+        );
+        assert_eq!(npt.region(page), None);
+    }
+
+    #[test]
     fn a_trapped_page_narrows_its_own_two_megabytes_and_nothing_further() {
         let (mut frames, window) = reserved();
         let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
@@ -1223,7 +1428,7 @@ pub(crate) mod tests {
         let trapped = PhysAddr::new(REGISTER_PAGE + FRAME_SIZE);
 
         npt.protect(&mut frames, trapped, FRAME_SIZE, Trap::Everything)
-            .map(|change| discharge(&npt, change))
+            .map(|(_, change)| discharge(&npt, change))
             .expect("the page can be trapped");
 
         for (gpa, span) in [
@@ -1261,15 +1466,20 @@ pub(crate) mod tests {
         let (mut frames, window) = reserved();
         let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
         let page = PhysAddr::new(REGISTER_PAGE);
-        npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
-            .map(|change| discharge(&npt, change))
+        let named = npt
+            .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .map(|(tag, change)| {
+                discharge(&npt, change);
+                tag
+            })
             .expect("the page can be trapped");
 
         assert_eq!(
             npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything),
-            Ok(Change::None),
+            Ok((named, Change::None)),
             "a description the map already holds is a transition that did not \
-             happen, and nothing is told about one"
+             happen, and nothing is told about one — and it answers with the name \
+             the region already had"
         );
     }
 
@@ -1281,7 +1491,7 @@ pub(crate) mod tests {
         npt.fault(page, fault(false))
             .expect("the fault can be answered");
 
-        let change = npt
+        let (_, change) = npt
             .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
             .expect("the page can be trapped while a guest is running");
 
@@ -1302,7 +1512,7 @@ pub(crate) mod tests {
         let (mut frames, window) = reserved();
         let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
 
-        let change = npt
+        let (_, change) = npt
             .sink(&mut frames, PhysAddr::new(REGISTER_PAGE))
             .expect("the page can be sunk");
 
@@ -1360,7 +1570,7 @@ pub(crate) mod tests {
             .expect("the fault can be answered");
         let before = probes.map(|gpa| translated(&npt, gpa));
         npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
-            .map(|change| discharge(&npt, change))
+            .map(|(_, change)| discharge(&npt, change))
             .expect("the page can be trapped");
 
         let change = npt
@@ -1516,7 +1726,7 @@ pub(crate) mod tests {
             });
             together.wait();
             npt.protect(&mut frames, inside, FRAME_SIZE, Trap::Everything)
-                .map(|change| discharge(&npt, change))
+                .map(|(_, change)| discharge(&npt, change))
                 .expect("the page can be taken over while another processor faults");
         });
 

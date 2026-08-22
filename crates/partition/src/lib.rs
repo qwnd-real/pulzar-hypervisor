@@ -133,8 +133,8 @@ impl Partition {
         let regions = regions.into_iter().collect::<Vec<_>>();
         self.devices.call_once(|| {
             sealed = true;
-            let mut npt = self.npt.lock();
-            let mut registrar = Registrar::new(space, &mut npt);
+            let npt = self.npt.lock();
+            let mut registrar = Registrar::new(space, &npt);
             outcome = registrar
                 .reserve(regions.len())
                 .map_err(PartitionError::from);
@@ -224,7 +224,7 @@ impl Partition {
     /// inside the guest could not be made to leave it.
     pub fn sink(&self, space: &mut AddressSpace, gpa: PhysAddr) -> Result<(), PartitionError> {
         let npt = self.npt.lock();
-        let change = npt.sink(space.frames(), gpa)?;
+        let (_, change) = npt.sink(space.frames(), gpa)?;
         Ok(npt.barrier(change)?)
     }
 

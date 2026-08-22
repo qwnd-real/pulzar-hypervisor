@@ -71,7 +71,7 @@ pub(crate) struct Map {
     regions: Regions<Interposition, REGIONS>,
     /// The pages the guest may write that nothing reads back, and the frames
     /// their writes are kept by.
-    sinks: Regions<PhysAddr, SINKS>,
+    sinks: Regions<Sunk, SINKS>,
     /// The pages of the hypervisor's own memory the guest is shown, and what it
     /// may do with each.
     exposures: Regions<Access, EXPOSED_PAGES>,
@@ -126,7 +126,7 @@ impl Map {
             return verdict(
                 sunk.range.first(),
                 sunk.range.end(),
-                Kind::Sink { spa: sunk.what },
+                Kind::Sink { spa: sunk.what.spa },
             );
         }
         if let Some(shown) = self.exposures.find(address) {
@@ -170,17 +170,44 @@ impl Map {
         self.chunk
     }
 
-    /// Whether the map already says exactly this: a region taken over by
-    /// exactly this range, letting exactly these accesses through.
+    /// The region something other than the hardware answers for that `gpa` is
+    /// in, or `None` if the hardware answers for it.
+    ///
+    /// Both descriptions of such a region answer here: one whose accesses fault
+    /// so that the hypervisor performs them, and one given to the guest over a
+    /// frame nothing reads because a processor performs them itself and reports
+    /// back the ones it declines. Which of the two a region is in says how an
+    /// access *arrives*; it does not change what answers for the region, and
+    /// this is the question something keying a device by name is asking.
+    pub(crate) fn region(&self, gpa: PhysAddr) -> Option<Answered> {
+        let address = gpa.as_u64();
+        let trapped = self
+            .regions
+            .find(address)
+            .map(|region| (region.range, region.what.tag));
+        trapped
+            .or_else(|| {
+                self.sinks
+                    .find(address)
+                    .map(|sunk| (sunk.range, sunk.what.tag))
+            })
+            .map(|(range, tag)| Answered { tag, range })
+    }
+
+    /// The name of the region the map already records by exactly this range,
+    /// letting exactly these accesses through, or `None` if it records no such
+    /// region.
     ///
     /// What tells a mutation with nothing to do from one with something to
-    /// change. Exactly, and by the same geometry a region is given back by,
-    /// because a request covering part of a region is not that region — and is
-    /// refused when it is recorded rather than answered for here.
-    pub(crate) fn interposed(&self, range: Range, trap: Trap) -> bool {
+    /// change, and what it answers with is the name that region already holds.
+    /// Exactly, and by the same geometry a region is given back by, because a
+    /// request covering part of a region is not that region — and is refused
+    /// when it is recorded rather than answered for here.
+    pub(crate) fn interposed(&self, range: Range, trap: Trap) -> Option<RegionTag> {
         self.regions
             .find(range.first())
-            .is_some_and(|region| region.range == range && region.what.trap == trap)
+            .filter(|region| region.range == range && region.what.trap == trap)
+            .map(|region| region.what.tag)
     }
 
     /// Records a region something other than the hardware answers for, and
@@ -216,12 +243,18 @@ impl Map {
     }
 
     /// Records one page as somewhere the guest's writes may go and nothing
-    /// reads, and the frame that keeps them.
+    /// reads, the frame that keeps them, and answers by what name.
     ///
     /// One page and not a range, because the frame is one frame: a run of pages
     /// answering with a single frame would be a run whose pages all translate
     /// to the same place, which is not something anything here wants and is
     /// a live-lock if a fault ever believed it.
+    ///
+    /// Named like a trapped region, and from the same names, because it is one:
+    /// what a guest's access to such a page reaches is a device this hypervisor
+    /// answers for, and the only difference is that a processor performs most
+    /// of those accesses itself. A name is what lets whatever answers be
+    /// found for the ones it does not.
     ///
     /// # Errors
     ///
@@ -230,7 +263,7 @@ impl Map {
     /// address, [`MapError::Overlaps`] if it is already described another
     /// way — a page already sunk included — or [`MapError::Full`] if there
     /// is no room for another.
-    pub(crate) fn sink(&mut self, page: PhysAddr, frame: PhysAddr) -> Result<(), MapError> {
+    pub(crate) fn sink(&mut self, page: PhysAddr, frame: PhysAddr) -> Result<RegionTag, MapError> {
         let page = Range::new(page, chunk::FRAME_SIZE)?;
         self.addressable(page)?;
         exclusive(
@@ -239,7 +272,21 @@ impl Map {
                 .clashing(page)
                 .or_else(|| self.exposures.clashing(page)),
         )?;
-        self.sinks.insert(page, frame)
+        let tag = self.name()?;
+        self.sinks.insert(page, Sunk { spa: frame, tag })?;
+        Ok(tag)
+    }
+
+    /// Stops sinking one page, and answers with the frame its writes were being
+    /// kept by so that it can be handed back.
+    ///
+    /// # Errors
+    ///
+    /// [`MapError::Geometry`] unless the address is page aligned, or
+    /// [`MapError::NoRegion`] if the page was not being sunk.
+    pub(crate) fn unsink(&mut self, page: PhysAddr) -> Result<PhysAddr, MapError> {
+        let page = Range::new(page, chunk::FRAME_SIZE)?;
+        Ok(self.sinks.remove(page)?.spa)
     }
 
     /// Records a range of the hypervisor's own memory as one the guest is
@@ -308,10 +355,11 @@ impl Map {
         }
         for sunk in self.sinks.iter() {
             info!(
-                "{who}: npt sinks guest physical {:#x} onto frame {:#x}, writable and never read \
-                 back",
+                "{who}: npt sinks guest physical {:#x} onto frame {:#x} as region {}, writable and \
+                 never read back",
                 sunk.range.first(),
-                sunk.what,
+                sunk.what.spa,
+                sunk.what.tag.number(),
             );
         }
         for shown in self.exposures.iter() {
@@ -332,18 +380,36 @@ impl Map {
     /// Drawn from the regions themselves rather than from a counter, because a
     /// counter that wrapped would hand out a name a live region still holds,
     /// and whatever keyed a device by that name would then reach the wrong
-    /// device. There are a thousand names for every region the set can
-    /// hold, so one is free whenever there is room for a region at all.
+    /// device. Both sets are searched, because both hold regions this
+    /// hypervisor answers for and a name has to mean one of them.
+    ///
+    /// Bounded by [`RegionTag::LIMIT`], which is what makes a name small enough
+    /// to index by: the lowest free name is never higher than the number of
+    /// regions that can hold one at once, so a set with room for a region has
+    /// room for its name.
     fn name(&self) -> Result<RegionTag, MapError> {
-        (0..=u16::MAX)
+        (0..u16::MAX)
             .map(RegionTag)
-            .find(|candidate| {
-                !self
-                    .regions
-                    .iter()
-                    .any(|region| region.what.tag == *candidate)
+            .take(RegionTag::LIMIT)
+            .find(|candidate| self.region_named(*candidate).is_none())
+            .ok_or(MapError::Full {
+                limit: RegionTag::LIMIT,
             })
-            .ok_or(MapError::Full { limit: REGIONS })
+    }
+
+    /// The range the region of that name covers, or `None` if no region holds
+    /// it.
+    fn region_named(&self, tag: RegionTag) -> Option<Range> {
+        self.regions
+            .iter()
+            .find(|region| region.what.tag == tag)
+            .map(|region| region.range)
+            .or_else(|| {
+                self.sinks
+                    .iter()
+                    .find(|sunk| sunk.what.tag == tag)
+                    .map(|sunk| sunk.range)
+            })
     }
 
     /// Refuses a range that reaches past what the processor can address.
@@ -470,11 +536,33 @@ pub enum Trap {
 pub struct RegionTag(pub(crate) u16);
 
 impl RegionTag {
+    /// One past the highest name the tables ever hand out.
+    ///
+    /// A name is the lowest one no live region holds, so it is never higher
+    /// than the number of regions that can hold one at once — which is what
+    /// lets something keying a device by name keep one slot per name in a
+    /// fixed array rather than searching or allocating.
+    pub const LIMIT: usize = REGIONS + SINKS;
+
     /// The name, as a number something else can index by.
     #[must_use]
     pub const fn number(self) -> u16 {
         self.0
     }
+}
+
+/// A region of a guest's memory something other than the hardware answers for:
+/// what it is called, and which of the guest's addresses it covers.
+///
+/// The whole of what something keying a device by region needs, and
+/// deliberately not the trap: how an access arrives is the tables' business,
+/// and what answers for it is the same either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Answered {
+    /// The name whatever answers for the region is known by.
+    pub tag: RegionTag,
+    /// Which of the guest's physical addresses it covers.
+    pub range: Range,
 }
 
 /// A run of guest physical addresses: a whole number of pages, on a page
@@ -536,7 +624,13 @@ impl Range {
     }
 
     /// Whether an address is inside the run.
-    pub(crate) const fn contains(self, gpa: u64) -> bool {
+    ///
+    /// Takes the address as an integer, because one caller asks about the last
+    /// byte of an access and that byte may be the last of the physical address
+    /// space — which is a number but not a [`PhysAddr`] that can be
+    /// constructed.
+    #[must_use]
+    pub const fn contains(self, gpa: u64) -> bool {
         self.first() <= gpa && gpa < self.end()
     }
 
@@ -656,6 +750,15 @@ struct Interposition {
     tag: RegionTag,
 }
 
+/// What the map says about a page the guest may write that nothing reads back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sunk {
+    /// The frame the guest's writes are kept by.
+    spa: PhysAddr,
+    /// The name whatever answers for the page is known by.
+    tag: RegionTag,
+}
+
 /// A verdict over the run from `first` up to but not including `end`.
 ///
 /// Every run the map answers with begins at or below the address it was asked
@@ -716,7 +819,7 @@ const ADDRESS_BITS: u8 = 52;
 const ADDRESS_LIMIT: u64 = 1 << ADDRESS_BITS;
 
 const _: () = assert!(
-    REGIONS < 1 << 16,
+    RegionTag::LIMIT < 1 << 16,
     "every region must have a name the tag type can hold",
 );
 const _: () = assert!(
@@ -737,7 +840,8 @@ mod tests {
     use x86_64::PhysAddr;
 
     use super::{
-        ADDRESS_LIMIT, Access, Kind, Map, MapError, REGIONS, Range, RegionTag, Trap, chunk,
+        ADDRESS_LIMIT, Access, Answered, Kind, Map, MapError, REGIONS, Range, RegionTag, Trap,
+        chunk,
     };
 
     /// The page every range here is measured in.
@@ -1108,6 +1212,92 @@ mod tests {
         assert!(
             matches!(map.resolve(PhysAddr::new(DEVICE)).kind, Kind::Ram { .. }),
             "and the memory behind it is ordinary again"
+        );
+    }
+
+    #[test]
+    fn both_descriptions_of_a_region_are_named_out_of_one_set() {
+        let mut map = map();
+        let sunk = NOWHERE + PAGE;
+        let trapped = map
+            .interpose(range(DEVICE, 2 * PAGE), Trap::Writes)
+            .expect("a region whose writes are trapped");
+        let given = map
+            .sink(PhysAddr::new(sunk), PhysAddr::new(CHUNK + 2 * PAGE))
+            .expect("a page given to the guest over a frame nothing reads");
+
+        assert_ne!(
+            trapped, given,
+            "one name is held by one region at a time, whichever way the two are described"
+        );
+        assert_eq!(
+            map.region(PhysAddr::new(DEVICE + PAGE)),
+            Some(Answered {
+                tag: trapped,
+                range: range(DEVICE, 2 * PAGE),
+            }),
+            "a trapped region answers with its name and the whole of its extent"
+        );
+        assert_eq!(
+            map.region(PhysAddr::new(sunk)),
+            Some(Answered {
+                tag: given,
+                range: range(sunk, PAGE),
+            }),
+            "and so does a page given rather than trapped, which is what lets one \
+             device be found however its accesses arrive"
+        );
+        assert_eq!(
+            map.region(PhysAddr::new(NOWHERE)),
+            None,
+            "while an address the hardware answers for is in no region at all"
+        );
+    }
+
+    #[test]
+    fn a_name_is_free_again_once_the_region_holding_it_has_gone() {
+        let mut map = map();
+        let first = map
+            .interpose(range(DEVICE, PAGE), Trap::Everything)
+            .expect("a region");
+
+        map.release(range(DEVICE, PAGE))
+            .expect("the region can be given back");
+        let again = map
+            .interpose(range(DEVICE, PAGE), Trap::Everything)
+            .expect("and taken over again");
+
+        assert_eq!(
+            first, again,
+            "a name is drawn from the live regions, so the lowest one comes back \
+             the moment nothing holds it"
+        );
+    }
+
+    #[test]
+    fn a_page_that_was_never_sunk_has_no_frame_to_give_back() {
+        let mut map = map();
+        let page = PhysAddr::new(NOWHERE);
+        let frame = PhysAddr::new(CHUNK + 2 * PAGE);
+
+        assert_eq!(
+            map.unsink(page),
+            Err(MapError::NoRegion {
+                base: NOWHERE,
+                bytes: PAGE,
+            }),
+            "there is no state a page that is not sunk could be transitioning out of"
+        );
+        map.sink(page, frame).expect("the page can be sunk");
+        assert_eq!(
+            map.unsink(page),
+            Ok(frame),
+            "and giving it up answers with the frame its writes were kept by, which \
+             is the only record of where that frame went"
+        );
+        assert!(
+            matches!(map.resolve(page).kind, Kind::Ram { .. }),
+            "after which the memory behind it is ordinary again"
         );
     }
 
