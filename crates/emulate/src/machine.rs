@@ -31,6 +31,7 @@
 //! executing a vector instruction at all.
 
 use memory::{Addressing, MemoryError, Written};
+use npt::Answered;
 use svm::SaveArea;
 use x86_64::PhysAddr;
 
@@ -83,6 +84,12 @@ pub(crate) trait Cpu {
 /// Narrower than [`Linear`](memory::Linear) on purpose: this crate translates,
 /// reads and writes, and does nothing else to a guest's memory. Anything the
 /// trait does not offer is something the emulator has no business doing.
+///
+/// The one thing here that is not memory is [`Guest::region`], and it is here
+/// because this is the handle onto the nested tables: they hold the one record
+/// of which region of a guest's memory something other than the hardware
+/// answers for, and an emulated access has to ask before it decides where its
+/// operand is.
 pub(crate) trait Guest {
     /// Where a linear address lands in the guest's physical memory.
     ///
@@ -121,6 +128,15 @@ pub(crate) trait Guest {
     /// How this guest translates: its mode, its segment bases and its address
     /// widths.
     fn addressing(&self) -> &Addressing;
+
+    /// The region something other than the hardware answers for that a guest
+    /// physical address is in, or `None` if the hardware answers for it.
+    ///
+    /// Both descriptions of such a region answer: one whose accesses fault so
+    /// that this crate performs them, and one a processor serves itself and
+    /// reports back only what it declines. Which of the two says how an access
+    /// arrived here, not what answers for it.
+    fn region(&self, gpa: PhysAddr) -> Option<Answered>;
 }
 
 /// The hypervisor's own virtual processor, which is the only implementation
@@ -178,6 +194,10 @@ impl Guest for memory::Linear<'_> {
     fn addressing(&self) -> &Addressing {
         Self::addressing(self)
     }
+
+    fn region(&self, gpa: PhysAddr) -> Option<Answered> {
+        self.physical().region(gpa)
+    }
 }
 
 #[cfg(test)]
@@ -189,7 +209,7 @@ pub(crate) mod tests {
     use svm::{SaveArea, SegmentAttributes};
     use x86_64::PhysAddr;
 
-    use super::{Cpu, Guest};
+    use super::{Answered, Cpu, Guest};
     use crate::{
         value::{WIDEST, Width},
         xmm::Vector,
@@ -352,6 +372,14 @@ pub(crate) mod tests {
     pub(crate) struct Memory {
         pages: RefCell<BTreeMap<u64, Page>>,
         addressing: Option<Addressing>,
+        /// Which regions something other than the hardware answers for, as the
+        /// nested tables would record them.
+        ///
+        /// Told separately from the set of devices, because that is how the two
+        /// really are: this stands in for the tables, which are the one record
+        /// of where a region is, and what answers for one is recorded
+        /// elsewhere under the name they both use.
+        regions: Vec<Answered>,
         /// How many times a linear address has been translated.
         ///
         /// A real translation is a walk of the guest's own page tables, which
@@ -377,8 +405,16 @@ pub(crate) mod tests {
             Self {
                 pages: RefCell::new(BTreeMap::new()),
                 addressing: Some(machine.addressing()),
+                regions: Vec::new(),
                 walks: Cell::new(0),
             }
+        }
+
+        /// Records where each region something other than the hardware answers
+        /// for is, as the nested tables would.
+        pub(crate) fn describing(&mut self, regions: Vec<Answered>) -> &mut Self {
+            self.regions = regions;
+            self
         }
 
         /// Describes one page, at a guest physical address of this map's
@@ -532,6 +568,13 @@ pub(crate) mod tests {
             self.addressing
                 .as_ref()
                 .expect("a guest memory must be built from a machine")
+        }
+
+        fn region(&self, gpa: PhysAddr) -> Option<Answered> {
+            self.regions
+                .iter()
+                .find(|region| region.range.contains(gpa.as_u64()))
+                .copied()
         }
     }
 }

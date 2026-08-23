@@ -47,6 +47,18 @@ impl<'a> Physical<'a> {
             .ok_or(MemoryError::Undescribed { gpa: gpa.as_u64() })
     }
 
+    /// The region something other than the hardware answers for that a guest
+    /// physical address is in, or `None` if the hardware answers for it.
+    ///
+    /// Not a question about memory, and here because this is the handle onto
+    /// the tables that record it: an emulated access has to know which
+    /// device answers for the address it lands on, and the tables are the
+    /// one place where a region's name and its extent are kept.
+    #[must_use]
+    pub fn region(&self, gpa: PhysAddr) -> Option<npt::Answered> {
+        self.npt.region(gpa)
+    }
+
     /// Copies `into.len()` bytes of the guest's physical memory.
     ///
     /// # Errors

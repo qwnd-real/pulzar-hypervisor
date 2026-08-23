@@ -288,7 +288,8 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     if policy.enabled() {
         partition.sink(&mut space, vlapic::apic_page())?;
     }
-    partition.interpose(&mut space, [vlapic::region()?])?;
+    let owed = partition.interpose(&mut space, [vlapic::region()?])?;
+    partition.barrier(owed)?;
     let mut vcpu = virtualize(&mut space)?;
     seed(&mut vcpu, inherited(handoff)?, portal.entry());
     vcpu.describe("core");

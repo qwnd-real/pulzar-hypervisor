@@ -323,7 +323,6 @@ pub(crate) fn perform(
     };
 
     let plan = Plan::moving(
-        mmio,
         cpu,
         guest,
         instruction,
@@ -406,8 +405,8 @@ fn misaligned(plan: &Plan, form: Form) -> Option<Fault> {
 fn preflight(mmio: &Mmio, guest: &impl Guest, plan: &Plan) -> Result<(), EmulateError> {
     match plan.to.place {
         Place::Device {
-            index, offset, gpa, ..
-        } => mmio.admits(index, offset, gpa, plan.to.width),
+            tag, offset, gpa, ..
+        } => mmio.admits(tag, offset, gpa, plan.to.width),
         // Writing nothing, to find out whether writing something would be
         // allowed. The guest's memory answers all-or-nothing, so a zero-length
         // probe cannot tell us anything — the range itself has to be the one that

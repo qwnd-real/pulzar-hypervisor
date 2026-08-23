@@ -35,12 +35,13 @@
 
 use iced_x86::{Instruction, OpKind, Register};
 use memory::{Addressing, Segment, Written};
+use npt::RegionTag;
 use x86_64::PhysAddr;
 
 use crate::{
     EmulateError, gpr,
     machine::{Cpu, Guest},
-    mmio::Mmio,
+    mmio::{self, Mmio},
     plan,
     value::{Data, Width},
     xmm::Vector,
@@ -61,8 +62,8 @@ pub(crate) enum Place {
     Memory(u64),
     /// A region something answers for instead of the hardware.
     Device {
-        /// Which region.
-        index: usize,
+        /// Which region, by the name the nested tables gave it.
+        tag: RegionTag,
         /// How far into it.
         offset: u64,
         /// Where, as the guest thinks of the address.
@@ -104,7 +105,6 @@ impl Place {
 /// operand's bytes do not lie in one contiguous piece of one region, or
 /// [`EmulateError::Memory`] if the guest's own tables do not translate it.
 pub(crate) fn place(
-    mmio: &Mmio,
     cpu: &impl Cpu,
     guest: &impl Guest,
     instruction: &Instruction,
@@ -135,7 +135,7 @@ pub(crate) fn place(
     // The whole span, not its first byte: this is what establishes that one
     // access can describe the operand at all.
     let gpa = plan::contiguous(guest, linear, width)?;
-    mmio.classify(gpa, width, linear)
+    mmio::classify(guest, gpa, width, linear)
 }
 
 /// What is at one end of a move now.
@@ -188,8 +188,8 @@ pub(crate) fn load(
             })
         }
         Place::Device {
-            index, offset, gpa, ..
-        } => mmio.read(index, offset, gpa, width),
+            tag, offset, gpa, ..
+        } => mmio.read(tag, offset, gpa, width),
     }
 }
 
@@ -229,8 +229,8 @@ pub(crate) fn store(
             }),
         },
         Place::Device {
-            index, offset, gpa, ..
-        } => mmio.write(index, offset, gpa, value),
+            tag, offset, gpa, ..
+        } => mmio.write(tag, offset, gpa, value),
     }
 }
 
@@ -347,6 +347,7 @@ const fn segment(register: Register) -> Option<Segment> {
 mod tests {
     use iced_x86::{OpKind, Register};
     use memory::Segment;
+    use npt::RegionTag;
 
     use super::{Place, base, immediate, in_memory, index, infallible};
     use crate::{
@@ -491,7 +492,7 @@ mod tests {
         assert!(!infallible(Place::Memory(0x1000)));
         assert!(!infallible(Place::Immediate(1)));
         assert!(!infallible(Place::Device {
-            index: 0,
+            tag: RegionTag::new(0),
             offset: 0,
             gpa: x86_64::PhysAddr::new(0x1000),
             linear: 0x1000,
@@ -503,7 +504,7 @@ mod tests {
         assert_eq!(Place::Memory(0x1234).linear(), Some(0x1234));
         assert_eq!(
             Place::Device {
-                index: 0,
+                tag: RegionTag::new(0),
                 offset: 8,
                 gpa: x86_64::PhysAddr::new(0x2000),
                 linear: 0x5678,

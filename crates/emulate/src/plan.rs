@@ -43,7 +43,6 @@ use x86_64::PhysAddr;
 use crate::{
     EmulateError, Provenance, Spanning, as_u64,
     machine::{Cpu, Guest},
-    mmio::Mmio,
     operand::{self, Place},
     value::Width,
 };
@@ -128,7 +127,6 @@ impl Plan {
     /// Whatever resolving either operand reports, and [`EmulateError::Span`] if
     /// either end is a range that no single access covers.
     pub(crate) fn moving(
-        mmio: &Mmio,
         cpu: &impl Cpu,
         guest: &impl Guest,
         instruction: &Instruction,
@@ -138,12 +136,12 @@ impl Plan {
         let (source, destination) = operands;
         let (from, to) = (
             End {
-                place: operand::place(mmio, cpu, guest, instruction, source, widths.0)?,
+                place: operand::place(cpu, guest, instruction, source, widths.0)?,
                 width: widths.0,
                 direction: Direction::Read,
             },
             End {
-                place: operand::place(mmio, cpu, guest, instruction, destination, widths.1)?,
+                place: operand::place(cpu, guest, instruction, destination, widths.1)?,
                 width: widths.1,
                 direction: Direction::Write,
             },
@@ -414,9 +412,9 @@ impl Stride {
         self.end.place = match self.end.place {
             Place::Memory(_) => Place::Memory(linear),
             Place::Device {
-                index, offset, gpa, ..
+                tag, offset, gpa, ..
             } => Place::Device {
-                index,
+                tag,
                 offset: offset.checked_add_signed(by)?,
                 gpa: PhysAddr::new(gpa.as_u64().checked_add_signed(by)?),
                 linear,
@@ -535,6 +533,7 @@ fn pointer(addressing: &Addressing) -> Width {
 #[cfg(test)]
 mod tests {
     use iced_x86::Register;
+    use npt::RegionTag;
     use svm::{SaveArea, SegmentAttributes};
     use x86_64::PhysAddr;
 
@@ -693,7 +692,7 @@ mod tests {
     fn device(linear: u64, gpa: u64, offset: u64, width: Width) -> End {
         End {
             place: Place::Device {
-                index: 0,
+                tag: RegionTag::new(0),
                 offset,
                 gpa: PhysAddr::new(gpa),
                 linear,
@@ -723,7 +722,7 @@ mod tests {
         assert_eq!(
             stepped.end().place,
             Place::Device {
-                index: 0,
+                tag: RegionTag::new(0),
                 offset: 4,
                 gpa: PhysAddr::new(0xFEE0_0004),
                 linear: 0x8004,
@@ -739,7 +738,7 @@ mod tests {
         assert_eq!(
             stepped.end().place,
             Place::Device {
-                index: 0,
+                tag: RegionTag::new(0),
                 offset: 0xC,
                 gpa: PhysAddr::new(0xFEE0_000C),
                 linear: 0x800C,

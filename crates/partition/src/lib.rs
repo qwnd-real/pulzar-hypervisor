@@ -24,13 +24,15 @@
 //!
 //! Which regions of a guest's memory the hypervisor answers for is a property
 //! of the guest: a guest physical address means the same thing on every
-//! processor running it. So the sealed set lives here, filled once by
-//! [`Partition::interpose`] before any processor has entered the guest, and
-//! read through a shared reference by all of them afterwards.
+//! processor running it. So the set lives here, and every processor reaches the
+//! same one.
 //!
-//! The registrar never escapes that call. It is built, filled and sealed inside
-//! it, which is what makes the set something every processor can read without a
-//! lock: nothing that could add to it exists once a guest can run.
+//! What answers for a region and where the region is are two records, kept
+//! apart on purpose. Where it is belongs to the nested tables, which are the
+//! only thing a fault can consult; what answers for it belongs to the set here;
+//! and the two are tied by the name the tables hand out. So a device is
+//! registered at any time, a region is trapped or given at any time, and
+//! neither decision has to wait for the other.
 
 #![no_std]
 
@@ -38,19 +40,17 @@ extern crate alloc;
 
 mod asid;
 
-use alloc::vec::Vec;
-
 use cpu::CpuIndex;
-use emulate::{Mmio, MmioError, Region, Registrar};
+use emulate::{EmulateError, Mmio, MmioError, Outcome as Performed, Region};
 use log::info;
 /// How a guest translates its addresses, which is what
 /// [`Partition::with_memory`] needs and what a caller reads out of a virtual
 /// processor before borrowing one.
 pub use memory::Addressing;
 use memory::{Linear, Physical};
-use npt::{Exposure, Npt, NptError, Resolution};
+use npt::{Answered, Change, Exposure, Npt, NptError, RegionTag, Resolution};
 use paging::AddressSpace;
-use spin::{Mutex, Once};
+use spin::{Mutex, Once, RwLock};
 use svm::exit::NestedPageFault;
 use thiserror::Error;
 use vcpu::{AvicProvision, Guest, Host, Vcpu, VcpuError};
@@ -67,7 +67,7 @@ pub struct Partition {
     nested_cr3: PhysAddr,
     asid: Asid,
     avic: Option<vcpu::AvicTables>,
-    devices: Once<Mmio>,
+    devices: RwLock<Mmio>,
 }
 
 impl Partition {
@@ -99,66 +99,123 @@ impl Partition {
             npt: Mutex::new(npt),
             asid,
             avic,
-            devices: Once::new(),
+            devices: RwLock::new(Mmio::new()),
         })
     }
 
     /// Takes over the regions the hypervisor answers for instead of the
     /// hardware behind them.
     ///
-    /// Called once, on the boot processor: the set of devices is sealed by the
-    /// registrar that filled it, which is what makes it safe to read from every
-    /// processor afterwards. Trapping the regions is no longer what constrains
-    /// when this happens — the nested tables report what they made stricter and
-    /// discharge it — but the set itself is still filled once and then only
-    /// read.
+    /// Two things per region, and they are separate decisions tied by one name.
+    /// The nested tables are told to trap the region where the region is
+    /// trapped at all, and answer with the name they gave it; and the
+    /// device that answers for that name is recorded here. A region whose
+    /// `trap` is `None` says nothing to the tables — something else already
+    /// describes it, a page given to the guest over a frame nothing reads
+    /// being the case that exists — and the name it already holds is the
+    /// one its device is registered under.
     ///
-    /// Room for every region is reserved before any of them is taken over, so
-    /// that running out of memory is a failure that has changed nothing rather
-    /// than one discovered after the tables have been edited.
+    /// May be called at any time, as often as it likes: what a trap makes
+    /// stricter is answered with rather than discharged here, so a caller can
+    /// coalesce a set of them into one barrier.
     ///
     /// # Errors
     ///
-    /// [`PartitionError::AlreadyInterposed`] for a second call, or
-    /// [`PartitionError::Mmio`] if a region cannot be taken over. A region that
-    /// fails is undone in full; the regions taken over before it stay taken
-    /// over, because a half-trapped guest is not one to hand back.
+    /// [`PartitionError::Unnamed`] for a device offered for a region nothing
+    /// describes as one this hypervisor answers for, [`PartitionError::Npt`] if
+    /// a region cannot be trapped, or [`PartitionError::Mmio`] if a device
+    /// cannot be registered. A region that fails leaves the ones before it
+    /// registered, because a half-described guest is not one to hand back.
     pub fn interpose(
         &self,
         space: &mut AddressSpace,
         regions: impl IntoIterator<Item = Region>,
-    ) -> Result<(), PartitionError> {
-        let mut outcome = Ok(());
-        let mut sealed = false;
-        let regions = regions.into_iter().collect::<Vec<_>>();
-        self.devices.call_once(|| {
-            sealed = true;
-            let npt = self.npt.lock();
-            let mut registrar = Registrar::new(space, &npt);
-            outcome = registrar
-                .reserve(regions.len())
-                .map_err(PartitionError::from);
-            if outcome.is_ok() {
-                for region in regions {
-                    if let Err(error) = registrar.register(region) {
-                        outcome = Err(error.into());
-                        break;
-                    }
+    ) -> Result<Change, PartitionError> {
+        let npt = self.npt.lock();
+        let mut owed = Change::None;
+        for region in regions {
+            let (gpa, bytes) = (region.gpa, region.bytes);
+            let tag = match region.trap {
+                Some(trap) => {
+                    let (tag, change) = npt.protect(space.frames(), gpa, bytes, trap)?;
+                    owed = owed.and(change);
+                    tag
                 }
-            }
-            registrar.seal()
-        });
-        if !sealed {
-            return Err(PartitionError::AlreadyInterposed);
+                // Nothing for the tables to change: whatever describes the region
+                // already does, and a region they describe already has a name.
+                None => {
+                    npt.region(gpa)
+                        .ok_or(PartitionError::Unnamed { gpa: gpa.as_u64() })?
+                        .tag
+                }
+            };
+            self.devices
+                .write()
+                .register(space, tag, gpa, bytes, region.device)?;
         }
-        outcome
+        Ok(owed)
     }
 
-    /// What answers for the regions this guest is not allowed to reach the
-    /// hardware through, or `None` before [`Partition::interpose`].
+    /// Discharges what a change to the guest's memory made stricter, so that no
+    /// processor can begin an access with a translation it invalidated.
+    ///
+    /// Every operation that describes a guest's memory answers with what it
+    /// made stricter rather than discharging it, so a caller making several
+    /// of them pays for one barrier rather than one each. A
+    /// [`Change::None`] or a [`Change::Loosened`] costs nothing at all and
+    /// reaches nobody.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionError::Npt`] if a processor inside the guest could not be
+    /// made to leave it, which means it may still be acting on what the
+    /// change replaced.
+    pub fn barrier(&self, change: Change) -> Result<(), PartitionError> {
+        Ok(self.npt.lock().barrier(change)?)
+    }
+
+    /// The region something other than the hardware answers for that a guest
+    /// physical address is in, or `None` if the hardware answers for it.
+    ///
+    /// What an exit path asks when it has an address and needs the name the
+    /// device answering it is kept under — which is every exit that reports an
+    /// access the hardware performed part of rather than faulting on.
     #[must_use]
-    pub fn devices(&self) -> Option<&Mmio> {
-        self.devices.get()
+    pub fn region(&self, gpa: PhysAddr) -> Option<Answered> {
+        self.npt.lock().region(gpa)
+    }
+
+    /// Performs the instruction behind an access to a region this hypervisor
+    /// answers for.
+    ///
+    /// `tag` is the region the access is in, which the caller has from the
+    /// fault or from [`Partition::region`]. Nothing is decoded until
+    /// something is known to answer for it: a region that is described as
+    /// this hypervisor's with no device registered is a state the two
+    /// decisions being independent allows, and decoding an instruction to
+    /// dispatch into nothing would report the wrong thing about it.
+    ///
+    /// # Errors
+    ///
+    /// [`EmulateError::NoDevice`] if nothing answers for that region, or
+    /// whatever performing the instruction reports.
+    pub fn dispatch(
+        &self,
+        vcpu: &mut Vcpu,
+        tag: RegionTag,
+        gpa: PhysAddr,
+        cause: NestedPageFault,
+    ) -> Result<Performed, EmulateError> {
+        let devices = self.devices.read();
+        if !devices.answers(tag) {
+            return Err(EmulateError::NoDevice {
+                region: tag.number(),
+            });
+        }
+        let addressing = Addressing::from_save(vcpu.save());
+        let npt = self.npt.lock();
+        let physical = Physical::new(&npt, npt.window());
+        devices.dispatch(vcpu, Linear::new(physical, addressing), gpa, cause)
     }
 
     /// Builds the calling processor's virtual processor for this guest.
@@ -347,10 +404,7 @@ impl Partition {
     pub fn describe(&self, who: &str) {
         info!("{who}: partition tagged asid {}", self.asid.number());
         self.npt.lock().describe(who);
-        match self.devices.get() {
-            Some(devices) => devices.describe(who),
-            None => info!("{who}: this guest's trapped regions have not been sealed yet"),
-        }
+        self.devices.read().describe(who);
     }
 }
 
@@ -388,11 +442,14 @@ pub enum PartitionError {
         /// How many the processor supports, the host's own included.
         count: u32,
     },
-    /// The set of trapped regions has already been sealed, and sealing it is
-    /// what makes it safe to enter the guest.
-    #[error("this guest's trapped regions have already been sealed")]
-    AlreadyInterposed,
-    /// A region could not be taken over.
+    /// A device was offered for a region nothing describes as one this
+    /// hypervisor answers for, so there is no name to register it under.
+    #[error("nothing describes guest physical {gpa:#x} as a region this hypervisor answers for")]
+    Unnamed {
+        /// Where the region was said to begin.
+        gpa: u64,
+    },
+    /// A device could not be registered for a region.
     #[error(transparent)]
     Mmio(#[from] MmioError),
     /// The guest's memory could not be described.

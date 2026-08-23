@@ -90,8 +90,7 @@ use x86_64::PhysAddr;
 
 pub use crate::{
     mmio::{
-        Capability, Commit, Device, Hardware, Mmio, MmioError, Read, Region, Registrar, Teardown,
-        Trap, Write,
+        Capability, Commit, Device, Hardware, Mmio, MmioError, Read, Region, Retired, Trap, Write,
     },
     plan::Fault,
     value::{Data, Width},
@@ -438,11 +437,15 @@ pub enum EmulateError {
         /// What stopped the rest.
         cause: &'static str,
     },
-    /// A region was named that no longer exists.
-    #[error("there is no interposed region {index}")]
-    NoSuchRegion {
-        /// Which was named.
-        index: usize,
+    /// Nothing answers for the region an access falls in.
+    ///
+    /// A region the nested tables trap and nothing was registered for. The two
+    /// decisions are independent, so this is a state that can be reached — and
+    /// reporting it is the only honest answer, there being no device to ask.
+    #[error("no device answers for region {region}")]
+    NoDevice {
+        /// Which region was named.
+        region: u16,
     },
     /// The guest's memory could not be reached.
     #[error(transparent)]

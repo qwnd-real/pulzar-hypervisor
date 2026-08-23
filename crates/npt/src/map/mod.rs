@@ -544,6 +544,18 @@ impl RegionTag {
     /// fixed array rather than searching or allocating.
     pub const LIMIT: usize = REGIONS + SINKS;
 
+    /// The name that number is.
+    ///
+    /// The inverse of [`RegionTag::number`], for something that has kept a name
+    /// of its own and is turning it back into one — a slot it was the index of,
+    /// a number out of a log line. Not a way to find out which regions exist: a
+    /// name no region holds is a name nothing answers for, and whatever keys
+    /// something by one is told the name by the tables that handed it out.
+    #[must_use]
+    pub const fn new(number: u16) -> Self {
+        Self(number)
+    }
+
     /// The name, as a number something else can index by.
     #[must_use]
     pub const fn number(self) -> u16 {

@@ -145,7 +145,6 @@ pub(crate) fn perform(
             stepped
         } else {
             let planned = match Plan::moving(
-                mmio,
                 cpu,
                 guest,
                 instruction,
@@ -255,7 +254,7 @@ const fn describe(error: &EmulateError) -> &'static str {
         EmulateError::Committed { .. } => "a device read had already happened",
         EmulateError::Memory(_) => "the guest's memory could not be reached",
         EmulateError::WidthMismatch { .. } => "two ends disagreed about the width",
-        EmulateError::NoSuchRegion { .. } => "the region no longer exists",
+        EmulateError::NoDevice { .. } => "nothing answers for the region",
         _ => "the instruction could not be carried on",
     }
 }
@@ -312,8 +311,8 @@ fn committed(done: u32, plan: &Plan, error: EmulateError) -> Result<Outcome, Emu
 fn preflight(mmio: &Mmio, guest: &impl Guest, plan: &Plan) -> Result<(), EmulateError> {
     match plan.to.place {
         Place::Device {
-            index, offset, gpa, ..
-        } => mmio.admits(index, offset, gpa, plan.to.width),
+            tag, offset, gpa, ..
+        } => mmio.admits(tag, offset, gpa, plan.to.width),
         Place::Memory(linear) => {
             guest
                 .writable(linear, plan.to.width)?
@@ -458,7 +457,7 @@ mod tests {
         // Inventing a fault for one of these would tell the guest about a problem
         // in its own code that does not exist.
         for error in [
-            EmulateError::NoSuchRegion { index: 3 },
+            EmulateError::NoDevice { region: 3 },
             EmulateError::Inadmissible {
                 gpa: 0x1000,
                 bytes: 4,

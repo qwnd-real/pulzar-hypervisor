@@ -1,32 +1,36 @@
 //! The regions a guest is not allowed to reach the hardware through, and what
 //! answers for them instead.
 //!
-//! # Registering is a different phase from dispatching, on purpose
+//! # Registering a device and trapping a region are two decisions
 //!
-//! Trapping a region reduces what the nested tables permit, so every processor
-//! that may have cached a translation of one has to be made to stop using it.
-//! The tables report what a trap made stricter and registering discharges that
-//! before it returns — which costs nothing at all here, because regions are
-//! registered before the guest has ever run, when no translation can have been
-//! cached.
+//! What answers for a region is recorded here. Where the region is, and which
+//! of the guest's own accesses to it fault, is recorded in the nested page
+//! tables — and the two are tied together by the name those tables hand out for
+//! the region. So a device is registered at any time, in any order with respect
+//! to the tables being told anything, and neither decision constrains the
+//! other.
 //!
-//! That is not a comment asking to be obeyed. [`Registrar`] is the only thing
-//! with a `register`, it borrows the nested tables for as long as it exists,
-//! and the only way to get an [`Mmio`] — the thing an exit handler holds — is
-//! to consume the registrar with [`Registrar::seal`]. So by the time a guest
-//! can run, there is nothing in existence that could trap a region and nothing
-//! holding the tables that would have to be reached to try.
+//! That is not tidiness. There are two ways an access reaches a device and only
+//! one of them is a fault. Where this hypervisor serves a region itself, the
+//! tables trap it and every access exits. Where the *processor* serves it — the
+//! interrupt acceleration driving a controller out of a backing page of its own
+//! — the guest's accesses never fault, and the ones the hardware declines to
+//! perform come back as an exit that names the address and the direction.
+//! Performing one of those is performing it against the same device a fault
+//! would have reached. The region has a name in both descriptions, so the
+//! device is found the same way whichever brought the access here, and nothing
+//! below this module needs to know which did.
 //!
-//! # A region need not be trapped at all
+//! # There is one record of where a region is, and it is not here
 //!
-//! Trapping is how a guest's *own* access arrives here, and it is not the only
-//! way one can. Where the processor serves a device itself and reports back the
-//! accesses it declines to serve, the report carries the address and the
-//! direction, and performing such an access is performing it against the device
-//! that answers the region — with no fault involved and nothing for the nested
-//! tables to say. So a [`Region`] whose `trap` is `None` is registered for
-//! dispatch and leaves the tables untouched, and whatever the guest's ordinary
-//! accesses reach instead is the caller's to arrange.
+//! [`Mmio::classify`] asks the tables which region an address is in and indexes
+//! by the name they answer with. Keeping a second copy of the geometry here
+//! would be a second thing to keep in step, and the two would not have to
+//! disagree loudly to be a device answering for an address it was never given.
+//!
+//! What is kept here is a device's aperture, whose length admission is checked
+//! against — that is the length of a *mapping* rather than of the region, and
+//! it is the only length a load or a store through it may be bounded by.
 //!
 //! # What a device is asked, and what it is not
 //!
@@ -86,8 +90,8 @@ mod window;
 use alloc::{boxed::Box, vec::Vec};
 
 use log::info;
-use npt::{Npt, NptError};
-use paging::{AddressSpace, CacheType, Mapping, PagingError, Protection, chunk::FRAME_SIZE};
+use npt::{MapError, Range, RegionTag};
+use paging::{AddressSpace, CacheType, Mapping, PagingError, Protection};
 use thiserror::Error;
 use x86_64::PhysAddr;
 
@@ -330,10 +334,9 @@ pub struct Region {
     /// Which of the guest's accesses have to come back to us, or `None` where
     /// none of them do.
     ///
-    /// `None` leaves the nested tables exactly as they are: the guest's own
-    /// accesses go wherever the tables already send them, and the device is
-    /// reached only for the accesses something else declines to serve and
-    /// reports.
+    /// `None` is for a region something else already describes: the guest's own
+    /// accesses go wherever the tables already send them, and this device is
+    /// reached only for the ones that something declines to serve and reports.
     pub trap: Option<Trap>,
     /// What answers them.
     pub device: Box<dyn Device>,
@@ -453,333 +456,182 @@ impl Write<'_> {
     }
 }
 
-/// Trapping regions, before the guest runs.
+/// What answers for each region of a guest something other than the hardware
+/// answers for.
 ///
-/// Holds the nested tables and the address space for as long as it exists,
-/// which is what makes the phase separation a property of the types rather than
-/// a rule to remember: nothing else can reduce what the tables permit while a
-/// registrar is alive, and a registrar cannot outlive [`Registrar::seal`].
-pub struct Registrar<'a> {
-    space: &'a mut AddressSpace,
-    npt: &'a Npt,
-    regions: Vec<Interposed>,
-}
-
-impl<'a> Registrar<'a> {
-    /// Nothing trapped yet, with the tables to trap regions in.
-    pub fn new(space: &'a mut AddressSpace, npt: &'a Npt) -> Self {
-        Self {
-            space,
-            npt,
-            regions: Vec::new(),
-        }
-    }
-
-    /// Reserves room for that many regions, so that registering one cannot fail
-    /// for want of memory after it has already changed the tables.
-    ///
-    /// # Errors
-    ///
-    /// [`MmioError::Storage`] if the heap cannot spare the room, which is worth
-    /// knowing before anything has been mapped rather than after.
-    pub fn reserve(&mut self, regions: usize) -> Result<(), MmioError> {
-        self.regions
-            .try_reserve(regions)
-            .map_err(|_| MmioError::Storage { regions })
-    }
-
-    /// Takes over a region of the guest's physical memory.
-    ///
-    /// Either the whole region is taken over or nothing is. Three things have
-    /// to happen — the device's registers are mapped where the device reaches
-    /// them at all, the nested tables are told to trap the region where the
-    /// region is trapped at all, and the device is remembered — and each of
-    /// them can fail, so each is undone if a later one does. The order is
-    /// chosen so that the failure of one leaves the least to undo: room to
-    /// remember the region is reserved first, because a reservation is the
-    /// only step that can fail *after* the tables have been changed and
-    /// cannot be undone by changing them back.
-    ///
-    /// A region whose `trap` is `None` skips the middle step entirely and the
-    /// tables are not reached at all, which is what makes registering a device
-    /// and trapping a region two decisions rather than one.
-    ///
-    /// # Errors
-    ///
-    /// [`MmioError::Geometry`] unless the region is a whole number of pages on
-    /// a page boundary that the processor can address,
-    /// [`MmioError::Overlaps`] if another region already covers part of it,
-    /// [`MmioError::Capability`] if the device declares one this crate
-    /// cannot serve, [`MmioError::Storage`] if there is no room to remember
-    /// it, [`MmioError::Paging`] if the mapping window has no room, or
-    /// [`MmioError::Npt`] if the nested tables cannot describe it a page at
-    /// a time. [`MmioError::Rollback`] if undoing a failed registration
-    /// itself failed, which is the one case that leaves the guest's tables in a
-    /// state this crate cannot describe.
-    pub fn register(&mut self, region: Region) -> Result<(), MmioError> {
-        let (gpa, bytes) = (region.gpa, region.bytes);
-        let end = geometry(gpa, bytes)?;
-        if self.regions.iter().any(|other| other.overlaps(gpa, bytes)) {
-            return Err(MmioError::Overlaps { gpa: gpa.as_u64() });
-        }
-        // A device that answers nothing would trap every access and refuse every
-        // one of them, which is a region the guest can never use rather than a
-        // device.
-        let capability = region.device.capability();
-        if !Width::ALL.iter().any(|width| capability.answers(*width)) {
-            return Err(MmioError::Capability { gpa: gpa.as_u64() });
-        }
-        // Reserved before anything external changes, because this is the only step
-        // that cannot be undone by putting something back the way it was.
-        self.reserve(1)?;
-
-        let aperture = match region.device.hardware() {
-            // SAFETY: this is a device aperture rather than memory — the caller is
-            // registering it precisely because hardware answers there — so there is
-            // nothing for a writable alias to conflict with. The range is checked
-            // above to be page aligned, a whole number of pages, and within the
-            // processor's physical address width. Uncached is what a device register
-            // needs: a write that sat in a cache line would never reach the bus.
-            Hardware::Reached => Aperture::Mapped(unsafe {
-                self.space
-                    .map_physical(gpa, bytes, Protection::ReadWrite, CacheType::UncachedMinus)
-            }?),
-            // Nothing to map. The device answers out of its own state and lets
-            // nothing through, so a mapping of the registers behind it would be a
-            // writable alias of somebody's hardware that no access ever reaches.
-            Hardware::Untouched => Aperture::Untouched { bytes },
-        };
-        // Nothing to change for a region the guest's own accesses never fault
-        // on: the tables already send them somewhere, and this device answers
-        // only what is reported to it.
-        if let Some(trap) = region.trap
-            && let Err(error) = self
-                .npt
-                .protect(self.space.frames(), gpa, bytes, trap)
-                .and_then(|(_, change)| self.npt.barrier(change))
-        {
-            // The aperture was made one statement ago, nothing has been handed its
-            // address, and the region is not in the list — so nothing derived from
-            // it exists anywhere.
-            if let Some(unmapping) = aperture.release(self.space) {
-                // The trap is gone but the window is not, and the address space
-                // has retired the run rather than handing it back. Reported rather
-                // than logged: a caller that carries on believing the region was
-                // simply refused would be wrong about how much of the machine is
-                // still described.
-                return Err(MmioError::Rollback {
-                    gpa: gpa.as_u64(),
-                    cause: unmapping,
-                });
-            }
-            return Err(error.into());
-        }
-
-        // Cannot reallocate: the room was reserved above.
-        self.regions.push(Interposed {
-            gpa,
-            end,
-            trap: region.trap,
-            aperture,
-            device: region.device,
-        });
-        Ok(())
-    }
-
-    /// Closes the set of trapped regions, which is what makes it usable.
-    ///
-    /// After this there is no way to trap another, and the tables that would
-    /// have to be reached to try are no longer borrowed — which is the
-    /// point: every region a guest could reach is now described, and no
-    /// cached translation anywhere can disagree with the tables.
-    #[must_use]
-    pub fn seal(self) -> Mmio {
-        Mmio {
-            regions: self.regions,
-        }
-    }
-}
-
-/// Whether a region is one the nested tables and the processor can describe,
-/// and where it ends.
-///
-/// The end is computed as an integer and checked before anything is done with
-/// it. A region one page below the top of the address space has an exclusive
-/// end that is not itself an address, and constructing one as a [`PhysAddr`]
-/// panics — on a path that is either setting a guest up or logging what it was
-/// set up with.
-fn geometry(gpa: PhysAddr, bytes: u64) -> Result<u64, MmioError> {
-    let malformed = || MmioError::Geometry {
-        gpa: gpa.as_u64(),
-        bytes,
-    };
-    if bytes == 0 || !gpa.as_u64().is_multiple_of(FRAME_SIZE) || !bytes.is_multiple_of(FRAME_SIZE) {
-        return Err(malformed());
-    }
-    let end = gpa.as_u64().checked_add(bytes).ok_or_else(malformed)?;
-    // The architecture's own container for a physical address is narrower than
-    // sixty-four bits, and this processor's is narrower again. A region past
-    // either is one whose translations could not be built and whose addresses
-    // could not be printed.
-    let addressable = u64::MAX >> (u64::BITS - u32::from(processor::physical_address_bits()));
-    if end - 1 > addressable || PhysAddr::try_new(end - 1).is_err() {
-        return Err(MmioError::Unaddressable {
-            gpa: gpa.as_u64(),
-            bytes,
-            bits: processor::physical_address_bits(),
-        });
-    }
-    Ok(end)
-}
-
-/// The trapped regions of a guest that is allowed to run.
+/// One slot per name the nested tables can hand out, indexed by the name, so
+/// finding what answers for a region is one bounds-checked load and there is
+/// nothing to allocate on any path. The array is what the tables' own bound on
+/// a name buys: a name is the lowest one no live region holds, so it is never
+/// higher than the number of regions that can hold one at once.
 ///
 /// Answered through a shared reference, so one of these serves every processor
 /// running the guest rather than one per processor — which is what the regions
 /// themselves are, since a guest physical address means the same thing on all
 /// of them.
 pub struct Mmio {
-    regions: Vec<Interposed>,
+    devices: [Option<Interposed>; RegionTag::LIMIT],
+}
+
+impl Default for Mmio {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Mmio {
-    /// Logs which regions are answered for and by what, which is the whole of
-    /// what a guest's view of its devices differs by.
-    pub fn describe(&self, who: &str) {
-        if self.regions.is_empty() {
-            info!("{who}: no region of the guest's memory is interposed on");
-            return;
-        }
-        for region in &self.regions {
-            // The last byte rather than one past it: one past the end of a region
-            // at the top of the address space is not an address at all.
-            let (gpa, last) = (region.gpa.as_u64(), region.end - 1);
-            match region.window().base() {
-                Some(base) => info!(
-                    "{who}: interposing on guest physical {gpa:#x}..={last:#x}, reached at {base:#x}"
-                ),
-                None => info!(
-                    "{who}: interposing on guest physical {gpa:#x}..={last:#x}, whose device \
-                     answers without reaching the hardware behind it"
-                ),
-            }
+    /// Nothing answering for anything yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            devices: [const { None }; RegionTag::LIMIT],
         }
     }
 
-    /// Gives every region back: the mappings unmapped, the traps removed, and
-    /// the devices returned to the caller.
+    /// Records what answers for the region called `tag`, and maps the hardware
+    /// behind it where the device reaches it.
+    ///
+    /// Says nothing to the nested tables. Whether the guest's own accesses to
+    /// the region fault is their decision and a separate call; what this
+    /// decides is only what answers when one arrives here.
+    ///
+    /// `gpa` and `bytes` are where the hardware behind the region is, which is
+    /// what a mapping of it needs and the only thing they are used for. Where
+    /// the *region* is stays the tables' to say.
+    ///
+    /// # Errors
+    ///
+    /// [`MmioError::Map`] unless the range is a whole number of pages on a page
+    /// boundary, [`MmioError::Capability`] if the device declares one this
+    /// crate cannot serve, [`MmioError::Registered`] if something already
+    /// answers for that name, [`MmioError::Paging`] if the mapping window
+    /// has no room, or [`MmioError::Rollback`] if a mapping made here could
+    /// not be removed again after the registration was refused.
+    pub fn register(
+        &mut self,
+        space: &mut AddressSpace,
+        tag: RegionTag,
+        gpa: PhysAddr,
+        bytes: u64,
+        device: Box<dyn Device>,
+    ) -> Result<(), MmioError> {
+        let region = tag.number();
+        // One checker decides what a valid range is, and it is the one the tables
+        // record the region by — so a range this accepts is one they would have
+        // accepted and there is no shape only half the workspace believes in.
+        let aperture = Range::new(gpa, bytes)?;
+        // A device that answers nothing would trap every access and refuse every
+        // one of them, which is a region the guest can never use rather than a
+        // device.
+        let capability = device.capability();
+        if !Width::ALL.iter().any(|width| capability.answers(*width)) {
+            return Err(MmioError::Capability { region });
+        }
+        let Some(slot) = self.devices.get_mut(usize::from(region)) else {
+            return Err(MmioError::NoDevice { region });
+        };
+        if slot.is_some() {
+            return Err(MmioError::Registered { region });
+        }
+        let mapped = match device.hardware() {
+            // SAFETY: this is a device aperture rather than memory — the caller is
+            // registering it precisely because hardware answers there — so there is
+            // nothing for a writable alias to conflict with. The range is a whole
+            // number of pages on a page boundary inside the address space the
+            // entry format can hold, checked above. Uncached is what a device
+            // register needs: a write that sat in a cache line would never reach
+            // the bus.
+            Hardware::Reached => Aperture::Mapped(unsafe {
+                space.map_physical(
+                    aperture.base(),
+                    aperture.bytes(),
+                    Protection::ReadWrite,
+                    CacheType::UncachedMinus,
+                )
+            }?),
+            // Nothing to map. The device answers out of its own state and lets
+            // nothing through, so a mapping of the registers behind it would be a
+            // writable alias of somebody's hardware that no access ever reaches.
+            Hardware::Untouched => Aperture::Untouched {
+                bytes: aperture.bytes(),
+            },
+        };
+        *slot = Some(Interposed {
+            aperture: mapped,
+            device,
+        });
+        Ok(())
+    }
+
+    /// Stops answering for the region called `tag`, and answers with what did.
+    ///
+    /// The counterpart of [`Mmio::register`], and the whole of what giving a
+    /// region up costs here: nothing is said to the nested tables, which are
+    /// told separately or not at all, and the name is free for whatever the
+    /// tables hand it to next.
+    ///
+    /// The mapping of the hardware behind the region comes back with the device
+    /// rather than being removed here, because removing it needs the address
+    /// space that made it and taking a device out of this set does not.
+    pub fn forget(&mut self, tag: RegionTag) -> Option<Retired> {
+        self.devices
+            .get_mut(usize::from(tag.number()))
+            .and_then(Option::take)
+            .map(|region| Retired { tag, region })
+    }
+
+    /// Stops answering for every region, and answers with what did.
     ///
     /// The counterpart registration never had. A guest that was built and then
     /// abandoned — because a later step of bring-up failed, or because it is
-    /// being taken down — otherwise leaks a window run per region and a trap
-    /// slot per trapped one, and leaves the nested tables trapping addresses
-    /// nothing answers for.
-    ///
-    /// Every region is attempted even if one fails, because stopping at the
-    /// first failure would leave the rest in exactly the state this exists
-    /// to get out of. What could not be undone is reported.
-    ///
-    /// # Errors
-    ///
-    /// [`MmioError::Rollback`] naming the first region whose mapping could not
-    /// be removed. The devices are returned regardless: they are the
-    /// caller's, and dropping them because the address space complained
-    /// would lose whatever state they hold.
-    ///
-    /// # Safety
-    ///
-    /// No processor may be running the guest these regions belong to, and
-    /// nothing derived from any window may still be in use.
-    pub unsafe fn teardown(self, space: &mut AddressSpace, npt: &Npt) -> Teardown {
-        let mut devices = Vec::new();
-        let mut failure = None;
-        for region in self.regions {
-            if region.trap.is_some()
-                && let Err(error) = npt
-                    .release(region.gpa, region.end - region.gpa.as_u64())
-                    .and_then(|change| npt.barrier(change))
-            {
-                failure = failure.or(Some(MmioError::Npt(error)));
-            }
-            if let Some(cause) = region.aperture.release(space) {
-                failure = failure.or(Some(MmioError::Rollback {
-                    gpa: region.gpa.as_u64(),
-                    cause,
-                }));
-            }
-            devices.push(region.device);
-        }
-        Teardown { devices, failure }
+    /// being taken down — otherwise leaks a window run per region and loses
+    /// whatever state its devices hold.
+    pub fn teardown(&mut self) -> Vec<Retired> {
+        (0..u16::MAX)
+            .map(RegionTag::new)
+            .take(RegionTag::LIMIT)
+            .filter_map(|tag| self.forget(tag))
+            .collect()
     }
 
-    /// Which region an access falls in, with every byte of it accounted for.
+    /// Whether anything answers for the region called `tag`.
     ///
-    /// `gpa` is where the access begins and `width` is how long it is, and both
-    /// matter: an access that begins in a region and ends outside it belongs to
-    /// neither, and one that begins in ordinary memory and ends in a region is
-    /// not ordinary memory.
-    ///
-    /// # Errors
-    ///
-    /// [`EmulateError::Span`] if the access is partly in a region and partly
-    /// not, or spans two regions.
-    pub(crate) fn classify(
-        &self,
-        gpa: PhysAddr,
-        width: Width,
-        linear: u64,
-    ) -> Result<Place, EmulateError> {
-        let span = |reason| EmulateError::Span {
-            linear,
-            bytes: width.bytes(),
-            reason,
-        };
-        // The last byte rather than one past the end, and as an integer rather than
-        // an address: an access that ends where the physical address space does has
-        // no one-past-the-end address, and constructing one panics.
-        let last = gpa
-            .as_u64()
-            .checked_add(width.span() - 1)
-            .ok_or_else(|| span(Spanning::Wraps))?;
+    /// What an exit path asks before it decodes an instruction to perform
+    /// against a device: a region the tables trap with nothing registered for
+    /// it is a state the two decisions being independent allows, and
+    /// reporting it is better than decoding an instruction to dispatch into
+    /// nothing.
+    #[must_use]
+    pub fn answers(&self, tag: RegionTag) -> bool {
+        self.at(tag).is_ok()
+    }
 
-        // One pass, asking both questions of each region as it goes. Two calls to
-        // a single-address lookup would scan the whole vector twice for every
-        // memory operand of every intercepted instruction.
-        let mut first = None;
-        let mut ends_inside = false;
-        for (index, region) in self.regions.iter().enumerate() {
-            if region.holds(gpa.as_u64()) {
-                first = Some((index, gpa.as_u64() - region.gpa.as_u64()));
-            }
-            if region.holds(last) {
-                ends_inside = true;
+    /// Logs which regions are answered for and by what, which is the whole of
+    /// what a guest's view of its devices differs by.
+    ///
+    /// Where each region is belongs to the nested tables and is logged with
+    /// them, under the same name.
+    pub fn describe(&self, who: &str) {
+        let mut answered = false;
+        for (region, interposed) in self.devices.iter().enumerate() {
+            let Some(interposed) = interposed else {
+                continue;
+            };
+            answered = true;
+            match interposed.window().base() {
+                Some(base) => {
+                    info!(
+                        "{who}: region {region} is answered for by a device reached at {base:#x}"
+                    );
+                }
+                None => info!(
+                    "{who}: region {region} is answered for by a device that never reaches the \
+                     hardware behind it"
+                ),
             }
         }
-
-        match first {
-            // Wholly inside one region, which is the only shape a single device
-            // transaction describes.
-            Some((index, offset)) if self.regions[index].holds(last) => Ok(Place::Device {
-                index,
-                offset,
-                gpa,
-                linear,
-            }),
-            // It begins in a region and ends somewhere else. Whether that somewhere
-            // is another region or ordinary memory changes the diagnostic and
-            // nothing else: either way the access is partly a device transaction
-            // and partly not, and which bytes go where is not something the
-            // instruction says.
-            Some(_) => Err(span(if ends_inside {
-                Spanning::TwoRegions
-            } else {
-                Spanning::Straddles
-            })),
-            // It begins outside every region. If it ends inside one it still
-            // straddles; if it does not, nothing interposes on any byte of it and
-            // it is the guest's own memory.
-            None if ends_inside => Err(span(Spanning::Straddles)),
-            None => Ok(Place::Memory(linear)),
+        if !answered {
+            info!("{who}: no region of the guest's memory is answered for here");
         }
     }
 
@@ -793,16 +645,17 @@ impl Mmio {
     ///
     /// # Errors
     ///
+    /// [`EmulateError::NoDevice`] if nothing answers for that region, or
     /// [`EmulateError::Inadmissible`] if the access is not one this device
     /// answers.
     pub(crate) fn admits(
         &self,
-        index: usize,
+        tag: RegionTag,
         offset: u64,
         gpa: PhysAddr,
         width: Width,
     ) -> Result<(), EmulateError> {
-        let region = self.at(index)?;
+        let region = self.at(tag)?;
         region
             .device
             .capability()
@@ -815,21 +668,22 @@ impl Mmio {
             })
     }
 
-    /// What the guest should see for a read of a trapped region.
+    /// What the guest should see for a read of a region something answers for.
     ///
     /// # Errors
     ///
+    /// [`EmulateError::NoDevice`] if nothing answers for that region,
     /// [`EmulateError::Inadmissible`] if the access is not one this device
     /// answers, or if the device answers with a value of a width other than
     /// the one it was asked about.
     pub(crate) fn read(
         &self,
-        index: usize,
+        tag: RegionTag,
         offset: u64,
         gpa: PhysAddr,
         width: Width,
     ) -> Result<Data, EmulateError> {
-        let region = self.at(index)?;
+        let region = self.at(tag)?;
         let window = region.window();
         let admitted = region
             .device
@@ -871,12 +725,12 @@ impl Mmio {
     /// another width.
     pub(crate) fn write(
         &self,
-        index: usize,
+        tag: RegionTag,
         offset: u64,
         gpa: PhysAddr,
         value: Data,
     ) -> Result<(), EmulateError> {
-        let region = self.at(index)?;
+        let region = self.at(tag)?;
         let window = region.window();
         let inadmissible = |reason| EmulateError::Inadmissible {
             gpa: gpa.as_u64(),
@@ -913,11 +767,20 @@ impl Mmio {
         Ok(())
     }
 
-    /// One region, by the index [`Mmio::classify`] gave.
-    fn at(&self, index: usize) -> Result<&Interposed, EmulateError> {
-        self.regions
-            .get(index)
-            .ok_or(EmulateError::NoSuchRegion { index })
+    /// What answers for the region of that name.
+    ///
+    /// A name higher than a slot and a slot nothing has been registered in are
+    /// one answer, because they are the same thing to a caller: nothing answers
+    /// for the region it named. That is a state the tables and this set being
+    /// independent allows — a region trapped with no device — and it is
+    /// reported rather than treated as impossible.
+    fn at(&self, tag: RegionTag) -> Result<&Interposed, EmulateError> {
+        self.devices
+            .get(usize::from(tag.number()))
+            .and_then(Option::as_ref)
+            .ok_or(EmulateError::NoDevice {
+                region: tag.number(),
+            })
     }
 
     /// Performs the instruction behind a nested page fault, whatever it turns
@@ -971,77 +834,163 @@ impl Mmio {
 }
 
 impl core::fmt::Debug for Mmio {
-    /// The regions, not the devices: what answers for one is a trait object
-    /// with no more to say about itself than its own address, and printing
-    /// that would be noise.
+    /// The names of the regions answered for, not the devices: what answers for
+    /// one is a trait object with no more to say about itself than its own
+    /// address, and printing that would be noise.
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_list()
-            .entries(self.regions.iter().map(|region| region.gpa))
+            .entries(
+                self.devices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(region, interposed)| interposed.as_ref().map(|_| region)),
+            )
             .finish()
     }
 }
 
-/// What became of taking a set of regions apart.
+/// Which region an access falls in, with every byte of it accounted for.
 ///
-/// Carries the devices back out whatever happened, because they belong to
-/// whoever registered them and may hold state that outlives the guest.
-#[must_use = "the devices are returned here, and dropping this drops them"]
-pub struct Teardown {
-    devices: Vec<Box<dyn Device>>,
-    failure: Option<MmioError>,
+/// `gpa` is where the access begins and `width` is how long it is, and both
+/// matter: an access that begins in a region and ends outside it belongs to
+/// neither, and one that begins in ordinary memory and ends in a region is not
+/// ordinary memory.
+///
+/// Both questions are asked of the nested tables rather than of the set of
+/// devices, because the tables hold the one record of where a region is. An
+/// access wholly inside one costs a single search of that record; every other
+/// shape costs two, which is what establishing that no byte of an access is in
+/// a region takes.
+///
+/// # Errors
+///
+/// [`EmulateError::Span`] if the access is partly in a region and partly not,
+/// or spans two regions.
+pub(crate) fn classify(
+    guest: &impl Guest,
+    gpa: PhysAddr,
+    width: Width,
+    linear: u64,
+) -> Result<Place, EmulateError> {
+    let span = |reason| EmulateError::Span {
+        linear,
+        bytes: width.bytes(),
+        reason,
+    };
+    // The last byte rather than one past the end, and as an integer rather than
+    // an address: an access that ends where the physical address space does has
+    // no one-past-the-end address, and constructing one panics.
+    let last = gpa
+        .as_u64()
+        .checked_add(width.span() - 1)
+        .ok_or_else(|| span(Spanning::Wraps))?;
+    match guest.region(gpa) {
+        // Wholly inside one region, which is the only shape a single device
+        // transaction describes.
+        Some(region) if region.range.contains(last) => Ok(Place::Device {
+            tag: region.tag,
+            offset: gpa.as_u64() - region.range.base().as_u64(),
+            gpa,
+            linear,
+        }),
+        // It begins in a region and ends somewhere else. Whether that somewhere
+        // is another region or ordinary memory changes the diagnostic and
+        // nothing else: either way the access is partly a device transaction
+        // and partly not, and which bytes go where is not something the
+        // instruction says.
+        Some(_) => Err(span(if ends_inside(guest, last) {
+            Spanning::TwoRegions
+        } else {
+            Spanning::Straddles
+        })),
+        // It begins outside every region. If it ends inside one it still
+        // straddles; if it does not, nothing interposes on any byte of it and it
+        // is the guest's own memory.
+        None if ends_inside(guest, last) => Err(span(Spanning::Straddles)),
+        None => Ok(Place::Memory(linear)),
+    }
 }
 
-impl Teardown {
-    /// The devices that answered for the regions.
-    pub fn devices(&mut self) -> Vec<Box<dyn Device>> {
-        core::mem::take(&mut self.devices)
+/// Whether the last byte of an access is inside a region something other than
+/// the hardware answers for.
+///
+/// Takes the address as an integer, because the last byte of an access may be
+/// the last byte of the physical address space — which is a number but not a
+/// [`PhysAddr`] that can be constructed. One that is not an address is in no
+/// region, the tables answering for nothing above the address space.
+fn ends_inside(guest: &impl Guest, last: u64) -> bool {
+    PhysAddr::try_new(last).is_ok_and(|end| guest.region(end).is_some())
+}
+
+/// One region's registration, taken back out of the set.
+///
+/// Two steps, because they need different things: the set stops naming the
+/// region without an address space in hand, and the mapping of the hardware
+/// behind it is handed back to the address space that made it.
+#[must_use = "the device is returned here, and the mapping behind it is still held"]
+pub struct Retired {
+    /// Which region it answered for.
+    tag: RegionTag,
+    /// What answered, and where its registers were reachable.
+    region: Interposed,
+}
+
+impl Retired {
+    /// Which region this answered for.
+    #[must_use]
+    pub const fn tag(&self) -> RegionTag {
+        self.tag
     }
 
-    /// What could not be undone, if anything.
+    /// Gives the mapping of the hardware behind the region back, and answers
+    /// with the device that was registered for it.
+    ///
+    /// The device comes back whether or not the mapping could be removed: it
+    /// belongs to whoever registered it and may hold state that outlives the
+    /// guest, so dropping it because the address space complained would lose
+    /// that.
     ///
     /// # Errors
     ///
-    /// The first failure encountered while taking the regions apart.
-    pub fn result(&self) -> Result<(), MmioError> {
-        self.failure.map_or(Ok(()), Err)
+    /// [`MmioError::Rollback`] if the mapping could not be removed, which
+    /// leaves the address space having retired the run rather than handed
+    /// it back.
+    ///
+    /// # Safety
+    ///
+    /// No processor may be running the guest this region belonged to, and
+    /// nothing derived from its window may still be in use.
+    pub unsafe fn release(
+        self,
+        space: &mut AddressSpace,
+    ) -> (Box<dyn Device>, Result<(), MmioError>) {
+        // SAFETY: forwarded to the caller, whose obligations are exactly what
+        // releasing an aperture asks for. The aperture is consumed here, so no
+        // further access through it is representable.
+        let cause = unsafe { self.region.aperture.release(space) };
+        let outcome = cause.map_or(Ok(()), |cause| {
+            Err(MmioError::Rollback {
+                region: self.tag.number(),
+                cause,
+            })
+        });
+        (self.region.device, outcome)
     }
 }
 
 /// One region that is answered for, and by what.
+///
+/// Where the region is is deliberately not here: the nested tables record that,
+/// and a second copy of it would be a second thing to keep in step. What the
+/// aperture knows is how long the *mapping* of the hardware behind the region
+/// is, which is what a load or a store through it has to be bounded by.
 struct Interposed {
-    gpa: PhysAddr,
-    /// One past the last byte, as an integer rather than an address: a region
-    /// may end where the physical address space does, and one past that is
-    /// not an address that can be constructed.
-    end: u64,
-    /// What the nested tables were told to fault on, if anything.
-    ///
-    /// Kept because giving a region back is the exact reverse of taking it
-    /// over: a region the tables were never told about has nothing to tell
-    /// them now, and asking them to release one would be asking about a range
-    /// they have no record of.
-    trap: Option<Trap>,
     aperture: Aperture,
     device: Box<dyn Device>,
 }
 
 impl Interposed {
-    /// Whether this region covers that address.
-    ///
-    /// Takes the address as an integer, because one caller asks about the last
-    /// byte of an access and that byte may be the last of the physical address
-    /// space — which is a number but not a [`PhysAddr`] one can construct.
-    fn holds(&self, gpa: u64) -> bool {
-        (self.gpa.as_u64()..self.end).contains(&gpa)
-    }
-
-    /// Whether this region covers any of `bytes` from `gpa`.
-    fn overlaps(&self, gpa: PhysAddr, bytes: u64) -> bool {
-        let theirs = gpa.as_u64();
-        theirs < self.end && self.gpa.as_u64() < theirs.saturating_add(bytes)
-    }
-
     /// Where this device's registers are reachable.
     fn window(&self) -> Window {
         self.aperture.window()
@@ -1102,14 +1051,17 @@ impl Aperture {
     ///
     /// By value, because an aperture that has been released must not be
     /// reachable afterwards.
-    fn release(self, space: &mut AddressSpace) -> Option<PagingError> {
+    ///
+    /// # Safety
+    ///
+    /// Nothing derived from a window made from this aperture may still be in
+    /// use, which means no processor may be running the guest whose region it
+    /// belonged to.
+    unsafe fn release(self, space: &mut AddressSpace) -> Option<PagingError> {
         match self {
-            // SAFETY: two callers, and each establishes the same thing. A failed
-            // registration has given the mapping's address to nothing and has not
-            // put the region in the list, and `teardown`'s caller guarantees no
-            // processor is running the guest and that nothing derived from the
-            // window is in use. The aperture is consumed here either way, so no
-            // further access is representable.
+            // SAFETY: the caller guarantees that nothing derived from a window
+            // made from this mapping is still in use. The aperture is consumed
+            // here, so no further access through it is representable.
             Self::Mapped(mapping) => unsafe { space.unmap(mapping) }.err(),
             // Nothing was mapped, so there is nothing to give back.
             Self::Untouched { .. } => None,
@@ -1121,63 +1073,45 @@ impl Aperture {
     }
 }
 
-/// Why a region could not be taken over.
+/// Why a device could not be registered for a region, or its registration given
+/// back.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MmioError {
-    /// The region is not a whole number of pages on a page boundary, which is
-    /// the granularity the nested tables can give it permissions of its own
-    /// at.
-    #[error("a region at {gpa:#x} of {bytes:#x} bytes is not a whole number of pages")]
-    Geometry {
-        /// Where the region begins.
-        gpa: u64,
-        /// How long it is.
-        bytes: u64,
-    },
-    /// The region reaches past what this processor can address physically.
-    #[error(
-        "a region at {gpa:#x} of {bytes:#x} bytes leaves this processor's {bits}-bit physical address space"
-    )]
-    Unaddressable {
-        /// Where the region begins.
-        gpa: u64,
-        /// How long it is.
-        bytes: u64,
-        /// How many physical address bits this processor has.
-        bits: u8,
-    },
-    /// Another region already covers part of this one, so which device answers
-    /// for the overlap would depend on the order they were registered in.
-    #[error("a region already covers part of {gpa:#x}")]
-    Overlaps {
-        /// Where the region begins.
-        gpa: u64,
-    },
     /// The device answers no access this crate can make, so every access to its
-    /// region would trap and then be refused.
-    #[error("the device for {gpa:#x} answers no access this hypervisor can make")]
+    /// region would arrive here and then be refused.
+    #[error("the device for region {region} answers no access this hypervisor can make")]
     Capability {
-        /// Where the region begins.
-        gpa: u64,
+        /// Which region it was offered for.
+        region: u16,
     },
-    /// There is no room to remember another region.
-    #[error("there is no room to remember {regions} more interposed regions")]
-    Storage {
-        /// How many were asked for.
-        regions: usize,
+    /// Something already answers for that region, and which device an access
+    /// reached would otherwise depend on the order the two were registered in.
+    #[error("a device already answers for region {region}")]
+    Registered {
+        /// Which region was named.
+        region: u16,
     },
-    /// A failed registration could not be undone, so the guest's tables
-    /// describe something this crate no longer accounts for.
-    #[error("the window for the region at {gpa:#x} could not be removed: {cause}")]
+    /// Nothing answers for the region named, either because no device was
+    /// registered for it or because the name is not one this set has a place
+    /// for.
+    #[error("no device answers for region {region}")]
+    NoDevice {
+        /// Which region was named.
+        region: u16,
+    },
+    /// A mapping of the hardware behind a region could not be removed, so the
+    /// address space has retired the run rather than handed it back.
+    #[error("the window for region {region} could not be removed: {cause}")]
     Rollback {
-        /// Where the region begins.
-        gpa: u64,
+        /// Which region it belonged to.
+        region: u16,
         /// Why the mapping could not be removed.
         cause: PagingError,
     },
-    /// The nested tables could not describe the region a page at a time.
+    /// The range the hardware behind the region is at is not one the nested
+    /// tables would describe.
     #[error(transparent)]
-    Npt(#[from] NptError),
+    Map(#[from] MapError),
     /// The device's registers could not be mapped.
     #[error(transparent)]
     Paging(#[from] PagingError),
@@ -1185,8 +1119,194 @@ pub enum MmioError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capability, Commit, Vectors, Widths};
-    use crate::value::{Data, Width};
+    use alloc::{boxed::Box, vec::Vec};
+
+    use npt::RegionTag;
+
+    use super::{Capability, Commit, Mmio, Vectors, Widths, classify, harness::Harness};
+    use crate::{
+        EmulateError, Spanning,
+        dispatch::{Answer, Recorder},
+        machine::tests::{Machine, Memory},
+        value::{Data, Width},
+    };
+
+    /// Where the region every test here puts a device at is, in the guest's
+    /// physical memory.
+    const APERTURE: u64 = 0xFEE0_0000;
+
+    /// How long it is: one page, which is the smallest a region can be.
+    const APERTURE_BYTES: u64 = 4096;
+
+    /// The name the tables gave that region.
+    const REGION: RegionTag = RegionTag::new(0);
+
+    #[test]
+    fn a_device_registered_for_a_region_the_tables_do_not_hold_is_never_reached() {
+        // What answers for the region, with nothing having told the tables where
+        // the region is — which is what registering a device without trapping
+        // anything leaves behind.
+        let (mmio, _) = Harness::new()
+            .region(REGION, APERTURE, APERTURE_BYTES, Box::new(Recorder::new()))
+            .seal();
+        let machine = Machine::long_mode();
+        let untouched = Memory::new(&machine);
+
+        assert_eq!(
+            classify(
+                &untouched,
+                x86_64::PhysAddr::new(APERTURE),
+                Width::Long,
+                0x8000
+            ),
+            Ok(crate::operand::Place::Memory(0x8000)),
+            "with no region recorded the address is the guest's own memory, which \
+             is exactly what leaving the tables alone means"
+        );
+        assert!(
+            mmio.answers(REGION),
+            "while the device is registered all the same, waiting for whichever way \
+             an access to the region arrives"
+        );
+    }
+
+    #[test]
+    fn a_region_the_tables_hold_with_no_device_is_reported_rather_than_dispatched_into() {
+        // The other direction: the tables know where the region is and nothing was
+        // ever registered for it.
+        let (_, regions) = Harness::new()
+            .region(REGION, APERTURE, APERTURE_BYTES, Box::new(Recorder::new()))
+            .seal();
+        let machine = Machine::long_mode();
+        let mut guest = Memory::new(&machine);
+        guest.describing(regions);
+        let nothing = Mmio::new();
+
+        let place = classify(
+            &guest,
+            x86_64::PhysAddr::new(APERTURE + 8),
+            Width::Long,
+            0x8000,
+        )
+        .expect("the address is in a region the tables hold");
+
+        assert_eq!(
+            place,
+            crate::operand::Place::Device {
+                tag: REGION,
+                offset: 8,
+                gpa: x86_64::PhysAddr::new(APERTURE + 8),
+                linear: 0x8000,
+            },
+            "the region answers with the name the tables gave it, whether or not \
+             anything has been registered under that name"
+        );
+        assert!(!nothing.answers(REGION));
+        assert_eq!(
+            nothing.admits(REGION, 8, x86_64::PhysAddr::new(APERTURE + 8), Width::Long),
+            Err(EmulateError::NoDevice { region: 0 }),
+            "and an access to it is reported rather than performed against nothing"
+        );
+    }
+
+    #[test]
+    fn an_access_that_leaves_a_region_belongs_to_neither_side_of_the_edge() {
+        let (_, regions) = Harness::new()
+            .region(REGION, APERTURE, APERTURE_BYTES, Box::new(Recorder::new()))
+            .seal();
+        let machine = Machine::long_mode();
+        let mut guest = Memory::new(&machine);
+        guest.describing(regions);
+
+        for (gpa, reason) in [
+            (APERTURE + APERTURE_BYTES - 2, Spanning::Straddles),
+            (APERTURE - 2, Spanning::Straddles),
+        ] {
+            assert_eq!(
+                classify(&guest, x86_64::PhysAddr::new(gpa), Width::Long, 0x8000),
+                Err(EmulateError::Span {
+                    linear: 0x8000,
+                    bytes: Width::Long.bytes(),
+                    reason,
+                }),
+                "an access at {gpa:#x} is partly a device transaction and partly not"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_is_found_by_name_across_a_removal_and_a_re_registration() {
+        let (mut mmio, _) = Harness::new()
+            .region(
+                REGION,
+                APERTURE,
+                APERTURE_BYTES,
+                Box::new(Recorder::new().reads(Answer::Invented(0x1111_1111))),
+            )
+            .seal();
+        assert_eq!(
+            read(&mmio),
+            Data::from_u64(0x1111_1111, Width::Long),
+            "the device registered under the name is the one an access reaches"
+        );
+
+        let retired = mmio.forget(REGION).expect("something answered for it");
+        assert_eq!(retired.tag(), REGION);
+        assert!(
+            !mmio.answers(REGION),
+            "after which the name answers for nothing"
+        );
+
+        let (again, _) = Harness::new()
+            .region(
+                REGION,
+                APERTURE,
+                APERTURE_BYTES,
+                Box::new(Recorder::new().reads(Answer::Invented(0x2222_2222))),
+            )
+            .seal();
+        assert_eq!(
+            read(&again),
+            Data::from_u64(0x2222_2222, Width::Long),
+            "and a name handed out again reaches whatever was registered for it \
+             this time, never what answered for it before"
+        );
+    }
+
+    #[test]
+    fn taking_the_set_apart_hands_every_device_back_and_leaves_no_region_named() {
+        let second = RegionTag::new(1);
+        let (mut mmio, _) = Harness::new()
+            .region(REGION, APERTURE, APERTURE_BYTES, Box::new(Recorder::new()))
+            .region(
+                second,
+                APERTURE + APERTURE_BYTES,
+                APERTURE_BYTES,
+                Box::new(Recorder::new().untouched()),
+            )
+            .seal();
+
+        let retired = mmio.teardown();
+
+        assert_eq!(
+            retired.iter().map(super::Retired::tag).collect::<Vec<_>>(),
+            [REGION, second],
+            "every region that was answered for comes back, in the order the names \
+             run"
+        );
+        assert!(!mmio.answers(REGION) && !mmio.answers(second));
+        assert!(
+            mmio.teardown().is_empty(),
+            "and there is nothing left to take apart"
+        );
+    }
+
+    /// What the device answering the region says for an aligned four-byte read
+    /// at its base.
+    fn read(mmio: &Mmio) -> Data {
+        mmio.read(REGION, 0, x86_64::PhysAddr::new(APERTURE), Width::Long)
+            .expect("the device answers an aligned four-byte read")
+    }
 
     #[test]
     fn a_scalar_device_answers_every_scalar_width_and_no_vector() {

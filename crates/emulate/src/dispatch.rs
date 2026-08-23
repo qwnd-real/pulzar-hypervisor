@@ -15,6 +15,7 @@
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
+use npt::RegionTag;
 use spin::Mutex;
 use svm::exit::NestedPageFault;
 use x86_64::PhysAddr;
@@ -29,6 +30,8 @@ use crate::{
 const APERTURE: u64 = 0xFEE0_0000;
 /// How long that aperture is: one page, which is the smallest a region can be.
 const APERTURE_BYTES: u64 = PAGE;
+/// The name the tables gave that region, which is what ties the device to it.
+const REGION: RegionTag = RegionTag::new(0);
 /// Where every test puts the instruction the guest stopped on.
 const RIP: u64 = 0x1000;
 
@@ -221,9 +224,13 @@ impl Fixture {
         // The guest reaches the device at this linear address, and its page
         // translates to the aperture.
         memory.map_at(DEVICE_LINEAR, APERTURE);
-        let mmio = Harness::new()
-            .region(APERTURE, APERTURE_BYTES, Box::new(recorder))
+        // Two records of two different things, as on a machine: what answers for
+        // the region goes in the set of devices, and where the region is goes in
+        // the guest's memory, which stands in for the nested tables.
+        let (mmio, regions) = Harness::new()
+            .region(REGION, APERTURE, APERTURE_BYTES, Box::new(recorder))
             .seal();
+        memory.describing(regions);
         Self {
             machine,
             memory,

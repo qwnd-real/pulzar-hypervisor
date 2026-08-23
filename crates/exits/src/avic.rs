@@ -24,7 +24,7 @@
 use emulate::Outcome;
 use inject::Pending;
 use log::{error, trace};
-use partition::{Addressing, Partition};
+use partition::Partition;
 use svm::{
     avic::{IncompleteIpiExit, UnacceleratedAccessExit},
     exit::NestedPageFault,
@@ -191,17 +191,6 @@ fn emulate(
     interrupts: &mut Pending,
     exit: UnacceleratedAccessExit,
 ) -> Flow {
-    let Some(devices) = partition.devices() else {
-        // The register page is a region of the guest whether or not the nested
-        // tables trap it, and it is registered before any processor enters —
-        // so an unsealed set means the guest was entered before its own memory
-        // was described, and resuming would exit here for ever.
-        error!(
-            "exits: nothing answers for the unaccelerated access at offset {:#x}",
-            exit.offset()
-        );
-        return Flow::Leave;
-    };
     // The access as the hardware would have reported it had the page faulted
     // instead of exiting: final, present, and in the direction the exit
     // names — which is all the emulator's provenance check asks of it.
@@ -210,10 +199,18 @@ fn emulate(
         .with_write(exit.is_write())
         .with_final_address(true);
     let gpa = PhysAddr::new(vlapic::apic_page().as_u64() + u64::from(exit.offset()));
-    let addressing = Addressing::from_save(vcpu.save());
-    match partition.with_memory(addressing, |guest| {
-        devices.dispatch(vcpu, guest, gpa, cause)
-    }) {
+    let Some(region) = partition.region(gpa) else {
+        // The register page is a region of the guest whether or not the nested
+        // tables trap it, so an address inside it that is in no region means the
+        // guest was entered before its own memory was described, and resuming
+        // would exit here for ever.
+        error!(
+            "exits: no region of the guest holds the unaccelerated access at offset {:#x}",
+            exit.offset()
+        );
+        return Flow::Leave;
+    };
+    match partition.dispatch(vcpu, region.tag, gpa, cause) {
         Ok(Outcome::Stepped | Outcome::Repeating) => Flow::Resume,
         Ok(Outcome::Faulted(fault)) => nested::raise(vcpu, fault, interrupts),
         Err(error) => nested::unserviceable(vcpu, partition, gpa, error),

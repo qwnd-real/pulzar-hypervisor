@@ -1,68 +1,76 @@
-//! A set of trapped regions built without a machine underneath it.
+//! A set of regions and a guest's memory that agree about where each region is,
+//! built without a machine underneath either.
 //!
-//! Registration needs an address space and nested page tables, which exist only
-//! on a booted machine — so [`Registrar`](super::Registrar) cannot be reached
-//! on the host, and neither could anything downstream of it. This builds the
-//! same [`Mmio`] the registrar builds, over bytes standing in for a device
-//! aperture, so that everything above registration is exercised by the tests:
-//! admission, the capability contract, commit binding, span classification, and
-//! the whole of dispatch.
+//! Registering a device needs an address space to map its aperture through, and
+//! recording where a region is needs nested page tables; both exist only on a
+//! booted machine. This plants a device in an [`Mmio`] over bytes standing in
+//! for an aperture, and hands back the regions to tell a test guest's memory
+//! about, so that everything above registration is exercised: admission, the
+//! capability contract, commit binding, span classification, and the whole of
+//! dispatch.
 //!
 //! What is *not* stubbed is the interesting part. The window is a real
 //! [`Window`](super::window::Window) over real bytes reached through a raw
 //! pointer, the volatile accesses are the same volatile accesses, and the
 //! admission and binding checks are the production ones. The only difference is
-//! where the bytes came from.
+//! where the bytes came from and who was told where the region is.
 
 use alloc::{boxed::Box, vec, vec::Vec};
 
+use npt::{Answered, Range, RegionTag};
 use x86_64::{PhysAddr, VirtAddr};
 
-use super::{Aperture, Device, Hardware, Interposed, Mmio, Trap};
+use super::{Aperture, Device, Hardware, Interposed, Mmio};
 
 /// Builds a set of regions over planted bytes.
-#[derive(Default)]
 pub(crate) struct Harness {
-    regions: Vec<Interposed>,
+    devices: [Option<Interposed>; RegionTag::LIMIT],
+    regions: Vec<Answered>,
 }
 
 impl Harness {
-    /// Nothing trapped yet.
+    /// Nothing answered for yet.
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            devices: [const { None }; RegionTag::LIMIT],
+            regions: Vec::new(),
+        }
     }
 
     /// Adds a region at this guest physical address, that many bytes long,
-    /// answered for by that device.
+    /// answered for by that device, under that name.
     ///
     /// The bytes behind it start as zeroes and are reached exactly as a real
     /// aperture is — and, as at registration, a device that declares it never
     /// reaches the hardware behind its region gets none of them.
-    ///
-    /// Trapped in full, because everything downstream of registration is
-    /// reached the same way whatever brought the access here: what the trap
-    /// decides is only which of the guest's own accesses fault, and nothing
-    /// below is told which one did.
-    pub(crate) fn region(mut self, gpa: u64, bytes: u64, device: Box<dyn Device>) -> Self {
+    pub(crate) fn region(
+        mut self,
+        tag: RegionTag,
+        gpa: u64,
+        bytes: u64,
+        device: Box<dyn Device>,
+    ) -> Self {
         let aperture = match device.hardware() {
             Hardware::Reached => plant(bytes),
             Hardware::Untouched => Aperture::Untouched { bytes },
         };
-        self.regions.push(Interposed {
-            gpa: PhysAddr::new(gpa),
-            end: gpa + bytes,
-            trap: Some(Trap::Everything),
-            aperture,
-            device,
+        self.devices[usize::from(tag.number())] = Some(Interposed { aperture, device });
+        self.regions.push(Answered {
+            tag,
+            range: Range::new(PhysAddr::new(gpa), bytes).expect("a region of whole pages"),
         });
         self
     }
 
-    /// The sealed set, as an exit handler would hold it.
-    pub(crate) fn seal(self) -> Mmio {
-        Mmio {
-            regions: self.regions,
-        }
+    /// The set of devices and the regions a guest's memory has to agree about,
+    /// as the nested tables and this set would.
+    pub(crate) fn seal(self) -> (Mmio, Vec<Answered>) {
+        (
+            Mmio {
+                devices: self.devices,
+            },
+            self.regions,
+        )
     }
 }
 

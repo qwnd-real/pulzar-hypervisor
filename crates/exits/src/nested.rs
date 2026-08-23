@@ -46,17 +46,13 @@ fn interposed(
     cause: NestedPageFault,
     interrupts: &mut Pending,
 ) -> Flow {
-    let Some(devices) = partition.devices() else {
-        // The region is trapped, so something meant to answer for it, but the
-        // set was never sealed. Resuming would fault at the same address
-        // forever.
-        error!("exits: nothing answers for the trapped access at {gpa:#x}");
+    let Some(region) = partition.region(gpa) else {
+        // The tables reported the address as one they do not answer for and now
+        // say it is in no region at all, which nothing else can produce.
+        error!("exits: the trapped access at {gpa:#x} is in no region");
         return Flow::Leave;
     };
-    let addressing = Addressing::from_save(vcpu.save());
-    match partition.with_memory(addressing, |guest| {
-        devices.dispatch(vcpu, guest, gpa, cause)
-    }) {
+    match partition.dispatch(vcpu, region.tag, gpa, cause) {
         // Done, or stopped part way through a repeated move with its progress in
         // the guest's own registers. Either way the guest resumes and needs
         // nothing from us.
