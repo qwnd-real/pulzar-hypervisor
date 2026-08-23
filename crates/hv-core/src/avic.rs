@@ -92,8 +92,7 @@ impl AvicPolicy {
     /// the hardware will follow the guest into it. What is withheld is the
     /// middle case — an acceleration that exists and cannot drive that face —
     /// where a guest in it would be delivered to in software at exactly the
-    /// moments it believed itself accelerated, and where the register page it
-    /// would fall back on is a sink for the life of the machine.
+    /// moments it believed itself accelerated.
     ///
     /// The one statement of it: the same answer decides the feature bit
     /// `CPUID` reports, the transitions a guest's own write of its base

@@ -104,10 +104,11 @@ use thiserror::Error;
 
 pub use crate::{
     avic::{
-        accelerated as avic_accelerated, apic_page, backing_page, deliverable as avic_deliverable,
-        hand_over as avic_hand_over, incomplete_ipi as avic_incomplete_ipi, provision,
-        publish_running as avic_publish_running, reconcile as avic_reconcile,
-        trap_access as avic_trap_access, unaccelerated_refused as avic_unaccelerated_refused,
+        GuestMemory, Redescribed, RegisterPage, accelerated as avic_accelerated, apic_page,
+        backing_page, deliverable as avic_deliverable, hand_over as avic_hand_over,
+        incomplete_ipi as avic_incomplete_ipi, provision, publish_running as avic_publish_running,
+        reconcile as avic_reconcile, trap_access as avic_trap_access,
+        unaccelerated_refused as avic_unaccelerated_refused,
         unaccelerated_trap as avic_unaccelerated_trap, unpublish_running as avic_unpublish_running,
         wake_targets as avic_wake_targets, wider_face as avic_wider_face, x2apic_offered,
     },

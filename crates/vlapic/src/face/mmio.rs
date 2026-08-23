@@ -13,24 +13,31 @@
 //! performs it against the device below.
 //!
 //! Where the processor serves the page instead — the acceleration driving the
-//! controller out of a backing page of its own — the page is not trapped, the
-//! guest's accesses never fault, and most of them never reach this hypervisor
-//! at all. The ones the acceleration will not perform are reported as an exit
-//! that names the offset and the direction, and the exit path performs them
-//! against this same device. So what arrives here is a subset rather than
-//! something different, and nothing below needs to know which of the two
-//! brought it.
+//! controller out of a backing page of its own — the page is given to the
+//! hardware, the guest's accesses never fault, and most of them never reach
+//! this hypervisor at all. The ones the acceleration will not perform are
+//! reported as an exit that names the offset and the direction, and the exit
+//! path performs them against this same device. So what arrives here is a
+//! subset rather than something different, and nothing below needs to know
+//! which of the two brought it.
 //!
 //! # This face exists only while the controller is in the older mode
 //!
-//! Neither route is taken away when the mode that has a register page is. The
-//! trap is installed once, before any guest runs, and cannot be removed while
-//! processors are executing; the acceleration's own redirection likewise
-//! outlives the mode it belongs to. So the aperture outlives the mode either
-//! way, and everything reaching it is gated on the controller actually being in
-//! that mode, before an offset is decoded or an error recorded. A guest that
-//! has switched its controller off, or moved it to the model-specific
-//! registers, must not find a second way to reach the same registers.
+//! Neither route is taken away when the mode that has a register page is. Which
+//! of the two the page is described as follows the *acceleration*, and it
+//! follows it at runtime: the page is given to the hardware exactly while no
+//! processor of the machine is running the guest with the emulated register
+//! file as its controller's authority, and it is trapped the moment one is. The
+//! controller's mode is deliberately not a term of that, which is what leaves
+//! one description right for every processor — a controller in the wider mode
+//! or switched off does not claim this page at all, so what the page says for
+//! its processor is unobservable.
+//!
+//! So the aperture outlives the mode whichever way the page is described, and
+//! everything reaching it is gated on the controller actually being in that
+//! mode, before an offset is decoded or an error recorded. A guest that has
+//! switched its controller off, or moved it to the model-specific registers,
+//! must not find a second way to reach the same registers.
 //!
 //! What it finds instead is what an address nothing decodes answers with, which
 //! is all-ones: outside that mode the page is not claimed by anything, so the
@@ -97,15 +104,17 @@ use crate::{
 ///
 /// Where the software model serves the page, every access is trapped, reads
 /// included: the values a guest reads out of its controller are this crate's
-/// answers and never the hardware's. Where the processor serves the page
-/// itself, out of the backing page provisioning built, the nested tables are
-/// left alone and no access of the guest's arrives here — but the device is
-/// still owed, because the accesses the acceleration declines to perform come
-/// back as an exit naming the address and the direction, and performing one of
-/// those is performing it against this device.
+/// answers and never the hardware's. On a machine whose processors can serve
+/// the page themselves the region is described by the sink instead, and the
+/// trap this asks for is `None` — not because the page is never trapped, but
+/// because which of its two descriptions it holds is decided again at every
+/// entry and belongs to the acceleration rather than to this registration.
 ///
-/// Which of the two it is follows from whether the acceleration was
-/// provisioned, so this is asked after [`crate::provision`] rather than before.
+/// The device is owed either way. While the processor serves the page, the
+/// accesses the acceleration declines to perform come back as an exit naming
+/// the address and the direction, and performing one of those is performing it
+/// against this device; while it does not, every access faults into the same
+/// one.
 ///
 /// # Errors
 ///
@@ -251,16 +260,16 @@ impl Page {
     /// names none.
     ///
     /// The face itself is gated before any register is decoded, and that comes
-    /// first for a reason. How this aperture is reached is settled once, before
-    /// any guest runs, and stays settled for the life of the machine — but the
-    /// registers behind it exist only while the controller is in the older
-    /// mode. A guest that has switched its controller off, or moved it to
-    /// the model-specific registers, has no memory-mapped face at all, and
-    /// one that still answered would be two programming interfaces to one
-    /// controller at once: a globally disabled guest could go on sending
-    /// interprocessor interrupts, acknowledging real hardware and
-    /// reprogramming physical sources through a page the architecture says
-    /// is not there.
+    /// first for a reason. How this aperture is reached follows the
+    /// acceleration and can change while the guest runs — but the registers
+    /// behind it exist only while the controller is in the older mode, and
+    /// those are two independent questions. A guest that has switched its
+    /// controller off, or moved it to the model-specific registers, has no
+    /// memory-mapped face at all, and one that still answered would be two
+    /// programming interfaces to one controller at once: a globally disabled
+    /// guest could go on sending interprocessor interrupts, acknowledging real
+    /// hardware and reprogramming physical sources through a page the
+    /// architecture says is not there.
     ///
     /// Nothing is recorded for an access outside that mode either. The
     /// illegal-register-address error belongs to a controller that has a

@@ -50,6 +50,7 @@ use svm::avic::{IncompleteIpiExit, MAX_PHYSICAL_ID, UnacceleratedAccessExit};
 use vcpu::Vcpu;
 use x86_64::PhysAddr;
 
+pub use crate::avic::activation::{GuestMemory, Redescribed, RegisterPage};
 use crate::{
     VlapicError,
     avic::{backing::ResetImage, tables::PhysicalTable},
@@ -201,19 +202,27 @@ pub const fn apic_page() -> PhysAddr {
 }
 
 /// Brings the control block's acceleration into agreement with the guest it
-/// describes, on the way into the guest.
+/// describes, and the guest's memory into agreement with both, on the way into
+/// the guest.
 ///
 /// The entry seam of every transition: the bit is set or cleared here, the
-/// backing page rebuilt or carried back, and the flush asked for — and an
-/// entry that changes nothing costs one comparison.
+/// backing page rebuilt or carried back, the register page's description
+/// brought to what the machine needs, and the flush asked for — and an entry
+/// that changes nothing pays two comparisons for it.
+///
+/// `memory` is the guest's memory, which this crate cannot reach for itself.
+/// The controllers' register page is described in it as one thing or the other
+/// depending on whether any processor is running the guest with the emulated
+/// register file as its controller's authority, and this is the only place that
+/// description ever changes.
 ///
 /// # Errors
 ///
 /// [`VlapicError::NotProvisioned`] answers as "no acceleration", which is
 /// the state of every machine the policy left on the software path; anything
 /// else names a frame or a processor the caller cannot be given.
-pub fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
-    activation::reconcile(vcpu)
+pub fn reconcile(vcpu: &mut Vcpu, memory: &impl GuestMemory) -> Result<(), VlapicError> {
+    activation::reconcile(vcpu, memory)
 }
 
 /// Whether the control block this processor was entered with, or is about to be

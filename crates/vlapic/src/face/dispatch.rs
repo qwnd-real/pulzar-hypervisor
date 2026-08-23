@@ -486,24 +486,32 @@ pub(crate) fn acted(vlapic: &Vlapic, written: Written) {
 /// Three things follow a face change, and every one of them is owed to the
 /// change rather than to the write: real hardware has to be brought across, the
 /// table hardware delivery resolves a logical destination through has to be
-/// settled because only the older face is resolved through it, and the decision
-/// to demote this controller has to be remade — the acceleration's state
-/// follows the guest's mode at the next entry either way, and the reasons it
-/// was taken away belong to the mode that was.
+/// settled because only the older face is resolved through it, and the
+/// decisions to demote this controller and to demote the machine have to be
+/// remade — the acceleration's state follows the guest's mode at the next entry
+/// either way, and the reasons it was taken away belong to the mode that was.
+///
+/// Both demotions, and the machine's one is the one that has become
+/// reconsiderable: the register page's description now follows the
+/// acceleration, so returning to it costs nothing that has to be undone. Which
+/// is also what makes this boundary something a guest can drive — see
+/// [`crate::avic::activation::permit_machine`], and the threshold that refuses
+/// to follow one that does.
 ///
 /// So a write that changed nothing is answered with nothing. The architecture
 /// explicitly allows one: software that reads this register, changes a field it
 /// is entitled to and writes it back has made no transition, and
 /// [`Vlapic::write_base`] is careful to say so. Acting anyway made the shortest
 /// loop a guest can write into a demotion undone, a backing page rebuilt and a
-/// translation flushed per iteration — because none of the four reasons a
-/// controller is demoted is a statement about the guest at all, and none of
+/// translation flushed per iteration — because none of the reasons a controller
+/// or a machine is demoted is a statement about the guest at all, and none of
 /// them is re-established by a guest register write.
 fn face_changed(vlapic: &Vlapic, transition: Transition) {
     if matches!(transition, Transition::Unchanged) {
         return;
     }
     vlapic.permit_avic();
+    crate::avic::activation::permit_machine();
     entered(vlapic, transition);
     // Settled here rather than left to the next entry, so that no peer resolves
     // to an identity the guest has just given up.

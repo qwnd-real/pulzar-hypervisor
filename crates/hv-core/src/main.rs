@@ -22,6 +22,12 @@
 //! controller's register page to translate to memory the guest may write, and
 //! redirects every access away from it, so the page is given a frame of the
 //! chunk that nothing ever reads — writable, and never read back by anything.
+//! That exception comes and goes: the page is given to the hardware exactly
+//! while no processor is running the guest with the emulated register file as
+//! its controller's authority, and whenever one is it is trapped again and the
+//! emulator answers for it. So the rest of the chunk is an immutable page of
+//! zeroes to the guest for the whole of its life, and this one page is either
+//! that frame or nothing at all.
 //!
 //! The same entry point is also reachable by starting `pulzar.efi` as an
 //! ordinary UEFI application, in which case the first argument is a firmware
@@ -281,12 +287,16 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // longer require it: they report what taking a region over made stricter, and
     // discharging that is what makes every processor stop using what it replaced.
     //
-    // What the policy decides is only how the guest's own accesses to the
-    // register page arrive. Where the processor drives the controller itself
-    // they do not arrive at all: the hardware redirects them to a backing page,
-    // and the register page — which the acceleration still requires to
-    // translate to writable memory — goes to a frame nothing reads. Where it
-    // does not, the page is trapped and every access faults into the emulator.
+    // What the policy decides here is only whether the register page has a frame
+    // and a name at all. Which of its two descriptions it holds is not settled
+    // here and does not outlive this function: on a machine whose processors can
+    // drive the controllers, the page follows the acceleration from the first
+    // entry onwards — given to the hardware while it is driving, trapped whenever
+    // the emulated register file is what answers for a controller — and the sink
+    // is where the frame and the name both directions keep come from. On a
+    // machine with no acceleration the page is trapped once, by the registration
+    // below, and stays that way.
+    //
     // Either way the page is a region this hypervisor answers for, because an
     // access the acceleration declines to perform is reported rather than
     // performed, and performing one of those means performing it against the

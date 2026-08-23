@@ -104,6 +104,7 @@ use core::{
 };
 
 use apic::REGISTER_STRIDE;
+use clock::Instant;
 use cpu::{ApicId, CpuIndex};
 use descriptors::Vector;
 use log::{info, trace, warn};
@@ -193,18 +194,73 @@ pub(crate) struct Activation {
     /// and every directed IPI takes the exit-and-kick path instead.
     ipi_virtual: bool,
     /// The machine has been told something is wrong with the acceleration
-    /// itself, and stays on the software path for the rest of its life.
+    /// itself, and delivers in software until a boundary gives the decision a
+    /// reason to be remade.
     ///
-    /// Sticky rather than re-enabled automatically: the conditions that set
-    /// it are either broken hypervisor state or a guest the hardware cannot
-    /// be trusted to resolve destinations for, and neither announces when it
-    /// has gone away.
+    /// Not sticky. Every condition that sets it is either broken hypervisor
+    /// state or a guest the hardware cannot be trusted to resolve destinations
+    /// for, and none of them announces when it has gone away — so it is lifted
+    /// where the guest replaces the state the decision was made from, which is
+    /// [`permit_machine`]. What makes that affordable is that the way back is
+    /// the *free* direction: giving the register page to the hardware grants
+    /// permission, and granting permission removes no constraint any processor
+    /// could be holding. [`Activation::sealed`] is the one demotion nothing
+    /// lifts.
     ///
     /// Written by any processor and read by all of them, Relaxed on both:
     /// nothing is published with it, and a reader that acted on it a moment
     /// late is a processor taking one more accelerated entry, which is what
     /// every reading of it is one entry away from anyway.
     machine_inhibited: AtomicBool,
+    /// The machine has stopped following a guest that drives the register
+    /// page's description, and delivers in software for the rest of its life.
+    ///
+    /// The one demotion [`permit_machine`] will not lift, because it is the
+    /// one that is a statement about the guest rather than about a condition
+    /// that may have gone away. Relaxed, as [`Activation::machine_inhibited`]
+    /// is and for the same reason.
+    sealed: AtomicBool,
+    /// Whether the emulated register file is the authority for each processor's
+    /// controller while it runs the guest, indexed by roster position.
+    ///
+    /// The whole of what the register page's description is a function of. Each
+    /// cell is written by the processor it belongs to, at its own entries, and
+    /// read by whichever processor is deciding what the page must be — both
+    /// under [`Activation::page`], which is what makes the set and the
+    /// description one fact rather than two. Relaxed on both accesses: the lock
+    /// is what orders them, and the fast path that reads a processor's own cell
+    /// without taking it reads a cell nothing else writes.
+    authorities: Box<[AtomicBool]>,
+    /// Held while the register page's description is brought to what those
+    /// publications ask for, and holding what a guest driving it has been
+    /// counted by.
+    ///
+    /// # Who takes it
+    ///
+    /// [`settle`] and nothing else, from the entry callback, where both
+    /// interrupt flags are already clear. A processor takes it only where what
+    /// it has to publish about its own controller has changed, so an entry that
+    /// changes nothing never reaches it.
+    ///
+    /// # What runs under it, and why waiting under it is safe
+    ///
+    /// A change to the guest's memory and the barrier that discharges one,
+    /// which makes every processor inside the guest leave it and waits for each
+    /// of them. That is the one lock in this crate whose critical section waits
+    /// for another processor at all, and the argument that it terminates is
+    /// that a spinner is never what the holder is waiting for: a processor
+    /// spinning here is inside its own entry callback, which is after the exit
+    /// that published it as out of the guest and before the store that
+    /// publishes it as in — so no barrier ever names it, and the holder's wait
+    /// is the barrier's own bounded one.
+    ///
+    /// Two rules follow, and they are the caller's to keep. Nothing under it
+    /// may take a second lock a holder of *this* one could be waiting for; and
+    /// nothing that can preempt a holder may ask for it — with host interrupts
+    /// off what still reaches one is a non-maskable interrupt or a machine
+    /// check, and a handler for either waiting on a lock the processor it
+    /// interrupted may hold would never finish.
+    page: Mutex<Oscillation>,
     /// Held while the logical table and the record of what is in it move.
     ///
     /// # Who takes it
@@ -290,6 +346,13 @@ pub(super) fn establish(
         window,
         ipi_virtual,
         machine_inhibited: AtomicBool::new(false),
+        sealed: AtomicBool::new(false),
+        // Nothing has entered the guest, so nothing is running it with the
+        // emulated register file as its controller's authority — which is what
+        // makes the register page the sunk one whichever description a boot
+        // gave it, and what leaves the first entry to say otherwise.
+        authorities: (0..processors).map(|_| AtomicBool::new(false)).collect(),
+        page: Mutex::new(Oscillation::default()),
         logical_lock: Mutex::new(()),
         logical_slots: (0..processors).map(|_| AtomicU16::new(NO_SLOT)).collect(),
         rebuilt_at: (0..processors).map(|_| AtomicU64::new(0)).collect(),
@@ -395,17 +458,17 @@ pub(crate) fn policy() -> Option<Policy> {
 /// where [`deliverable`] asks it and the only place it is asked. Registers of a
 /// software-disabled controller are architecturally still readable and
 /// writable, and the backing page is exactly where they should be read and
-/// written.
+/// written — the hardware serves them there, and traps the write of the very
+/// register that switches the controller back on.
 ///
-/// Making it a term here would be worse than redundant on a machine the policy
-/// provisioned. Reset leaves it clear, so every processor the guest starts
-/// would come up unaccelerated — and the register page a controller then falls
-/// back to is not the emulator's, because the acceleration's redirection is
-/// arranged once before the guest runs and the page translates to a frame
-/// nothing reads for the rest of the machine's life. The guest's write of the
-/// very register that would switch the controller on would land there and be
-/// lost, and no processor but the first would ever have an interrupt
-/// controller.
+/// So the division is the one the doc above states and nothing more: the model
+/// gates whether the acceleration is *activated*, and the backing page gates
+/// whether it *delivers*. Making the bit a term here would move a
+/// per-controller state into the one question the register page's description
+/// answers for the whole machine — see [`model_answers`] — and buy nothing for
+/// it: every processor of a guest with one controller switched off would take
+/// an exit per register access, where today the hardware serves them and the
+/// model is told what it needs at the trap.
 pub(crate) fn active_for(vlapic: &Vlapic) -> bool {
     ACTIVATED
         .get()
@@ -561,10 +624,58 @@ fn face_limit(face: Face, provisioned: u16) -> u16 {
     }
 }
 
-/// Brings the control block's acceleration into agreement with the guest it
-/// describes, on the way in.
+/// How the interrupt controllers' register page is described in the guest's
+/// memory.
 ///
-/// Cheap in steady state: a comparison, and nothing else. Where the guest's
+/// One description for the machine, and [`model_answers`] is what makes that
+/// right: the page is decoded by a controller in one face only, so what it says
+/// for a processor whose controller is anywhere else is unobservable, and what
+/// is left is a single question about the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterPage {
+    /// Present, writable, over a frame nothing reads.
+    ///
+    /// What the acceleration requires of the page whose accesses it redirects
+    /// away: the hardware checks that it translates to memory the guest may
+    /// write, and then never touches what it translates to.
+    Given,
+    /// Described by nothing at all, so that every access to it faults and is
+    /// answered by the emulated register file.
+    Interposed,
+}
+
+/// What bringing the register page to a description came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Redescribed {
+    /// The guest's memory already said this. Nothing was written and no
+    /// processor was told anything, which is what keeps a guest driving the
+    /// description towards the state it is already in from costing the machine
+    /// anything at all.
+    Already,
+    /// It did not, and every processor has been made to stop using whatever the
+    /// description replaced.
+    Moved,
+    /// It could not be brought to it, which is reported where the guest's
+    /// memory is described rather than here.
+    Refused,
+}
+
+/// How this crate reaches the description of the guest's own memory.
+///
+/// The nested page tables are above this crate, so the one page whose
+/// description follows the acceleration is changed through whoever holds the
+/// guest rather than through anything reached from here. Handed in at the entry
+/// that may have to change it, which is also the only place that ever does.
+pub trait GuestMemory {
+    /// Brings the interrupt controllers' register page to `wanted`, discharging
+    /// whatever the change owes every processor.
+    fn describe_register_page(&self, wanted: RegisterPage) -> Redescribed;
+}
+
+/// Brings the control block's acceleration into agreement with the guest it
+/// describes, and the guest's memory into agreement with both, on the way in.
+///
+/// Cheap in steady state: two comparisons, and nothing else. Where the guest's
 /// face and the control block's bits disagree, the transition is performed
 /// here — the backing page rebuilt from the model on the way up, the
 /// hardware's state carried back into the model on the way down, the
@@ -574,6 +685,32 @@ fn face_limit(face: Face, provisioned: u16) -> u16 {
 /// transition keeps is that the software model moves first and the acceleration
 /// follows it.
 ///
+/// # The register page is settled twice, on either side of the transition
+///
+/// The page is given to the hardware exactly while nothing is running the guest
+/// with the emulated register file as its controller's authority, and the two
+/// orders that keeps are not interchangeable — one of them is the bug this
+/// arrangement removes, and it looks equally reasonable.
+///
+/// The settle *before* the transition is the one that matters. A processor that
+/// gave up the acceleration while the page was still the hardware's would leave
+/// its guest reading and writing a frame nothing answers for, with the model as
+/// the only authority for a controller the guest can no longer reach. So it
+/// publishes first and the page is trapped before it disarms, and what it may
+/// disarm at all depends on the page having been trapped: [`Settled::Given`] is
+/// a page that could not be, and the acceleration stays on the block, which is
+/// the one state a given page is correct for.
+///
+/// The settle *after* it is the same publication made from the truth rather
+/// than from the intention. A transition that was refused or that failed leaves
+/// the model this controller's authority however the model asked, and the page
+/// has to say so before the guest runs.
+///
+/// A processor caught between the two — armed, with the page trapped — takes a
+/// nested fault per register access and is answered out of its model and its
+/// backing page, which is the path an unaccelerated access already takes.
+/// Correct, and slower until the next entry settles it.
+///
 /// # Errors
 ///
 /// [`VlapicError::NotProvisioned`] is answered as "no acceleration" rather
@@ -582,19 +719,23 @@ fn face_limit(face: Face, provisioned: u16) -> u16 {
 /// [`VlapicError::AvicRefused`] is a transition the entry rules would not have
 /// survived, reported with the acceleration left exactly as it was. Anything
 /// else names a frame the window does not reach or a processor the roster does
-/// not describe, and takes the acceleration off this controller as it is
-/// reported — see [`degraded`].
+/// not describe, and demotes the machine as it is reported — see [`degraded`].
 ///
 /// In every case the caller degrades rather than refusing the entry, and what
 /// the guest is entered with is what the control block says rather than what
 /// the model asked for: [`accelerated`] is the predicate that makes that true.
-pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
+pub(crate) fn reconcile(vcpu: &mut Vcpu, memory: &impl GuestMemory) -> Result<(), VlapicError> {
     let Some(activation) = ACTIVATED.get() else {
         return Ok(());
     };
     let vlapic = current()?;
+    let who = vlapic.index().get();
     let have = face_of(vcpu);
-    let want = active_face(activation, vlapic);
+    let asked = active_face(activation, vlapic);
+    let want = match settle(activation, memory, who, model_answers(vlapic.mode(), asked)) {
+        Settled::Ready => asked,
+        Settled::Given => have,
+    };
     // One reading above the match rather than one inside an arm, because which
     // life the backing page belongs to is a term of every transition and not of
     // one: it decides whether a deactivation may carry the page into the model,
@@ -639,12 +780,160 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
             }
         }
     });
-    degraded(vlapic, performed)
+    let performed = degraded(performed);
+    // From the block the processor is really about to be entered with, and its
+    // answer is nothing left to act on: the transition has happened, and a page
+    // that could not be trapped is a failure the guest's memory reports where it
+    // is described.
+    settle(
+        activation,
+        memory,
+        who,
+        model_answers(vlapic.mode(), face_of(vcpu)),
+    );
+    performed
 }
 
-/// Takes the acceleration off this controller where a transition could not be
-/// performed, so that a failure degrades rather than being attempted again on
-/// every entry for the rest of the guest's life.
+/// Brings the register page's description to what the machine needs, and
+/// answers whether the model may be this controller's authority while its
+/// processor runs.
+///
+/// `model` is what this processor has to publish about itself. The page is
+/// given exactly while no processor publishes it, so a processor that publishes
+/// before it disarms has trapped the page before any guest access can land in
+/// the sink while the model is the authority, and one that unpublishes after it
+/// arms has given the page only once nothing is running the guest without the
+/// acceleration. That is the whole of the ordering, and it is per processor
+/// rather than machine-wide because the state that has to be ordered against
+/// is.
+///
+/// # The fast path is the whole of what an entry usually pays
+///
+/// A processor whose publication has not changed has nothing to settle: the
+/// description is a function of what every processor has published, so whatever
+/// it is now already accounts for this one. One relaxed load of a cell nothing
+/// else writes, and a comparison.
+fn settle(activation: &Activation, memory: &impl GuestMemory, who: usize, model: bool) -> Settled {
+    let Ok(published) = activation.authority(who) else {
+        // A processor the roster does not describe has nowhere to publish
+        // anything — and no backing page and no table entry either, so the
+        // transition below is one it cannot perform in any case. The page is
+        // left as the processors the roster does describe have asked for it.
+        return Settled::Ready;
+    };
+    if published.load(Ordering::Relaxed) == model {
+        return Settled::Ready;
+    }
+    let (settled, restless) = {
+        let mut oscillation = activation.page.lock();
+        // Published before the description is decided and under the same lock,
+        // so that the set the decision is made from cannot be added to while it
+        // is read.
+        published.store(model, Ordering::Relaxed);
+        let redescribed = memory.describe_register_page(activation.wanted());
+        let settled = settled(redescribed, model);
+        // A page that could not be trapped leaves this processor carrying the
+        // acceleration, so what it was about to publish about itself is not what
+        // will be true of it.
+        published.store(settled.published(model), Ordering::Relaxed);
+        (
+            settled,
+            matches!(redescribed, Redescribed::Moved) && oscillation.moved(clock::now()),
+        )
+    };
+    // Outside the lock: a line of serial output is taken with a machine-wide
+    // lock of its own, and the rule that lets this one be waited under is that
+    // nothing under it waits for something a spinner could be holding.
+    if restless {
+        refuse_to_follow(activation);
+    }
+    settled
+}
+
+/// Whether the emulated register file, rather than the hardware, is the
+/// authority for a controller's register page while its processor runs the
+/// guest.
+///
+/// The one term of the page's description each processor contributes, and the
+/// reason one description is right for the whole machine. Two things have to
+/// hold, and the second is what takes every other per-processor difference out
+/// of the question: a controller in the face a guest reaches through
+/// model-specific registers, or one its guest has switched off, does not claim
+/// the page at all — it has no memory-mapped face, and [`crate::face::mmio`]
+/// answers all-ones for one that asks anyway — so what the page says for such a
+/// processor is unobservable. What is left is a controller in the older face
+/// whose control block does not carry the acceleration, whatever the reason for
+/// that is: a machine that demoted, a controller demoted on its own, or a
+/// transition that could not be performed.
+const fn model_answers(mode: Mode, face: Option<Face>) -> bool {
+    face.is_none() && matches!(mode, Mode::XApic)
+}
+
+/// What the register page must be described as, out of the one thing that
+/// decides it.
+///
+/// Pure rather than folded into [`Activation::wanted`], because "given exactly
+/// while nothing is running the guest without the acceleration" is the whole of
+/// the machine-wide state this work exists to establish, and a decision of
+/// values can be read against the two states it covers.
+const fn wanted(model_answers_anywhere: bool) -> RegisterPage {
+    if model_answers_anywhere {
+        RegisterPage::Interposed
+    } else {
+        RegisterPage::Given
+    }
+}
+
+/// Whether the register page is described as this processor's run needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settled {
+    /// It is, so whatever the model asks of the acceleration may be performed.
+    Ready,
+    /// The page is still given and could not be trapped, so the model may not
+    /// become this controller's authority: the control block keeps the
+    /// acceleration it already carries, which is the state a given page is
+    /// correct for, and a later entry arranges the page.
+    ///
+    /// A block that carries none is the one state this cannot repair, and it is
+    /// reachable only from a machine already reporting that the description of
+    /// its guest's memory will not move. Nothing this entry does makes it
+    /// worse, and the report is where it is answered.
+    Given,
+}
+
+impl Settled {
+    /// What the processor leaves published about itself, given what it was
+    /// going to publish.
+    ///
+    /// Derived rather than answered alongside, because the two are one fact: a
+    /// processor that keeps the acceleration because the page could not be
+    /// trapped is not one the model is the authority for.
+    const fn published(self, model: bool) -> bool {
+        matches!(self, Self::Ready) && model
+    }
+}
+
+/// What a description that was asked for came to.
+///
+/// Pure rather than folded into [`settle`], because refusing to let the model
+/// become a controller's authority while the page is still the hardware's is
+/// the decision this whole arrangement exists to make, and a decision of values
+/// can be read against the states it covers.
+///
+/// A refusal in the other direction is not one of them. A page that could not
+/// be *given* costs speed and nothing else: every access to it faults and is
+/// answered out of the model and the backing page, which is the path an
+/// unaccelerated access already takes.
+const fn settled(redescribed: Redescribed, model: bool) -> Settled {
+    match redescribed {
+        Redescribed::Refused if model => Settled::Given,
+        Redescribed::Already | Redescribed::Moved | Redescribed::Refused => Settled::Ready,
+    }
+}
+
+/// Demotes the machine where a transition could not be performed, so that a
+/// failure degrades rather than being attempted again on every entry for the
+/// rest of the guest's life.
 ///
 /// The entry itself is already correct without this, because what the processor
 /// is entered with is what the block carries and a transition that failed left
@@ -656,23 +945,33 @@ pub(crate) fn reconcile(vcpu: &mut Vcpu) -> Result<(), VlapicError> {
 /// say so again, once per entry, through a serial port taken with a
 /// machine-wide lock. One demotion is one attempt and one line.
 ///
-/// The cost is that a failure whose cause goes away costs this controller its
-/// acceleration until the guest's own next change of face, which is where
-/// [`Vlapic::permit_avic`] remakes the decision, or until a reset. None of the
-/// causes announces when it has gone away, which is why the sticky answer is
-/// the honest one.
+/// The machine rather than this controller, which costs the acceleration on
+/// every processor. That is what a failure of this hypervisor's own interrupt
+/// delivery deserves, and it is also what makes one description of the register
+/// page right for all of them: a controller demoted on its own is a processor
+/// whose guest reaches that page through the emulator, and the page is the
+/// machine's.
+///
+/// Not a one-way door either. The way back exists now and is the free
+/// direction, so the demotion is lifted where the guest replaces the state it
+/// was decided from — [`permit_machine`] — rather than standing for the life of
+/// the machine because nothing could undo the description it implies.
 ///
 /// A refusal is deliberately not one of them. [`VlapicError::AvicRefused`] is
 /// reported with nothing edited — the block is exactly as the processor has
 /// been entering it all along — and the rules behind it are re-asked at the
 /// next entry for the price of reading fields that are already in cache.
-fn degraded(vlapic: &Vlapic, performed: Result<(), VlapicError>) -> Result<(), VlapicError> {
+fn degraded(performed: Result<(), VlapicError>) -> Result<(), VlapicError> {
     match performed {
         Ok(()) | Err(VlapicError::AvicRefused(_)) => {}
-        Err(_) => vlapic.inhibit_avic(),
+        Err(_) => inhibit_machine(UNRECONCILED),
     }
     performed
 }
+
+/// Why the machine stops trusting the acceleration when a control block could
+/// not be brought to it.
+const UNRECONCILED: &str = "a control block could not be brought to hardware delivery";
 
 /// Takes away the one encoding of the enable bits the architecture defines no
 /// meaning for, at the entry that found a block holding it.
@@ -1841,8 +2140,8 @@ pub(crate) fn msr_write(
     }
 }
 
-/// Stops driving this controller in hardware from inside an exit, handing the
-/// page's state back to the model first.
+/// Stops driving this machine's controllers in hardware from inside an exit,
+/// handing this controller's page back to its model first.
 ///
 /// What [`disable`] performs at an entry, performed at the moment a caller
 /// stops trusting the acceleration: the access that discovered the trouble is
@@ -1859,9 +2158,15 @@ pub(crate) fn msr_write(
 /// true state, and putting the page back would restore exactly what the reset
 /// was required to destroy.
 ///
+/// The machine rather than this controller alone, for the reason [`degraded`]
+/// gives: every caller of this is a disagreement inside this hypervisor rather
+/// than anything the guest did, and one description of the register page has to
+/// be right for every processor.
+///
 /// The demotion itself happens whether or not the carry could, because a claim
-/// that cannot reach the page is one the processor stops making either way; the
-/// control block's enable bits follow at the next entry.
+/// that cannot reach the page is one the machine stops making either way; every
+/// control block's enable bits follow at its own next entry, and the register
+/// page is trapped there before any of them gives the acceleration up.
 ///
 /// # Errors
 ///
@@ -1876,15 +2181,30 @@ pub(crate) fn hand_back(vlapic: &Vlapic) -> Result<(), VlapicError> {
             }
             Ok(())
         });
-    vlapic.inhibit_avic();
+    inhibit_machine(UNPERFORMABLE);
     carried
 }
 
-/// Demotes the whole machine, for the rest of its life.
+/// Why the machine stops trusting the acceleration when the hardware reports a
+/// controller register access nothing could perform where it was reported.
+const UNPERFORMABLE: &str = "the hardware reported a register access nothing could perform";
+
+/// Demotes the whole machine, until a boundary gives the decision a reason to
+/// be remade.
 ///
 /// For the reports that say the acceleration itself cannot be trusted:
-/// destinations resolving somewhere the guest did not name them, or an exit
-/// the architecture has no reason to raise.
+/// destinations resolving somewhere the guest did not name them, an exit the
+/// architecture has no reason to raise, or a control block this hypervisor
+/// could not bring to the state hardware delivery needs.
+///
+/// Nothing about the register page happens here, and that is the ordering the
+/// whole arrangement rests on. Every processor still inside the guest is still
+/// carrying the acceleration, which is exactly the state the given page is
+/// correct for; each of them publishes at its own next entry that the model has
+/// become its controller's authority, and it is *that* which traps the page —
+/// before the same entry disarms the block. A demotion that trapped the page
+/// here would trap it while processors were still driving their controllers out
+/// of it, which is correct but pays a fault per register access for nothing.
 ///
 /// The exchange is Relaxed, as every access to the flag is: what it orders is
 /// nothing but the line below, and the flag itself is the whole of what any
@@ -1898,7 +2218,162 @@ pub(crate) fn inhibit_machine(reason: &str) {
     }
 }
 
+/// Allows hardware delivery on this machine again, at a boundary that
+/// re-establishes the reasons it was taken away.
+///
+/// Called where a guest changes which face its controller answers through,
+/// which is the same boundary a controller's own demotion is reconsidered at
+/// and for the same reason: a demotion is a statement about state the guest has
+/// just replaced, and a guest that walks its faces is entitled to have the
+/// decision remade. What makes it affordable is that this is the *free*
+/// direction — giving the register page back to the hardware grants permission,
+/// so no processor has to be told anything, and the processors take the
+/// acceleration up again at their own next entries.
+///
+/// Refused where the machine has stopped following a guest that drives the
+/// register page's description. That is the one demotion which is a statement
+/// about the guest rather than about a condition that may have gone away, so a
+/// guest cannot lift it by driving the thing it was demoted for.
+pub(crate) fn permit_machine() {
+    let Some(activation) = ACTIVATED.get() else {
+        return;
+    };
+    if activation.sealed.load(Ordering::Relaxed) {
+        return;
+    }
+    if activation.machine_inhibited.swap(false, Ordering::Relaxed) {
+        info!("vlapic: hardware delivery permitted for the machine again");
+    }
+}
+
+/// Stops the machine following a guest that is driving the register page's
+/// description, and says so once.
+///
+/// The demotion a threshold produces rather than a failure, and the only one
+/// nothing lifts: what it reports needs no repeating to stay true, and the
+/// guest keeps a working interrupt controller — every access to the page faults
+/// and is answered out of the emulated register file, which is what a machine
+/// with no acceleration at all does for every guest it runs.
+fn refuse_to_follow(activation: &Activation) {
+    if activation.sealed.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    activation.machine_inhibited.store(true, Ordering::Relaxed);
+    warn!(
+        "vlapic: this guest has moved the description of its controllers' register page more than \
+         {MOVES} times in {} ms; hardware delivery is inhibited for the machine for the rest of \
+         its life, and every access to that page is answered by the emulated register file",
+        WINDOW_NANOS / NANOS_PER_MILLI,
+    );
+}
+
+/// How often the register page's description has moved lately, which is what
+/// the machine refuses to go on following.
+///
+/// A guest can drive the description. Whether the emulated register file is a
+/// controller's authority follows the face its guest puts that controller in,
+/// and the register that decides the face is one this hypervisor never stops
+/// intercepting — so a guest on a demoted machine can alternate between a face
+/// that claims the register page and one that does not, and each alternation is
+/// a write to the guest's memory and, one way, an interrupt to every processor
+/// inside the guest.
+///
+/// What the tables already make free is doing nothing: a transition to the
+/// description they already hold writes nothing and sends nothing, and is not
+/// counted here. So this only has to cover a guest that really is flipping
+/// between two different states.
+#[derive(Clone, Copy, Debug, Default)]
+struct Oscillation {
+    /// Where on the monotonic clock, in nanoseconds, the window being counted
+    /// against began — or nothing, where no clock could say.
+    since: Option<u64>,
+    /// How many transitions have been counted in it.
+    moves: u32,
+}
+
+impl Oscillation {
+    /// Counts one transition that moved the description, and answers whether
+    /// the machine should stop following the guest.
+    ///
+    /// `now` is the monotonic clock, or `None` where nothing has installed one.
+    fn moved(&mut self, now: Option<Instant>) -> bool {
+        self.counted(now.map(Instant::nanos))
+    }
+
+    /// The same, out of the reading the decision is made from.
+    ///
+    /// Nanoseconds rather than the clock's own type, for the reason every other
+    /// decision in this file is a function of values: what a threshold within a
+    /// window does at each of its boundaries is exactly the kind of thing that
+    /// has to be readable against the cases it covers.
+    ///
+    /// A window nothing can measure — no clock installed, which is a machine
+    /// still being brought up and before any guest could have driven anything —
+    /// is left standing rather than restarted, so the count accumulates. That
+    /// is the safe direction for it to fail in: it refuses a run of
+    /// transitions rather than allowing an unbounded one.
+    fn counted(&mut self, now: Option<u64>) -> bool {
+        let restart = self.moves == 0
+            || self
+                .since
+                .zip(now)
+                .is_some_and(|(since, now)| now.saturating_sub(since) >= WINDOW_NANOS);
+        if restart {
+            self.since = now;
+            self.moves = 0;
+        }
+        self.moves = self.moves.saturating_add(1);
+        self.moves > MOVES
+    }
+}
+
+/// How many times the register page's description may move in one window before
+/// the machine stops following the guest.
+///
+/// Generous against what a guest legitimately causes, which is one transition
+/// per demotion and one per recovery, and small against what a loop can do,
+/// which is thousands a second.
+const MOVES: u32 = 64;
+
+/// How long that window is.
+const WINDOW_NANOS: u64 = 1_000_000_000;
+
+/// Nanoseconds in a millisecond, for saying the window in the unit a reader
+/// thinks in.
+const NANOS_PER_MILLI: u64 = 1_000_000;
+
 impl Activation {
+    /// Where the processor at roster position `index` publishes whether the
+    /// emulated register file is the authority for its controller.
+    ///
+    /// Fallible for the reason [`Activation::rebuilt_at`] is.
+    fn authority(&self, index: usize) -> Result<&AtomicBool, VlapicError> {
+        self.authorities.get(index).ok_or(VlapicError::NoLapic)
+    }
+
+    /// What the interrupt controllers' register page must be described as.
+    ///
+    /// The whole of the machine-wide state the page follows: it is given
+    /// exactly while no processor has published that the emulated register file
+    /// is the authority for its controller. Read under [`Activation::page`], so
+    /// nothing can join the set while it is being read.
+    ///
+    /// A publication stands until the processor that made it next enters the
+    /// guest, and nothing expires it — so a machine that demoted while a
+    /// processor was running, and whose guest then reset that processor and
+    /// never started it again, keeps the page trapped although nothing needs it
+    /// to be. That costs an exit per register access on the processors that are
+    /// running and nothing else, and it is the direction this has to fail in: a
+    /// publication that lapsed on its own would be the page given back to the
+    /// hardware while a processor was still running the guest without it.
+    fn wanted(&self) -> RegisterPage {
+        wanted(
+            self.authorities
+                .iter()
+                .any(|authority| authority.load(Ordering::Relaxed)),
+        )
+    }
+
     /// The backing page of the processor at roster position `index`.
     fn page(&self, index: usize) -> Result<PhysAddr, VlapicError> {
         self.backing
@@ -2657,6 +3132,12 @@ mod tests {
     //! and what the two read-modify-writes over a physical-table entry
     //! leave of the rest of it.
     //!
+    //! The register page's description is here as well, as the four decisions
+    //! it is made of: which processors the page has to be the emulator's
+    //! for, what the machine then needs it described as, what a description
+    //! that could not be arranged leaves a control block carrying, and when
+    //! a guest driving the description stops being followed.
+    //!
     //! The logical table's own three operations are here too, and they are the
     //! one thing in this file that touches a structure rather than deciding
     //! something. They reach it through a closure, so a test supplies an array
@@ -2677,10 +3158,11 @@ mod tests {
 
     use super::{
         Acknowledged, ApicId, Entry, FLAT_DESTINATION_FORMAT, Face, IS_RUNNING, IS_VALID,
-        LOGICAL_ENTRIES, LOGICAL_VALID, Life, Mode, Move, NO_SLOT, Publish, Register, Standing,
-        TaskPriority, VlapicError, Written, disclaim, driven_face, entry_slot, eoi_vector,
-        face_bits, face_limit, logical_slot, mirrored, move_for, publication, publish_logical,
-        withdraw,
+        LOGICAL_ENTRIES, LOGICAL_VALID, Life, MOVES, Mode, Move, NO_SLOT, Oscillation, Publish,
+        Redescribed, Register, RegisterPage, Settled, Standing, TaskPriority, VlapicError,
+        WINDOW_NANOS, Written, disclaim, driven_face, entry_slot, eoi_vector, face_bits,
+        face_limit, logical_slot, mirrored, model_answers, move_for, publication, publish_logical,
+        settled, wanted, withdraw,
     };
 
     /// Every mode a controller can be in, which is the one term of the
@@ -2822,6 +3304,121 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn the_page_is_the_emulators_for_a_controller_the_hardware_does_not_drive_in_the_older_face() {
+        // The one term each processor contributes to the register page's
+        // description, read against every state it is decided from. The second
+        // half of it is what makes one description right for the whole machine:
+        // a controller in the wider face or switched off has no memory-mapped
+        // face at all, so what the page says for its processor is unobservable
+        // and it contributes nothing.
+        for mode in MODES {
+            for machine_inhibited in [false, true] {
+                for x2avic in [false, true] {
+                    for inhibited in [false, true] {
+                        let face = driven_face(machine_inhibited, mode, x2avic, inhibited);
+                        assert_eq!(
+                            model_answers(mode, face),
+                            mode == Mode::XApic && face.is_none(),
+                            "{mode:?}, machine inhibited {machine_inhibited}, x2avic {x2avic}, \
+                             inhibited {inhibited}"
+                        );
+                    }
+                }
+            }
+        }
+        // And whichever reason took the acceleration off a controller in the
+        // older face, the answer is the same one: the page has to be the
+        // emulator's, because the emulator is what its guest will reach.
+        assert!(model_answers(Mode::XApic, None));
+        assert!(!model_answers(Mode::XApic, Some(Face::XAvic)));
+    }
+
+    #[test]
+    fn the_page_is_given_exactly_while_no_processor_needs_the_model_to_answer_for_it() {
+        // The whole of the machine-wide state the page follows. One processor
+        // running the guest without the acceleration is enough to take the page
+        // off the hardware, because there is one description for all of them.
+        assert_eq!(wanted(false), RegisterPage::Given);
+        assert_eq!(wanted(true), RegisterPage::Interposed);
+    }
+
+    #[test]
+    fn a_page_that_could_not_be_trapped_leaves_the_acceleration_where_it_was() {
+        // The decision that closes the window this whole arrangement exists to
+        // close: a processor may only let the model become its controller's
+        // authority once the page it would then reach is the emulator's. So a
+        // description that moved and one that already said this are both ready,
+        // and only a refusal in the trapping direction holds the transition back.
+        for redescribed in [Redescribed::Already, Redescribed::Moved] {
+            for model in [false, true] {
+                assert_eq!(settled(redescribed, model), Settled::Ready, "{model}");
+            }
+        }
+        assert_eq!(settled(Redescribed::Refused, true), Settled::Given);
+        // A page that could not be *given* costs speed and nothing else: every
+        // access to it faults and is answered out of the model and the backing
+        // page, which is the path an unaccelerated access already takes.
+        assert_eq!(settled(Redescribed::Refused, false), Settled::Ready);
+    }
+
+    #[test]
+    fn a_processor_that_keeps_the_acceleration_publishes_that_it_kept_it() {
+        // What it publishes and what its control block carries are one fact: a
+        // processor held back from giving the acceleration up must not be
+        // counted among those the page has to be the emulator's for, or nothing
+        // would ever give the page back.
+        assert!(Settled::Ready.published(true));
+        assert!(!Settled::Given.published(true));
+        // And a processor taking the acceleration on publishes nothing either
+        // way, which is what lets the page be given again.
+        assert!(!Settled::Ready.published(false));
+        assert!(!Settled::Given.published(false));
+    }
+
+    #[test]
+    fn a_run_of_transitions_inside_one_window_is_refused_and_one_spread_out_is_not() {
+        let mut oscillation = Oscillation::default();
+
+        for move_number in 1..=MOVES {
+            assert!(
+                !oscillation.counted(Some(0)),
+                "a guest is followed for the first {MOVES} transitions of a window, \
+                 and this is number {move_number}"
+            );
+        }
+
+        assert!(
+            oscillation.counted(Some(0)),
+            "the one past the threshold is where the machine stops following it"
+        );
+
+        // The same run, one window apart each time: a guest that moves the
+        // description occasionally for the whole life of a machine is not
+        // driving anything, and a count that never reset would eventually
+        // refuse it.
+        let mut patient = Oscillation::default();
+        for window in 0..4 * u64::from(MOVES) {
+            assert!(
+                !patient.counted(Some(window * WINDOW_NANOS)),
+                "window {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_nothing_can_measure_still_refuses_a_run() {
+        // Before a clock is installed, which is a machine still being brought up
+        // and before any guest could have driven anything. The window cannot
+        // elapse, so the count accumulates and the run is refused — which is the
+        // direction an unmeasurable window has to fail in.
+        let mut oscillation = Oscillation::default();
+        for _ in 0..MOVES {
+            assert!(!oscillation.counted(None));
+        }
+        assert!(oscillation.counted(None));
     }
 
     #[test]

@@ -127,6 +127,22 @@
 //! redirecting every access away from it: an exit is no longer the expected
 //! shape of an access, and the page still has to translate to something.
 //!
+//! That is a statement about a *moment* rather than about the life of a
+//! machine, because whether anything is performing a page's accesses can
+//! change while the guest runs. So a sunk page has both descriptions and
+//! [`Npt::give`] and [`Npt::withhold`] move it between them: given, it is the
+//! frame nothing reads; withheld, it is described as nothing at all and every
+//! access to it is reported exactly as a trapped region's is. What does not
+//! move is the frame or the name — both belong to the page rather than to
+//! either description, which is what makes the transition cost no allocation
+//! and leaves whatever answers for the region answering for it throughout.
+//!
+//! The two directions are not symmetrical, and the asymmetry is the whole
+//! reason the pair is cheap. Giving the page grants permission, so no processor
+//! can hold anything that contradicts it and nothing has to be told;
+//! withholding it takes permission away, and that is the direction a barrier is
+//! owed for.
+//!
 //! # Every region has a name, whichever way it is described
 //!
 //! Both operations hand out a [`RegionTag`], and [`Npt::region`] answers with
@@ -747,6 +763,76 @@ impl Npt {
             bytes: page.bytes(),
         }
         .and(self.coarsen(&map, page)?))
+    }
+
+    /// Gives a sunk page to the guest, so that its accesses reach the frame
+    /// nothing reads instead of being reported.
+    ///
+    /// The direction that grants permission, and so the free one: an entry that
+    /// described nothing now describes a page the guest may write, which no
+    /// processor can hold anything contradicting — a not-present entry caches
+    /// nothing. So it answers [`Change::Loosened`] and owes no barrier.
+    ///
+    /// Answers [`Change::None`] where the page is already being given, which is
+    /// what keeps something driving the description back and forth from paying
+    /// for a transition it is already in.
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::Map`] if the page is not page aligned or is not being sunk
+    /// at all, [`NptError::OutOfFrames`] if this processor has no frame left
+    /// for a table, [`NptError::Unreachable`] if the window does not reach one,
+    /// or [`NptError::Coarser`] if a larger page already covers the address.
+    /// The page is left with no translation on any of them, which is a guest
+    /// that faults on it and is answered out of the model rather than one that
+    /// reaches memory nothing reads.
+    pub fn give(&self, gpa: PhysAddr) -> Result<Change, NptError> {
+        let page = Range::new(gpa, chunk::FRAME_SIZE)?;
+        let mut map = self.map.write();
+        if !map.sink_given(gpa, true)? {
+            return Ok(Change::None);
+        }
+        Ok(owed(self.fill_page(&map, gpa)?, page))
+    }
+
+    /// Stops giving a sunk page to the guest, so that every access to it faults
+    /// and is reported under the name the page already holds.
+    ///
+    /// The counterpart of [`Npt::give`], and the direction that pays: an entry
+    /// that described a page the guest may write now describes nothing, and a
+    /// processor which has entered this guest may still be acting on the one it
+    /// replaced. So it answers [`Change::Tightened`], and [`Npt::barrier`] is
+    /// what stops every processor using what it took away.
+    ///
+    /// Neither the frame nor the name is given up. A page is sunk because
+    /// something other than this hypervisor performs its accesses, and this is
+    /// the state in which nothing is performing them — a state the page comes
+    /// back out of, over the same frame and under the same name, which is why
+    /// this is not [`Npt::unsink`].
+    ///
+    /// # Errors
+    ///
+    /// [`NptError::Map`] if the page is not page aligned or is not being sunk
+    /// at all, or [`NptError::Unreachable`] if the window does not reach one of
+    /// these tables. The page is left as it was on either: a page the map said
+    /// nothing was performing the accesses of while the tables went on giving
+    /// it would be a caller told the page was trapped when it is not.
+    pub fn withhold(&self, gpa: PhysAddr) -> Result<Change, NptError> {
+        let page = Range::new(gpa, chunk::FRAME_SIZE)?;
+        let mut map = self.map.write();
+        if !map.sink_given(gpa, false)? {
+            return Ok(Change::None);
+        }
+        // Cleared rather than rewritten, for the reason [`Npt::release`] clears
+        // one: nothing here has to say what the page should be instead, because
+        // the map has just been made to say it and [`Npt::fault`] is what asks.
+        match self.tree.abandon(gpa) {
+            Ok(written) => Ok(owed(written, page)),
+            Err(refused) => {
+                let _ = map.sink_given(gpa, true);
+                Err(refused)
+            }
+        }
     }
 
     /// The region something other than the hardware answers for that `gpa` is
@@ -1893,6 +1979,142 @@ pub(crate) mod tests {
             npt.translate(inside).expect("the tables can be walked"),
             None,
             "a page every access to which faults must end up described by nothing"
+        );
+    }
+
+    #[test]
+    fn a_sunk_page_withheld_is_the_region_it_already_was_and_no_longer_translates() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+        let named = npt
+            .sink(&mut frames, page)
+            .map(|(tag, change)| {
+                discharge(&npt, change);
+                tag
+            })
+            .expect("the page can be sunk");
+
+        let withheld = npt.withhold(page).expect("the page can be withheld");
+
+        assert_eq!(
+            withheld,
+            Change::Tightened {
+                first: page,
+                bytes: FRAME_SIZE,
+            },
+            "an entry that described a page the guest may write and now describes \
+             nothing is one a processor may still be acting on"
+        );
+        discharge(&npt, withheld);
+        assert_eq!(
+            npt.translate(page).expect("the tables can be walked"),
+            None,
+            "a page nothing is performing the accesses of must have no translation"
+        );
+        for write in [false, true] {
+            assert_eq!(
+                npt.fault(page, fault(write))
+                    .expect("the fault can be answered"),
+                Outcome::Interposed { tag: named },
+                "and every access to it belongs to whatever answers for the region, \
+                 by the name the page has held since it was sunk"
+            );
+        }
+        assert_eq!(
+            npt.region(page),
+            Some(Answered {
+                tag: named,
+                range: Range::new(page, FRAME_SIZE).expect("one page is a range"),
+            }),
+            "which is the same name, because a name belongs to the page rather than \
+             to either description of it"
+        );
+    }
+
+    #[test]
+    fn giving_a_withheld_page_back_costs_nothing_and_puts_the_same_frame_behind_it() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+        npt.sink(&mut frames, page)
+            .map(|(_, change)| discharge(&npt, change))
+            .expect("the page can be sunk");
+        let sunk = translated(&npt, page).spa;
+        let held = npt.frames.held();
+        npt.withhold(page)
+            .map(|change| discharge(&npt, change))
+            .expect("the page can be withheld");
+
+        let given = npt.give(page).expect("and given again");
+
+        assert_eq!(
+            given,
+            Change::Loosened,
+            "describing a page nothing described takes nothing away, so no processor \
+             has to be told"
+        );
+        discharge(&npt, given);
+        assert_eq!(
+            translated(&npt, page).spa,
+            sunk,
+            "and it is the frame the page was given in the first place, which the \
+             transition never handed back"
+        );
+        assert_eq!(
+            npt.frames.held(),
+            held,
+            "so neither direction costs a frame of the chunk or a table"
+        );
+    }
+
+    #[test]
+    fn describing_a_sunk_page_as_it_already_is_writes_nothing_and_owes_nothing() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+        npt.sink(&mut frames, page)
+            .map(|(_, change)| discharge(&npt, change))
+            .expect("the page can be sunk");
+
+        assert_eq!(
+            npt.give(page),
+            Ok(Change::None),
+            "a page already being given is a transition that did not happen"
+        );
+        npt.withhold(page)
+            .map(|change| discharge(&npt, change))
+            .expect("the page can be withheld");
+        assert_eq!(
+            npt.withhold(page),
+            Ok(Change::None),
+            "and so is a page already withheld — which is what keeps something \
+             driving the description from sending anything for it"
+        );
+    }
+
+    #[test]
+    fn only_a_sunk_page_has_two_descriptions_to_move_between() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        let page = PhysAddr::new(REGISTER_PAGE);
+        let missing = Err(NptError::Map(MapError::NoRegion {
+            base: REGISTER_PAGE,
+            bytes: FRAME_SIZE,
+        }));
+
+        assert_eq!(
+            npt.withhold(page),
+            missing,
+            "there is no description to move a page nothing sinks between"
+        );
+        npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .map(|(_, change)| discharge(&npt, change))
+            .expect("the page can be trapped instead");
+        assert_eq!(
+            npt.give(page),
+            missing,
+            "and a region trapped outright has no frame to be given over"
         );
     }
 

@@ -23,7 +23,9 @@
 //! 2. **Inside a region something other than the hardware answers for.** An
 //!    address whose accesses must fault must never be described — not even as
 //!    the memory really behind it.
-//! 3. **A sunk page**, which the guest may write and nothing reads back.
+//! 3. **A sunk page**, which the guest may write and nothing reads back — or,
+//!    while nothing is performing its accesses for it, one whose accesses fault
+//!    exactly as a region's do.
 //! 4. **A page of the hypervisor's own memory the guest is shown on purpose.**
 //! 5. **The rest of the hypervisor's own memory**, which reads as one shared
 //!    page of zeroes and can never take a write.
@@ -126,7 +128,18 @@ impl Map {
             return verdict(
                 sunk.range.first(),
                 sunk.range.end(),
-                Kind::Sink { spa: sunk.what.spa },
+                // A page whose accesses nothing is performing at this moment is
+                // answered for exactly as a trapped region is, and under the
+                // name it already holds: every access to it faults, and
+                // whatever answers for the region answers it.
+                if sunk.what.given {
+                    Kind::Sink { spa: sunk.what.spa }
+                } else {
+                    Kind::Interposed {
+                        tag: sunk.what.tag,
+                        trap: Trap::Everything,
+                    }
+                },
             );
         }
         if let Some(shown) = self.exposures.find(address) {
@@ -256,6 +269,9 @@ impl Map {
     /// of those accesses itself. A name is what lets whatever answers be
     /// found for the ones it does not.
     ///
+    /// Recorded as being given, which is what a page is sunk for; whether it
+    /// still is at any later moment is [`Map::sink_given`]'s to record.
+    ///
     /// # Errors
     ///
     /// [`MapError::Geometry`] unless the address is page aligned,
@@ -273,8 +289,36 @@ impl Map {
                 .or_else(|| self.exposures.clashing(page)),
         )?;
         let tag = self.name()?;
-        self.sinks.insert(page, Sunk { spa: frame, tag })?;
+        self.sinks.insert(
+            page,
+            Sunk {
+                spa: frame,
+                tag,
+                given: true,
+            },
+        )?;
         Ok(tag)
+    }
+
+    /// Records whether a sunk page is being given to the guest at this moment,
+    /// and answers whether that changed what the map said.
+    ///
+    /// The whole of the transition between a page's two descriptions, and the
+    /// reason it is one record rather than two regions: the frame the guest's
+    /// writes are kept by and the name whatever answers for the page is known
+    /// by belong to the page and not to either description, so neither is given
+    /// up and taken again as the description moves.
+    ///
+    /// # Errors
+    ///
+    /// [`MapError::Geometry`] unless the address is page aligned, or
+    /// [`MapError::NoRegion`] if the page is not being sunk at all.
+    pub(crate) fn sink_given(&mut self, page: PhysAddr, given: bool) -> Result<bool, MapError> {
+        let page = Range::new(page, chunk::FRAME_SIZE)?;
+        let sunk = self.sinks.amend(page)?;
+        let moved = sunk.given != given;
+        sunk.given = given;
+        Ok(moved)
     }
 
     /// Stops sinking one page, and answers with the frame its writes were being
@@ -355,11 +399,15 @@ impl Map {
         }
         for sunk in self.sinks.iter() {
             info!(
-                "{who}: npt sinks guest physical {:#x} onto frame {:#x} as region {}, writable and \
-                 never read back",
+                "{who}: npt sinks guest physical {:#x} onto frame {:#x} as region {}, {}",
                 sunk.range.first(),
                 sunk.what.spa,
                 sunk.what.tag.number(),
+                if sunk.what.given {
+                    "given to the guest, writable and never read back"
+                } else {
+                    "withheld, so every access to it is the region's to answer"
+                },
             );
         }
         for shown in self.exposures.iter() {
@@ -769,6 +817,15 @@ struct Sunk {
     spa: PhysAddr,
     /// The name whatever answers for the page is known by.
     tag: RegionTag,
+    /// Whether the page is being given to the guest at this moment.
+    ///
+    /// A page is sunk because something other than this hypervisor performs its
+    /// accesses, and that is not true for the whole of a machine's life. While
+    /// nothing is performing them the page has to be the hypervisor's again, so
+    /// it is described exactly as a trapped region is and under the same name —
+    /// which is what makes the transition cost neither a frame nor a second
+    /// name, both of which stay the page's across it.
+    given: bool,
 }
 
 /// A verdict over the run from `first` up to but not including `end`.

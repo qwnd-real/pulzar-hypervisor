@@ -400,11 +400,11 @@ impl<'a> Exits<'a> {
         }
         let _ = vlapic::set_away(true);
         // The control block's acceleration follows the guest's own state at
-        // every entry: the enable bit, the backing page and the tables move
-        // here, and an entry that changes nothing pays one comparison for
-        // it. A failure demotes to the software path below rather than
-        // refusing the entry.
-        if let Err(error) = vlapic::avic_reconcile(vcpu) {
+        // every entry: the enable bit, the backing page, the tables and the
+        // description of the controllers' register page move here, and an entry
+        // that changes nothing pays two comparisons for it. A failure demotes to
+        // the software path below rather than refusing the entry.
+        if let Err(error) = vlapic::avic_reconcile(vcpu, self.partition) {
             error!("exits: the interrupt acceleration could not be reconciled: {error}");
         }
         // Read out of the block rather than out of the controller, because the

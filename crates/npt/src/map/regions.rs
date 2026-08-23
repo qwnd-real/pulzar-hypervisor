@@ -106,6 +106,29 @@ impl<W: Copy, const N: usize> Regions<W, N> {
         Ok(())
     }
 
+    /// What the range added with exactly this geometry means, to be changed
+    /// where it means something that can move.
+    ///
+    /// Exactly, for the reason [`Regions::remove`] insists on it: a request
+    /// covering part of a range is not that range, and answering for it would
+    /// change what a range nobody named says.
+    ///
+    /// # Errors
+    ///
+    /// [`MapError::NoRegion`] if no range here has exactly this geometry.
+    pub(crate) fn amend(&mut self, range: Range) -> Result<&mut W, MapError> {
+        let at = self.above(range.first());
+        self.regions
+            .get_mut(at)
+            .and_then(Option::as_mut)
+            .filter(|region| region.range == range)
+            .map(|region| &mut region.what)
+            .ok_or(MapError::NoRegion {
+                base: range.first(),
+                bytes: range.bytes(),
+            })
+    }
+
     /// Removes the range that was added with exactly this geometry, and answers
     /// what it meant.
     ///

@@ -42,7 +42,7 @@ mod asid;
 
 use cpu::CpuIndex;
 use emulate::{EmulateError, Mmio, MmioError, Outcome as Performed, Region};
-use log::info;
+use log::{error, info};
 /// How a guest translates its addresses, which is what
 /// [`Partition::with_memory`] needs and what a caller reads out of a virtual
 /// processor before borrowing one.
@@ -54,7 +54,7 @@ use spin::{Once, RwLock};
 use svm::exit::NestedPageFault;
 use thiserror::Error;
 use vcpu::{AvicProvision, Guest, Host, Vcpu, VcpuError};
-use vlapic::VlapicError;
+use vlapic::{GuestMemory, Redescribed, RegisterPage, VlapicError};
 use x86_64::PhysAddr;
 
 pub use crate::asid::{Asid, Asids};
@@ -413,6 +413,62 @@ impl Partition {
         info!("{who}: partition tagged asid {}", self.asid.number());
         self.npt.describe(who);
         self.devices.read().describe(who);
+    }
+}
+
+/// How the interrupt controllers' register page is described in this guest's
+/// memory.
+///
+/// The one page whose description follows something that changes while the
+/// guest runs, and the direction the call comes from is the point: what it
+/// should be is the controllers' own to decide, and only the guest knows where
+/// its memory is described. So the decision is made above and handed down here,
+/// at the entry that may have to change it.
+impl GuestMemory for Partition {
+    /// Brings the page to `wanted` and discharges whatever that owed.
+    ///
+    /// One of the two directions pays and the other does not. Giving the page
+    /// grants permission — an entry that described nothing now describes memory
+    /// the guest may write — and the walker notices a lifted constraint by
+    /// itself, so nothing is owed. Withholding it takes permission away, and
+    /// what the barrier does is stop every processor beginning an access with
+    /// the translation it replaced.
+    ///
+    /// A failure is reported here rather than answered with, because what a
+    /// caller can do about it is decide what to run rather than to look at the
+    /// reason: it is the description of this guest's memory that would not
+    /// move, and this is where that memory is.
+    ///
+    /// A barrier that could not reach every processor is one of those failures,
+    /// and it leaves the page trapped with some processor possibly still
+    /// holding the translation it replaced. That processor is one still
+    /// inside the guest, which is a processor still driving its controller
+    /// out of the page — the state the translation it holds is correct for.
+    /// Every processor that gives the acceleration up does so at an entry,
+    /// and an entry after a barrier has advanced what it compares against
+    /// discards this guest's translations before the guest runs again, so
+    /// the one that matters cannot be missed.
+    fn describe_register_page(&self, wanted: RegisterPage) -> Redescribed {
+        let page = vlapic::apic_page();
+        let moved = match wanted {
+            RegisterPage::Given => self.npt.give(page),
+            RegisterPage::Interposed => self.npt.withhold(page),
+        };
+        let discharged = moved.and_then(|change| {
+            self.npt.barrier(change)?;
+            Ok(change)
+        });
+        match discharged {
+            Ok(Change::None) => Redescribed::Already,
+            Ok(Change::Loosened | Change::Tightened { .. }) => Redescribed::Moved,
+            Err(cause) => {
+                error!(
+                    "partition: the controllers' register page at {page:#x} could not be described \
+                     as {wanted:?}: {cause}"
+                );
+                Redescribed::Refused
+            }
+        }
     }
 }
 

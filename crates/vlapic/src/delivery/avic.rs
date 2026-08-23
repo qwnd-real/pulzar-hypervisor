@@ -177,7 +177,8 @@ enum Inhibit {
     Nothing,
     /// This processor's controller goes back to the software path.
     Processor,
-    /// The whole machine does, for the rest of its life, for this reason.
+    /// The whole machine does, for this reason, until a boundary gives the
+    /// decision a reason to be remade.
     Machine(&'static str),
 }
 
