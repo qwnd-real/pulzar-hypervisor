@@ -164,12 +164,15 @@ impl Firmware {
         // back now cannot be taken back at the next exit either, and retrying
         // would report the same failure for the rest of the guest's life.
         self.stage = Stage::Gone;
-        match partition.conceal(self.portal.entry(), self.portal.bytes()) {
+        match partition
+            .conceal(self.portal.entry(), self.portal.bytes())
+            .and_then(|change| partition.barrier(change))
+        {
             Ok(()) => {
-                // The tables now permit less than they did, and this processor
-                // has been running on them — so what it cached from them has to
-                // go before it enters the guest again.
-                vcpu.flush();
+                // The tables now permit less than they did, and every processor
+                // that has run this guest may have cached what they used to say
+                // — so the barrier above is what makes each of them discard it,
+                // this one at its own next entry.
                 info!("exits: the portal is behind the guest and reads as zeroes again");
             }
             // Not fatal to the guest: the pages stay visible and read-only, so

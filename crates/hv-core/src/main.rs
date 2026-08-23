@@ -258,18 +258,24 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     let partition = PARTITION.try_call_once(|| Partition::establish(&mut space, avic_tables))?;
     partition.describe("core");
     let portal = Portal::place(space.direct_map(), handoff)?;
-    partition.expose(
+    // Every description of the guest's memory made here answers with what it
+    // made stricter and one barrier discharges all of them, because a barrier is
+    // what makes every processor stop using what a description replaced and
+    // there is no processor to reach yet. Coalesced rather than taken one at a
+    // time for that reason alone: the calls are legal at any time and each would
+    // otherwise pay for its own.
+    let mut owed = partition.expose(
         &mut space,
         portal.entry(),
         chunk::FRAME_SIZE,
         Exposure::ReadExecute,
     )?;
-    partition.expose(
+    owed = owed.and(partition.expose(
         &mut space,
         portal.parameters(),
         chunk::FRAME_SIZE,
         Exposure::ReadOnly,
-    )?;
+    )?);
     // Before the guest has ever run, because the first access it makes to one of
     // these regions has to arrive where the region is answered for. The tables no
     // longer require it: they report what taking a region over made stricter, and
@@ -286,9 +292,9 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // performed, and performing one of those means performing it against the
     // same device a fault would have reached.
     if policy.enabled() {
-        partition.sink(&mut space, vlapic::apic_page())?;
+        owed = owed.and(partition.sink(&mut space, vlapic::apic_page())?);
     }
-    let owed = partition.interpose(&mut space, [vlapic::region()?])?;
+    owed = owed.and(partition.interpose(&mut space, [vlapic::region()?])?);
     partition.barrier(owed)?;
     let mut vcpu = virtualize(&mut space)?;
     seed(&mut vcpu, inherited(handoff)?, portal.entry());

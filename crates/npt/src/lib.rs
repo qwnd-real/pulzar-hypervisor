@@ -82,13 +82,18 @@
 //! trouble.
 //!
 //! A guest *writing* there is a different matter. The write faults and
-//! [`Npt::fault`] reports [`Resolution::Shadowed`], which is as far as these
-//! tables can take it: there is no page to accept the write and there never
-//! will be. Resuming the guest unchanged re-executes the instruction and faults
-//! again, so the caller has to step over it instead — emulate the instruction,
-//! discard the write, and resume past it. That is not something the tables can
-//! do, and it is stated here so that a live-lock is not diagnosed as a bug in
-//! them.
+//! [`Npt::fault`] reports [`Outcome::Refused`], which is as far as these tables
+//! can take it: there is no page to accept the write and there never will be.
+//! Resuming the guest unchanged re-executes the instruction and faults again,
+//! so the caller has to step over it instead — emulate the instruction, discard
+//! the write, and resume past it. That is not something the tables can do, and
+//! it is stated here so that a live-lock is not diagnosed as a bug in them.
+//!
+//! A guest whose *own page tables* are in such memory is the one case where
+//! stepping over the instruction does not help, because what faulted is the
+//! walk rather than the access: the instruction would fault again on the same
+//! walk for ever. It is reported apart, as [`Outcome::WalkRefused`], so that a
+//! caller answers it with the exception the guest's own architecture owes it.
 //!
 //! [`Npt::create`] checks that the chunk is 2 MiB aligned and a whole number of
 //! 2 MiB regions rather than assuming it, because that is what makes the 2 MiB
@@ -102,7 +107,7 @@
 //! other than the memory or device behind it — a device the hypervisor
 //! interposes on, presenting the guest a view that is not the hardware's.
 //! Either writes alone fault or every access does, and [`Npt::fault`] reports
-//! [`Resolution::Trapped`] for an address inside one rather than describing it.
+//! [`Outcome::Interposed`] for an address inside one rather than describing it.
 //!
 //! Trapping a range is the one thing here that needs finer granularity than the
 //! fill rule would otherwise produce, so it splits whatever larger page covers
@@ -310,14 +315,17 @@ impl Npt {
     ///
     /// # Errors
     ///
-    /// [`NptError::Map`] carrying [`MapError::Unaddressable`] if the address is
-    /// above the processor's physical address width, [`NptError::OutOfFrames`]
-    /// if this processor has no frame left for a table,
-    /// [`NptError::Unreachable`] if the window does not reach one, or
+    /// [`NptError::OutOfFrames`] if this processor has no frame left for a
+    /// table, [`NptError::Unreachable`] if the window does not reach one, or
     /// [`NptError::Coarser`] if a larger page already covers the address, which
     /// means something described this region at a granularity the fill rule
     /// never produces.
-    pub fn fault(&self, gpa: PhysAddr, cause: NestedPageFault) -> Result<Resolution, NptError> {
+    ///
+    /// An address the machine does not have is not one of them: it is an
+    /// [`Outcome::Unaddressable`] rather than a failure here, because nothing
+    /// about these tables went wrong and what the caller owes the guest is the
+    /// same kind of decision as for every other outcome.
+    pub fn fault(&self, gpa: PhysAddr, cause: NestedPageFault) -> Result<Outcome, NptError> {
         // Before the map is read, because filling this processor's list reaches
         // for the address space the chunk's allocator lives in, and nothing here
         // may hold one lock while it takes another. Nothing is asked of it in the
@@ -329,14 +337,14 @@ impl Npt {
             // Before the tables are touched at all, because an address inside
             // one of these faults on purpose and describing it is exactly what
             // must not happen.
-            Kind::Interposed { .. } => Ok(Resolution::Trapped),
+            Kind::Interposed { tag, .. } => Ok(Outcome::Interposed { tag }),
             // Nothing can describe an address the machine does not have, and
             // narrowing one into an address that exists would describe the
             // wrong page.
-            Kind::Unaddressable => Err(MapError::Unaddressable { gpa: gpa.as_u64() }.into()),
+            Kind::Unaddressable => Ok(Outcome::Unaddressable),
             Kind::Ram { .. } | Kind::Sink { .. } => {
                 self.tree.fill(&self.frames, verdict, gpa)?;
-                Ok(Resolution::Mapped)
+                Ok(Outcome::Filled)
             }
             // A write to either faults however it is described — no page behind
             // them can take one — so what the caller is owed is what the access
@@ -595,7 +603,7 @@ impl Npt {
     /// The counterpart of [`Npt::expose`], for entry code whose work is done.
     /// Afterwards the range is indistinguishable from the rest of the chunk — a
     /// guest reading it sees zeroes, and a guest writing it is reported as
-    /// [`Resolution::Shadowed`] like any other write to hypervisor memory.
+    /// [`Outcome::Refused`] like any other write to hypervisor memory.
     ///
     /// # What it makes stricter
     ///
@@ -894,32 +902,54 @@ fn owned(map: &Map, gpa: PhysAddr, bytes: u64) -> Result<Range, NptError> {
 /// A read is satisfied by whatever the page was described as, so the guest
 /// merely retries it. A write is not and never will be: neither the shared page
 /// of zeroes nor the entry code the guest is shown has a page behind it that
-/// may take one, so the caller has to step the guest past the instruction
-/// rather than resume it.
-fn hypervisors(cause: NestedPageFault) -> Resolution {
-    if cause.write() {
-        Resolution::Shadowed
-    } else {
-        Resolution::Mapped
+/// may take one.
+///
+/// Which of the two answers a write is owed depends on what was writing. The
+/// guest's own instruction is answered by being stepped over. A walk of the
+/// guest's page tables is not: the processor was reading a table the guest put
+/// in this memory and writing the bit that records the access, and stepping the
+/// instruction leaves the walk unsatisfied — so the same instruction faults
+/// again, for ever.
+fn hypervisors(cause: NestedPageFault) -> Outcome {
+    match (cause.write(), cause.page_table_walk()) {
+        (false, _) => Outcome::Filled,
+        (true, false) => Outcome::Refused,
+        (true, true) => Outcome::WalkRefused,
     }
 }
 
 /// What became of a guest physical address that faulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Resolution {
+pub enum Outcome {
     /// A translation exists now, and the access will succeed when the guest
     /// retries it.
-    Mapped,
+    Filled,
     /// The guest tried to write memory the hypervisor owns. Reads there see
     /// zeroes; a write cannot be satisfied, so resuming the guest unchanged
     /// re-executes it and faults again. The caller has to emulate the
     /// instruction, discard the write, and resume past it.
-    Shadowed,
-    /// The address is inside a region the hardware does not answer for.
-    /// Nothing was described and nothing will be: what the access means is the
-    /// caller's to decide, and stepping the guest past it is the caller's to
-    /// do.
-    Trapped,
+    Refused,
+    /// A walk of the guest's own page tables tried to write memory the
+    /// hypervisor owns, which is a write these tables can no more satisfy than
+    /// any other — and one the guest cannot be stepped past, because what
+    /// faulted is not the instruction but the translation it needs. The caller
+    /// owes the guest the exception its own architecture answers an
+    /// unsatisfiable translation with.
+    WalkRefused,
+    /// The address is inside a region the hardware does not answer for, named
+    /// by the region's tag. Nothing was described and nothing will be: what the
+    /// access means is the caller's to decide, and stepping the guest past it
+    /// is the caller's to do.
+    Interposed {
+        /// The name whatever answers for the region is known by.
+        tag: RegionTag,
+    },
+    /// Above the processor's physical address width, so not an address this
+    /// machine has at all. Nothing describes it and nothing may: a guest that
+    /// reached it has been given an answer no real machine would give, and
+    /// folding it into an address that exists would answer for a different
+    /// page.
+    Unaddressable,
 }
 
 /// What a mutation did to what a processor may already believe.
@@ -1176,7 +1206,8 @@ pub(crate) mod tests {
     use x86_64::{PhysAddr, VirtAddr};
 
     use super::{
-        Answered, Change, MapError, Npt, NptError, Range, Resolution, Translation, Trap, chunk,
+        Answered, Change, Exposure, MapError, Npt, NptError, Outcome, Range, Translation, Trap,
+        chunk, hypervisors,
     };
 
     /// Where the interrupt controllers' register page is, which is the one page
@@ -1217,8 +1248,12 @@ pub(crate) mod tests {
         let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
         let page = PhysAddr::new(REGISTER_PAGE);
 
-        npt.protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
-            .map(|(_, change)| discharge(&npt, change))
+        let named = npt
+            .protect(&mut frames, page, FRAME_SIZE, Trap::Everything)
+            .map(|(tag, change)| {
+                discharge(&npt, change);
+                tag
+            })
             .expect("the page can be trapped");
 
         assert_eq!(
@@ -1230,8 +1265,9 @@ pub(crate) mod tests {
             assert_eq!(
                 npt.fault(page, fault(write))
                     .expect("the fault can be answered"),
-                Resolution::Trapped,
-                "a {} of a trapped page belongs to whatever answers for it",
+                Outcome::Interposed { tag: named },
+                "a {} of a trapped page belongs to whatever answers for it, by the \
+                 name the tables gave the region",
                 if write { "write" } else { "read" }
             );
         }
@@ -1267,7 +1303,7 @@ pub(crate) mod tests {
         assert_eq!(
             npt.fault(page, fault(true))
                 .expect("the fault can be answered"),
-            Resolution::Mapped,
+            Outcome::Filled,
             "a described page that faults anyway is described rather than reported"
         );
     }
@@ -1350,6 +1386,119 @@ pub(crate) mod tests {
             None,
             "while the page beside it is the hardware's to answer for"
         );
+    }
+
+    #[test]
+    fn what_a_write_to_the_hypervisors_own_memory_comes_to_tells_a_walk_from_an_access() {
+        // The whole of the decision, as the table it is. A read is satisfied by
+        // whatever the page was described as, so the guest merely retries it; a
+        // write is not, and which answer it gets turns on what was writing —
+        // the guest's own instruction, which can be stepped over, or a walk of
+        // its page tables, which cannot, because what waits is the translation
+        // rather than the instruction.
+        for (write, walk, owed) in [
+            (false, false, Outcome::Filled),
+            (false, true, Outcome::Filled),
+            (true, false, Outcome::Refused),
+            (true, true, Outcome::WalkRefused),
+        ] {
+            assert_eq!(
+                hypervisors(
+                    NestedPageFault::new()
+                        .with_write(write)
+                        .with_page_table_walk(walk)
+                ),
+                owed,
+                "write {write}, page table walk {walk}"
+            );
+            assert_eq!(
+                hypervisors(
+                    NestedPageFault::new()
+                        .with_present(true)
+                        .with_write(write)
+                        .with_page_table_walk(walk)
+                ),
+                owed,
+                "and whether a translation was present says nothing about it: a page \
+                 of the hypervisor's own memory is present and readable, and it is the \
+                 write that has nowhere to go"
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_of_address_a_guest_can_fault_on_has_an_outcome_that_makes_progress() {
+        let (mut frames, window) = reserved();
+        let npt = Npt::create(&mut frames, window).expect("tables over the chunk");
+        // One page of the hypervisor's own memory shown to the guest on purpose,
+        // and one of the register page's two descriptions each, so that every
+        // arm of the answer is reached over an address really described that way.
+        let shown = PhysAddr::new(LARGE + 3 * FRAME_SIZE);
+        npt.expose(&mut frames, shown, FRAME_SIZE, Exposure::ReadOnly)
+            .map(|change| discharge(&npt, change))
+            .expect("a page of the chunk can be shown to the guest");
+        let sunk = PhysAddr::new(REGISTER_PAGE);
+        npt.sink(&mut frames, sunk)
+            .map(|(_, change)| discharge(&npt, change))
+            .expect("the register page can be sunk");
+        let trapped = PhysAddr::new(REGISTER_PAGE + LARGE);
+        let named = npt
+            .protect(&mut frames, trapped, FRAME_SIZE, Trap::Everything)
+            .map(|(tag, change)| {
+                discharge(&npt, change);
+                tag
+            })
+            .expect("a device aperture can be taken over");
+
+        for (gpa, what, reads, writes, walks) in [
+            (
+                PhysAddr::new(RAM),
+                "ordinary memory",
+                Outcome::Filled,
+                Outcome::Filled,
+                Outcome::Filled,
+            ),
+            (
+                PhysAddr::new(LARGE),
+                "the hypervisor's own memory",
+                Outcome::Filled,
+                Outcome::Refused,
+                Outcome::WalkRefused,
+            ),
+            (
+                shown,
+                "a page of it the guest is shown",
+                Outcome::Filled,
+                Outcome::Refused,
+                Outcome::WalkRefused,
+            ),
+            (
+                sunk,
+                "a page given to the guest over a frame nothing reads",
+                Outcome::Filled,
+                Outcome::Filled,
+                Outcome::Filled,
+            ),
+            (
+                trapped,
+                "a region this hypervisor answers for",
+                Outcome::Interposed { tag: named },
+                Outcome::Interposed { tag: named },
+                Outcome::Interposed { tag: named },
+            ),
+        ] {
+            for (cause, owed, direction) in [
+                (fault(false), reads, "a read"),
+                (fault(true), writes, "a write"),
+                (walk(), walks, "a walk of the guest's own page tables"),
+            ] {
+                assert_eq!(
+                    npt.fault(gpa, cause).expect("the fault can be answered"),
+                    owed,
+                    "{direction} of {what} at {gpa:#x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1438,7 +1587,7 @@ pub(crate) mod tests {
             assert_eq!(
                 npt.fault(gpa, fault(false))
                     .expect("the fault can be answered"),
-                Resolution::Mapped,
+                Outcome::Filled,
                 "ordinary memory around a trapped page is still the guest's"
             );
             let translation = npt
@@ -1725,21 +1874,25 @@ pub(crate) mod tests {
                 }
             });
             together.wait();
-            npt.protect(&mut frames, inside, FRAME_SIZE, Trap::Everything)
-                .map(|(_, change)| discharge(&npt, change))
+            let named = npt
+                .protect(&mut frames, inside, FRAME_SIZE, Trap::Everything)
+                .map(|(tag, change)| {
+                    discharge(&npt, change);
+                    tag
+                })
                 .expect("the page can be taken over while another processor faults");
+            assert_eq!(
+                npt.fault(inside, fault(false))
+                    .expect("the fault can be answered"),
+                Outcome::Interposed { tag: named },
+                "and a fault on it names the region it was taken over as"
+            );
         });
 
         assert_eq!(
             npt.translate(inside).expect("the tables can be walked"),
             None,
             "a page every access to which faults must end up described by nothing"
-        );
-        assert_eq!(
-            npt.fault(inside, fault(false))
-                .expect("the fault can be answered"),
-            Resolution::Trapped,
-            "and stay that way however often the guest touches it"
         );
     }
 
@@ -1788,11 +1941,23 @@ pub(crate) mod tests {
     }
 
     /// A nested page fault of the direction alone, which is all [`Npt::fault`]
-    /// reads of one.
+    /// reads of one for an access the guest itself made.
     fn fault(write: bool) -> NestedPageFault {
         NestedPageFault::new()
             .with_write(write)
             .with_final_address(true)
+    }
+
+    /// A nested page fault of a walk of the guest's own page tables, which is
+    /// the one access whose direction is not the guest instruction's.
+    ///
+    /// Always a write and never against the final address: the processor is
+    /// reading one of the guest's tables and recording that it did, and the
+    /// address the guest was after has not been arrived at.
+    fn walk() -> NestedPageFault {
+        NestedPageFault::new()
+            .with_write(true)
+            .with_page_table_walk(true)
     }
 
     /// An allocator over a run of host memory standing in for the reserved

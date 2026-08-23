@@ -48,9 +48,9 @@ use log::info;
 /// processor before borrowing one.
 pub use memory::Addressing;
 use memory::{Linear, Physical};
-use npt::{Answered, Change, Exposure, Npt, NptError, RegionTag, Resolution};
+use npt::{Answered, Change, Exposure, Npt, NptError, Outcome, RegionTag};
 use paging::AddressSpace;
-use spin::{Mutex, Once, RwLock};
+use spin::{Once, RwLock};
 use svm::exit::NestedPageFault;
 use thiserror::Error;
 use vcpu::{AvicProvision, Guest, Host, Vcpu, VcpuError};
@@ -63,7 +63,7 @@ pub use crate::asid::{Asid, Asids};
 /// interrupts run on when the hardware delivers them.
 #[derive(Debug)]
 pub struct Partition {
-    npt: Mutex<Npt>,
+    npt: Npt,
     nested_cr3: PhysAddr,
     asid: Asid,
     avic: Option<vcpu::AvicTables>,
@@ -96,7 +96,7 @@ impl Partition {
         let npt = Npt::create(space.frames(), window)?;
         Ok(Self {
             nested_cr3: npt.root(),
-            npt: Mutex::new(npt),
+            npt,
             asid,
             avic,
             devices: RwLock::new(Mmio::new()),
@@ -131,20 +131,20 @@ impl Partition {
         space: &mut AddressSpace,
         regions: impl IntoIterator<Item = Region>,
     ) -> Result<Change, PartitionError> {
-        let npt = self.npt.lock();
         let mut owed = Change::None;
         for region in regions {
             let (gpa, bytes) = (region.gpa, region.bytes);
             let tag = match region.trap {
                 Some(trap) => {
-                    let (tag, change) = npt.protect(space.frames(), gpa, bytes, trap)?;
+                    let (tag, change) = self.npt.protect(space.frames(), gpa, bytes, trap)?;
                     owed = owed.and(change);
                     tag
                 }
                 // Nothing for the tables to change: whatever describes the region
                 // already does, and a region they describe already has a name.
                 None => {
-                    npt.region(gpa)
+                    self.npt
+                        .region(gpa)
                         .ok_or(PartitionError::Unnamed { gpa: gpa.as_u64() })?
                         .tag
                 }
@@ -171,7 +171,7 @@ impl Partition {
     /// made to leave it, which means it may still be acting on what the
     /// change replaced.
     pub fn barrier(&self, change: Change) -> Result<(), PartitionError> {
-        Ok(self.npt.lock().barrier(change)?)
+        Ok(self.npt.barrier(change)?)
     }
 
     /// The region something other than the hardware answers for that a guest
@@ -182,7 +182,7 @@ impl Partition {
     /// access the hardware performed part of rather than faulting on.
     #[must_use]
     pub fn region(&self, gpa: PhysAddr) -> Option<Answered> {
-        self.npt.lock().region(gpa)
+        self.npt.region(gpa)
     }
 
     /// Performs the instruction behind an access to a region this hypervisor
@@ -213,8 +213,7 @@ impl Partition {
             });
         }
         let addressing = Addressing::from_save(vcpu.save());
-        let npt = self.npt.lock();
-        let physical = Physical::new(&npt, npt.window());
+        let physical = Physical::new(&self.npt, self.npt.window());
         devices.dispatch(vcpu, Linear::new(physical, addressing), gpa, cause)
     }
 
@@ -256,7 +255,7 @@ impl Partition {
     }
 
     /// Sends one page of the guest's memory to the zero sink rather than the
-    /// hardware behind it.
+    /// hardware behind it, and answers with what that made stricter.
     ///
     /// What the interrupt controllers' register page becomes when the
     /// processor serves the controller itself: a read that no longer exits
@@ -271,18 +270,30 @@ impl Partition {
     /// frame is allocated for this page alone, never released, and read
     /// back by nothing.
     ///
-    /// Whatever this made stricter is discharged before it returns.
-    ///
     /// # Errors
     ///
     /// [`PartitionError::Npt`] if the page cannot be sunk — because it is
     /// already sunk, because it is one the hypervisor has taken over, or
-    /// because the chunk cannot spare the frame behind it — or if a processor
-    /// inside the guest could not be made to leave it.
-    pub fn sink(&self, space: &mut AddressSpace, gpa: PhysAddr) -> Result<(), PartitionError> {
-        let npt = self.npt.lock();
-        let (_, change) = npt.sink(space.frames(), gpa)?;
-        Ok(npt.barrier(change)?)
+    /// because the chunk cannot spare the frame behind it.
+    pub fn sink(&self, space: &mut AddressSpace, gpa: PhysAddr) -> Result<Change, PartitionError> {
+        let (_, change) = self.npt.sink(space.frames(), gpa)?;
+        Ok(change)
+    }
+
+    /// Stops giving that page to the guest, leaving it with no translation and
+    /// its frame held back until the barrier this owes has passed.
+    ///
+    /// The counterpart of [`Partition::sink`], and the direction that pays: a
+    /// processor which has run this guest may hold a translation of the page to
+    /// the frame being handed back, so the frame is not reusable until the
+    /// barrier has returned.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionError::Npt`] if the page was not being sunk, or if the tables
+    /// describing it cannot be reached.
+    pub fn unsink(&self, gpa: PhysAddr) -> Result<Change, PartitionError> {
+        Ok(self.npt.unsink(gpa)?)
     }
 
     /// Describes the region containing a guest physical address the guest could
@@ -298,32 +309,27 @@ impl Partition {
         &self,
         gpa: PhysAddr,
         cause: NestedPageFault,
-    ) -> Result<Resolution, PartitionError> {
-        Ok(self.npt.lock().fault(gpa, cause)?)
+    ) -> Result<Outcome, PartitionError> {
+        Ok(self.npt.fault(gpa, cause)?)
     }
 
     /// Makes immutable hypervisor-owned entry code or data visible to the
-    /// guest.
+    /// guest, and answers with what that made stricter.
     ///
     /// The allocator the tables it needs come from is the caller's, which is
-    /// what the address space is while the guest is being built. Whatever this
-    /// made stricter is discharged before it returns, which for a page nothing
-    /// had described is nothing at all.
+    /// what the address space is while the guest is being built.
     ///
     /// # Errors
     ///
-    /// [`PartitionError::Npt`] if the requested range cannot be exposed, or if
-    /// a processor inside the guest could not be made to leave it.
+    /// [`PartitionError::Npt`] if the requested range cannot be exposed.
     pub fn expose(
         &self,
         space: &mut AddressSpace,
         gpa: PhysAddr,
         bytes: u64,
         exposure: Exposure,
-    ) -> Result<(), PartitionError> {
-        let npt = self.npt.lock();
-        let change = npt.expose(space.frames(), gpa, bytes, exposure)?;
-        Ok(npt.barrier(change)?)
+    ) -> Result<Change, PartitionError> {
+        Ok(self.npt.expose(space.frames(), gpa, bytes, exposure)?)
     }
 
     /// Takes back what [`Partition::expose`] made visible, leaving the range
@@ -331,18 +337,15 @@ impl Partition {
     ///
     /// How entry code is retired once the guest is past it. It takes permission
     /// away, so a processor that has run this guest may hold a translation
-    /// these tables no longer justify; the barrier that answers for it is
-    /// taken before this returns, and the processor making the next entry
-    /// discards what it cached on the way in.
+    /// these tables no longer justify; the barrier that answers for it is the
+    /// caller's to discharge, and the processor making the next entry discards
+    /// what it cached on the way in.
     ///
     /// # Errors
     ///
-    /// [`PartitionError::Npt`] if the range cannot be concealed, or if a
-    /// processor inside the guest could not be made to leave it.
-    pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<(), PartitionError> {
-        let npt = self.npt.lock();
-        let change = npt.conceal(gpa, bytes)?;
-        Ok(npt.barrier(change)?)
+    /// [`PartitionError::Npt`] if the range cannot be concealed.
+    pub fn conceal(&self, gpa: PhysAddr, bytes: u64) -> Result<Change, PartitionError> {
+        Ok(self.npt.conceal(gpa, bytes)?)
     }
 
     /// Publishes that this processor is entering the guest, and arms the
@@ -351,22 +354,24 @@ impl Partition {
     ///
     /// What the tables need on the way in, and the whole of what being able to
     /// change a guest's memory while it runs costs a world switch.
-    pub fn before_entry(&self, vcpu: &mut Vcpu, who: CpuIndex) {
-        self.npt.lock().before_entry(vcpu, who);
+    ///
+    /// Which processor it is is read here rather than handed in. The tables
+    /// reach a processor by its position in the machine's roster, and the only
+    /// processor that can honestly answer that is the one entering — so a
+    /// parameter would be a fact the caller has to fetch for this and could
+    /// fetch wrongly.
+    pub fn before_entry(&self, vcpu: &mut Vcpu) {
+        self.npt.before_entry(vcpu, here());
     }
 
     /// Publishes that this processor has left the guest, so that a change to
     /// the guest's memory stops having to make it leave.
-    pub fn after_exit(&self, who: CpuIndex) {
-        self.npt.lock().after_exit(who);
+    pub fn after_exit(&self) {
+        self.npt.after_exit(here());
     }
 
     /// Borrows this guest's memory translated the way one virtual processor
     /// currently translates.
-    ///
-    /// The nested tables remain locked for the closure, so every translation
-    /// and read observes one coherent table state. The higher-ranked closure
-    /// prevents the borrowed memory view from escaping that lock.
     ///
     /// Takes how the guest translates rather than the state-save area it was
     /// read out of, because [`Addressing`] is a small copied value and a save
@@ -374,16 +379,19 @@ impl Partition {
     /// this call has borrowed the virtual processor, which is usually the very
     /// thing the closure needs.
     ///
-    /// The closure runs with the tables locked, so nothing it calls may ask for
-    /// them again: a device answering an intercepted access must not resolve a
-    /// fault.
+    /// What it hands out is a view coherent per entry rather than across the
+    /// whole closure, which is exactly what the hardware gives the guest: the
+    /// tables answer every translation out of whatever they say at the moment
+    /// it is asked, and nothing is held to keep two of them agreeing. So the
+    /// closure may reach for the tables again — a device answering an
+    /// intercepted access may resolve a fault — because there is nothing here
+    /// to deadlock on.
     pub fn with_memory<T>(
         &self,
         addressing: Addressing,
         use_memory: impl for<'a> FnOnce(Linear<'a>) -> T,
     ) -> T {
-        let npt = self.npt.lock();
-        let physical = Physical::new(&npt, npt.window());
+        let physical = Physical::new(&self.npt, self.npt.window());
         use_memory(Linear::new(physical, addressing))
     }
 
@@ -403,7 +411,7 @@ impl Partition {
     /// else.
     pub fn describe(&self, who: &str) {
         info!("{who}: partition tagged asid {}", self.asid.number());
-        self.npt.lock().describe(who);
+        self.npt.describe(who);
         self.devices.read().describe(who);
     }
 }
@@ -461,4 +469,18 @@ pub enum PartitionError {
     /// The guest's interrupt structures could not be reached.
     #[error(transparent)]
     Vlapic(#[from] VlapicError),
+}
+
+/// Which processor is running this, as the nested tables name one.
+///
+/// Read rather than handed in, because a processor's position in the machine's
+/// roster is a fact only that processor can answer for. One load through the
+/// `GS` base, which is what a hook on the world switch may afford.
+fn here() -> CpuIndex {
+    // SAFETY: every processor attaches immediately after installing its
+    // descriptor tables and before it is given a control block, so a processor
+    // entering or leaving a guest has attached — and nothing in this image
+    // loads a segment selector into `GS` afterwards, which is the one thing
+    // that would zero the base again.
+    unsafe { cpu::current() }.index()
 }

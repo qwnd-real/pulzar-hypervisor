@@ -236,17 +236,25 @@ impl<'a> Exits<'a> {
 
     /// Answers one exit.
     ///
-    /// The order is not a matter of taste. An event whose delivery this exit
-    /// interrupted has to be taken back before anything can overwrite the
-    /// injection field; the guest's task priority has to be taken out of
-    /// whichever authority owned it before anything consults it, because the
-    /// guest moves that register without exiting either way — through the
-    /// control block where interrupt masking is virtualized, and through
-    /// the backing page while the hardware drives its controller; and both
-    /// have to happen before the exit is answered, because answering one
-    /// can send this processor an interrupt.
+    /// The order is not a matter of taste. This processor is out of the guest,
+    /// so it says so to the guest's memory first, because until it does a
+    /// change to that memory made anywhere on the machine waits for this
+    /// processor to leave. An event whose delivery this exit interrupted
+    /// has to be taken back before anything can overwrite the injection
+    /// field; the guest's task priority has to be taken out of whichever
+    /// authority owned it before anything consults it, because the guest
+    /// moves that register without exiting either way — through the control
+    /// block where interrupt masking is virtualized, and through the
+    /// backing page while the hardware drives its controller; and both have
+    /// to happen before the exit is answered, because answering one can
+    /// send this processor an interrupt.
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
         let reason = vcpu.reason();
+        // First, and one relaxed store: a change to the guest's memory makes
+        // every processor inside the guest leave it and waits for each of them,
+        // so a processor that has left and not said so is one such a change
+        // waits out in full.
+        self.partition.after_exit();
         self.census.record(vcpu);
         // Read out of the control block rather than out of the controller: which
         // authority owned the guest's task priority for the run that has just
@@ -487,6 +495,16 @@ impl<'a> Exits<'a> {
         if let Injected::Interrupt(vector) = injected {
             let _ = vlapic::committed(vector);
         }
+        // Where a change to the guest's memory made on another processor is
+        // honoured: this processor says it is going into the guest, and is told
+        // whether anything has been made stricter since it was last in there — in
+        // which case the entry discards what it cached of this guest's
+        // translations. One relaxed store, one fence, one relaxed load and a
+        // comparison, and it is deliberately after the acceleration has been
+        // reconciled above: a processor waiting for that transition is not yet
+        // in the guest, and one that said it was would be a processor a change
+        // to the guest's memory waits for with interrupts already clear.
+        self.partition.before_entry(vcpu);
         // Published last, when everything the entry prepared is in place and
         // the guest is about to run: from here until the exit, another
         // processor's own hardware may resolve an interprocessor interrupt to
