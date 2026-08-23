@@ -373,6 +373,16 @@ impl Map {
         })
     }
 
+    /// How many frames the pages given to the guest are being kept by.
+    ///
+    /// One each, whether the page is being given at this moment or withheld:
+    /// the frame belongs to the page for as long as the page is sunk at
+    /// all, which is what makes the transition between its two descriptions
+    /// cost nothing.
+    pub(crate) fn sunk_frames(&self) -> usize {
+        self.sinks.iter().count()
+    }
+
     /// Logs everything the map holds, which is all of what a guest's view of
     /// memory is that the machine's own memory map does not already say.
     pub(crate) fn describe(&self, who: &str) {

@@ -199,8 +199,11 @@ mod frames;
 mod map;
 mod tree;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use cpu::CpuIndex;
-use paging::{DirectMap, Frames, chunk};
+use log::{info, warn};
+use paging::{DirectMap, Frames, as_usize, chunk};
 use processor::Features;
 use spin::RwLock;
 use svm::exit::NestedPageFault;
@@ -237,7 +240,56 @@ pub struct Npt {
     frames: FrameCache,
     /// What makes a change to any of it safe while a guest is running on it.
     coherence: Coherence,
+    /// What a guest has been refused, which nothing else records.
+    refusals: Refusals,
 }
+
+/// What a guest has asked of the hypervisor's own memory and been refused.
+///
+/// Relaxed on every access and read by nothing but a report. Both numbers are
+/// about a guest rather than about these tables: one is an instruction the
+/// caller has to step over, and the other is a translation the caller has to
+/// answer with an exception, and a machine producing either in quantity is a
+/// guest walking memory that is not its own.
+#[derive(Debug)]
+struct Refusals {
+    /// Writes to the hypervisor's own memory, which no page can take.
+    refused: AtomicU64,
+    /// Walks of the guest's own page tables that tried to make one.
+    walks: AtomicU64,
+}
+
+impl Refusals {
+    /// Nothing refused yet.
+    const fn new() -> Self {
+        Self {
+            refused: AtomicU64::new(0),
+            walks: AtomicU64::new(0),
+        }
+    }
+
+    /// Records what a fault on the hypervisor's own memory came to.
+    fn record(&self, outcome: Outcome) {
+        match outcome {
+            Outcome::Refused => self.refused.fetch_add(1, Ordering::Relaxed),
+            Outcome::WalkRefused => self.walks.fetch_add(1, Ordering::Relaxed),
+            Outcome::Filled | Outcome::Interposed { .. } | Outcome::Unaddressable => return,
+        };
+    }
+}
+
+/// How many frames of the reserved chunk one guest's description of its memory
+/// is expected to need.
+///
+/// A budget rather than a limit anything enforces, and a wide one: a machine of
+/// half a terabyte with the hypervisor's own memory and one interposed region
+/// in it costs thirty-nine frames, and the number grows with the count of
+/// ranges described more finely than a gigabyte rather than with the size of
+/// the machine. [`Npt::describe`] prints the live count and the high-water mark
+/// against it, so a description that quietly starts using pages where it used
+/// gigabytes is visible in a log rather than discovered as an exhausted chunk
+/// months later.
+pub const FRAME_BUDGET: usize = 256;
 
 impl Npt {
     /// Builds an empty set of tables for a guest whose physical memory is the
@@ -287,6 +339,7 @@ impl Npt {
             ),
             frames: cache,
             coherence: Coherence::new(roster.map_or(&[][..], |roster| roster.entries())),
+            refusals: Refusals::new(),
         })
     }
 
@@ -369,7 +422,9 @@ impl Npt {
             // and a page the guest has not touched before is described.
             Kind::Shadow | Kind::Exposed { .. } => {
                 self.tree.fill(&self.frames, verdict, gpa)?;
-                Ok(hypervisors(cause))
+                let outcome = hypervisors(cause);
+                self.refusals.record(outcome);
+                Ok(outcome)
             }
         }
     }
@@ -428,6 +483,7 @@ impl Npt {
     /// told is that some processor may still be acting on what it replaced.
     pub fn barrier(&self, change: Change) -> Result<(), NptError> {
         let Change::Tightened { first, bytes } = change else {
+            self.coherence.free();
             return Ok(());
         };
         self.coherence.barrier(first, bytes)?;
@@ -856,6 +912,38 @@ impl Npt {
         self.map.read().describe(who);
         self.frames.describe(who);
         self.coherence.describe(who);
+        let footprint = self.footprint();
+        info!(
+            "{who}: npt is built out of {footprint} frames of the chunk, {} KiB, against a budget \
+             of {FRAME_BUDGET}",
+            footprint * as_usize(chunk::FRAME_SIZE) / 1024,
+        );
+        if footprint > FRAME_BUDGET {
+            warn!(
+                "{who}: npt has taken more of the chunk than the budget allows, which is a guest's \
+                 memory described more finely than it should have to be"
+            );
+        }
+        info!(
+            "{who}: npt has refused {} guest writes to the hypervisor's own memory and {} page \
+             table walks that tried to make one",
+            self.refusals.refused.load(Ordering::Relaxed),
+            self.refusals.walks.load(Ordering::Relaxed),
+        );
+    }
+
+    /// How many frames of the reserved chunk this description of the guest's
+    /// memory is built out of.
+    ///
+    /// The tree's tables and the two frames it has whatever it describes, plus
+    /// one for each page given to the guest over a frame nothing reads. What it
+    /// deliberately does not count is the frames each processor keeps aside for
+    /// tables it has not built yet — those are [`FrameCache::describe`]'s, and
+    /// they belong to the machine rather than to this guest's description of
+    /// its memory.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        self.tree.frames() + self.map.read().sunk_frames()
     }
 
     /// Describes every region of `range` that has stopped needing to be written
@@ -1288,12 +1376,14 @@ pub(crate) mod tests {
     use std::{sync::Barrier, vec::Vec};
 
     use paging::{DirectMap, Frames, chunk::FRAME_SIZE};
+    use spin::RwLock;
     use svm::exit::NestedPageFault;
     use x86_64::{PhysAddr, VirtAddr};
 
     use super::{
-        Answered, Change, Exposure, MapError, Npt, NptError, Outcome, Range, Translation, Trap,
-        chunk, hypervisors,
+        Answered, Change, Coherence, Exposure, FRAME_BUDGET, FrameCache, Map, MapError, Npt,
+        NptError, Outcome, Range, Refusals, Translation, Trap, Tree, as_usize, chunk, frame,
+        hypervisors,
     };
 
     /// Where the interrupt controllers' register page is, which is the one page
@@ -1304,6 +1394,27 @@ pub(crate) mod tests {
     /// granularity ordinary memory is described in wherever nothing is in the
     /// way.
     const LARGE: u64 = 2 << 20;
+
+    /// What one entry of the level above that describes.
+    const HUGE: u64 = 1 << 30;
+
+    /// How much of a physical address the machine the footprint is asserted
+    /// over implements: half a terabyte.
+    const SIMULATED_BITS: u8 = 39;
+
+    /// How much memory that is.
+    const SIMULATED: u64 = 1 << SIMULATED_BITS;
+
+    /// How many frames of the chunk describing the whole of it costs.
+    ///
+    /// Spelled out rather than computed, because a number derived from the same
+    /// rule the code follows would agree with a mistake in that rule: one root,
+    /// one page-directory-pointer table for the 512 GiB, one page directory for
+    /// each of the two gigabytes that hold anything finer than themselves, one
+    /// page table per 2 MiB of the chunk, one page table for the 2 MiB holding
+    /// the register page, the shared page of zeroes, and the frame the register
+    /// page is given.
+    const BUDGETED: usize = 1 + 1 + 2 + as_usize(chunk::CHUNK_SIZE / LARGE) + 1 + 1 + 1;
 
     /// Where the machine's memory begins for the tests that race two threads at
     /// it: far above the run standing in for the chunk, so that nothing else is
@@ -2116,6 +2227,100 @@ pub(crate) mod tests {
             missing,
             "and a region trapped outright has no frame to be given over"
         );
+    }
+
+    #[test]
+    fn a_machine_of_half_a_terabyte_is_described_inside_the_frame_budget() {
+        let (mut frames, window) = reserved();
+        // A machine of 512 GiB with gigabyte pages, described rather than
+        // discovered: what the footprint is depends on the page sizes the
+        // processor reports and on how much of a physical address it implements,
+        // and a number asserted against the host running the test would be a
+        // number about that host.
+        let npt = simulated(&mut frames, window);
+        let page = PhysAddr::new(REGISTER_PAGE);
+        // First, because a page described alone cannot be broken out of a
+        // gigabyte that already describes it — which is the same order a boot
+        // takes for the same reason.
+        npt.sink(&mut frames, page)
+            .map(|(_, change)| discharge(&npt, change))
+            .expect("the register page can be sunk");
+        for giga in 0..SIMULATED / HUGE {
+            describe(&npt, &mut frames, PhysAddr::new(giga * HUGE));
+        }
+        // The two gigabytes that hold anything finer than themselves, described
+        // the whole way down: the one the hypervisor's own memory is in, and the
+        // one the register page is in.
+        for base in [0, PhysAddr::new(REGISTER_PAGE).align_down(HUGE).as_u64()] {
+            for large in 0..HUGE / LARGE {
+                describe(&npt, &mut frames, PhysAddr::new(base + large * LARGE));
+            }
+        }
+
+        assert_eq!(
+            npt.footprint(),
+            BUDGETED,
+            "one root, one pointer table, one page directory per gigabyte that holds \
+             anything finer, one page table per 2 MiB of the chunk and one for the \
+             2 MiB holding the register page, the shared page of zeroes, and the \
+             frame the register page is given"
+        );
+        assert!(
+            npt.footprint() <= FRAME_BUDGET,
+            "and the whole of it inside the budget, with room for the machine to be \
+             far larger: every other gigabyte of it is one entry of the pointer \
+             table and costs no frame at all"
+        );
+        // Which is what the number is asserted for: the footprint grows with the
+        // count of ranges described more finely than a gigabyte, and not with the
+        // size of the machine. Every gigabyte that holds nothing finer is one
+        // entry of the pointer table, and the two that do are one entry per
+        // 2 MiB of themselves.
+        for giga in 0..SIMULATED / HUGE {
+            let finely = giga == 0 || giga == REGISTER_PAGE / HUGE;
+            assert_eq!(
+                translated(&npt, PhysAddr::new(giga * HUGE + HUGE / 2)).span,
+                if finely { LARGE } else { HUGE / 2 },
+                "gigabyte {giga} of the machine"
+            );
+        }
+    }
+
+    /// Tables over a simulated machine, rather than over the one running the
+    /// test.
+    ///
+    /// [`Npt::create`] asks the processor how much of a physical address it
+    /// implements and whether it has gigabyte pages, which is exactly right on
+    /// a machine and exactly wrong for a footprint asserted by number: the
+    /// answer would be about the host. So the three layers are composed
+    /// here with both written down.
+    fn simulated(frames: &mut Frames, window: DirectMap) -> Npt {
+        let chunk = Range::new(frames.chunk_base(), chunk::CHUNK_SIZE)
+            .expect("the chunk is a whole number of pages");
+        let root = frame(frames, window).expect("the chunk has a frame for the root");
+        let zero = frame(frames, window).expect("and one for the page of zeroes");
+        let cache = FrameCache::new(1);
+        cache.stock(frames);
+        Npt {
+            map: RwLock::new(Map::new(chunk, SIMULATED_BITS)),
+            tree: Tree::new(root, zero, window, true),
+            frames: cache,
+            coherence: Coherence::new(&[]),
+            refusals: Refusals::new(),
+        }
+    }
+
+    /// Describes the region containing one address, keeping this processor's
+    /// list of table frames full as it goes.
+    ///
+    /// A test has no address space to refill that list through — the frames for
+    /// that come through the one every processor shares — so the allocator the
+    /// test holds is what stands in for it. Which is why this takes one:
+    /// nothing on a machine does.
+    fn describe(npt: &Npt, frames: &mut Frames, gpa: PhysAddr) {
+        npt.frames.stock(frames);
+        npt.fault(gpa, fault(false))
+            .expect("the fault can be answered");
     }
 
     /// The addresses one racing thread describes: a page of ordinary memory

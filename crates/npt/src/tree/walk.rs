@@ -74,6 +74,13 @@ impl Level {
     /// reaching one has arrived rather than having somewhere further to go.
     pub(crate) const TABLES: [Self; 3] = [Self::Root, Self::Pointer, Self::Directory];
 
+    /// Every level one entry can describe memory at, coarsest first.
+    ///
+    /// The counterpart of [`Level::TABLES`], and the root is in neither sense
+    /// both: nothing asks to describe a region at the root, so no leaf is ever
+    /// written there, and every leaf this crate writes is at one of these.
+    pub(crate) const LEAVES: [Self; 3] = [Self::Pointer, Self::Directory, Self::Page];
+
     /// Bits of a guest physical address below this level's index.
     const fn shift(self) -> u32 {
         /// Bits of an address that are an offset within the smallest page.

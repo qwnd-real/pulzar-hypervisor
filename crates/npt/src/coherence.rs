@@ -199,6 +199,44 @@ pub(crate) struct Coherence {
     /// reason, and the second would wait for acknowledgements the first is
     /// already waiting for.
     kicked: Mutex<Vec<CpuIndex>>,
+    /// What the barriers taken over these tables have come to.
+    barriers: Barriers,
+}
+
+/// What the barriers taken over one set of tables have come to.
+///
+/// Relaxed on every access and read by nothing but a report. What they are for
+/// is the two failures this layer has that nothing else can see: a barrier that
+/// stopped reaching a processor, and a guest driving one often enough that the
+/// interrupts are the cost of running it.
+#[derive(Debug)]
+struct Barriers {
+    /// Changes that owed nothing, so nothing was sent and nobody had to leave
+    /// the guest.
+    free: AtomicU64,
+    /// Tightenings whose barrier found nobody inside the guest.
+    alone: AtomicU64,
+    /// Tightenings whose barrier had processors to make leave.
+    sent: AtomicU64,
+    /// How many processors those made leave the guest, in all.
+    kicked: AtomicU64,
+    /// Barriers a processor did not answer in the time it was given, each of
+    /// which is a processor that may still have been acting on what the
+    /// mutation replaced.
+    incomplete: AtomicU64,
+}
+
+impl Barriers {
+    /// None taken yet.
+    const fn new() -> Self {
+        Self {
+            free: AtomicU64::new(0),
+            alone: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            kicked: AtomicU64::new(0),
+            incomplete: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Coherence {
@@ -217,7 +255,18 @@ impl Coherence {
                 .map(|entry| Post::new(entry.index()))
                 .collect(),
             kicked: Mutex::new(Vec::with_capacity(processors.len())),
+            barriers: Barriers::new(),
         }
+    }
+
+    /// Records a change that owed no barrier at all, which is every change that
+    /// granted permission or wrote what was already written.
+    ///
+    /// Counted here rather than where the change was made, so that what a
+    /// report says about the barriers this guest has taken includes the ones it
+    /// did not have to.
+    pub(crate) fn free(&self) {
+        self.barriers.free.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Makes every processor inside the guest leave it, so that none of them
@@ -251,12 +300,18 @@ impl Coherence {
         if kicked.is_empty() {
             // Nobody to make leave. Every processor's next entry reads the epoch
             // this call has already advanced.
+            self.barriers.alone.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        self.barriers.sent.fetch_add(1, Ordering::Relaxed);
+        self.barriers
+            .kicked
+            .fetch_add(kicked.len() as u64, Ordering::Relaxed);
         if evicted(&kicked) {
             return Ok(());
         }
         let unanswered = kicked.len();
+        self.barriers.incomplete.fetch_add(1, Ordering::Relaxed);
         error!(
             "npt: {unanswered} processors did not leave the guest after guest physical \
              {:#x}..{:#x} was made stricter",
@@ -307,6 +362,15 @@ impl Coherence {
                 .filter(|post| post.station.inside())
                 .count(),
             self.posts.len(),
+        );
+        info!(
+            "{who}: npt barriers: {} owed nothing, {} found nobody inside the guest, {} made {} \
+             processors leave it, {} were not answered in time",
+            self.barriers.free.load(Ordering::Relaxed),
+            self.barriers.alone.load(Ordering::Relaxed),
+            self.barriers.sent.load(Ordering::Relaxed),
+            self.barriers.kicked.load(Ordering::Relaxed),
+            self.barriers.incomplete.load(Ordering::Relaxed),
         );
     }
 }

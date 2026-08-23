@@ -46,6 +46,8 @@
 mod entry;
 pub(crate) mod walk;
 
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use log::info;
 use paging::{DirectMap, as_usize};
 use x86_64::{PhysAddr, structures::paging::PageTableIndex};
@@ -76,6 +78,8 @@ pub(crate) struct Tree {
     window: DirectMap,
     /// Whether the processor has pages of a gigabyte.
     large: bool,
+    /// What building it has cost so far.
+    counts: Counts,
 }
 
 impl Tree {
@@ -95,7 +99,17 @@ impl Tree {
             zero,
             window,
             large,
+            counts: Counts::new(),
         }
+    }
+
+    /// How many frames of the reserved chunk the tree is built out of.
+    ///
+    /// Its tables, plus the two frames it has whatever it describes: the root,
+    /// and the one page of zeroes every page of the hypervisor's own memory
+    /// reads as.
+    pub(crate) fn frames(&self) -> usize {
+        FIXED + self.counts.tables.load(Ordering::Relaxed)
     }
 
     /// The value a guest's control block names these tables by.
@@ -147,7 +161,11 @@ impl Tree {
             | Kind::Interposed { .. }
             | Kind::Unaddressable => {
                 let at = self.descend(frames, gpa, self.coarsest(verdict, gpa))?;
-                self.install(at, self.describes(verdict, at.level, gpa))
+                let written = self.install(at, self.describes(verdict, at.level, gpa))?;
+                if written != Written::Same {
+                    self.counts.wrote(at.level);
+                }
+                Ok(written)
             }
         }
     }
@@ -296,6 +314,8 @@ impl Tree {
             at.index,
             self.describes(verdict, level, base),
         )?;
+        self.counts.compacted.fetch_add(1, Ordering::Relaxed);
+        self.counts.tables.fetch_sub(1, Ordering::Relaxed);
         Ok(Some(table))
     }
 
@@ -308,6 +328,23 @@ impl Tree {
             self.root,
             if self.large { "1 GiB" } else { "2 MiB" },
             self.zero,
+        );
+        let filled = Level::LEAVES.map(|level| self.counts.filled(level));
+        info!(
+            "{who}: npt has described {} regions by a gigabyte, {} by 2 MiB and {} by a page, \
+             broken up {} large pages and given {} regions back to one entry",
+            filled[0],
+            filled[1],
+            filled[2],
+            self.counts.split.load(Ordering::Relaxed),
+            self.counts.compacted.load(Ordering::Relaxed),
+        );
+        info!(
+            "{who}: npt holds {} table frames, {} at its most, and lost {} to another processor \
+             describing the same region first",
+            self.counts.tables.load(Ordering::Relaxed),
+            self.counts.peak.load(Ordering::Relaxed),
+            self.counts.lost.load(Ordering::Relaxed),
         );
     }
 
@@ -342,6 +379,10 @@ impl Tree {
                 .covers(first + slot * SHADOW.span(), SHADOW.span())
                 .then_some(wanted)
         })?;
+        // One fill rather than the five hundred and twelve entries it wrote: what
+        // the number is for is how often the tree has been described, and this
+        // is one description of one region.
+        self.counts.wrote(SHADOW);
         Ok(written(at.value, wanted))
     }
 
@@ -594,9 +635,13 @@ impl Tree {
         let frame = frames.take()?;
         let wanted = encode(Entry::Table { frame });
         match walk::exchange(self.window, table, index, absent, wanted)? {
-            None => Ok(wanted),
+            None => {
+                self.counts.installed();
+                Ok(wanted)
+            }
             Some(installed) => {
                 frames.give(frame);
+                self.counts.lost.fetch_add(1, Ordering::Relaxed);
                 Ok(installed)
             }
         }
@@ -643,9 +688,85 @@ impl Tree {
             at.index,
             encode(Entry::Table { frame }),
         )?;
+        self.counts.split.fetch_add(1, Ordering::Relaxed);
+        self.counts.installed();
         Ok(frame)
     }
 }
+
+/// What building the tree has cost.
+///
+/// Relaxed on every access, and nothing here is read to decide anything: these
+/// are what a report says about a guest's memory, and the shape of the tree is
+/// where this crate's cost and its correctness both live — a description that
+/// quietly starts using pages where it used gigabytes, a storm of fills, a
+/// compaction that stopped happening, are each a number here and invisible
+/// without one.
+#[derive(Debug)]
+struct Counts {
+    /// Regions described, by the level of the entry that describes each.
+    ///
+    /// Indexed as [`Level::LEAVES`] is ordered, coarsest first. One per fill
+    /// that wrote something rather than one per entry written, because what the
+    /// number answers is how often a region has had to be described.
+    filled: [AtomicU64; Level::LEAVES.len()],
+    /// Tables another processor installed first, whose frame went straight back
+    /// to the list it came from.
+    lost: AtomicU64,
+    /// Large pages broken into a table of the level below.
+    split: AtomicU64,
+    /// Regions that stopped needing to be written down finely and went back to
+    /// one entry.
+    compacted: AtomicU64,
+    /// Table frames the tree holds now.
+    tables: AtomicUsize,
+    /// The most it has held at once.
+    peak: AtomicUsize,
+}
+
+impl Counts {
+    /// Nothing described yet.
+    const fn new() -> Self {
+        Self {
+            filled: [const { AtomicU64::new(0) }; Level::LEAVES.len()],
+            lost: AtomicU64::new(0),
+            split: AtomicU64::new(0),
+            compacted: AtomicU64::new(0),
+            tables: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    /// Records one fill that described a region at `level`.
+    fn wrote(&self, level: Level) {
+        if let Some(slot) = Level::LEAVES.iter().position(|leaf| *leaf == level) {
+            self.filled[slot].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// How many of those there have been at `level`.
+    fn filled(&self, level: Level) -> u64 {
+        Level::LEAVES
+            .iter()
+            .position(|leaf| *leaf == level)
+            .map_or(0, |slot| self.filled[slot].load(Ordering::Relaxed))
+    }
+
+    /// Records one more table the tree is built out of, and the high-water mark
+    /// it may have moved.
+    ///
+    /// Two relaxed operations rather than one, which cannot report fewer tables
+    /// than there are: the count is what the footprint is read from, and the
+    /// mark only ever grows.
+    fn installed(&self) {
+        let tables = self.tables.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(tables, Ordering::Relaxed);
+    }
+}
+
+/// Frames the tree holds whatever it describes: the root, and the one page of
+/// zeroes every page of the hypervisor's own memory reads as.
+const FIXED: usize = 2;
 
 /// What writing one entry came to.
 ///
