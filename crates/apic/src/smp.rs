@@ -77,14 +77,14 @@ use crate::{
     trampoline::Trampoline,
 };
 
-/// Pages behind each started processor's stack: sixty-four kilobytes, with an
-/// unmapped guard page below and above.
+/// Pages behind each started processor's stack: one hundred and twenty-eight
+/// kilobytes, with an unmapped guard page below and above.
 ///
-/// The same order of magnitude as the stack the loader gives the boot
-/// processor. A processor that has been started runs the same code every other
-/// one does, so sizing its stack for less would only mean finding out later
-/// which of them is the one that overflows.
-const STACK_PAGES: u64 = 16;
+/// The same as the stack the loader gives the boot processor. A processor that
+/// has been started runs the same code every other one does, so sizing its
+/// stack for less would only mean finding out later which of them is the one
+/// that overflows.
+const STACK_PAGES: u64 = 32;
 
 /// How long a processor is left in reset before it is told where to begin.
 ///

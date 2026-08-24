@@ -70,10 +70,19 @@ use crate::{
 /// operation.
 const PROBE_BYTES: usize = 4096;
 
-/// Pages of the hypervisor's initial stack: 64 KiB, with an unmapped guard page
-/// below and above. Enough for bring-up, which puts nothing large on the stack
-/// and recurses nowhere.
-const CORE_STACK_PAGES: u64 = 16;
+/// Pages of the hypervisor's initial stack: 128 KiB, with an unmapped guard
+/// page below and above.
+///
+/// Sized for what composing the guest costs rather than for what the code looks
+/// like it should cost. The one guest is a several-kilobyte value — its
+/// description of the guest's memory holds the region set inline, and the set
+/// of devices answering for those regions holds a slot per region name — and it
+/// is built, returned and moved into the cell that keeps it, which in a build
+/// with no inlining is that value again in every frame of the chain. Measured
+/// at sixty-nine kilobytes on the deepest of them, against the sixty-four this
+/// used to be: the overflow landed on the guard page below, which is the one
+/// way it could have been anything but silent.
+const CORE_STACK_PAGES: u64 = 32;
 
 /// Bytes of stack the entry point's calling convention expects to find already
 /// reserved.
