@@ -452,6 +452,27 @@ pub struct NestedPagingControl {
     pub read_only_guest_page_tables: bool,
     /// Let the guest execute the broadcast invalidation instructions rather
     /// than raising an invalid-opcode exception.
+    ///
+    /// What the guest asked for is not quite what goes out. The processor
+    /// replaces the address-space identifier in the guest's operand with this
+    /// block's and marks it valid before broadcasting, so a guest cannot
+    /// invalidate anything outside the address space it was given — which is
+    /// what makes the instruction safe to hand over at all.
+    ///
+    /// That substitution is also the one condition on setting this. The
+    /// broadcast reaches every processor in the machine and each of them
+    /// matches it on the identifier alone, so a guest that carried
+    /// different identifiers on different processors would invalidate on
+    /// the one it was running on and leave every other holding exactly what
+    /// it had just asked them to drop. A guest whose identifier is one
+    /// value machine-wide is owed nothing further; a hypervisor that cannot
+    /// promise that has to intercept the instruction instead of enabling
+    /// it.
+    ///
+    /// Present only on a processor that reports the broadcast invalidation
+    /// control in its virtualization feature leaf. Where it is absent the
+    /// instructions are available to a guest whatever this says, so it is a bit
+    /// that takes a capability away rather than one that grants it.
     pub invlpgb_enable: bool,
     #[bits(56)]
     __: u64,
@@ -484,13 +505,44 @@ pub struct VirtualizationControl {
 
 #[cfg(test)]
 mod tests {
-    //! The word at 060h is the most-written word in the block, and the two bits
-    //! of it that choose how a guest's interrupts are delivered are the ones
-    //! whose positions nothing else can catch: the layout macro fixes the *sum*
-    //! of the field widths to the size of the word, so resizing or reordering
-    //! anything below them moves them and still compiles.
+    //! The layout macro fixes the *sum* of a word's field widths to the size of
+    //! the word, so resizing or reordering anything below a bit moves that bit
+    //! and still compiles. Two words are pinned here against that, because in
+    //! both of them a moved bit is a working control block that runs the guest
+    //! differently rather than one the processor refuses.
+    //!
+    //! The word at 060h is the most-written in the block, and the two bits of
+    //! it that choose how a guest's interrupts are delivered are the ones
+    //! whose positions nothing else can catch. The word at 090h carries the
+    //! bit that lets a guest broadcast invalidations, immediately above the
+    //! one that stops the processor writing accessed and dirty bits into
+    //! the guest's own page tables — so a bit that slid by one would
+    //! quietly take over the guest's page-table maintenance while the
+    //! enable it was meant to be did nothing.
 
-    use super::InterruptControl;
+    use super::{InterruptControl, NestedPagingControl};
+
+    /// The nested-paging word's own two bits, at bits 6 and 7 of 090h
+    /// (APM Table B-1).
+    #[test]
+    fn broadcast_invalidation_sits_above_the_read_only_page_table_control() {
+        assert_eq!(
+            NestedPagingControl::new()
+                .with_invlpgb_enable(true)
+                .into_bits(),
+            1 << 7
+        );
+        assert_eq!(
+            NestedPagingControl::new()
+                .with_read_only_guest_page_tables(true)
+                .into_bits(),
+            1 << 6
+        );
+        // And the bit every block sets, so that a field inserted above it fails
+        // here rather than at an entry that runs the guest without a second set
+        // of page tables.
+        assert_eq!(NestedPagingControl::new().with_enabled(true).into_bits(), 1);
+    }
 
     /// The two enable bits, at bits 31 and 30 of the interrupt-control word
     /// (APM Table B-1).

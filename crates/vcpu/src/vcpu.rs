@@ -152,6 +152,13 @@ pub struct Guest {
     pub nested_cr3: PhysAddr,
     /// Which address space the guest's translations are tagged with. Never
     /// zero: zero is the host's own, and a guest given it is refused.
+    ///
+    /// One value for the whole guest, on every processor it runs on. A guest
+    /// here may invalidate translations on every processor of the machine at
+    /// once, and each of them matches that broadcast on this identifier alone —
+    /// so a guest given one identifier here and a different one there would
+    /// invalidate on the processor it was running on and leave every other
+    /// holding exactly what it had just asked them to drop.
     pub asid: u32,
     /// The structures interrupt virtualization runs on, if the guest is to be
     /// given them. `None` leaves the control block's fields zeroed, which is
@@ -189,9 +196,10 @@ impl Vcpu {
     /// Allocates a control block and programs the little of it that is not
     /// guest state.
     ///
-    /// What is written is the mandatory intercept, nested paging, the two
-    /// values in [`Guest`], and — if the guest carries them — the structures
-    /// its interrupt virtualization runs on. Writing those structures does not
+    /// What is written is the mandatory intercept, nested paging together with
+    /// the broadcast invalidation a guest is allowed under it, the two values
+    /// in [`Guest`], and — if the guest carries them — the structures its
+    /// interrupt virtualization runs on. Writing those structures does not
     /// enable the acceleration: the enable bits belong to the interrupt
     /// control and stay clear, so a block in this state has complete tables
     /// the processor is not yet asked to use. What is not written is every
@@ -267,7 +275,20 @@ impl Vcpu {
         control.intercept_1 = Intercepts1::MSR_PROT;
         control.intercept_2 = Intercepts2::from_flags(Intercepts2Flags::VMRUN);
         control.msr_permissions = msrpm_phys.as_u64();
-        control.nested_paging = NestedPagingControl::new().with_enabled(true);
+        // Broadcast invalidation is handed to the guest wherever the processor
+        // lets it be, because the alternative a guest falls back on is an
+        // interprocessor interrupt per shootdown, every one of which is an exit
+        // for the sender and an exit for each processor it reaches. Nothing has
+        // to be intercepted for it: the processor replaces the address-space
+        // identifier in the guest's operand with this block's, so an invalidation
+        // reaches this guest's translations and no others, and one guest carries
+        // one identifier on every processor of the machine, so the broadcast
+        // reaches exactly the processors holding what it names. On a processor
+        // without the control the bit does not exist and is left clear — such a
+        // processor already lets a guest execute the instructions.
+        control.nested_paging = NestedPagingControl::new()
+            .with_enabled(true)
+            .with_invlpgb_enable(host.svm().features.contains(SvmFeatures::INVLPGB_TLBSYNC));
         control.nested_cr3 = guest.nested_cr3.as_u64();
         control.asid = guest.asid;
         // The architecture wants these structures initialized even while the

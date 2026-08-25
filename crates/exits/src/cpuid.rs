@@ -70,19 +70,6 @@ const HYPERVISOR_LEAF_BASE: u32 = 0x4000_0000;
 /// than just the one or two leaves any particular hypervisor happens to use.
 const HYPERVISOR_LEAF_LIMIT: u32 = 0x4000_00FF;
 
-/// The leaf whose EBX word advertises the broadcast invalidation
-/// instructions, `INVLPGB` and `TLBSYNC`.
-const CAPACITY_AND_FEATURES: u32 = 0x8000_0008;
-
-/// Broadcast invalidation's bit in that word.
-///
-/// Hidden because the control block bit that lets a guest execute those
-/// instructions is not set, so a guest that believed the capability would take
-/// an invalid-opcode exception on its first cross-processor invalidation. What
-/// it does instead is send interprocessor interrupts, which the emulated
-/// controller already mediates.
-const BROADCAST_INVALIDATION: u32 = 1 << 3;
-
 /// Answers the guest with the machine's own answer, less the virtualization
 /// extension, the extended APIC register space, the hypervisor-present bit,
 /// and anything in the hypervisor leaf range.
@@ -158,9 +145,6 @@ pub(crate) fn exit(vcpu: &mut Vcpu) -> Flow {
     }
     if leaf == STANDARD_FEATURES {
         result.ecx &= !HYPERVISOR_PRESENT;
-    }
-    if leaf == CAPACITY_AND_FEATURES {
-        result.ebx &= !BROADCAST_INVALIDATION;
     }
     if (HYPERVISOR_LEAF_BASE..=HYPERVISOR_LEAF_LIMIT).contains(&leaf) {
         result.eax = 0;
