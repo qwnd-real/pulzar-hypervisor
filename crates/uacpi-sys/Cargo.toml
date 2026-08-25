@@ -1,0 +1,16 @@
+[package]
+name = "uacpi-sys"
+description = "Raw bindings to the uACPI ACPI implementation, built from the pinned submodule"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+# Declares that this crate is the one place uACPI is built, so two copies of the
+# static library can never end up in one link.
+links = "uacpi"
+
+[build-dependencies]
+bindgen = { workspace = true }
+cc = { workspace = true }
+
+[lints]
+workspace = true

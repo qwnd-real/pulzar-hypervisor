@@ -73,7 +73,7 @@ impl Mcfg {
         if !listed.is_multiple_of(ENTRY_BYTES) {
             warn!(
                 "acpi: the mcfg at {:#x} ends {} bytes into an allocation; ignoring the remainder",
-                table.phys(),
+                table.at(),
                 listed % ENTRY_BYTES,
             );
         }

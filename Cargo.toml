@@ -11,6 +11,7 @@ members = [
     "crates/handoff",
     "crates/hv-core",
     "crates/hv-loader",
+    "crates/hypercall",
     "crates/inject",
     "crates/ipi",
     "crates/memory",
@@ -24,9 +25,11 @@ members = [
     "crates/serial",
     "crates/snapshot",
     "crates/svm",
+    "crates/uacpi-sys",
     "crates/vcpu",
     "crates/vlapic",
     "crates/xtask",
+    "tools/apic-dump",
 ]
 
 [workspace.package]
@@ -77,6 +80,10 @@ descriptors = { path = "crates/descriptors" }
 emulate = { path = "crates/emulate" }
 exits = { path = "crates/exits" }
 handoff = { path = "crates/handoff" }
+# The call a guest makes into this hypervisor, and what comes back. Shared
+# rather than firmware-side: the hypervisor's exit path serves it and a tool
+# running inside the guest issues it, so the crate depends on nothing else here.
+hypercall = { path = "crates/hypercall" }
 inject = { path = "crates/inject" }
 ipi = { path = "crates/ipi" }
 memory = { path = "crates/memory" }
@@ -89,6 +96,11 @@ probe = { path = "crates/probe" }
 processor = { path = "crates/processor" }
 snapshot = { path = "crates/snapshot" }
 svm = { path = "crates/svm" }
+# The ACPI implementation itself, as C compiled out of a pinned submodule.
+# `uacpi-sys` is the boundary and nothing else: `acpi` reads the machine's
+# tables through it, and `hv-core` defines the callbacks it needs from a host,
+# because those are the only part that has to know what machine this is.
+uacpi-sys = { path = "crates/uacpi-sys" }
 vcpu = { path = "crates/vcpu" }
 vlapic = { path = "crates/vlapic" }
 
@@ -139,6 +151,14 @@ iced-x86 = { version = "1.21", default-features = false, features = [
 # per-allocation accounting on top of what `Talc::reserved` already answers for
 # the one place utilization is reported.
 talc = "5.0.4"
+
+# Build-time dependencies of `uacpi-sys`, and of nothing else. `cc` drives the
+# C compiler over uACPI's sources, and `bindgen` reads the same checked-out
+# headers to produce the declarations for them — which is what keeps the
+# declarations and the compiled code describing one version of uACPI. Both run
+# on the build host, so neither reaches the firmware image.
+bindgen = "0.72"
+cc = "1.4"
 
 # Host-side dependencies, used only by the `xtask` runner.
 anyhow = "1.0"

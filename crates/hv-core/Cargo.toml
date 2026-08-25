@@ -41,6 +41,9 @@ spin = { workspace = true }
 svm = { workspace = true }
 talc = { workspace = true }
 thiserror = { workspace = true }
+# uACPI's host: this image is the only thing in the workspace that can answer
+# what uACPI needs of a machine, so it defines every one of those callbacks.
+uacpi-sys = { workspace = true }
 uefi-raw = { workspace = true }
 vcpu = { workspace = true }
 vlapic = { workspace = true }

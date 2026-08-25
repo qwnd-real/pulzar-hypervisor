@@ -37,9 +37,14 @@
 #![no_main]
 #![no_std]
 
+// The heap this image installs is what makes an allocating collection usable,
+// and uACPI's host answers for allocations of its own out of the same one.
+extern crate alloc;
+
 mod avic;
 mod error;
 mod heap;
+mod uacpi;
 
 use core::{convert::Infallible, ffi::c_void, hint::black_box, panic::PanicInfo};
 
@@ -322,6 +327,23 @@ fn bring_up(handoff: &'static Handoff) -> Result<Infallible, CoreError> {
     // machine rather than to this function, and every processor reaches the same
     // one through the same lock.
     paging::adopt(space)?;
+
+    // The other half of uACPI, and the last subsystem of the host to come up.
+    // Everything it can ask for now exists: the heap, the clock, this processor's
+    // interrupt controller, the machine's devices — and the address space is
+    // reachable through a lock, which is what lets an operation region outside the
+    // direct map be mapped at all.
+    //
+    // Not fatal. What this adds is the namespace and the values firmware's
+    // bytecode computes, and nothing the hypervisor needs to run a guest comes
+    // from there — the processors, the interrupt routing, the apertures and the
+    // counters were all read from the tables during the survey. So a machine whose
+    // definition blocks do not load is one pulzar knows the shape of but not the
+    // behaviour of, and that is worth a record rather than a refusal to boot.
+    if let Err(status) = uacpi::initialize() {
+        error!("core: uacpi could not build the machine's namespace: {status}");
+    }
+    uacpi::describe("core");
 
     heap.describe("core");
     cpu::describe("core");
@@ -698,16 +720,27 @@ fn start_clock(
 /// the tables themselves stay firmware's and are handed on to whatever boots
 /// next.
 ///
+/// uACPI is what finds and checks the tables, so it is brought as far up as it
+/// can be here: the root pointer and the direct map are published, and its
+/// table subsystem is started on nothing but those and the log. The rest of it
+/// — the namespace, and the bytecode that builds it — comes at the end of
+/// bring-up, because interpreting bytecode needs a clock, a set of interrupt
+/// controllers and the machine's devices, and every one of those is found in
+/// the tables read here.
+///
 /// # Errors
 ///
-/// [`CoreError::Acpi`] if the tables cannot be read, or if the machine has no
-/// MADT — without which its other processors could never be started.
+/// [`CoreError::Uacpi`] if firmware published no root pointer or its table
+/// directory cannot be read, or [`CoreError::Acpi`] if a table pulzar parses
+/// does not hold what it should — or if the machine has no MADT, without which
+/// its other processors could never be started.
 fn survey_machine(handoff: &Handoff, space: &AddressSpace) -> Result<Acpi, CoreError> {
-    // SAFETY: `acpi_rsdp` is the address the loader read out of firmware's own
-    // configuration table, and `space` is the active address space, whose direct
-    // map covers every physical address the memory map described as memory —
-    // which includes the ranges firmware keeps its tables in.
-    let acpi = unsafe { Acpi::collect(handoff.acpi_rsdp, space.direct_map()) }?;
+    // The direct map rather than a mapping of its own, because every table a
+    // machine has is in memory firmware's memory map described — and the map is a
+    // base and a length, so reaching one costs no page table and no lock.
+    uacpi::attach(space.direct_map(), handoff.acpi_rsdp);
+    uacpi::early_tables()?;
+    let acpi = Acpi::collect()?;
     acpi.describe("core");
     Ok(acpi)
 }

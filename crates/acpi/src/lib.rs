@@ -5,26 +5,32 @@
 //! None of it can be discovered any other way, and all of it lives in memory
 //! that belongs to firmware — memory a pass-through hypervisor hands on to
 //! whatever boots after it. So the tables are read once, during bring-up, and
-//! turned into values the hypervisor owns outright. After
-//! [`Acpi::collect`] returns, nothing in this crate points at firmware's memory
-//! any more.
+//! turned into values the hypervisor owns outright. After [`Acpi::collect`]
+//! returns, nothing in this crate points at firmware's memory any more.
 //!
-//! Nothing here depends on UEFI. The only thing needed from outside is the
-//! physical address of the root pointer, which the boot protocol carries, and a
-//! direct map to read through — so the tables can be collected after the
-//! firmware half of the address space is gone, which is exactly when it
-//! happens.
+//! # What reads the tables, and what parses them
+//!
+//! Finding a table is uACPI's. It reads the root pointer, chooses between the
+//! two directories a root pointer can name, checks every header and every
+//! checksum, keeps what passed, and maps a table on request — see [`tables`].
+//! None of that is worth a second implementation, and the parts of it that are
+//! easy to get subtly wrong are exactly the parts a shared implementation has
+//! already got right.
+//!
+//! Reading what is inside a table is this crate's, and stays this crate's.
+//! Every parser below turns firmware's bytes into a type the rest of the
+//! hypervisor can use — a roster of processors, a set of configuration space
+//! apertures, a description of a counter — which is a different job from
+//! finding the bytes and answers to different requirements.
 //!
 //! # What is kept
 //!
-//! A directory of every table the root directory lists, so a table can be found
-//! later without walking firmware's structures again, and full parses of the
-//! ones that are needed now: the [`Madt`], for the processors and interrupt
-//! controllers, the [`Mcfg`], for PCI Express configuration space, and the
-//! [`Hpet`] and the timer of the [`Fadt`], for the counters the hypervisor
-//! keeps time with. Parsing the rest
-//! when the rest is needed costs nothing that has been given up here, because
-//! the directory kept their addresses.
+//! A directory of every table uACPI is holding, so a table can be named later
+//! without asking again, and full parses of the ones that are needed now: the
+//! [`Madt`], for the processors and interrupt controllers, the [`Mcfg`], for
+//! PCI Express configuration space, and the [`Hpet`] and the timer of the
+//! [`Fadt`], for the counters the hypervisor keeps time with. Parsing the rest
+//! when the rest is needed costs nothing that has been given up here.
 //!
 //! Only the [`Madt`] is required. A machine may legitimately have no PCI
 //! Express and no event timer, so those two are parsed if present and reported
@@ -32,18 +38,26 @@
 //!
 //! # How much firmware is trusted
 //!
-//! Structurally, none of it. Every address is checked against the direct map,
-//! every length against the bytes actually present, and every checksum against
-//! zero, so a table that does not add up is refused rather than read.
+//! Structurally, none of it. uACPI answers for a table's own extent and
+//! checksum, and every read inside one is checked against the bytes the
+//! structure actually occupies, so a field that runs past the end of its table
+//! is refused rather than read.
 //!
-//! Semantically, as much as possible. A table whose header does not check out
-//! is dropped from the directory and the rest are kept; a reserved encoding in
-//! a field is logged and treated as the default it should have been; a length
+//! Semantically, as much as possible. A table that cannot be described is
+//! dropped from the directory and the rest are kept; a reserved encoding in a
+//! field is logged and treated as the default it should have been; a length
 //! that does not divide evenly into entries is honoured for the entries it does
 //! cover. The difference is deliberate: a corrupt structure cannot be read
 //! safely, but a machine whose firmware is merely sloppy is still a machine
 //! pulzar should run on, and the sloppiness belongs in the log rather than in a
 //! refusal to boot.
+//!
+//! # What must already be true
+//!
+//! uACPI's table subsystem has to be up, which is the host's to arrange: it is
+//! the host that knows where firmware published the root pointer and how to
+//! reach physical memory. [`Acpi::collect`] reports uACPI's own refusal if it
+//! is called before then, so the ordering is checked rather than assumed.
 //!
 //! # Allocation
 //!
@@ -62,14 +76,14 @@ mod hpet;
 mod madt;
 mod mcfg;
 mod raw;
-mod rsdp;
 mod sdt;
+mod tables;
 
 use alloc::vec::Vec;
 
 use log::{info, warn};
-use paging::DirectMap;
 use thiserror::Error;
+use uacpi_sys::Status;
 use x86_64::PhysAddr;
 
 pub use crate::{
@@ -81,13 +95,9 @@ pub use crate::{
         SourceOverride, Trigger,
     },
     mcfg::{ConfigSpace, Mcfg},
-    rsdp::Directory,
     sdt::{Signature, Table},
 };
-use crate::{
-    raw::{Fields, Physical},
-    rsdp::RootPointer,
-};
+use crate::{raw::Fields, tables::Held};
 
 /// Table lengths and entry counts are `u32` while addresses are `u64` and
 /// indices are `usize`, so the three are converted constantly. That is lossless
@@ -101,8 +111,6 @@ const _: () = assert!(
 /// Everything the hypervisor keeps from firmware's ACPI tables.
 #[derive(Debug)]
 pub struct Acpi {
-    revision: u8,
-    directory: Directory,
     tables: Vec<Table>,
     madt: Madt,
     mcfg: Option<Mcfg>,
@@ -111,54 +119,28 @@ pub struct Acpi {
 }
 
 impl Acpi {
-    /// Reads the tables that hang off the root pointer at `rsdp`.
+    /// Reads the tables uACPI is holding.
     ///
     /// # Errors
     ///
-    /// [`AcpiError::NoRootPointer`] if `rsdp` is zero, which is how the boot
-    /// protocol says firmware published none; [`AcpiError::MissingTable`] if
-    /// the machine has no [`Madt`], without which its processors cannot be
-    /// found; and otherwise whichever check the root pointer or a table failed.
-    ///
-    /// # Safety
-    ///
-    /// `rsdp` must be the address firmware published for its root pointer, and
-    /// `map` must be the direct map of the active address space.
-    pub unsafe fn collect(rsdp: u64, map: DirectMap) -> Result<Self, AcpiError> {
-        // SAFETY: the caller guarantees `map` is the live direct map.
-        let memory = unsafe { Physical::new(map) };
-        let pointer = RootPointer::read(&memory, rsdp)?;
-        let (directory, tables) = collect_directory(&memory, &pointer)?;
-
-        let madt = lookup(&tables, Signature::MADT).ok_or(AcpiError::MissingTable {
-            signature: Signature::MADT,
-        })?;
-        let madt = Madt::parse(&sdt::contents(&memory, madt)?)?;
-
+    /// [`AcpiError::MissingTable`] if the machine has no [`Madt`], without
+    /// which its processors cannot be found; [`AcpiError::Uacpi`] if uACPI
+    /// refused a lookup, which before its table subsystem is up is what
+    /// every lookup does; and otherwise whichever check a table's contents
+    /// failed.
+    pub fn collect() -> Result<Self, AcpiError> {
+        let tables = directory();
+        let madt = required(Signature::MADT, Madt::parse)?;
         Ok(Self {
-            revision: pointer.revision(),
-            mcfg: optional(&memory, &tables, Signature::MCFG, Mcfg::parse)?,
-            hpet: optional(&memory, &tables, Signature::HPET, Hpet::parse)?,
-            fadt: optional(&memory, &tables, Signature::FADT, Fadt::parse)?,
-            directory,
+            mcfg: optional(Signature::MCFG, Mcfg::parse)?,
+            hpet: optional(Signature::HPET, Hpet::parse)?,
+            fadt: optional(Signature::FADT, Fadt::parse)?,
             tables,
             madt,
         })
     }
 
-    /// The ACPI revision firmware's root pointer claimed.
-    #[must_use]
-    pub const fn revision(&self) -> u8 {
-        self.revision
-    }
-
-    /// The directory the tables were found through.
-    #[must_use]
-    pub const fn directory(&self) -> Directory {
-        self.directory
-    }
-
-    /// Every table the directory listed and this crate could check, whether or
+    /// Every table uACPI is holding that this crate could describe, whether or
     /// not it was parsed.
     #[must_use]
     pub fn tables(&self) -> &[Table] {
@@ -172,7 +154,9 @@ impl Acpi {
     /// and the ones this crate parses are never among them.
     #[must_use]
     pub fn table(&self, signature: Signature) -> Option<&Table> {
-        lookup(&self.tables, signature)
+        self.tables
+            .iter()
+            .find(|table| table.signature() == signature)
     }
 
     /// The processors and interrupt controllers.
@@ -208,17 +192,12 @@ impl Acpi {
 
     /// Logs everything that was collected.
     pub fn describe(&self, who: &str) {
-        info!(
-            "{who}: acpi revision {}, {} listing {} tables",
-            self.revision,
-            self.directory,
-            self.tables.len(),
-        );
+        info!("{who}: acpi holds {} tables", self.tables.len());
         for table in &self.tables {
             info!(
-                "{who}: acpi table {} at {:#x}, {:#x} bytes, revision {}",
+                "{who}: acpi table {} at index {}, {:#x} bytes, revision {}",
                 table.signature(),
-                table.phys(),
+                table.index(),
                 table.length(),
                 table.revision(),
             );
@@ -242,10 +221,13 @@ impl Acpi {
 /// Why the firmware tables could not be read.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum AcpiError {
-    /// Firmware published no root pointer, so the machine describes itself
-    /// through no ACPI at all.
-    #[error("firmware published no ACPI root pointer")]
-    NoRootPointer,
+    /// uACPI refused a lookup. Before its table subsystem is up that is every
+    /// lookup, and afterwards it means firmware's directory itself is unusable.
+    #[error("uACPI refused the request: {status}")]
+    Uacpi {
+        /// What uACPI reported.
+        status: Status,
+    },
     /// A firmware structure holds an address with bits set above the physical
     /// address space.
     #[error("{value:#x} is not a usable physical address")]
@@ -253,20 +235,11 @@ pub enum AcpiError {
         /// The offending value.
         value: u64,
     },
-    /// The direct map does not cover a structure firmware described, which
-    /// means the memory map did not describe that range as memory.
-    #[error("the direct map does not reach the {len:#x} bytes at physical {phys:#x}")]
-    Unreachable {
-        /// Where the structure was said to be.
-        phys: u64,
-        /// How much of it was wanted.
-        len: usize,
-    },
     /// A structure is shorter than a field a parser has to read out of it.
-    #[error("the structure at {phys:#x} is {len} bytes, too short for {wanted} at offset {offset}")]
+    #[error("the structure at {at:#x} is {len} bytes, too short for {wanted} at offset {offset}")]
     Truncated {
-        /// Where the structure is.
-        phys: u64,
+        /// Where the structure was read.
+        at: u64,
         /// How long it turned out to be.
         len: usize,
         /// Where the field starts.
@@ -274,35 +247,6 @@ pub enum AcpiError {
         /// How many bytes the field needs.
         wanted: usize,
     },
-    /// Nothing at the address the boot protocol carried spells the signature
-    /// ACPI defines for a root pointer.
-    #[error("physical {phys:#x} does not hold an ACPI root pointer")]
-    NotARootPointer {
-        /// The address that was checked.
-        phys: u64,
-    },
-    /// A structure's bytes do not sum to zero, so it is corrupt.
-    #[error("the {len} bytes at {phys:#x} do not sum to zero")]
-    BadChecksum {
-        /// Where the structure is.
-        phys: u64,
-        /// How much of it was summed.
-        len: usize,
-    },
-    /// A directory does not identify itself as the kind of directory the root
-    /// pointer said it was.
-    #[error("the table at {phys:#x} is {found}, not the {expected} it was named as")]
-    WrongSignature {
-        /// Where the table is.
-        phys: u64,
-        /// What it should have been.
-        expected: Signature,
-        /// What it turned out to be.
-        found: Signature,
-    },
-    /// Neither directory the root pointer names could be read.
-    #[error("the ACPI root pointer names no readable table directory")]
-    NoDirectory,
     /// A table pulzar cannot do without is absent.
     #[error("the machine has no {signature} table, which pulzar requires")]
     MissingTable {
@@ -311,77 +255,49 @@ pub enum AcpiError {
     },
     /// A table holds a variable-length structure that declares a length no walk
     /// could get past.
-    #[error("the table at {phys:#x} holds a zero-length structure at offset {offset}")]
+    #[error("the table at {at:#x} holds a zero-length structure at offset {offset}")]
     ZeroLengthEntry {
-        /// Where the table is.
-        phys: u64,
+        /// Where the table was read.
+        at: u64,
         /// Where in it the structure is.
         offset: usize,
     },
 }
 
-/// Reads the best directory that reads, and locates every table it lists.
+/// Describes every table uACPI is holding.
 ///
-/// The preferred directory is tried first and the next one only if it fails, so
-/// a firmware that fills in a broken extended directory beside a sound legacy
-/// one still boots. The failure that ends the attempt is the one reported,
-/// since it is the one that describes the machine's most capable directory.
-fn collect_directory(
-    memory: &Physical,
-    pointer: &RootPointer,
-) -> Result<(Directory, Vec<Table>), AcpiError> {
-    let mut refused = AcpiError::NoDirectory;
-    for directory in pointer.directories() {
-        match listed_tables(memory, directory) {
-            Ok(tables) => return Ok((directory, tables)),
-            Err(error) => {
-                warn!("acpi: the {directory} is unusable: {error}");
-                refused = error;
-            }
+/// A table that cannot be described is dropped with a warning rather than
+/// failing the whole directory: one unreadable table is not a reason to refuse
+/// a machine, and a table pulzar actually needs going missing this way is
+/// reported by its own absence. uACPI has already refused anything whose header
+/// or checksum did not hold, so what is dropped here is a table it accepted and
+/// this crate could not read a header out of — which should be nothing.
+fn directory() -> Vec<Table> {
+    let count = tables::count();
+    let mut tables = Vec::with_capacity(count);
+    for index in 0..count {
+        match Held::at(index).and_then(|held| held.map(|held| held.describe()).transpose()) {
+            Ok(Some(table)) => tables.push(table),
+            // uACPI holds fewer tables than it did a moment ago, which is
+            // possible while nothing holds a reference to them.
+            Ok(None) => {}
+            Err(error) => warn!("acpi: ignoring the table at index {index}: {error}"),
         }
     }
-    Err(refused)
+    tables
 }
 
-/// Locates every table `directory` lists.
+/// Parses a table the machine must have.
 ///
-/// A table whose own header does not check out is dropped with a warning rather
-/// than failing the whole directory. One unreadable table is not a reason to
-/// refuse a machine, and a table pulzar actually needs going missing this way
-/// is reported by its own absence.
-fn listed_tables(memory: &Physical, directory: Directory) -> Result<Vec<Table>, AcpiError> {
-    let header = sdt::locate(memory, directory.phys())?;
-    if header.signature() != directory.signature() {
-        return Err(AcpiError::WrongSignature {
-            phys: directory.phys().as_u64(),
-            expected: directory.signature(),
-            found: header.signature(),
-        });
-    }
-    let body = sdt::contents(memory, &header)?;
-    let listed = body.size() - sdt::HEADER_BYTES;
-    let stride = directory.stride();
-    if !listed.is_multiple_of(stride) {
-        warn!(
-            "acpi: the {directory} ends {} bytes into an entry; ignoring the remainder",
-            listed % stride
-        );
-    }
-
-    let mut tables = Vec::new();
-    for index in 0..listed / stride {
-        let phys = address(directory.entry(&body, sdt::HEADER_BYTES + index * stride)?)?;
-        match sdt::locate(memory, phys) {
-            Ok(table) => tables.push(table),
-            Err(error) => warn!("acpi: ignoring the table at {phys:#x}: {error}"),
-        }
-    }
-    Ok(tables)
-}
-
-/// The first table with this signature.
-fn lookup(tables: &[Table], signature: Signature) -> Option<&Table> {
-    tables.iter().find(|table| table.signature() == signature)
+/// # Errors
+///
+/// [`AcpiError::MissingTable`] if it is absent, or whatever the lookup or the
+/// parse reported.
+fn required<T>(
+    signature: Signature,
+    parse: impl FnOnce(&Fields<'_>) -> Result<T, AcpiError>,
+) -> Result<T, AcpiError> {
+    optional(signature, parse)?.ok_or(AcpiError::MissingTable { signature })
 }
 
 /// Parses a table the machine may or may not have.
@@ -391,14 +307,16 @@ fn lookup(tables: &[Table], signature: Signature) -> Option<&Table> {
 /// is still an error, because that is firmware describing something incorrectly
 /// rather than describing nothing.
 fn optional<T>(
-    memory: &Physical,
-    tables: &[Table],
     signature: Signature,
     parse: impl FnOnce(&Fields<'_>) -> Result<T, AcpiError>,
 ) -> Result<Option<T>, AcpiError> {
-    lookup(tables, signature)
-        .map(|table| sdt::contents(memory, table).and_then(|body| parse(&body)))
-        .transpose()
+    let Some(held) = Held::find(signature)? else {
+        return Ok(None);
+    };
+    // Parsed while the table is still held, and the result is this crate's own
+    // from then on: dropping the reference is what lets uACPI take the mapping
+    // down, so nothing that borrows the table may outlive this.
+    parse(&held.fields()?).map(Some)
 }
 
 /// A physical address out of a firmware table.

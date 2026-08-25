@@ -148,7 +148,7 @@ impl Hpet {
         if hpet.revision == 0 {
             warn!(
                 "acpi: the hpet at {:#x} reports revision 0, which the specification forbids",
-                table.phys()
+                table.at()
             );
         }
         Ok(hpet)

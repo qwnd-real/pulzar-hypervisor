@@ -241,7 +241,7 @@ impl Madt {
             let length = usize::from(table.u8(offset + 1)?);
             if length < HEADER {
                 return Err(AcpiError::ZeroLengthEntry {
-                    phys: table.phys().as_u64(),
+                    at: table.at(),
                     offset,
                 });
             }

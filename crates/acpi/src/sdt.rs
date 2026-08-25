@@ -1,21 +1,16 @@
-//! The header every ACPI table begins with, and what can be trusted after it
-//! has been checked.
+//! The header every ACPI table begins with, and what a checked table is.
 //!
 //! Thirty-six bytes naming the table, giving its total length, and carrying a
-//! checksum over the whole of it. Locating a table means reading that header,
-//! believing its length only far enough to read the bytes it claims, and then
-//! requiring those bytes to sum to zero. Only then does the table become a
-//! [`Table`], which is this crate's evidence that a signature, an address and a
-//! length belong together.
+//! checksum over the whole of it. Nothing here reads a table out of memory or
+//! verifies one: uACPI walks the root pointer's directory, checks each header
+//! and each checksum, and hands over tables that have already passed. What is
+//! left is the two things this crate says about a table it has been handed —
+//! which table it is, and where to find it again — and that is what [`Table`]
+//! is.
 
 use core::fmt::{self, Display, Formatter, Write};
 
-use x86_64::PhysAddr;
-
-use crate::{
-    AcpiError, as_usize,
-    raw::{Fields, Physical},
-};
+use crate::{AcpiError, raw::Fields};
 
 /// Bytes in the header every table begins with.
 pub const HEADER_BYTES: usize = 36;
@@ -24,7 +19,7 @@ pub const HEADER_BYTES: usize = 36;
 const SIGNATURE: usize = 0;
 
 /// Offset of the table's total length, header included.
-const LENGTH: usize = 4;
+pub const LENGTH: usize = 4;
 
 /// Offset of the table's revision.
 const REVISION: usize = 8;
@@ -64,6 +59,13 @@ impl Signature {
     pub const fn new(characters: [u8; 4]) -> Self {
         Self(characters)
     }
+
+    /// The four characters and a terminator, which is how uACPI is asked for a
+    /// table by signature.
+    pub(crate) const fn terminated(self) -> [u8; 5] {
+        let [a, b, c, d] = self.0;
+        [a, b, c, d, 0]
+    }
 }
 
 impl Display for Signature {
@@ -84,22 +86,53 @@ impl Display for Signature {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Table {
     signature: Signature,
-    phys: PhysAddr,
+    index: usize,
+    at: u64,
     length: u32,
     revision: u8,
 }
 
 impl Table {
+    /// Reads what a table's header says about it.
+    ///
+    /// `index` is the position uACPI keeps the table at, which is the only name
+    /// the table can be asked for again by.
+    ///
+    /// # Errors
+    ///
+    /// [`AcpiError::Truncated`] if the bytes do not reach the end of a header,
+    /// which for a table uACPI has already checked cannot happen.
+    pub fn read(index: usize, header: &Fields<'_>) -> Result<Self, AcpiError> {
+        Ok(Self {
+            signature: Signature(header.array::<4>(SIGNATURE)?),
+            index,
+            at: header.at(),
+            length: header.u32(LENGTH)?,
+            revision: header.u8(REVISION)?,
+        })
+    }
+
     /// The four characters naming the table.
     #[must_use]
     pub const fn signature(&self) -> Signature {
         self.signature
     }
 
-    /// Where the table lives in physical memory.
+    /// Where uACPI keeps the table, which is how it is asked for again.
     #[must_use]
-    pub const fn phys(&self) -> PhysAddr {
-        self.phys
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The address the table was readable at when it was described.
+    ///
+    /// A virtual address, and not one to read through afterwards: the mapping
+    /// behind it belongs to uACPI, which gives it back once nothing holds a
+    /// reference to the table. It is kept because it is what identifies the
+    /// table in a log line beside everything else that was said about it.
+    #[must_use]
+    pub const fn at(&self) -> u64 {
+        self.at
     }
 
     /// Bytes the table occupies, header included.
@@ -114,49 +147,4 @@ impl Table {
     pub const fn revision(&self) -> u8 {
         self.revision
     }
-}
-
-/// Reads and checks the header of the table at `phys`.
-///
-/// # Errors
-///
-/// [`AcpiError::Unreachable`] if the direct map does not reach the table,
-/// [`AcpiError::Truncated`] if it claims to be shorter than a header, or
-/// [`AcpiError::BadChecksum`] if its bytes do not sum to zero.
-pub fn locate(memory: &Physical, phys: PhysAddr) -> Result<Table, AcpiError> {
-    let header = Fields::new(phys, memory.bytes(phys, HEADER_BYTES)?);
-    let signature = Signature(header.array::<4>(SIGNATURE)?);
-    let length = header.u32(LENGTH)?;
-    let size = as_usize(u64::from(length));
-    if size < HEADER_BYTES {
-        return Err(AcpiError::Truncated {
-            phys: phys.as_u64(),
-            len: size,
-            offset: 0,
-            wanted: HEADER_BYTES,
-        });
-    }
-    if !Fields::new(phys, memory.bytes(phys, size)?).sums_to_zero() {
-        return Err(AcpiError::BadChecksum {
-            phys: phys.as_u64(),
-            len: size,
-        });
-    }
-    Ok(Table {
-        signature,
-        phys,
-        length,
-        revision: header.u8(REVISION)?,
-    })
-}
-
-/// The whole of `table`, header included, ready for a parser.
-///
-/// # Errors
-///
-/// [`AcpiError::Unreachable`] if the direct map no longer reaches the table,
-/// which cannot happen for a table [`locate`] returned.
-pub fn contents<'a>(memory: &'a Physical, table: &Table) -> Result<Fields<'a>, AcpiError> {
-    let size = as_usize(u64::from(table.length));
-    Ok(Fields::new(table.phys, memory.bytes(table.phys, size)?))
 }

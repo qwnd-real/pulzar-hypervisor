@@ -94,7 +94,7 @@ impl Fadt {
                 warn!(
                     "acpi: the fadt at {:#x} says its timer block decodes {decoded} bytes rather \
                      than {TIMER_BYTES}; treating the timer as absent",
-                    table.phys()
+                    table.at()
                 );
             }
             return Ok(Self { pm_timer: None });

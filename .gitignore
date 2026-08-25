@@ -4,6 +4,7 @@
 **/target/
 .agents/
 .jspace/
+.freebuff/
 
 # Temp
 /tmp/

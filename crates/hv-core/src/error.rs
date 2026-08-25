@@ -18,6 +18,7 @@ use partition::PartitionError;
 use pci::PciError;
 use portal::PortalError;
 use thiserror::Error;
+use uacpi_sys::Status;
 use vcpu::VcpuError;
 use vlapic::VlapicError;
 
@@ -41,6 +42,11 @@ pub enum CoreError {
     /// The firmware tables could not be read.
     #[error(transparent)]
     Acpi(#[from] AcpiError),
+    /// uACPI could not be brought up far enough to read the machine's table
+    /// directory, which means firmware published no root pointer or the
+    /// directory it names is unusable.
+    #[error("uACPI could not read the machine's tables: {0}")]
+    Uacpi(#[from] Status),
     /// The processor's own descriptor tables could not be set up.
     #[error(transparent)]
     Descriptors(#[from] DescriptorError),
