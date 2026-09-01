@@ -44,6 +44,10 @@ const CACHYOS_DISK_SIZE: &str = "48G";
 /// so only written sectors consume host space.
 const WINDOWS_DISK_SIZE: &str = "64G";
 
+/// Room for a scratch filesystem, if a guest puts one on the `NVMe` disk at
+/// all. The qcow2 is sparse, so an untouched disk consumes none of it.
+const NVME_DISK_SIZE: &str = "1G";
+
 /// How much of a download goes by between progress lines.
 const PROGRESS_STEP: usize = 256 << 20;
 
@@ -76,6 +80,22 @@ impl Checksum {
 /// Location of a guest's disk image in the per-user cache.
 pub fn image_path(guest: Guest) -> Result<PathBuf> {
     Ok(paths::cache_dir("disks")?.join(format!("{}.qcow2", guest.label())))
+}
+
+/// The blank disk the machine's `NVMe` controller holds, created on first use.
+///
+/// The controller is the one device this hypervisor answers for in place of
+/// the hardware, so every machine has one — the guest an OS was provisioned
+/// onto is attached alongside it, not moved onto it, which keeps the boot
+/// media and the interposed device two separate questions. The disk is blank
+/// and stays that way unless a guest partitions it, and it is kept in the
+/// cache so whatever a guest puts on it survives between runs.
+pub fn nvme_disk() -> Result<PathBuf> {
+    let image = paths::cache_dir("disks")?.join("nvme.qcow2");
+    if !image.exists() {
+        create_disk(&image, NVME_DISK_SIZE)?;
+    }
+    Ok(image)
 }
 
 /// Fetches the pre-installed Debian image as the Linux guest disk.

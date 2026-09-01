@@ -1,5 +1,6 @@
 //! QEMU orchestration: OVMF firmware, the virtual-FAT ESP drive, guest OS
-//! disks, and the software TPM that Windows 11 requires.
+//! disks, the `NVMe` controller the hypervisor interposes, and the software TPM
+//! that Windows 11 requires.
 //!
 //! Firmware variable stores are kept per guest in the user cache, so NVRAM
 //! boot entries written while an OS installs survive into later runs.
@@ -41,6 +42,13 @@ const TOPOLOGY: &str = "8,sockets=1,cores=4,threads=2";
 /// `invtsc` says the timestamp counter runs at a constant rate, which is what
 /// lets a guest use it as a timebase rather than as a cycle counter.
 const PROCESSOR: &str = "host,invtsc=on,topoext=on";
+
+/// The serial number the emulated controller presents.
+///
+/// Written with the letters, digits and zero a real serial has, so that a
+/// replacement of the same shape — and one of every class of character it
+/// holds — is visible at a glance inside the guest.
+const NVME_SERIAL: &str = "S4XPNV0K8123456";
 
 /// Memory the guest is given. Enough for a desktop installer to run in.
 const MEMORY: &str = "8G";
@@ -188,6 +196,20 @@ pub fn launch(spec: &Spec) -> Result<()> {
         ));
         qemu.args(["-device", "ide-hd,drive=os,bus=ide.1,bootindex=1"]);
     }
+    // The NVMe controller, with a blank disk on it. Attached to every
+    // machine rather than only the ones asked for, because it is the one
+    // device this hypervisor interposes and its takeover is worth running on
+    // every boot rather than only where a guest happened to be provisioned
+    // onto NVMe. The serial is written out with the letters, digits and zero
+    // a real one has, so that a replacement of the same shape is visible at
+    // a glance inside the guest. No bootindex: nothing boots from it unless
+    // a guest chooses to.
+    let nvme = disk::nvme_disk()?;
+    qemu.arg("-drive").arg(format!(
+        "if=none,id=nvme,format=qcow2,file={}",
+        drive_path(&nvme)
+    ));
+    qemu.args(["-device", &format!("nvme,drive=nvme,serial={NVME_SERIAL}")]);
     if let Some(iso) = &spec.installer {
         qemu.arg("-drive").arg(format!(
             "if=none,id=installer,format=raw,media=cdrom,file={}",
