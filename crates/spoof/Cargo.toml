@@ -1,0 +1,9 @@
+[package]
+name = "spoof"
+description = "Keyed, format-preserving replacements for the strings and byte fields that identify a device"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

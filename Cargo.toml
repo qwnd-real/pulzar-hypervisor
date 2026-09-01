@@ -24,6 +24,7 @@ members = [
     "crates/processor",
     "crates/serial",
     "crates/snapshot",
+    "crates/spoof",
     "crates/svm",
     "crates/uacpi-sys",
     "crates/vcpu",
@@ -71,7 +72,8 @@ uefi-raw = "0.15.1"
 # register the machine may not have and reports a refusal rather than taking
 # it, `vlapic` is the interrupt controller a guest sees in place of the
 # machine's own, and `exits` is what every one of a guest's exits means and
-# what the host does about it.
+# what the host does about it. `spoof` is the keyed transform that replaces an
+# identifying string with one of the same shape.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -95,6 +97,7 @@ portal = { path = "crates/portal" }
 probe = { path = "crates/probe" }
 processor = { path = "crates/processor" }
 snapshot = { path = "crates/snapshot" }
+spoof = { path = "crates/spoof" }
 svm = { path = "crates/svm" }
 # The ACPI implementation itself, as C compiled out of a pinned submodule.
 # `uacpi-sys` is the boundary and nothing else: `acpi` reads the machine's
