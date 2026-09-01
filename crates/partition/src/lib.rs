@@ -395,6 +395,19 @@ impl Partition {
         use_memory(Linear::new(physical, addressing))
     }
 
+    /// Borrows this guest's memory as physical, the way the hardware behind a
+    /// device sees it.
+    ///
+    /// For a holder that works in guest-physical terms and has no guest
+    /// translation to offer — a device answering an access, reading the
+    /// queues its hardware shares with the guest. The view is the same one
+    /// [`Partition::with_memory`] builds its linear view on, with the same
+    /// per-entry coherence, and the same absence of anything to deadlock on.
+    pub fn with_physical<T>(&self, use_memory: impl for<'a> FnOnce(Physical<'a>) -> T) -> T {
+        let physical = Physical::new(&self.npt, self.npt.window());
+        use_memory(physical)
+    }
+
     /// The value a control block names this guest's memory by.
     #[must_use]
     pub const fn nested_cr3(&self) -> PhysAddr {
