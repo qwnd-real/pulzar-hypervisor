@@ -70,7 +70,7 @@ use crate::{
     Host, Invalid, Registers, VcpuError, invalid,
     invalid::AvicLimits,
     registers::{RAX, RSP},
-    switch,
+    switch::{self, Block},
 };
 
 /// The permission bits for the registers this layer always intercepts.
@@ -182,14 +182,14 @@ pub enum Flow {
 /// whose cache is keyed on its address.
 #[derive(Debug)]
 pub struct Vcpu {
-    registers: Registers,
+    block: Block,
     vmcb: NonNull<Vmcb>,
     vmcb_phys: PhysAddr,
     msrpm_phys: PhysAddr,
     host: &'static Host,
     tsc_adjust: u64,
-    dirty: CleanBits,
-    stale: bool,
+    entry: Entry,
+    flush_command: TlbControl,
 }
 
 impl Vcpu {
@@ -255,17 +255,17 @@ impl Vcpu {
             0
         };
         let mut vcpu = Self {
-            registers: Registers::zeroed(),
+            block: Block::new(host.snapshot()),
             vmcb,
             vmcb_phys,
             msrpm_phys,
             host,
             tsc_adjust,
-            // Everything counts as edited until the first entry, so that entry
-            // publishes a clean field of zero.
-            dirty: CleanBits::ALL_CACHED,
-            // A guest that has never run has cached no translation of its own.
-            stale: false,
+            // A block the processor has never seen has nothing cached behind
+            // it, and a guest that has never run has cached no translation of
+            // its own.
+            entry: Entry::UNSEEN,
+            flush_command: flush_command(host.svm().features),
         };
 
         let control = vcpu.control_mut();
@@ -326,13 +326,16 @@ impl Vcpu {
 
     /// Runs the guest until `exits` says to stop.
     ///
-    /// `exits` is called once per exit, with the host's own state back in the
-    /// processor and both interrupt flags — the global one and the ordinary
-    /// one — set, so it may do anything the hypervisor can normally do,
-    /// including taking an interrupt, which is how an interrupt that arrived
-    /// while the guest was running reaches the host's handler. The ordinary
-    /// flag is also left set when this returns, because it was set to enter
-    /// the loop and nothing here clears it again.
+    /// `exits` is called twice per exit. At [`RunPhase::Exit`] the host's own
+    /// state is back in the processor and both interrupt flags — the global one
+    /// and the ordinary one — are set, so it may do anything the hypervisor can
+    /// normally do, including taking an interrupt, which is how an interrupt
+    /// that arrived while the guest was running reaches the host's handler. At
+    /// [`RunPhase::Enter`] the global flag is clear, because that call is the
+    /// last decision before the guest runs and nothing may arrive between the
+    /// decision and the entry; the ordinary flag is set there too, and is set
+    /// when this returns, but with the global flag clear it delivers nothing —
+    /// so an [`RunPhase::Enter`] callback must not wait for an interrupt.
     ///
     /// # Errors
     ///
@@ -360,8 +363,16 @@ impl Vcpu {
             return Err(VcpuError::Invalid(invalid));
         }
 
+        // Once, rather than around every entry. With interrupt masking
+        // virtualized, SVM takes the host's interrupt flag at entry as the mask
+        // for physical interrupts while the guest runs, so the flag has to be
+        // set here — but nothing in the loop below clears it, and the global
+        // flag is what excludes interrupts where they must be excluded. A pair
+        // of flag instructions per exit would buy nothing that the global flag
+        // is not already buying.
+        interrupts::enable();
+
         loop {
-            interrupts::disable();
             // SAFETY: `Host::install` enabled SVM on this processor. VMRUN
             // restores GIF on the successful path; the early return below
             // restores it explicitly.
@@ -370,38 +381,28 @@ impl Vcpu {
                 // SAFETY: GIF was cleared immediately above and no VMRUN has
                 // occurred to restore it.
                 unsafe { switch::enable_global_interrupts() };
-                interrupts::enable();
                 return Ok(());
             }
-            let clean = CleanBits::ALL_CACHED.soil(self.dirty);
-            let flush = if self.stale {
-                flush_command()
-            } else {
-                TlbControl::DoNothing
-            };
+            // Consumed by the entry it applies to: whatever the exit before it
+            // edited is published now, and what the next entry publishes starts
+            // again from everything cached and nothing flushed.
+            let entry = self.entry;
+            self.entry = Entry::CACHED;
             let control = self.control_mut();
-            control.clean = clean;
-            control.tlb_control = flush;
-            self.dirty = CleanBits::nothing_cached();
-            self.stale = false;
-
-            // With interrupt masking virtualized, SVM takes the host's IF at
-            // entry as the mask for physical interrupts while the guest runs.
-            // GIF remains clear until VMRUN, so enabling IF here cannot deliver
-            // anything into the half-restored state below. The helper includes
-            // a NOP, which consumes STI's one-instruction interrupt shadow
-            // before VMRUN samples the flag.
-            interrupts::enable();
+            control.clean = entry.clean;
+            control.tlb_control = entry.tlb;
 
             // SAFETY: the block was checked above and after every exit that
             // edited it, `Host::install` enabled the extension and programmed
             // the host state-save address on this processor, and the snapshot
-            // comes from that same call on this same processor. The caller
-            // guarantees the block has not moved and has not been entered
-            // elsewhere. GIF is clear across the final preparation and switch,
-            // so physical interrupts cannot observe partially restored state.
+            // the block carries comes from that same call on this same
+            // processor. The caller guarantees the block has not moved and has
+            // not been entered elsewhere. GIF is clear across the final
+            // preparation and switch, so physical interrupts cannot observe
+            // partially restored state, and the interrupt flag was set before
+            // the loop and has not been cleared since.
             unsafe {
-                switch::enter(&mut self.registers, self.vmcb_phys, self.host.snapshot());
+                switch::enter(&mut self.block, self.vmcb_phys);
             }
 
             if self.control().exit_code == ExitCode::INVALID {
@@ -461,7 +462,7 @@ impl Vcpu {
     /// Clearing more than was edited only costs a re-read; clearing less runs
     /// the guest on state that is no longer there. When unsure, clear.
     pub const fn soil(&mut self, groups: CleanBits) {
-        self.dirty = self.dirty.union(groups);
+        self.entry.clean = self.entry.clean.soil(groups);
     }
 
     /// Discards this guest's cached translations on the way into the next
@@ -476,7 +477,7 @@ impl Vcpu {
     /// Consumed by the entry it applies to, so one edit costs one flush rather
     /// than a flush on every entry for the rest of the guest's life.
     pub const fn flush(&mut self) {
-        self.stale = true;
+        self.entry.tlb = self.flush_command;
     }
 
     /// The timestamp counter value the guest observes now.
@@ -568,12 +569,12 @@ impl Vcpu {
     /// The general-purpose registers the hardware leaves to the hypervisor.
     #[must_use]
     pub const fn registers(&self) -> &Registers {
-        &self.registers
+        &self.block.registers
     }
 
     /// The same, to write.
     pub const fn registers_mut(&mut self) -> &mut Registers {
-        &mut self.registers
+        &mut self.block.registers
     }
 
     /// The register an encoded four-bit number names.
@@ -584,7 +585,7 @@ impl Vcpu {
     #[must_use]
     pub fn gpr(&self, number: u8) -> u64 {
         let number = number & NUMBER;
-        match self.registers.by_number(number) {
+        match self.block.registers.by_number(number) {
             Some(value) => value,
             None if number == RAX => self.save().rax,
             // The block holds all sixteen but these two, so this is the other.
@@ -599,7 +600,7 @@ impl Vcpu {
     /// either needs nothing cleared.
     pub fn set_gpr(&mut self, number: u8, value: u64) {
         let number = number & NUMBER;
-        if self.registers.set_by_number(number, value) {
+        if self.block.registers.set_by_number(number, value) {
             return;
         }
         if number == RAX {
@@ -753,8 +754,8 @@ impl Vcpu {
         // sixteen-bit code that predates `CPUID` identified what it was running
         // on. It is this processor's signature because that is the processor the
         // guest is running on.
-        self.registers = Registers::zeroed();
-        self.registers.rdx = u64::from(processor::cpuid(FEATURE_LEAF, 0).eax);
+        self.block.registers = Registers::zeroed();
+        self.block.registers.rdx = u64::from(processor::cpuid(FEATURE_LEAF, 0).eax);
         self.soil(CleanBits::ALL_CACHED);
         self.flush();
     }
@@ -800,6 +801,41 @@ pub enum RunPhase {
     Enter,
     /// The guest has exited and the callback may inspect and answer the exit.
     Exit,
+}
+
+/// What the next entry publishes about the processor's cached copy of the
+/// control block and about this guest's cached translations.
+///
+/// The two together rather than apart, because they are the same value: what
+/// one exit's edits owe the entry after it. Every entry reads both and resets
+/// both, and neither is ever read or reset without the other — so keeping them
+/// adjacent in one value is what lets that be one load and one store on a path
+/// that is taken as often as a guest exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+struct Entry {
+    /// Which groups the processor may take from its own cache.
+    clean: CleanBits,
+    /// What it must discard of this guest's translations first.
+    tlb: TlbControl,
+}
+
+impl Entry {
+    /// What an entry following an exit that edited nothing publishes: every
+    /// group reusable, nothing flushed. The steady state, and what every entry
+    /// resets to — which is what makes such an exit cost nothing extra.
+    const CACHED: Self = Self {
+        clean: CleanBits::ALL_CACHED,
+        tlb: TlbControl::DoNothing,
+    };
+
+    /// What the first entry into a block publishes. The processor has never
+    /// seen it, so it has nothing cached that could be reused and nothing of
+    /// this guest's to discard.
+    const UNSEEN: Self = Self {
+        clean: CleanBits::nothing_cached(),
+        tlb: TlbControl::DoNothing,
+    };
 }
 
 /// Sets both permission bits of every named register in a permission map.
@@ -881,10 +917,15 @@ impl MsrPassthrough {
 /// processor without it has only the instrument that discards every translation
 /// on the machine, the host's included — enormously more expensive, and still
 /// correct, which is what makes it the fallback rather than a refusal.
-fn flush_command() -> TlbControl {
-    match processor::svm() {
-        Some(svm) if svm.features.contains(SvmFeatures::FLUSH_BY_ASID) => TlbControl::FlushGuest,
-        _ => TlbControl::FlushAll,
+///
+/// Answered from the feature set this processor was found to have rather than
+/// asked again: it is fixed for the life of the machine, and the entry path is
+/// no place to be re-deriving a constant.
+const fn flush_command(features: SvmFeatures) -> TlbControl {
+    if features.contains(SvmFeatures::FLUSH_BY_ASID) {
+        TlbControl::FlushGuest
+    } else {
+        TlbControl::FlushAll
     }
 }
 

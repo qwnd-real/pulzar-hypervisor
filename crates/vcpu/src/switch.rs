@@ -44,19 +44,95 @@
 //! property of the target rather than a convention to be kept, which is what
 //! makes it safe to save nothing.
 //!
-//! # Why a naked function
+//! # Why this is assembly written into the loop rather than a function
 //!
-//! An inline `asm!` block would have to declare every general-purpose register
-//! clobbered, and the compiler would spill and reload around it — the same
-//! work, less predictably, and with no say over which register holds the
-//! control block's address at the moment `VMRUN` executes. A naked function is
-//! the whole sequence and nothing else.
+//! The guest destroys every general-purpose register, so anything the
+//! hypervisor still needs afterwards has to be in memory across the entry. The
+//! only question is who puts it there. A function with a calling convention has
+//! to preserve the eight registers the convention calls its caller's, whether
+//! or not any of them holds something — sixteen stack operations per exit to
+//! protect, in the loop this serves, three live values. Written into the loop
+//! with everything the guest touches declared clobbered, the compiler spills
+//! exactly what is live and nothing else.
+//!
+//! Two further costs travel with the call. The larger is the return: the guest
+//! runs between the call and it, and overruns the processor's return-address
+//! predictor while it does, so the return mispredicts on every single exit —
+//! the same effect the return-address control in the control area exists to be
+//! able to ask for deliberately. The smaller is that a called switch cannot say
+//! which register it wants the control block's address in, so the address
+//! arrives wherever the convention put it and has to be moved into the one
+//! register the three virtualization instructions accept.
+//!
+//! Two of the fourteen cannot be handled by declaring them, because the
+//! compiler keeps both for itself: the frame pointer, which may be the only way
+//! back to the frame, and the base register, which it reserves for a stack that
+//! has had to be realigned. Those two are saved and restored by hand, which is
+//! four instructions rather than sixteen.
+//!
+//! # What the caller owes, and why it is not repeated here
+//!
+//! The global interrupt flag is cleared by [`Vcpu::run`](crate::Vcpu::run)
+//! before it makes the final decision to enter, so that no non-maskable
+//! interrupt can arrive between the decision and the guest. This does not clear
+//! it again: the flag is already clear by the time the block below starts, and
+//! clearing a cleared flag is a microcoded instruction on the one path where
+//! there is nothing to spend one on. The same goes for the ordinary interrupt
+//! flag in the other direction — with masking virtualized it is what the guest
+//! runs with, and the loop keeps it set rather than setting it per entry.
 
-use core::{arch::naked_asm, mem::offset_of};
+use core::{
+    arch::asm,
+    mem::{align_of, offset_of, size_of},
+};
 
 use x86_64::PhysAddr;
 
 use crate::Registers;
+
+/// Bytes a cache line occupies on the processors this runs on.
+const CACHE_LINE: usize = 64;
+
+/// Everything the world switch has to reach once the guest has run.
+///
+/// The guest leaves no register holding anything, so a switch coming out of one
+/// has exactly two ways to find something: the stack, and whatever it can reach
+/// from the one address it pushed there. This is that address. It holds the
+/// fourteen registers the switch moves, and the one further value the switch
+/// needs on the way out — which is why that value lives here rather than being
+/// pushed beside the pointer or fetched again by the caller.
+///
+/// # What its placement is for
+///
+/// Aligned to a cache line and no larger than two, so the switch's fourteen
+/// stores reach as few lines as they can and nothing else a virtual processor
+/// holds shares one of them. The snapshot address then costs no line of its
+/// own: it sits in what would otherwise be the padding after the fourteenth
+/// register, in the second of the two lines the stores have already brought in.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(64))]
+pub(crate) struct Block {
+    /// The registers the architecture leaves to the hypervisor.
+    pub(crate) registers: Registers,
+    /// Physical address of the control block this processor's own `FS`, `GS`,
+    /// `TR` and `LDTR` come back from, as [`Host::install`] left them.
+    ///
+    /// Held as a plain quadword because the switch loads it as one.
+    ///
+    /// [`Host::install`]: crate::Host::install
+    snapshot: u64,
+}
+
+impl Block {
+    /// A block of zeroed registers that will restore `snapshot` on the way out
+    /// of every guest entered through it.
+    pub(crate) const fn new(snapshot: PhysAddr) -> Self {
+        Self {
+            registers: Registers::zeroed(),
+            snapshot: snapshot.as_u64(),
+        }
+    }
+}
 
 /// Runs the guest a control block describes until it exits.
 ///
@@ -68,9 +144,9 @@ use crate::Registers;
 /// # Safety
 ///
 /// `guest` must be the physical address of a page-aligned, write-back control
-/// block whose state passes the processor's entry checks, `host` the physical
-/// address of a control block a `VMSAVE` has been performed into on *this*
-/// processor, and `registers` must point at a block this call may overwrite
+/// block whose state passes the processor's entry checks, and `block` must
+/// carry the physical address of a control block a `VMSAVE` has been performed
+/// into on *this* processor. The register half of `block` is overwritten
 /// entirely.
 ///
 /// The extension must be enabled in the extended feature register and the host
@@ -79,15 +155,135 @@ use crate::Registers;
 /// since it was last entered here, nor moved it, without having first cleared
 /// its clean field: the processor identifies its cached copy by the block's
 /// physical address alone.
-pub(crate) unsafe fn enter(registers: &mut Registers, guest: PhysAddr, host: PhysAddr) {
-    // SAFETY: the caller guarantees every precondition the switch relies on,
-    // and the borrow is what makes the register block's exclusivity the
-    // compiler's business rather than the contract's.
+///
+/// The global interrupt flag must already be clear and the ordinary one set:
+/// this clears neither and sets neither, for the reasons given in this module.
+///
+/// `RAX` is the pivot of the whole sequence. It is the operand `VMLOAD`,
+/// `VMRUN` and `VMSAVE` all take, and it is the one general-purpose register
+/// the hardware carries itself — so the guest's value goes to the control block
+/// on the way out and the host's comes back, which means the `VMSAVE` after the
+/// exit already has its operand without anything being reloaded.
+#[expect(
+    clippy::inline_always,
+    reason = "being in the caller's frame is the whole point: out of line this regains the call, \
+              the return that mispredicts after every guest, and the eight preserved registers"
+)]
+#[inline(always)]
+pub(crate) unsafe fn enter(block: &mut Block, guest: PhysAddr) {
+    // SAFETY: the caller guarantees every precondition the switch relies on.
+    // Every register the guest destroys is declared below except the two the
+    // compiler will not accept there — the frame pointer and the base
+    // register — and those two are saved and restored by the block itself.
     unsafe {
-        switch(
-            core::ptr::from_mut(registers),
-            guest.as_u64(),
-            host.as_u64(),
+        asm!(
+            // The two registers that cannot be declared, and then the one value
+            // that has to outlive the guest: the block to store its registers
+            // into, from which the control block the host's own state comes
+            // back from is reached.
+            "push rbp",
+            "push rbx",
+            "push rcx",
+
+            // The guest's registers. RCX is the block's address and so is
+            // loaded last, once nothing else needs it.
+            "mov rdx, [rcx + {RDX}]",
+            "mov rbx, [rcx + {RBX}]",
+            "mov rbp, [rcx + {RBP}]",
+            "mov rsi, [rcx + {RSI}]",
+            "mov rdi, [rcx + {RDI}]",
+            "mov r8,  [rcx + {R8}]",
+            "mov r9,  [rcx + {R9}]",
+            "mov r10, [rcx + {R10}]",
+            "mov r11, [rcx + {R11}]",
+            "mov r12, [rcx + {R12}]",
+            "mov r13, [rcx + {R13}]",
+            "mov r14, [rcx + {R14}]",
+            "mov r15, [rcx + {R15}]",
+            "mov rcx, [rcx + {RCX}]",
+
+            // Nothing may arrive between here and the guest running: an
+            // interrupt taken with half the guest's state loaded would be taken
+            // in a world that does not exist. The caller cleared the global
+            // interrupt flag; VMRUN sets it again as it enters the guest, and
+            // #VMEXIT clears it again on the way back.
+            "vmload rax",
+            "vmrun rax",
+            // #VMEXIT resumes here, with the global interrupt flag clear, RSP
+            // as VMRUN found it and RAX back to the guest control block's
+            // address — which is exactly the operand this needs. The guest's
+            // FS, GS, TR and LDTR are still in the processor at this point and
+            // nowhere else.
+            "vmsave rax",
+
+            // The guest's registers, before the host's own state comes back
+            // rather than after it. Both of the block's lines may have been
+            // evicted while the guest ran, and a VMLOAD standing in front of
+            // these stores would hold the reads that fetch those lines for
+            // ownership behind its microcode instead of letting them run under
+            // it. Its RAX is already in the control block, which is what makes
+            // RAX free to address the block with.
+            "pop rax",
+            "mov [rax + {RCX}], rcx",
+            "mov [rax + {RDX}], rdx",
+            "mov [rax + {RBX}], rbx",
+            "mov [rax + {RBP}], rbp",
+            "mov [rax + {RSI}], rsi",
+            "mov [rax + {RDI}], rdi",
+            "mov [rax + {R8}],  r8",
+            "mov [rax + {R9}],  r9",
+            "mov [rax + {R10}], r10",
+            "mov [rax + {R11}], r11",
+            "mov [rax + {R12}], r12",
+            "mov [rax + {R13}], r13",
+            "mov [rax + {R14}], r14",
+            "mov [rax + {R15}], r15",
+
+            // The host's own FS, GS, TR, LDTR and fast-system-call registers,
+            // from the snapshot taken when this processor came up, which the
+            // block carries so that nothing had to keep it in a register the
+            // guest would have destroyed.
+            "mov rax, [rax + {SNAPSHOT}]",
+            "vmload rax",
+
+            // Everything the guest left behind is now recorded, so an interrupt
+            // arriving here can be taken safely — and one that caused this exit
+            // is taken here, on the host's own descriptor table, with the host's
+            // task register and GS base already restored one instruction ago.
+            "stgi",
+
+            "pop rbx",
+            "pop rbp",
+
+            RCX = const offset_of!(Block, registers.rcx),
+            RDX = const offset_of!(Block, registers.rdx),
+            RBX = const offset_of!(Block, registers.rbx),
+            RBP = const offset_of!(Block, registers.rbp),
+            RSI = const offset_of!(Block, registers.rsi),
+            RDI = const offset_of!(Block, registers.rdi),
+            R8 = const offset_of!(Block, registers.r8),
+            R9 = const offset_of!(Block, registers.r9),
+            R10 = const offset_of!(Block, registers.r10),
+            R11 = const offset_of!(Block, registers.r11),
+            R12 = const offset_of!(Block, registers.r12),
+            R13 = const offset_of!(Block, registers.r13),
+            R14 = const offset_of!(Block, registers.r14),
+            R15 = const offset_of!(Block, registers.r15),
+            SNAPSHOT = const offset_of!(Block, snapshot),
+
+            inout("rax") guest.as_u64() => _,
+            inout("rcx") core::ptr::from_mut(block) => _,
+            out("rdx") _,
+            out("rsi") _,
+            out("rdi") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            out("r12") _,
+            out("r13") _,
+            out("r14") _,
+            out("r15") _,
         );
     }
 }
@@ -117,129 +313,15 @@ pub(crate) unsafe fn enable_global_interrupts() {
     unsafe { core::arch::asm!("stgi", options(nomem, nostack, preserves_flags)) };
 }
 
-/// The switch.
-///
-/// This target's C ABI is the Windows one, so the three arguments arrive in
-/// `RCX`, `RDX` and `R8`, and `RBX`, `RBP`, `RDI`, `RSI` and `R12` through
-/// `R15` belong to the caller. Eight of those are pushed; the six volatile
-/// registers are not, because the guest is welcome to whatever they held.
-///
-/// `RAX` is the pivot of the whole sequence. It is the operand `VMLOAD`,
-/// `VMRUN` and `VMSAVE` all take, and it is the one general-purpose register
-/// the hardware carries itself — so the guest's value goes to the control block
-/// on the way out and the host's comes back, which means the `VMSAVE` after the
-/// exit already has its operand without anything being reloaded.
-///
-/// # Safety
-///
-/// As [`enter`], which is the only caller and exists to state the same
-/// preconditions in terms of the types they are really about.
-#[unsafe(naked)]
-unsafe extern "C" fn switch(registers: *mut Registers, guest: u64, host: u64) {
-    naked_asm!(
-        // The caller's registers, and then the two values that have to outlive
-        // the guest: the block to store its registers into, and the control
-        // block the host's own state comes back from.
-        "push rbx",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "push rcx",
-        "push r8",
-
-        // The operand of all three virtualization instructions below.
-        "mov rax, rdx",
-
-        // The guest's registers. RCX is the block's address and so is loaded
-        // last, once nothing else needs it.
-        "mov rbx, [rcx + {RBX}]",
-        "mov rdx, [rcx + {RDX}]",
-        "mov rbp, [rcx + {RBP}]",
-        "mov rsi, [rcx + {RSI}]",
-        "mov rdi, [rcx + {RDI}]",
-        "mov r8,  [rcx + {R8}]",
-        "mov r9,  [rcx + {R9}]",
-        "mov r10, [rcx + {R10}]",
-        "mov r11, [rcx + {R11}]",
-        "mov r12, [rcx + {R12}]",
-        "mov r13, [rcx + {R13}]",
-        "mov r14, [rcx + {R14}]",
-        "mov r15, [rcx + {R15}]",
-        "mov rcx, [rcx + {RCX}]",
-
-        // Nothing may arrive between here and the guest running: an interrupt
-        // taken with half the guest's state loaded would be taken in a world
-        // that does not exist. VMRUN sets the flag again as it enters the
-        // guest, and #VMEXIT clears it again on the way back.
-        // GIF was cleared by `Vcpu::run` before the final entry decision, so
-        // no NMI can consume that decision before VMRUN enables GIF for the
-        // guest. Repeating CLGI is harmless and keeps this routine safe for
-        // callers that do not need a final decision under GIF exclusion.
-        "clgi",
-        "vmload rax",
-        "vmrun rax",
-        // #VMEXIT resumes here, with the global interrupt flag clear, RSP as
-        // VMRUN found it and RAX back to the guest control block's address —
-        // which is exactly the operand this needs. The guest's FS, GS, TR and
-        // LDTR are still in the processor at this point and nowhere else.
-        "vmsave rax",
-
-        // The host's own FS, GS, TR, LDTR and fast-system-call registers, from
-        // the snapshot taken when this processor came up.
-        "pop rax",
-        "vmload rax",
-
-        // The guest's registers. Its RAX is already in the control block, which
-        // is what makes RAX free to address the block with.
-        "pop rax",
-        "mov [rax + {RBX}], rbx",
-        "mov [rax + {RCX}], rcx",
-        "mov [rax + {RDX}], rdx",
-        "mov [rax + {RBP}], rbp",
-        "mov [rax + {RSI}], rsi",
-        "mov [rax + {RDI}], rdi",
-        "mov [rax + {R8}],  r8",
-        "mov [rax + {R9}],  r9",
-        "mov [rax + {R10}], r10",
-        "mov [rax + {R11}], r11",
-        "mov [rax + {R12}], r12",
-        "mov [rax + {R13}], r13",
-        "mov [rax + {R14}], r14",
-        "mov [rax + {R15}], r15",
-
-        // Everything the guest left behind is now recorded, so an interrupt
-        // arriving here can be taken safely — and one that caused this exit is
-        // taken here, on the host's own descriptor table, with the host's task
-        // register and GS base already restored one instruction ago.
-        "stgi",
-
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop rbx",
-        "ret",
-
-        RCX = const offset_of!(Registers, rcx),
-        RDX = const offset_of!(Registers, rdx),
-        RBX = const offset_of!(Registers, rbx),
-        RBP = const offset_of!(Registers, rbp),
-        RSI = const offset_of!(Registers, rsi),
-        RDI = const offset_of!(Registers, rdi),
-        R8 = const offset_of!(Registers, r8),
-        R9 = const offset_of!(Registers, r9),
-        R10 = const offset_of!(Registers, r10),
-        R11 = const offset_of!(Registers, r11),
-        R12 = const offset_of!(Registers, r12),
-        R13 = const offset_of!(Registers, r13),
-        R14 = const offset_of!(Registers, r14),
-        R15 = const offset_of!(Registers, r15),
-    )
-}
+const _: () = assert!(
+    align_of::<Block>() == CACHE_LINE,
+    "the block the switch rewrites on every exit must not share a line",
+);
+const _: () = assert!(
+    size_of::<Block>() <= 2 * CACHE_LINE,
+    "the switch's fourteen stores must not reach a third cache line",
+);
+const _: () = assert!(
+    offset_of!(Block, snapshot) >= size_of::<Registers>(),
+    "the snapshot must sit past the registers, in what would be padding after them",
+);

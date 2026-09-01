@@ -8,18 +8,19 @@
 //! # Two ways to reach a physical address, chosen by which one can work
 //!
 //! Almost everything uACPI asks for is memory: a table, a definition block, a
-//! structure hanging off one. All of it is described as memory by firmware's own
-//! memory map, and the direct map already describes all of that — so the answer
-//! is arithmetic on an address, with no page table edited and no range claimed.
-//! That matters, because it is the answer given for every table on every machine.
+//! structure hanging off one. All of it is described as memory by firmware's
+//! own memory map, and the direct map already describes all of that — so the
+//! answer is arithmetic on an address, with no page table edited and no range
+//! claimed. That matters, because it is the answer given for every table on
+//! every machine.
 //!
 //! What is left is operation regions in device memory, which is where a great
 //! deal of firmware's bytecode does its work: the platform's own registers, an
 //! event timer's block, a chipset's configuration. Those get a mapping of their
-//! own out of the mapping window, uncached, because a device's registers are not
-//! memory and must not be read from a cache line. Each one is remembered until it
-//! is given back, since releasing it needs the value the address space handed out
-//! rather than just the address.
+//! own out of the mapping window, uncached, because a device's registers are
+//! not memory and must not be read from a cache line. Each one is remembered
+//! until it is given back, since releasing it needs the value the address space
+//! handed out rather than just the address.
 //!
 //! # Being inside the direct map is not being mapped by it
 //!
@@ -203,15 +204,15 @@ pub(super) unsafe extern "C" fn uacpi_kernel_free(mem: *mut c_void, size: raw::u
 
 /// Where the direct map really reads `bytes` at `phys`, if it really does.
 ///
-/// Numerically inside the map is not enough — see this module — so the map's own
-/// page tables are asked, at both ends of the range, and a range they do not
-/// both answer for belongs to [`device`] instead.
+/// Numerically inside the map is not enough — see this module — so the map's
+/// own page tables are asked, at both ends of the range, and a range they do
+/// not both answer for belongs to [`device`] instead.
 ///
 /// Before the address space became the machine's there is nothing to ask, and
-/// nothing to ask about: all early table access maps is tables, and a table is in
-/// memory the map describes. That is also the only window in which this is on the
-/// path of every table on every machine, which is the one place the cost of a
-/// walk would be worth avoiding.
+/// nothing to ask about: all early table access maps is tables, and a table is
+/// in memory the map describes. That is also the only window in which this is
+/// on the path of every table on every machine, which is the one place the cost
+/// of a walk would be worth avoiding.
 fn translated(map: &DirectMap, phys: PhysAddr, bytes: u64) -> Option<VirtAddr> {
     let virt = map.reach(phys, bytes).ok()?;
     if !paging::adopted() {

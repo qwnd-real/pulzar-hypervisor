@@ -22,21 +22,18 @@
 //! save one match arm at a use site. [`Vcpu::gpr`](crate::Vcpu::gpr) is that
 //! match arm, written once.
 
-/// Bytes a cache line occupies on the processors this runs on.
-///
-/// The block is aligned to one so that the switch's fourteen stores land in as
-/// few lines as they can, and so that no other field of a virtual processor
-/// shares a line with registers the switch rewrites on every exit.
-const CACHE_LINE: usize = 64;
-
 /// The fourteen general-purpose registers the hypervisor is responsible for.
 ///
 /// The order is the order the architecture encodes register numbers in, minus
 /// the two the hardware carries itself. That is not for arithmetic — the
 /// mapping from an encoded number to a field is a match, not an index — but it
 /// means a dump of this structure reads in the order a disassembler names them.
+///
+/// Where these sit in memory is not this type's business but
+/// [`Block`](crate::switch::Block)'s, which is the thing the world switch is
+/// handed and which states what the placement has to achieve.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C, align(64))]
+#[repr(C)]
 pub struct Registers {
     /// The count register, and the first argument of the fast system call
     /// convention.
@@ -186,12 +183,4 @@ const R15: u8 = 15;
 const _: () = assert!(
     core::mem::offset_of!(Registers, r15) + size_of::<u64>() == 14 * size_of::<u64>(),
     "the fourteen registers must lie end to end, since the switch addresses them by offset",
-);
-const _: () = assert!(
-    align_of::<Registers>() == CACHE_LINE,
-    "the block the switch rewrites on every exit must not share a line",
-);
-const _: () = assert!(
-    size_of::<Registers>() <= 2 * CACHE_LINE,
-    "the switch's fourteen stores must not reach a third cache line",
 );

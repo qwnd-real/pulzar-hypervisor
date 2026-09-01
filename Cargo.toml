@@ -182,3 +182,17 @@ pedantic = { level = "deny", priority = -1 }
 undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
 allow_attributes_without_reason = "deny"
+
+# The hypervisor is a dozen crates and its hottest path crosses most of them: a
+# guest's exit is answered by code in `exits` reading structures defined in
+# `svm` through accessors in `vcpu`. Cargo's default release settings optimize
+# each crate on its own, which leaves every one of those boundaries a call —
+# including calls that exist only to return a field or to test a feature bit
+# that was decided at boot. Whole-program optimization is what lets them fold,
+# and a single codegen unit is what lets it see all of them at once.
+#
+# The cost is build time on a clean release build, which is paid by whoever
+# measures rather than by whoever develops: the default profile is untouched.
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -78,7 +78,7 @@ use inject::{Injected, Pending};
 use log::{error, info, trace};
 use partition::{Addressing, Partition};
 use portal::Portal;
-use svm::{CleanBits, Reason};
+use svm::{CleanBits, ExitCode};
 use thiserror::Error;
 use vcpu::{Flow, RunPhase, Vcpu, VcpuError};
 use vlapic::{Resumption, VlapicError};
@@ -248,8 +248,16 @@ impl<'a> Exits<'a> {
     /// backing page while the hardware drives its controller; and both have
     /// to happen before the exit is answered, because answering one can
     /// send this processor an interrupt.
+    ///
+    /// The code is matched raw rather than decoded through [`svm::Reason`].
+    /// Every exit answered below is one the architecture gives a single code,
+    /// so decoding first would turn one dispatch into two — a jump through a
+    /// table to reach the reason and a second through another to reach the
+    /// answer, both of them indirect branches on the one path every exit takes.
+    /// What the decoded form is for is the codes that carry a register number
+    /// or a vector, and nothing here answers one of those.
     fn exit(&mut self, vcpu: &mut Vcpu) -> Flow {
-        let reason = vcpu.reason();
+        let code = vcpu.control().exit_code;
         // First, and one relaxed store: a change to the guest's memory makes
         // every processor inside the guest leave it and waits for each of them,
         // so a processor that has left and not said so is one such a change
@@ -300,17 +308,14 @@ impl<'a> Exits<'a> {
         if let Some(firmware) = &mut self.firmware {
             firmware.retire(vcpu, self.partition);
         }
-        let flow = match reason {
-            Some(Reason::Cpuid) => cpuid::exit(vcpu),
-            Some(Reason::MsrAccess) => {
-                self.virtualization
-                    .exit(vcpu, &mut self.mtrrs, &mut self.interrupts)
-            }
-            Some(Reason::NestedPageFault) => {
-                nested::exit(vcpu, self.partition, &mut self.interrupts)
-            }
-            Some(Reason::AvicIncompleteIpi) => avic::incomplete_ipi(vcpu, &mut self.census),
-            Some(Reason::AvicUnacceleratedAccess) => avic::unaccelerated_access(
+        let flow = match code {
+            ExitCode::CPUID => cpuid::exit(vcpu),
+            ExitCode::MSR => self
+                .virtualization
+                .exit(vcpu, &mut self.mtrrs, &mut self.interrupts),
+            ExitCode::NPF => nested::exit(vcpu, self.partition, &mut self.interrupts),
+            ExitCode::AVIC_INCOMPLETE_IPI => avic::incomplete_ipi(vcpu, &mut self.census),
+            ExitCode::AVIC_NOACCEL => avic::unaccelerated_access(
                 vcpu,
                 self.partition,
                 &mut self.interrupts,
@@ -320,19 +325,17 @@ impl<'a> Exits<'a> {
             // a word carrying this hypervisor's own selector is a hypercall from
             // somewhere inside the guest, at any privilege level, and anything
             // else is the portal telling the host how far firmware has got.
-            Some(Reason::Vmmcall) => match hypercall::exit(vcpu, self.partition) {
+            ExitCode::VMMCALL => match hypercall::exit(vcpu, self.partition) {
                 Some(flow) => flow,
                 None => self.notified(vcpu),
             },
-            Some(
-                Reason::Vmrun
-                | Reason::Vmload
-                | Reason::Vmsave
-                | Reason::Stgi
-                | Reason::Clgi
-                | Reason::Skinit
-                | Reason::Invlpga,
-            ) => hidden_svm::refuse(vcpu, &mut self.interrupts),
+            ExitCode::VMRUN
+            | ExitCode::VMLOAD
+            | ExitCode::VMSAVE
+            | ExitCode::STGI
+            | ExitCode::CLGI
+            | ExitCode::SKINIT
+            | ExitCode::INVLPGA => hidden_svm::refuse(vcpu, &mut self.interrupts),
             // Two exits that are answered by the fact of having happened.
             //
             // The first says the guest became willing to take an interrupt: the
@@ -342,19 +345,19 @@ impl<'a> Exits<'a> {
             // the host at the world switch and has already been given to
             // whichever controller it was for, and the exit itself carries
             // nothing further.
-            Some(Reason::VirtualInterrupt | Reason::Interrupt | Reason::Nmi) => Flow::Resume,
+            ExitCode::VINTR | ExitCode::INTR | ExitCode::NMI => Flow::Resume,
             // The guest asked to be woken by an interrupt. What it is owed is in
             // software, so this is where the processor is parked rather than
             // inside a guest nothing would re-enter.
-            Some(Reason::Hlt) => self.halted(vcpu),
+            ExitCode::HLT => self.halted(vcpu),
             // The guest left an interrupt handler, which ends the window during
             // which it takes no further non-maskable interrupt.
-            Some(Reason::Iret) => {
+            ExitCode::IRET => {
                 self.interrupts.intercepted_iret(vcpu);
                 Flow::Resume
             }
             _ => {
-                error!("exits: unhandled {:?}", vcpu.control().exit_code);
+                error!("exits: unhandled {code:?}");
                 Flow::Leave
             }
         };
