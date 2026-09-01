@@ -179,6 +179,7 @@ impl Census {
     /// which has gone quiet ever ran at all.
     fn summarize(&mut self, vcpu: &Vcpu) {
         let save = vcpu.save();
+
         info!(
             "exits: {} exits ({} in all), guest at {:#x}, cs {:#x}, cr3 {:#x}, rflags {:#x}",
             self.counted, self.lifetime, save.rip, save.cs.selector, save.cr3, save.rflags
