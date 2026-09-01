@@ -37,7 +37,15 @@
 //!    that is also acquired without it, so no other lock can be waited for by
 //!    the processor holding this one while its own holder waits for this. In
 //!    practice that means the closure does address-space work and nothing else:
-//!    no nested-paging structure, no partition, no device.
+//!    no nested-paging structure, no partition, no device. The one exception is
+//!    taking a guest's storage controllers over at the moment its firmware
+//!    services end — asking their configuration registers how far they decode,
+//!    mapping their doorbell arrays, and registering the regions the hypervisor
+//!    answers for — which is a whole subsystem's bring-up under the lock, and
+//!    safe only because of when it happens: the guest is stopped mid-call and
+//!    the other processors do not exist yet, so with no second processor to
+//!    hold the locks it takes, the wait this rule forbids cannot happen. That
+//!    exception is as wide as that one moment and no wider.
 //!
 //! Rule 1 is checked rather than merely stated: a debug build records the
 //! processor that holds the lock and refuses a second acquisition from the same
