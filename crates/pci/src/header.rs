@@ -389,6 +389,16 @@ impl Class {
     /// Bridges of every kind.
     pub const BRIDGE: u8 = 0x06;
 
+    /// Storage devices and storage controllers of every kind.
+    pub const MASS_STORAGE: u8 = 0x01;
+
+    /// The subclass of a controller speaking the NVM command set.
+    pub const NVM: u8 = 0x08;
+
+    /// The programming interface of an `NVMe` controller, whose BAR0 holds the
+    /// register file and doorbell array the storage driver answers for.
+    pub const NVME: u8 = 0x02;
+
     /// The subclass of a bridge onto the machine's own bus hierarchy.
     pub const HOST: u8 = 0x00;
 
@@ -432,6 +442,12 @@ impl Class {
     #[must_use]
     pub const fn is_host_bridge(self) -> bool {
         self.base == Self::BRIDGE && self.sub == Self::HOST
+    }
+
+    /// Whether this function is an `NVMe` controller.
+    #[must_use]
+    pub const fn is_nvme(self) -> bool {
+        self.base == Self::MASS_STORAGE && self.sub == Self::NVM && self.interface == Self::NVME
     }
 
     /// What the base class is called.
@@ -835,3 +851,34 @@ const MEMORY_GRANULARITY: u64 = 0xF_FFFF;
 
 /// Bits a prefetchable window's upper half is shifted by.
 const PREFETCH_UPPER_SHIFT: u8 = 32;
+
+#[cfg(test)]
+mod tests {
+    use super::Class;
+
+    /// A class from its three bytes, the way a surveyed function reports it.
+    const fn class(base: u8, sub: u8, interface: u8) -> Class {
+        Class {
+            base,
+            sub,
+            interface,
+        }
+    }
+
+    #[test]
+    fn an_nvme_controller_is_recognised() {
+        assert!(class(Class::MASS_STORAGE, Class::NVM, Class::NVME).is_nvme());
+    }
+
+    #[test]
+    fn nothing_else_is() {
+        // An `NVMe` interface under another subclass, an NVM subclass under
+        // another base class, and a bridge: mass storage of the other kinds
+        // shares this base class, so the interface and subclass both have to
+        // agree.
+        assert!(!class(Class::MASS_STORAGE, Class::NVM, 0x01).is_nvme());
+        assert!(!class(Class::MASS_STORAGE, 0x01, Class::NVME).is_nvme());
+        assert!(!class(0x02, Class::NVM, Class::NVME).is_nvme());
+        assert!(!class(0x06, 0x00, 0x00).is_nvme());
+    }
+}
