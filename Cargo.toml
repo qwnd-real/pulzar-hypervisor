@@ -7,6 +7,7 @@ members = [
     "crates/config",
     "crates/cpu",
     "crates/descriptors",
+    "crates/drivers/nvme",
     "crates/emulate",
     "crates/exits",
     "crates/handoff",
@@ -73,9 +74,11 @@ uefi-raw = "0.15.1"
 # register the machine may not have and reports a refusal rather than taking
 # it, `vlapic` is the interrupt controller a guest sees in place of the
 # machine's own, and `exits` is what every one of a guest's exits means and
-# what the host does about it. `spoof` is the keyed transform that replaces an
-# identifying string with one of the same shape, and `config` the machine's
-# own choices, the transform's seed among them.
+# what the host does about it. `nvme` is the storage driver that answers a
+# guest's identify commands with what `spoof` makes of them — `spoof` being
+# the keyed transform that replaces an identifying string with one of the same
+# shape, and `config` the machine's own choices, the transform's seed among
+# them.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
@@ -92,6 +95,7 @@ hypercall = { path = "crates/hypercall" }
 inject = { path = "crates/inject" }
 ipi = { path = "crates/ipi" }
 memory = { path = "crates/memory" }
+nvme = { path = "crates/drivers/nvme" }
 npt = { path = "crates/npt" }
 paging = { path = "crates/paging" }
 partition = { path = "crates/partition" }

@@ -18,6 +18,9 @@ log = { workspace = true }
 # Reaching the buffer a hypercall names, which is a linear address of the
 # calling guest and has to be walked as one.
 memory = { workspace = true }
+# Taking the storage controllers over at the moment firmware's services end,
+# which is what this crate's notification of that moment exists to sequence.
+nvme = { workspace = true }
 npt = { workspace = true }
 partition = { workspace = true }
 portal = { workspace = true }

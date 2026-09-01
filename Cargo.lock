@@ -447,6 +447,7 @@ dependencies = [
  "log",
  "memory",
  "npt",
+ "nvme",
  "partition",
  "portal",
  "probe",
@@ -782,6 +783,25 @@ dependencies = [
  "svm",
  "thiserror",
  "vcpu",
+ "x86_64",
+]
+
+[[package]]
+name = "nvme"
+version = "0.1.0"
+dependencies = [
+ "bitfield-struct",
+ "config",
+ "emulate",
+ "log",
+ "memory",
+ "npt",
+ "paging",
+ "partition",
+ "pci",
+ "spin 0.12.2",
+ "spoof",
+ "thiserror",
  "x86_64",
 ]
 

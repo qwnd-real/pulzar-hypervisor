@@ -1,0 +1,40 @@
+[package]
+name = "nvme"
+description = "The storage controller a guest reads its disks' identities from, answered for so that what it reads names nothing"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Packed register layouts: the controller's capabilities and the admin
+# queues' attributes are fields at fixed widths, declared once.
+bitfield-struct = { workspace = true }
+# The machine's own choices, the seed among them, that decide what the
+# replacements look like.
+config = { workspace = true }
+# The device contract this driver implements and the regions it registers
+# through.
+emulate = { workspace = true }
+log = { workspace = true }
+# Reaching the guest's queues and identify buffers, which are the guest's
+# memory addressed physically.
+memory = { workspace = true }
+# Coalescing what trapping each controller's regions owes, so one barrier
+# pays for all of them.
+npt = { workspace = true }
+# Mapping the doorbell array once, when the controllers are taken over.
+paging = { workspace = true }
+# Registering the regions this driver answers for.
+partition = { workspace = true }
+# Finding the controllers, and the probe that asks a base address register
+# how far it decodes.
+pci = { workspace = true }
+# The lock around each controller's admin-queue tracking.
+spin = { workspace = true }
+# The transforms the identifying fields are replaced with.
+spoof = { workspace = true }
+thiserror = { workspace = true }
+x86_64 = { workspace = true }
+
+[lints]
+workspace = true

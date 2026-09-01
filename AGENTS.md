@@ -49,6 +49,8 @@ pulzar/
 ├── rustfmt.toml         ← formatting policy (uses unstable options → nightly)
 ├── .cargo/config.toml   ← cargo aliases (`cargo xtask`)
 └── crates/
+    ├── drivers/          ← device drivers that interpose a guest's device MMIO
+    │   └── nvme/         ← answers a guest's NVMe identify commands with spoofed identity
     ├── hv-loader/       ← UEFI application: first-stage loader for the hypervisor
     ├── hv-core/         ← UEFI application: hypervisor image (stub until the loader loads it)
     └── xtask/           ← host tool: stages boot media, provisions guest disks, runs QEMU

@@ -93,11 +93,13 @@ use crate::{census::Census, firmware::Firmware, msr::Virtualization, mtrr::Mtrrs
 /// what its guest is owed, how far it has got out of firmware — which for every
 /// processor but one is "there was no firmware" — what it has been told about
 /// this machine's virtualization extension, and the memory-type ranges it was
-/// given in place of this core's own. The guest's memory is borrowed rather
-/// than held, because that part really is shared by all of them.
+/// given in place of this core's own. The guest itself is held for the
+/// machine's lifetime rather than borrowed, because what a processor hands
+/// the guest's devices over to at the end of firmware has to reach them for
+/// as long as the guest runs, from every processor it runs on.
 #[derive(Debug)]
-pub struct Exits<'a> {
-    partition: &'a Partition,
+pub struct Exits {
+    partition: &'static Partition,
     firmware: Option<Firmware>,
     interrupts: Pending,
     virtualization: Virtualization,
@@ -106,10 +108,10 @@ pub struct Exits<'a> {
     census: Census,
 }
 
-impl<'a> Exits<'a> {
+impl Exits {
     /// What will answer for a guest that is entered at `portal`.
     #[must_use]
-    pub fn new(partition: &'a Partition, portal: Portal, boot: Boot) -> Self {
+    pub fn new(partition: &'static Partition, portal: Portal, boot: Boot) -> Self {
         Self {
             partition,
             firmware: Some(Firmware::new(portal, boot)),
@@ -134,7 +136,7 @@ impl<'a> Exits<'a> {
     /// each one answering what firmware really left on the core it is
     /// running on.
     #[must_use]
-    pub fn joining(partition: &'a Partition) -> Self {
+    pub fn joining(partition: &'static Partition) -> Self {
         Self {
             partition,
             firmware: None,
@@ -383,7 +385,7 @@ impl<'a> Exits<'a> {
             error!("exits: a processor with no portal issued VMMCALL");
             return Flow::Leave;
         };
-        firmware.notified(vcpu)
+        firmware.notified(vcpu, self.partition)
     }
 
     /// Decides what the guest takes on its way back in, or that there is no

@@ -83,12 +83,12 @@ impl Firmware {
     }
 
     /// Acts on one of the portal's notifications.
-    pub(crate) fn notified(&mut self, vcpu: &mut Vcpu) -> Flow {
+    pub(crate) fn notified(&mut self, vcpu: &mut Vcpu, partition: &'static Partition) -> Flow {
         let marker = vcpu.registers().rdx;
         match Notification::from_bits(marker) {
             Some(Notification::LoaderUnloaded) => self.loader(vcpu, true),
             Some(Notification::LoaderSkipped) => self.loader(vcpu, false),
-            Some(Notification::ExitSucceeded) => self.handed(vcpu),
+            Some(Notification::ExitSucceeded) => self.handed(vcpu, partition),
             Some(Notification::StartReturned) => {
                 error!(
                     "exits: firmware StartImage returned status {:#x}",
@@ -183,9 +183,9 @@ impl Firmware {
         }
     }
 
-    /// Restores firmware's table, takes the legacy interrupt controllers back,
-    /// and starts the other processors now that firmware no longer owns the
-    /// machine.
+    /// Restores firmware's table, takes the legacy interrupt controllers and
+    /// the storage controllers back, and starts the other processors now
+    /// that firmware no longer owns the machine.
     ///
     /// The controllers go first, and before anything else here, because they
     /// are the one piece of the machine that was handed *to* the guest
@@ -198,7 +198,17 @@ impl Firmware {
     /// left open is an interrupt arriving on a number no guest has claimed
     /// and nothing here can name, because the vector base is write-only and
     /// cannot be read back.
-    fn handed(&mut self, vcpu: &mut Vcpu) -> Flow {
+    ///
+    /// The storage controllers go next, and still before the others are
+    /// started, for two reasons. Taking one over means writing to its
+    /// configuration space — asking a base address register how far it
+    /// decodes — which is this hypervisor's to do from exactly this moment:
+    /// the guest's `ExitBootServices` has returned and nothing of the
+    /// guest's owns a device yet. And the takeover registers regions of the
+    /// guest's memory and maps the doorbells behind them, whose barriers
+    /// cost one interprocessor interrupt per processor once they are running
+    /// and nothing at all while this is the only one.
+    fn handed(&mut self, vcpu: &mut Vcpu, partition: &'static Partition) -> Flow {
         if self.stage == Stage::Portal {
             error!("exits: ExitBootServices succeeded before the loader transition");
             return Flow::Leave;
@@ -218,6 +228,13 @@ impl Firmware {
                 // will otherwise finish: what is left is firmware's own masks,
                 // which is the state the machine was in a moment ago.
                 Err(error) => warn!("exits: the legacy controllers could not be masked: {error}"),
+            }
+            // Not fatal to the guest, for the same reason the masked
+            // controllers were not: a guest whose drives answer with their
+            // real serial numbers still boots, and a guest that does not
+            // boot is the worse failure.
+            if let Err(error) = nvme::adopt(partition) {
+                warn!("exits: the nvme controllers could not be taken over: {error}");
             }
             info!("exits: About to boot APICs");
             let started = apic::start(self.boot.trampoline, self.boot.attach);
