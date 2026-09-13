@@ -6,7 +6,7 @@
 [![Issues](https://img.shields.io/github/issues/yourusername/pulzar?style=flat-square)](https://github.com/yourusername/pulzar/issues)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 
-A minimal pass-through type-1 hypervisor for x86_64 with nested virtualization support.
+A minimal pass-through type-1 hypervisor for x86_64.
 
 Pulzar continues the UEFI boot cycle transparently, jumping into the UEFI context inside a virtualized environment and handing off to the next bootloader (Windows, Linux). The guest OS then runs entirely under Pulzar's control, with device access shadowed at the hypervisor level.
 
