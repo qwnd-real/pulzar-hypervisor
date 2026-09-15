@@ -67,7 +67,6 @@
 
 extern crate alloc;
 
-mod decode;
 #[cfg(test)]
 mod dispatch;
 mod gpr;
@@ -134,7 +133,7 @@ const fn as_usize(value: u64) -> usize {
 /// mean the crate was built wrong rather than anything about the machine.
 pub fn install() -> Result<(), EmulateError> {
     xmm::available()?;
-    let bytes = decode::warm()?;
+    let bytes = mmio::decode::warm()?;
     info!("emulate: decoder ready, its own sample instruction read as {bytes} bytes");
     match processor::svm() {
         Some(svm) if svm.features.contains(SvmFeatures::NEXT_RIP) => {
@@ -167,7 +166,7 @@ pub fn next_rip(vcpu: &Vcpu, guest: Linear<'_>) -> Result<u64, EmulateError> {
     if let Some(supplied) = supplied(vcpu) {
         return Ok(supplied);
     }
-    let instruction = decode::instruction(vcpu, &guest)?;
+    let instruction = mmio::decode::instruction(vcpu, &guest)?;
     plan::after(vcpu.save(), instruction.len()).ok_or(EmulateError::Undecodable {
         rip: vcpu.save().rip,
         bytes: instruction.len(),

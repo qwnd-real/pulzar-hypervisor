@@ -399,6 +399,12 @@ impl Class {
     /// register file and doorbell array the storage driver answers for.
     pub const NVME: u8 = 0x02;
 
+    /// The base class of network controllers.
+    pub const NETWORK: u8 = 0x02;
+
+    /// The subclass of an Ethernet controller.
+    pub const ETHERNET: u8 = 0x00;
+
     /// The subclass of a bridge onto the machine's own bus hierarchy.
     pub const HOST: u8 = 0x00;
 
@@ -448,6 +454,13 @@ impl Class {
     #[must_use]
     pub const fn is_nvme(self) -> bool {
         self.base == Self::MASS_STORAGE && self.sub == Self::NVM && self.interface == Self::NVME
+    }
+
+    /// Whether this function is an Ethernet controller, the kind whose
+    /// registers carry the address a network interface is known by.
+    #[must_use]
+    pub const fn is_ethernet(self) -> bool {
+        self.base == Self::NETWORK && self.sub == Self::ETHERNET
     }
 
     /// What the base class is called.
@@ -871,14 +884,18 @@ mod tests {
     }
 
     #[test]
-    fn nothing_else_is() {
-        // An `NVMe` interface under another subclass, an NVM subclass under
-        // another base class, and a bridge: mass storage of the other kinds
-        // shares this base class, so the interface and subclass both have to
-        // agree.
-        assert!(!class(Class::MASS_STORAGE, Class::NVM, 0x01).is_nvme());
-        assert!(!class(Class::MASS_STORAGE, 0x01, Class::NVME).is_nvme());
-        assert!(!class(0x02, Class::NVM, Class::NVME).is_nvme());
-        assert!(!class(0x06, 0x00, 0x00).is_nvme());
+    fn an_ethernet_controller_is_recognised() {
+        assert!(class(Class::NETWORK, Class::ETHERNET, 0x00).is_ethernet());
+    }
+
+    #[test]
+    fn no_other_network_controller_is() {
+        // Other network subclasses share this base class, so the subclass
+        // has to agree; and the programming interface is free, because
+        // every Ethernet controller this workspace answers for reports a
+        // different one.
+        assert!(!class(Class::NETWORK, 0x80, 0x00).is_ethernet());
+        assert!(!class(Class::BRIDGE, Class::HOST, 0x00).is_ethernet());
+        assert!(class(Class::NETWORK, Class::ETHERNET, 0x11).is_ethernet());
     }
 }

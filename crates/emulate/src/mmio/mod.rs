@@ -83,6 +83,7 @@
 //! it is genuinely shared, rather than paying for a lock around the whole
 //! dispatch path because the signature demanded one.
 
+pub(crate) mod decode;
 #[cfg(test)]
 pub(crate) mod harness;
 mod window;
@@ -808,7 +809,7 @@ impl Mmio {
             // the guest is executing from, which is not this crate's to put right.
             return Err(EmulateError::FetchFault { gpa: gpa.as_u64() });
         }
-        let instruction = crate::decode::instruction(cpu, guest)?;
+        let instruction = decode::instruction(cpu, guest)?;
         let reported = crate::plan::Reported { gpa, cause };
         let outcome = if let Some(width) = crate::mov::string(instruction.code()) {
             crate::string::perform(self, cpu, guest, &instruction, width, reported)?

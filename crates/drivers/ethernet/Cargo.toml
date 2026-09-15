@@ -1,0 +1,36 @@
+[package]
+name = "ethernet"
+description = "The network controllers a guest reads its interfaces' identities from, answered for so that what it reads names nothing"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Flag sets, for the scattered control bits of the EEPROM interfaces.
+bitflags = { workspace = true }
+# The machine's own choices, the seed among them, that decide what the
+# replacements look like.
+config = { workspace = true }
+# The device contract this driver implements and the regions it registers
+# through.
+emulate = { workspace = true }
+log = { workspace = true }
+# Coalescing what trapping each controller's regions owes, so one barrier
+# pays for all of them.
+npt = { workspace = true }
+# Mapping the register pages once, when the controllers are taken over.
+paging = { workspace = true }
+# Registering the regions this driver answers for.
+partition = { workspace = true }
+# Finding the controllers, and the probe that asks a base address register
+# how far it decodes.
+pci = { workspace = true }
+# Refusing a second takeover.
+spin = { workspace = true }
+# The transform the address's serial half is replaced with.
+spoof = { workspace = true }
+thiserror = { workspace = true }
+x86_64 = { workspace = true }
+
+[lints]
+workspace = true

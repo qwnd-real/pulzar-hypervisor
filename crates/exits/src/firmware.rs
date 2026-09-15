@@ -236,6 +236,15 @@ impl Firmware {
             if let Err(error) = nvme::adopt(partition) {
                 warn!("exits: the nvme controllers could not be taken over: {error}");
             }
+            // The network controllers are taken over in the same moment and
+            // for the same reasons: this is the one window in which their
+            // registers are this hypervisor's to read and their serial
+            // EEPROMs to drive, and the same fail-open rule holds — a guest
+            // that boots reading one real address beats one that does not
+            // boot.
+            if let Err(error) = ethernet::adopt(partition) {
+                warn!("exits: the ethernet controllers could not be taken over: {error}");
+            }
             info!("exits: About to boot APICs");
             let started = apic::start(self.boot.trampoline, self.boot.attach);
             // Whatever came of it, and before the guest is let go: every

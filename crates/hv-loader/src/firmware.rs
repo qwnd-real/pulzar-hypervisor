@@ -47,10 +47,15 @@ use crate::{
 };
 
 /// Path of the hypervisor image on the boot volume.
+///
+/// The Windows boot manager's own place, so a machine whose firmware boots
+/// Windows by default finds the hypervisor where it was already looking:
+/// the loader is staged as the removable-media boot program, and the core
+/// under the path this names.
 const IMAGE_PATH: &uefi::CStr16 = cstr16!("\\pulzar.efi");
 
 /// UEFI path of the image the initial guest starts.
-const GUEST_IMAGE_PATH: &uefi::CStr16 = cstr16!("\\EFI\\Limine\\limine_x64.efi");
+const GUEST_IMAGE_PATH: &uefi::CStr16 = cstr16!("\\EFI\\Microsoft\\Boot\\bootmgfw.efi");
 
 /// The loader's own image, as firmware describes it.
 ///

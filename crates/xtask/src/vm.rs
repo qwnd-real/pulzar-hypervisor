@@ -50,6 +50,16 @@ const PROCESSOR: &str = "host,invtsc=on,topoext=on";
 /// holds — is visible at a glance inside the guest.
 const NVME_SERIAL: &str = "S4XPNV0K8123456";
 
+/// The address the emulated Intel controller presents.
+///
+/// Written with the QEMU prefix a virtual one has, so that a replacement
+/// of the same shape — same prefix, different serial — is visible at a
+/// glance inside the guest.
+const INTEL_MAC: &str = "52:54:00:12:34:56";
+
+/// The address the emulated Realtek controller presents.
+const REALTEK_MAC: &str = "52:54:00:98:76:54";
+
 /// Memory the guest is given. Enough for a desktop installer to run in.
 const MEMORY: &str = "8G";
 
@@ -210,6 +220,27 @@ pub fn launch(spec: &Spec) -> Result<()> {
         drive_path(&nvme)
     ));
     qemu.args(["-device", &format!("nvme,drive=nvme,serial={NVME_SERIAL}")]);
+    // The ethernet controllers, with user-mode networking behind them.
+    // Attached for the same reason the storage controller is: they are the
+    // other devices this hypervisor interposes, and their takeovers are
+    // worth running on every boot. Two of them, because the two vendors'
+    // controllers keep their identities in different places — Intel's in
+    // the receive-address registers, Realtek's in the registers and the
+    // serial EEPROM behind them — and a boot that exercised only one would
+    // never notice the other going wrong. The addresses are written out
+    // with the vendor prefixes a real one has, so that a replacement of
+    // the same shape is visible at a glance inside the guest. No
+    // bootindex: nothing boots from the network unless a guest chooses to.
+    qemu.args(["-netdev", "user,id=network0"]);
+    qemu.args([
+        "-device",
+        &format!("e1000e,netdev=network0,mac={INTEL_MAC}"),
+    ]);
+    qemu.args(["-netdev", "user,id=network1"]);
+    qemu.args([
+        "-device",
+        &format!("rtl8139,netdev=network1,mac={REALTEK_MAC}"),
+    ]);
     if let Some(iso) = &spec.installer {
         qemu.arg("-drive").arg(format!(
             "if=none,id=installer,format=raw,media=cdrom,file={}",

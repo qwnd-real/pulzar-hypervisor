@@ -7,9 +7,8 @@ members = [
     "crates/config",
     "crates/cpu",
     "crates/descriptors",
+    "crates/drivers/ethernet",
     "crates/drivers/nvme",
-    "crates/emulate",
-    "crates/exits",
     "crates/handoff",
     "crates/hv-core",
     "crates/hv-loader",
@@ -75,16 +74,18 @@ uefi-raw = "0.15.1"
 # it, `vlapic` is the interrupt controller a guest sees in place of the
 # machine's own, and `exits` is what every one of a guest's exits means and
 # what the host does about it. `nvme` is the storage driver that answers a
-# guest's identify commands with what `spoof` makes of them — `spoof` being
-# the keyed transform that replaces an identifying string with one of the same
-# shape, and `config` the machine's own choices, the transform's seed among
-# them.
+# guest's identify commands with what `spoof` makes of them, and `ethernet`
+# the network driver that answers a guest's queries for its interfaces'
+# factory addresses the same way — `spoof` being the keyed transform that
+# replaces an identifying string with one of the same shape, and `config`
+# the machine's own choices, the transform's seed among them.
 acpi = { path = "crates/acpi" }
 apic = { path = "crates/apic" }
 clock = { path = "crates/clock" }
 config = { path = "crates/config" }
 cpu = { path = "crates/cpu" }
 descriptors = { path = "crates/descriptors" }
+ethernet = { path = "crates/drivers/ethernet" }
 emulate = { path = "crates/emulate" }
 exits = { path = "crates/exits" }
 handoff = { path = "crates/handoff" }

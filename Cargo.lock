@@ -435,6 +435,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethernet"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "config",
+ "emulate",
+ "log",
+ "npt",
+ "paging",
+ "partition",
+ "pci",
+ "spin 0.12.2",
+ "spoof",
+ "thiserror",
+ "x86_64",
+]
+
+[[package]]
 name = "exits"
 version = "0.1.0"
 dependencies = [
@@ -442,6 +460,7 @@ dependencies = [
  "bitflags",
  "descriptors",
  "emulate",
+ "ethernet",
  "hypercall",
  "inject",
  "log",
